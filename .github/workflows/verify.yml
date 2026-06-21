@@ -69,7 +69,7 @@ jobs:
           COVERAGE_GATE: ${{ vars.COVERAGE_GATE || '85' }}
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install Node.js
         uses: actions/setup-node@v4
