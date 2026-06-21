@@ -1,0 +1,2 @@
+{"session_id":"codex-session-3","turn_id":"turn-1","timestamp":"2026-05-15T10:00:00Z","model":"gpt-5.1-codex","last_token_usage":{"input_tokens":400,"output_tokens":180},"total_token_usage":{"input_tokens":400,"output_tokens":180},"costUSD":0.015}
+{"session_id":"codex-session-3","turn_id":"turn-2","timestamp":"2026-05-15T10:01:00Z","model":"gpt-5.1-codex","last_token_usage":{"input_tokens":350,"output_tokens":160},"total_token_usage":{"input_tokens":750,"output_tokens":340},"costUSD":0.025}

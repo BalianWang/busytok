@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prompt-palette-open-accessibility-settings"
+description = "Enables the prompt_palette_open_accessibility_settings command without any pre-configured scope."
+commands.allow = ["prompt_palette_open_accessibility_settings"]
+
+[[permission]]
+identifier = "deny-prompt-palette-open-accessibility-settings"
+description = "Denies the prompt_palette_open_accessibility_settings command without any pre-configured scope."
+commands.deny = ["prompt_palette_open_accessibility_settings"]

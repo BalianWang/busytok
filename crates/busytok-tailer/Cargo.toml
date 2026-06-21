@@ -1,0 +1,15 @@
+[package]
+name = "busytok-tailer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+busytok-domain = { path = "../busytok-domain" }
+notify = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

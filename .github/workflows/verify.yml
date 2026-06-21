@@ -1,0 +1,95 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build sidecars for macOS (required by tauri build.rs externalBin)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build -p busytok-service -p busytok
+          mkdir -p apps/gui/src-tauri/binaries
+          cp target/debug/busytok-service apps/gui/src-tauri/binaries/busytok-service-aarch64-apple-darwin
+          cp target/debug/busytok apps/gui/src-tauri/binaries/busytok-aarch64-apple-darwin
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Install cargo-audit + cargo-deny
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo audit --deny warnings
+
+      - name: cargo deny check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo deny check
+
+      - name: Install llvm-cov
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo llvm-cov
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo llvm-cov --workspace --fail-under-lines ${COVERAGE_GATE}
+        env:
+          COVERAGE_GATE: ${{ vars.COVERAGE_GATE || '85' }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm typecheck
+        run: pnpm typecheck
+
+      - name: pnpm test
+        run: pnpm -r test
+
+      - name: pnpm coverage
+        if: matrix.os == 'ubuntu-latest'
+        run: pnpm -r test:coverage
+
+      - name: release workflow smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: bash tests/workflows/release_workflow_test.sh

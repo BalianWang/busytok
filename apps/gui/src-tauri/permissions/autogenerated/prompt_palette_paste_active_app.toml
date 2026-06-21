@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prompt-palette-paste-active-app"
+description = "Enables the prompt_palette_paste_active_app command without any pre-configured scope."
+commands.allow = ["prompt_palette_paste_active_app"]
+
+[[permission]]
+identifier = "deny-prompt-palette-paste-active-app"
+description = "Denies the prompt_palette_paste_active_app command without any pre-configured scope."
+commands.deny = ["prompt_palette_paste_active_app"]

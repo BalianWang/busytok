@@ -1,0 +1,61 @@
+node_modules/
+
+# Playwright
+**/test-results/
+**/playwright-report/
+
+# Build outputs
+/target/
+/build/
+/dist/
+**/coverage/
+apps/gui/dist/
+**/ephemeral/
+apps/desktop/.dart_tool/
+apps/desktop/build/
+apps/desktop/macos/Pods/
+
+# Flutter tooling
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+
+# Local environment and logs
+.env
+.env.local
+*.log
+.DS_Store
+
+# Editor and local agent tooling
+.idea/
+.vscode/
+.claude/
+.codex/
+.gemini/
+.cc-switch/
+CLAUDE.md
+GEMINI.md
+
+# ts-rs auto-generated per-type bindings (we use generated.ts instead)
+**/bindings/
+
+# Worktree / planning scratch
+.worktrees/
+.spec-workflow/
+.history
+
+# Xcode user state
+**/xcuserdata/
+**/*.xcuserstate
+
+# Signing material — defense-in-depth against accidental commits.
+# These should also never be created inside the repo, but if they are, ignore.
+*.p12
+*.p8
+*.cer
+*.key
+updater.key
+updater.key.pub
+
+# Locally-built sidecars — CI builds fresh; committed sidecars removed in PR2.
+apps/gui/src-tauri/binaries/

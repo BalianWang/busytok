@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desktop-host-retry-shortcut-registration"
+description = "Enables the desktop_host_retry_shortcut_registration command without any pre-configured scope."
+commands.allow = ["desktop_host_retry_shortcut_registration"]
+
+[[permission]]
+identifier = "deny-desktop-host-retry-shortcut-registration"
+description = "Denies the desktop_host_retry_shortcut_registration command without any pre-configured scope."
+commands.deny = ["desktop_host_retry_shortcut_registration"]

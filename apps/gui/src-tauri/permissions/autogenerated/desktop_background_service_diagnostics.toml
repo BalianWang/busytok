@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desktop-background-service-diagnostics"
+description = "Enables the desktop_background_service_diagnostics command without any pre-configured scope."
+commands.allow = ["desktop_background_service_diagnostics"]
+
+[[permission]]
+identifier = "deny-desktop-background-service-diagnostics"
+description = "Denies the desktop_background_service_diagnostics command without any pre-configured scope."
+commands.deny = ["desktop_background_service_diagnostics"]

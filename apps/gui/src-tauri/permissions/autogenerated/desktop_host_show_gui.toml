@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desktop-host-show-gui"
+description = "Enables the desktop_host_show_gui command without any pre-configured scope."
+commands.allow = ["desktop_host_show_gui"]
+
+[[permission]]
+identifier = "deny-desktop-host-show-gui"
+description = "Denies the desktop_host_show_gui command without any pre-configured scope."
+commands.deny = ["desktop_host_show_gui"]

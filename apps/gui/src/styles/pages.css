@@ -1,0 +1,1605 @@
+/* ── Overview console ────────────────────────────────────── */
+
+.overview-console {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding-top: 8px;
+}
+
+.overview-console__status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.overview-console__charts-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  align-items: stretch;
+}
+
+@media (max-width: 1240px) {
+  .overview-console__charts-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Shared chart card ──────────────────────────────────────── */
+/* Trend + live-curve are the primary visual anchors of the overview
+   surface, so they sit one material layer up: a stronger surface and a
+   heavier shadow than the supporting ranking/recent panels below. */
+
+.overview-console__trend,
+.live-curve-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 18px 22px 16px;
+  border-radius: 24px;
+  background: var(--color-surface-strong);
+  border: 1px solid var(--color-border-soft);
+  box-shadow: var(--material-shadow-elevated);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.overview-console__trend-header,
+.live-curve-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 32px;
+  margin-bottom: 12px;
+}
+
+.overview-console__trend-header h2,
+.live-curve-panel__header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--color-text);
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.overview-console__trend-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+/* ── Trend chart area ────────────────────────────────────────── */
+
+.overview-console__chart {
+  flex: 1;
+  min-height: 220px;
+  border-top: 1px solid var(--color-border-soft);
+  padding-top: 10px;
+}
+
+.overview-console__heatmap {
+  /* The heatmap card fills the full width */
+}
+
+.overview-console__breakdowns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 1360px) {
+  .overview-console__breakdowns {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1240px) {
+  .overview-console__trend-header {
+    flex-wrap: wrap;
+  }
+
+  .overview-console__trend-controls {
+    flex-wrap: wrap;
+  }
+
+  .overview-console__breakdowns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ── Overview metric cards ───────────────────────────────── */
+
+.overview-console__metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+.metric-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 18px;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
+  box-shadow: var(--material-shadow-card);
+  overflow: hidden;
+}
+
+.metric-card__label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-faint);
+}
+
+.metric-card__value {
+  font-size: 28px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+  line-height: 1.2;
+}
+
+.metric-card__helper {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+/* Subtle top accent bar — replaces the legacy 3px left border strip.
+   Surfaced as a structural element so the calm treatment is observable
+   in tests and renders cleanly in both themes. The bar reads as a faint
+   semantic hint, never as the primary visual signal; the number stays
+   neutral high-contrast text. */
+.metric-card__top-accent {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+/* Tone variants — calm tinted wash + matching top accent. The wash is a
+   very low-opacity semantic tint layered into the surface so the card
+   still reads as part of the monitoring surface, not as a semantic
+   billboard. Number stays neutral text. */
+/* Neutral intentionally uses canvas-subtle (no semantic tint) rather than a
+   colored soft token, so it reads as "no signal" rather than a faint status. */
+.metric-card--neutral {
+  background: color-mix(in srgb, var(--color-surface) 92%, var(--color-canvas-subtle) 8%);
+}
+.metric-card--neutral .metric-card__top-accent {
+  background: var(--color-border);
+  opacity: 0.5;
+}
+
+.metric-card--success {
+  background: color-mix(in srgb, var(--color-surface) 90%, var(--color-status-success-soft) 10%);
+}
+.metric-card--success .metric-card__top-accent {
+  background: var(--color-status-success);
+}
+
+.metric-card--warning {
+  background: color-mix(in srgb, var(--color-surface) 90%, var(--color-status-warning-soft) 10%);
+}
+.metric-card--warning .metric-card__top-accent {
+  background: var(--color-status-warning);
+}
+
+.metric-card--danger {
+  background: color-mix(in srgb, var(--color-surface) 90%, var(--color-status-danger-soft) 10%);
+}
+.metric-card--danger .metric-card__top-accent {
+  background: var(--color-status-danger);
+}
+
+/* ── Rankings ────────────────────────────────────────────── */
+/* Rankings sit one material layer quieter than the primary trend and
+   heatmap anchors: a softer, near-borderless surface with no card
+   shadow so they read as supporting context rather than competing
+   cards. */
+
+.overview-console__rankings {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+.ranking-section {
+  padding: 18px 20px;
+  border-radius: var(--radius-lg);
+  background: var(--color-canvas-subtle);
+  border: 1px solid var(--color-border-soft);
+  box-shadow: none;
+}
+
+.ranking-section__title {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.ranking-section__empty {
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.ranking-section__items {
+  display: flex;
+  flex-direction: column;
+}
+
+.ranking-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--color-border-soft);
+  gap: 12px;
+}
+
+.ranking-item:last-child {
+  border-bottom: 0;
+}
+
+.ranking-item__bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: var(--color-data-primary);
+  opacity: 0.07;
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.ranking-item__label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+
+.ranking-item__value {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+}
+
+/* ── Recent Activity ─────────────────────────────────────── */
+/* Recent activity is the trailing supporting section and sits one
+   material layer quieter than the primary metrics and charts. */
+
+.overview-console__recent {
+  padding: 18px 20px;
+  border-radius: var(--radius-lg);
+  background: var(--color-canvas-subtle);
+  border: 1px solid var(--color-border-soft);
+  box-shadow: none;
+}
+
+.overview-console__recent h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+/* ── Chart empty state ──────────────────────────────────── */
+
+.overview-console__chart-empty,
+.overview-console__chart-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--color-text-muted);
+  font-size: 14px;
+}
+
+.overview-console__chart-empty-frame {
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  border: 1px dashed var(--color-border-soft);
+  background: transparent;
+}
+
+.overview-console__chart-empty {
+  position: relative;
+  flex-direction: column;
+  gap: 8px;
+}
+
+@media (max-width: 1100px) {
+  .overview-console__metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .overview-console__rankings {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .overview-console__metrics {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Activity page ───────────────────────────────────────── */
+
+.activity-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.activity-page__range {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.activity-page__range-hint {
+  font-size: 13px;
+  color: var(--color-text-faint);
+}
+
+.activity-page__table-shell {
+  overflow-x: auto;
+  padding: 0;
+}
+
+/* ── Status pills for ledger tables ───────────────────────────── */
+/* StatusPill uses ActivityStatusDto (ok/warning/error) — a different
+   source enum from StatusChip's ToneDto. The CSS maps each pill tone
+   to the SAME status token family as the corresponding chip, so both
+   components share visual treatment at the token layer without
+   forcing the underlying TS enums to merge. */
+.status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+/* status-pill--ok maps to the same success treatment as
+   status-chip--success. */
+.status-pill--ok {
+  background: var(--color-status-success-soft);
+  color: var(--color-status-success);
+}
+
+.status-pill--warning {
+  background: var(--color-status-warning-soft);
+  color: var(--color-status-warning);
+}
+
+/* status-pill--error maps to the same danger treatment as
+   status-chip--danger. */
+.status-pill--error {
+  background: var(--color-status-danger-soft);
+  color: var(--color-status-danger);
+}
+
+/* ── Detail drawer content ────────────────────────────────────── */
+
+.detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.detail-stack dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+}
+
+.detail-stack dt {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.detail-stack dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+.detail-stack section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.detail-stack section p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text);
+}
+
+.detail-stack section ul {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.detail-stack section li {
+  font-size: 13px;
+  color: var(--color-text);
+  margin-bottom: 2px;
+}
+
+.detail-stack__loading,
+.detail-stack__empty {
+  padding: 24px 0;
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+/* ── Projects/Models/Sessions pages ──────────────────────── */
+
+.projects-page,
+.models-page,
+.sessions-page,
+.breakdown-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* ── Prompt Palette page ─────────────────────────────────── */
+
+.prompt-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.prompt-page__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.prompt-page__header p {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+/* Toolbar reads as one quiet utility band rather than a stack of
+   unrelated controls. The grid keeps search/filter/sort on a single
+   shared inset surface; labels are softened so the input fields, not
+   the chrome, carry the visual weight. */
+.prompt-page__toolbar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1.3fr) minmax(160px, 0.7fr) minmax(160px, 0.7fr) auto;
+  align-items: end;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+}
+
+.prompt-page__search,
+.prompt-page__filter {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.prompt-page__search span,
+.prompt-page__filter span {
+  color: var(--color-text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.prompt-page__search input,
+.prompt-page__filter input {
+  width: 100%;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  padding: 9px 12px;
+  font-size: 13px;
+}
+
+.prompt-page__list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.prompt-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  padding: var(--space-4);
+}
+
+.prompt-row__main {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-1);
+}
+
+.prompt-row__title {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.prompt-row__meta .prompt-tag {
+  padding: 1px 6px;
+  font-size: 10px;
+}
+
+.prompt-row__tag-overflow {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  align-self: center;
+}
+
+.prompt-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Row actions recede until interaction. The list reads as content
+   inventory rather than an icon wall; actions lift to full opacity
+   only when the row is actively hovered or focused. The modifier is
+   surfaced structurally so the recessed treatment is observable. */
+.prompt-row__actions--recessed {
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+
+.prompt-row:hover .prompt-row__actions--recessed,
+.prompt-row__actions--recessed:focus-within {
+  opacity: 1;
+}
+
+.prompt-row__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.prompt-row__icon-btn:hover {
+  background: var(--color-surface-elevated);
+  color: var(--color-text);
+}
+
+.prompt-row__icon-btn[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+.prompt-row__icon-btn[aria-disabled="true"]:hover {
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.prompt-row__icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Pinned state reads as a stronger neutral emphasis rather than an
+   accent billboard — accent is reserved for focus, selection, and
+   primary actions, not for every pinned row in the list. */
+.prompt-row__icon-btn--active {
+  color: var(--color-text);
+}
+
+.prompt-row__icon-btn--success {
+  color: var(--color-status-success);
+}
+
+.prompt-row__icon-btn--danger:hover {
+  color: var(--color-status-danger);
+}
+
+.prompt-row__tooltip {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1;
+  user-select: none;
+  animation-duration: 150ms;
+  box-shadow: var(--material-shadow-elevated);
+}
+
+.prompt-row__tooltip-arrow {
+  fill: var(--color-surface-strong);
+}
+
+@media (max-width: 980px) {
+  .prompt-page__toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .prompt-row {
+    grid-template-columns: 1fr;
+  }
+
+  .prompt-row__actions {
+    justify-content: flex-start;
+  }
+
+  /* On touch/narrow layouts there is no hover; keep actions fully
+     visible so they remain discoverable without a pointer. */
+  .prompt-row__actions--recessed {
+    opacity: 1;
+  }
+}
+
+/* ── Detail drawer extras (shared) ────────────────────────── */
+
+.detail-stack__error {
+  color: var(--color-status-danger);
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.detail-stack__diag-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.diag-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
+}
+
+.diag-item--info    { border-left: 3px solid var(--color-border); }
+.diag-item--warning { border-left: 3px solid var(--color-status-warning); }
+.diag-item--error   { border-left: 3px solid var(--color-status-danger); }
+
+.detail-stack__activity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.detail-stack__activity-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-border-soft);
+  font-size: 13px;
+}
+
+.detail-stack__activity-item:last-child {
+  border-bottom: 0;
+}
+
+.detail-stack__activity-time {
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  min-width: 60px;
+}
+
+/* ── Settings page ───────────────────────────────────────── */
+
+.settings-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.settings-page__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+@media (max-width: 980px) {
+  .settings-page__grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Settings pane (row-based desktop layout) ── */
+
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  max-width: 680px;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.settings-section > h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.settings-section > .settings-panel {
+  margin-top: var(--space-2);
+}
+
+/* ── Activity pagination ─────────────────────────────────── */
+
+.activity-pagination {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: 12px 6px 4px;
+  border-top: 1px solid var(--color-border-soft);
+  margin-top: auto;
+}
+
+.activity-pagination__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.activity-pagination__label {
+  font-size: 0.82rem;
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.activity-pagination__rows-group {
+  display: inline-flex;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.activity-pagination__rows-btn {
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.activity-pagination__rows-btn:hover {
+  color: var(--color-text);
+}
+
+.activity-pagination__rows-btn.is-active {
+  background: var(--color-accent-50);
+  color: var(--color-accent-600);
+  font-weight: 600;
+}
+
+.activity-pagination__rows-btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+
+.activity-pagination__rows-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.activity-pagination__summary {
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.activity-pagination__nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.activity-pagination__nav-btn {
+  height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.activity-pagination__nav-btn:hover:not(:disabled) {
+  color: var(--color-text);
+}
+
+.activity-pagination__nav-btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+
+.activity-pagination__nav-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.activity-pagination__page-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 10px;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  border-left: 1px solid var(--color-border);
+  border-right: 1px solid var(--color-border);
+}
+
+/* ── Overview heatmap ────────────────────────────────────── */
+/* Heatmap is a primary visual anchor of the overview surface and sits
+   on the same elevated material layer as the trend chart. */
+
+.overview-heatmap {
+  padding: 18px 20px;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-strong);
+  border: 1px solid var(--color-border-soft);
+  box-shadow: var(--material-shadow-elevated);
+}
+
+.overview-heatmap__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: 14px;
+}
+
+.overview-heatmap__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.overview-heatmap__total {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.overview-heatmap__total-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.overview-heatmap__total-value {
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.overview-heatmap__months {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  margin-bottom: 4px;
+  padding-left: 28px;
+}
+
+.overview-heatmap__month-label {
+  width: 13px;
+  font-size: 10px;
+  color: var(--color-text-muted);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.overview-heatmap__grid-body {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.overview-heatmap__weekdays {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 1px;
+}
+
+.overview-heatmap__weekday {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  font-size: 9px;
+  color: var(--color-text-faint);
+  line-height: 1;
+}
+
+.overview-heatmap__grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.overview-heatmap__row {
+  display: flex;
+  gap: 2px;
+}
+
+.overview-heatmap__cell {
+  display: block;
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  cursor: default;
+}
+
+/* ── Heatmap ramp ────────────────────────────────────────────────── */
+/* Neutral empty substrate + dedicated indigo intensity ramp. The empty  */
+/* cell uses a NEUTRAL token (not a data color), so inactive days read as */
+/* quiet background; levels 1-4 are discrete indigo steps. This splits    */
+/* the two visual roles ("no activity" vs "activity intensity") that the  */
+/* old single data-primary alpha ramp conflated — restoring the empty-vs- */
+/* level-1 separation that matters most for sparse years. Tokens adapt    */
+/* automatically to light/dark themes (see tokens.css).                   */
+.overview-heatmap__cell--0 { background: var(--color-heatmap-empty); }
+.overview-heatmap__cell--1 { background: var(--color-heatmap-level-1); }
+.overview-heatmap__cell--2 { background: var(--color-heatmap-level-2); }
+.overview-heatmap__cell--3 { background: var(--color-heatmap-level-3); }
+.overview-heatmap__cell--4 { background: var(--color-heatmap-level-4); }
+.overview-heatmap__cell--placeholder {
+  background: transparent;
+  border: 0;
+}
+
+.overview-heatmap__summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--space-3);
+  margin-bottom: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.overview-heatmap__summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.overview-heatmap__summary-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.overview-heatmap__summary-value {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.overview-heatmap__legend {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+}
+
+.overview-heatmap__legend-label {
+  font-size: 10px;
+  color: var(--color-text-faint);
+}
+
+.overview-heatmap__legend-swatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+}
+
+.overview-heatmap__tooltip {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-strong);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--material-shadow-elevated);
+  z-index: 200;
+  pointer-events: none;
+}
+
+.overview-heatmap__tooltip-date {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--color-text);
+  white-space: nowrap;
+}
+
+.overview-heatmap__tooltip-value {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 1px;
+  white-space: nowrap;
+}
+
+/* ── Live curve panel ────────────────────────────────────── */
+
+.live-curve-panel__status {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.live-curve-panel__chart-frame {
+  flex: 1;
+  min-height: 220px;
+}
+
+/* ── Chart tooltip ───────────────────────────────────────── */
+
+.chart-tooltip {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-strong);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--material-shadow-elevated);
+}
+
+.chart-tooltip__label {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--color-text);
+  white-space: nowrap;
+}
+
+.chart-tooltip__value {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 1px;
+  white-space: nowrap;
+}
+
+/* ── Client row ───────────────────────────────────────────── */
+
+.client-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+}
+
+.client-row__main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.client-row__identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.client-row__identity h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.client-row__state {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.client-row__state--ok {
+  background: color-mix(in srgb, var(--color-status-success) 12%, transparent);
+  color: var(--color-status-success);
+}
+
+.client-row__state--attention {
+  background: color-mix(in srgb, var(--color-status-warning) 12%, transparent);
+  color: var(--color-status-warning);
+}
+
+.client-row__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+/* ── Shell reminder ───────────────────────────────────────── */
+
+.shell-reminder {
+  display: grid;
+  gap: var(--space-1);
+  padding: 12px 14px;
+  border-radius: var(--radius-lg);
+  max-width: 320px;
+  border: 1px solid color-mix(in srgb, var(--color-accent-500) 18%, transparent);
+  background: color-mix(in srgb, var(--color-accent-500) 8%, transparent);
+  color: var(--color-text);
+}
+
+.shell-reminder strong {
+  font-size: 0.85rem;
+}
+
+.shell-reminder span {
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.shell-reminder--budget_exceeded {
+  border-color: color-mix(in srgb, var(--color-status-danger) 40%, transparent);
+  background: color-mix(in srgb, var(--color-status-danger) 12%, transparent);
+}
+
+/* ── Breakdown detail: metric cards row ────────────────────── */
+
+.breakdown-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-3);
+}
+
+.breakdown-metrics .metric-card {
+  box-shadow: none;
+  padding: 12px 14px;
+}
+
+.breakdown-metrics .metric-card__value {
+  font-size: 20px;
+}
+
+/* ── Breakdown detail: chart shell ─────────────────────────── */
+
+.breakdown-chart {
+  height: 200px;
+  margin: 0;
+  padding: 4px 0;
+}
+
+/* ── Breakdown detail: mono values (hashes etc.) ──────────── */
+
+.detail-stack__mono {
+  font-family: var(--font-mono, "SF Mono", "Menlo", monospace);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.detail-stack__activity-source {
+  flex: 1;
+  font-weight: 500;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.detail-stack__activity-tokens {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* ── Pane eyebrow ─────────────────────────────────────────── */
+
+.pane-eyebrow {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+/* ── Settings row ──────────────────────────────────────────────── */
+
+.settings-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+.settings-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-row h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--color-text);
+  white-space: nowrap;
+}
+
+.settings-row p {
+  margin: var(--space-1) 0 0;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.4;
+  max-width: 360px;
+}
+
+.settings-row__control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.settings-row__error {
+  font-size: 11px;
+  color: var(--color-status-danger);
+  white-space: nowrap;
+}
+
+.settings-row--dangerous {
+  padding: var(--space-3) var(--space-3);
+  margin: 0 calc(var(--space-3) * -1);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-status-danger) 6%, transparent);
+  border-left: 3px solid var(--color-status-danger);
+}
+
+.settings-row--dangerous h3 {
+  color: var(--color-status-danger);
+}
+
+/* ── Settings panel ────────────────────────────────────────────── */
+
+.settings-panel {
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
+  box-shadow: var(--material-shadow-card);
+}
+
+/* ── Toggle switch ──────────────────────────────────────────────── */
+
+.toggle-label {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.toggle {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.toggle-track {
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--toggle-track-inactive);
+  position: relative;
+  transition: background 0.2s;
+}
+
+.toggle-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--toggle-thumb-active);
+  transition: transform 0.2s;
+}
+
+.toggle:checked + .toggle-track {
+  background: var(--toggle-track-active);
+}
+
+.toggle:checked + .toggle-track::after {
+  transform: translateX(16px);
+}
+
+.toggle-label:hover .toggle-track {
+  background: var(--color-border-strong);
+}
+
+.toggle-label:hover .toggle:checked + .toggle-track {
+  background: var(--color-accent-600);
+}
+
+.toggle:focus-visible + .toggle-track {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* ── Segmented control (radio group) ────────────────────────────── */
+
+.segmented-group {
+  display: inline-flex;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+.segmented-label {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.segmented-label input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.segmented-label span {
+  display: inline-block;
+  padding: 4px 14px;
+  font-size: 13px;
+  color: var(--color-text-muted);
+  background: transparent;
+  transition: background 0.15s, color 0.15s;
+}
+
+.segmented-label input:checked + span {
+  background: var(--color-accent-50);
+  color: var(--color-accent-600);
+  font-weight: 600;
+}
+
+.segmented-label input:focus-visible + span {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+
+.segmented-label:not(:last-child) span {
+  border-right: 1px solid var(--color-border);
+}
+
+/* ── Manual root controls ───────────────────────────────────────── */
+
+.manual-root-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.manual-root-controls .input {
+  width: 240px;
+}
+
+/* ── Diagnostics badges & values ───────────────────────────────── */
+
+.diag-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.diag-badge--ok {
+  background: color-mix(in srgb, var(--color-status-success) 12%, transparent);
+  color: var(--color-status-success);
+}
+
+.diag-badge--error {
+  background: color-mix(in srgb, var(--color-status-danger) 12%, transparent);
+  color: var(--color-status-danger);
+}
+
+.diag-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Usage page tabs ───────────────────────────────────────── */
+
+.usage-page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.usage-tabs {
+  position: relative;
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+.usage-tabs__tab {
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: color 0.2s;
+  white-space: nowrap;
+}
+
+.usage-tabs__tab:hover {
+  color: var(--color-text);
+}
+
+.usage-tabs__tab.is-active {
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.usage-tabs__indicator {
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  background: var(--color-accent-500);
+  transition: transform 0.2s ease, width 0.2s ease;
+  pointer-events: none;
+}
+
+.usage-content {
+  min-height: 0;
+}
+
+/* ── Tag Filter Combobox ─────────────────────────────────────────────── */
+.tag-filter-combobox__input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.tag-filter-combobox__input-wrap input {
+  width: 100%;
+  padding-right: 24px;
+  /* Inherits from .prompt-page__filter input */
+}
+.tag-filter-combobox__clear {
+  position: absolute;
+  right: 6px;
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+}
+.tag-filter-combobox__clear:hover {
+  color: var(--color-text);
+}
+.tag-filter-combobox__popover {
+  min-width: 160px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.tag-filter-combobox__popover .app-select__item.is-highlighted {
+  background: var(--material-tint-accent);
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "prompt-palette",
+  "description": "Prompt Palette window — only palette_panel_message is exposed",
+  "windows": ["prompt-palette"],
+  "permissions": [
+    "core:default",
+    "allow-palette-panel-message"
+  ]
+}

@@ -1,0 +1,243 @@
+/* ═════════════════════════════════════════════════════════════════ */
+/* Busytok semantic token contract                                   */
+/* Five layers: Neutral · Accent · Status · Data · Material          */
+/* Light theme is the default; dark theme overrides via [data-theme] */
+/* ══════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── 1. Neutral tokens ──────────────────────────────────────── */
+  /* Light: cool paper-gray canvas, translucent white surfaces,     */
+  /* deep ink text.                                                 */
+  --color-canvas: #EEF1F4;
+  --color-canvas-subtle: #F5F7FA;
+  --color-surface: rgba(255, 255, 255, 0.85);
+  --color-surface-strong: rgba(255, 255, 255, 0.96);
+  --color-surface-elevated: rgba(255, 255, 255, 0.92);
+  --color-sidebar: rgba(238, 241, 244, 0.88);
+  --color-border-soft: rgba(15, 23, 42, 0.06);
+  --color-border: rgba(15, 23, 42, 0.12);
+  --color-border-strong: rgba(15, 23, 42, 0.20);
+  --color-text: #111827;
+  --color-text-muted: #6b7280;
+  --color-text-faint: #9ca3af;
+  /* Explicit reverse/on-accent foreground — never literal #fff */
+  --color-text-reverse: rgba(255, 255, 255, 0.96);
+
+  /* ── 2. Accent tokens — single cool indigo family ───────────── */
+  --color-accent-50: #eef2ff;
+  --color-accent-100: #e0e7ff;
+  --color-accent-400: #6366f1;
+  --color-accent-500: #4f46e5;
+  --color-accent-600: #4338ca;
+  --color-accent-700: #3730a3;
+  --color-focus-ring: rgba(79, 70, 229, 0.42);
+
+  /* ── 3. Status tokens ───────────────────────────────────────── */
+  /* Restrained for a calm audit tool. Soft variants are ~10-15%   */
+  /* opacity tints suitable for chip backgrounds.                  */
+  --color-status-success: #6dba78;
+  --color-status-success-soft: rgba(109, 186, 120, 0.14);
+  --color-status-warning: #c29a55;
+  --color-status-warning-soft: rgba(194, 154, 85, 0.16);
+  --color-status-danger: #d56a6a;
+  --color-status-danger-soft: rgba(213, 106, 106, 0.16);
+  /* Info reuses the accent family — no separate blue family.
+     The soft variant uses raw rgba intentionally, matching the other
+     status-soft tints (~10-15% opacity chip backgrounds).            */
+  --color-status-info: var(--color-accent-500);
+  --color-status-info-soft: rgba(79, 70, 229, 0.14);
+
+  /* ── 4. Data tokens ─────────────────────────────────────────── */
+  /* Harmonize with indigo but visually distinct from semantic      */
+  /* status colors. Designed for charts/heatmaps/rankings.         */
+  /* Primary: indigo-family, slightly desaturated for readability. */
+  --color-data-primary: #6671db;
+  --color-data-primary-soft: rgba(102, 113, 219, 0.2);
+  /* Secondary: cool teal, distinct from success green.           */
+  --color-data-secondary: #2f9eaa;
+  --color-data-secondary-soft: rgba(47, 158, 170, 0.16);
+  /* Tertiary: muted violet, distinct from primary indigo.        */
+  --color-data-tertiary: #8b6fbf;
+  --color-data-tertiary-soft: rgba(139, 111, 191, 0.16);
+  /* Live primary: brighter, cleaner indigo reserved for the high-frequency */
+  /* real-time throughput curve so it reads above the quieter chart palette. */
+  --color-data-live-primary: #4f63f6;
+  --color-data-live-primary-soft: rgba(79, 99, 246, 0.22);
+  /* Attention: warm amber for transient/estimated data, distinct */
+  /* from status.warning.                                          */
+  --color-data-attention: #d69554;
+  /* Neutral: gray for no-data / inactive series.                 */
+  --color-data-neutral: rgba(17, 24, 39, 0.30);
+
+  /* Heatmap: dedicated calendar-heatmap tokens. The empty cell is a NEUTRAL */
+  /* substrate (NOT a data color) so inactive days read as quiet background;  */
+  /* levels 1-4 are a discrete indigo intensity ramp that DARKENS as activity */
+  /* rises. Separating "no activity" from "activity intensity" is what makes  */
+  /* empty vs level-1 readable — the spacing that matters most for sparse     */
+  /* years. level-2 intentionally equals accent-400 for palette harmony.      */
+  --color-heatmap-empty: #ebedf2;
+  --color-heatmap-level-1: #a5b4fc;
+  --color-heatmap-level-2: #6366f1;
+  --color-heatmap-level-3: #4338ca;
+  --color-heatmap-level-4: #312e81;
+
+  /* ── 5. Material tokens ─────────────────────────────────────── */
+  --material-surface-alpha: 0.85;
+  --material-surface-strong-alpha: 0.96;
+  /* Glass blur ladder. In light theme these produce real backdrop-blur       */
+  /* chrome. In dark theme they are all zeroed (see override below) so the    */
+  /* surface ladder carries depth alone — see spec: "dark theme replaces      */
+  /* glass with surface ladder".                                              */
+  --material-glass-blur: 18px; /* standard surface (panels, titlebar)         */
+  --material-glass-blur-strong: 24px; /* heavy chrome (sidebar)               */
+  --material-glass-blur-subtle: 6px; /* minor (overlay scrims, chips)         */
+  --material-glass-saturate: 1.08;
+  --material-overlay-scrim: rgba(17, 24, 39, 0.32);
+  --material-shadow-card: 0 10px 24px rgba(17, 24, 39, 0.05);
+  --material-shadow-elevated: 0 18px 44px rgba(17, 24, 39, 0.12);
+  --material-tint-accent: rgba(79, 70, 229, 0.08);
+  --material-tint-success: rgba(109, 186, 120, 0.10);
+  --material-tint-warning: rgba(194, 154, 85, 0.10);
+  --material-tint-danger: rgba(213, 106, 106, 0.10);
+
+  /* ── Toggle switch (component-contract, stabilized in Task 3) ── */
+  /* Active state is accent-led; thumb uses reverse foreground.    */
+  --toggle-track-active: var(--color-accent-500);
+  --toggle-thumb-active: var(--color-text-reverse);
+  --toggle-track-inactive: var(--color-border);
+
+  /* ── Radii ──────────────────────────────────────────────────── */
+  --radius-xs: 8px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 22px;
+  --radius-pill: 999px;
+
+  /* ── Spacing ────────────────────────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-12: 48px;
+
+  /* ── Fonts ──────────────────────────────────────────────────── */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  --font-code: "SF Mono", "Menlo", "Monaco", monospace;
+
+  /* Legacy --app-* migration aliases removed post-review. All component
+     surfaces now consume the semantic --color-* / --material-* tokens
+     directly. The heatmap ramp consumes the dedicated --color-heatmap-*
+     tokens defined above (neutral empty + indigo intensity levels).   */
+}
+
+/* ══════════════════════════════════════════════════════════════════ */
+/* Dark theme — designed first as the primary reading experience for  */
+/* data surfaces. Deep slate/graphite canvas, slightly raised ink     */
+/* surfaces, soft off-white text — not pure black.                    */
+/* ══════════════════════════════════════════════════════════════════ */
+:root[data-theme="dark"] {
+  /* ── Neutral: deep slate, layered surfaces ──────────────────── */
+  --color-canvas: #0d1117;
+  --color-canvas-subtle: #11161d;
+  --color-surface: rgba(22, 27, 34, 0.92);
+  --color-surface-strong: #161b22;
+  --color-surface-elevated: #1f262e;
+  --color-sidebar: rgba(13, 17, 23, 0.92);
+  --color-border-soft: rgba(255, 255, 255, 0.06);
+  --color-border: rgba(255, 255, 255, 0.10);
+  --color-border-strong: rgba(255, 255, 255, 0.16);
+  --color-text: #e6edf3;
+  --color-text-muted: #8b949e;
+  --color-text-faint: #6e7681;
+  --color-text-reverse: rgba(13, 17, 23, 0.92);
+
+  /* ── Accent: indigo family — slightly lifted dark variants ──── */
+  --color-accent-50: #1e1b4b;
+  --color-accent-100: #312e81;
+  --color-accent-400: #818cf8;
+  --color-accent-500: #6366f1;
+  --color-accent-600: #4f46e5;
+  --color-accent-700: #4338ca;
+  --color-focus-ring: rgba(129, 140, 248, 0.50);
+
+  /* ── Status: slightly lifted so chips stay legible on dark ──── */
+  --color-status-success: #7ec98a;
+  --color-status-success-soft: rgba(126, 201, 138, 0.16);
+  --color-status-warning: #d6a964;
+  --color-status-warning-soft: rgba(214, 169, 100, 0.18);
+  --color-status-danger: #e07c7c;
+  --color-status-danger-soft: rgba(224, 124, 124, 0.18);
+  --color-status-info: var(--color-accent-400);
+  --color-status-info-soft: rgba(129, 140, 248, 0.18);
+
+  /* ── Data: lifted for dark-background chart readability ─────── */
+  --color-data-primary: #8d9bff;
+  --color-data-primary-soft: rgba(141, 155, 255, 0.24);
+  --color-data-secondary: #5fc7d4;
+  --color-data-secondary-soft: rgba(95, 199, 212, 0.18);
+  --color-data-tertiary: #b29bdc;
+  --color-data-tertiary-soft: rgba(178, 155, 220, 0.18);
+  /* Live primary lifts further than generic data.primary so the real-time */
+  /* curve remains readable against dark analytical surfaces.               */
+  --color-data-live-primary: #a7b8ff;
+  --color-data-live-primary-soft: rgba(167, 184, 255, 0.3);
+  --color-data-attention: #e6a865;
+  --color-data-neutral: rgba(230, 237, 243, 0.28);
+
+  /* Heatmap: empty is a neutral dark slate (substrate, NOT indigo); the    */
+  /* active ramp BRIGHTENS as intensity rises so dense days pop on dark.     */
+  --color-heatmap-empty: #232a35;
+  --color-heatmap-level-1: #4338ca;
+  --color-heatmap-level-2: #6366f1;
+  --color-heatmap-level-3: #818cf8;
+  --color-heatmap-level-4: #c7d2fe;
+
+  /* ── Material: dark theme reduces glass saturation; surface    */
+  /* ladder is the primary depth mechanism. Glass blur is zeroed   */
+  /* across all three ladder tiers — surface ladder alone carries  */
+  /* depth in dark theme, per spec.                                */
+  --material-glass-blur: 0px;
+  --material-glass-blur-strong: 0px;
+  --material-glass-blur-subtle: 0px;
+  --material-glass-saturate: 1;
+  --material-overlay-scrim: rgba(0, 0, 0, 0.52);
+  --material-shadow-card: 0 10px 24px rgba(0, 0, 0, 0.36);
+  --material-shadow-elevated: 0 18px 44px rgba(0, 0, 0, 0.48);
+  --material-tint-accent: rgba(129, 140, 248, 0.10);
+  --material-tint-success: rgba(126, 201, 138, 0.10);
+  --material-tint-warning: rgba(214, 169, 100, 0.10);
+  --material-tint-danger: rgba(224, 124, 124, 0.10);
+
+  /* Heatmap tokens defined above override the light defaults: neutral   */
+  /* dark slate empty + a brightening indigo ramp.                      */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+/* Remove default button appearance */
+button {
+  appearance: none;
+}
