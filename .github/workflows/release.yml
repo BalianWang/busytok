@@ -168,7 +168,7 @@ jobs:
             -exec shasum -a 256 {} \; >> "$RUNNER_TEMP/sha256sums.txt"
 
       - name: Create draft GitHub Release and upload artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
