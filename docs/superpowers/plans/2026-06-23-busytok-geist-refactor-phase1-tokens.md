@@ -13,7 +13,8 @@
 (From spec `docs/superpowers/specs/2026-06-22-busytok-geist-refactor-design.md`. Every task implicitly includes these.)
 
 - **No component-structure changes this phase.** Token values change and cascade; component logic/JSX is untouched (except the one bootstrap observability hook in Task 7).
-- **No dead code.** Removed/renamed tokens are deleted everywhere — no compatibility aliases. (`surface-strong`, `surface-elevated`, `canvas-subtle`, `border-soft`, `sidebar`, `radius-xs`, `radius-xl` must be gone after Phase 1.)
+- **No dead code.** Removed/renamed tokens are deleted everywhere — no compatibility aliases, in CSS **and TS**. Must be gone after Phase 1: `surface-strong`, `surface-elevated`, `canvas-subtle`, `border-soft`, `sidebar`, `radius-xs`, `radius-xl`, plus the now-dead `--material-surface-alpha` / `--material-surface-strong-alpha` (zero consumers once the translucent tiers collapse).
+- **Token contract is consumed by TS too.** `chartTokens.ts`, `nivoTheme.ts`, and `LiveCurvePanel.tsx` read CSS vars at runtime (`cssVar()` / `resolveCssColor` / inline `var()`); their token-string literals MUST be migrated alongside the CSS, or charts silently fall back to hardcoded colors and lose dark-theme adaptation.
 - **Indigo accent + SF Pro font are unchanged** — only neutral/material/radius/data-tempering tokens change.
 - **Coverage gate:** `pnpm coverage:gui` requires ≥90% lines. Token CSS edits do not lower TS coverage; every new TS module (Task 7) ships with a test.
 - **Reuse existing infra:** extend `tokens.test.ts` and `scripts/check-busytok-gui-surfaces.sh` in place; do not introduce a new lint toolchain.
@@ -29,7 +30,9 @@
 | `apps/gui/src/styles/surfaces.css` | Shell containers (`.desktop-shell`, `.page-surface`) | Migrate renames; drop `backdrop-filter` from `.page-surface` |
 | `apps/gui/src/styles/components.css` | Sidebar/titlebar/chip/dialog/palette/table | Migrate renames + surface-tier repoint |
 | `apps/gui/src/styles/pages.css` | Overview/metric/heatmap/ranking/tables | Migrate renames + surface-tier repoint + radius outliers |
-| `scripts/check-busytok-gui-surfaces.sh` | bash `rg` regression guard | Add stale-token / blur / radius / hex rules |
+| `apps/gui/src/lib/chartTokens.ts`, `nivoTheme.ts` | Chart theme via runtime CSS-var resolution | Migrate `--color-border-soft` / `--color-surface-strong` string literals |
+| `apps/gui/src/components/overview/LiveCurvePanel.tsx` (+ `.test.tsx`) | Live chart grid/loading color via CSS vars | Migrate `--color-border-soft` / `--color-surface-strong` string literals |
+| `scripts/check-busytok-gui-surfaces.sh` | bash `rg` regression guard | Add stale-token / blur / radius / hex rules (scan CSS **and TS**) |
 | `apps/gui/src/logging/designSystem.ts` | **New** — design-system version marker | Created (Task 7) |
 | `apps/gui/src/logging/designSystem.test.ts` | **New** — marker test | Created (Task 7) |
 | `apps/gui/src/main.tsx` | Bootstrap | Call marker once after `initThemeRuntime()` (Task 7) |
@@ -40,6 +43,8 @@
 - `--color-canvas-subtle` → `--color-surface-subtle` (rename)
 - `--color-border-soft` → `--color-border-subtle` (rename)
 - `--color-sidebar` → `--color-chrome` (rename)
+
+**TS consumers (P0):** the renames above also apply to the CSS-var string literals inside `chartTokens.ts`, `chartTokens.test.ts`, `nivoTheme.ts`, `LiveCurvePanel.tsx`, and `LiveCurvePanel.test.tsx` — these resolve tokens at runtime, so a missed migration silently breaks chart theming. Tasks 1 & 2 include them in the substitution loops; Task 8's guard scans all of `apps/gui/src` (not just CSS).
 
 ---
 
@@ -99,18 +104,23 @@ In the **dark** `:root[data-theme="dark"]` block, immediately after the dark `--
 
 - [ ] **Step 4: Rename consumers (mechanical)**
 
-Run from the repo root (the strings are distinct; these substitutions are safe):
+Run from the repo root (the strings are distinct; these substitutions are safe). **Include the TS consumers** — `chartTokens.ts` / `LiveCurvePanel.tsx` resolve `--color-border-soft` at runtime and their tests assert the literal string; a CSS-only rename would leave dangling refs that silently break chart theming:
 
 ```bash
-for f in apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css; do
+for f in apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css \
+         apps/gui/src/lib/chartTokens.ts apps/gui/src/lib/chartTokens.test.ts \
+         apps/gui/src/components/overview/LiveCurvePanel.tsx \
+         apps/gui/src/components/overview/LiveCurvePanel.test.tsx; do
   perl -0pi -e 's/--color-border-soft/--color-border-subtle/g; s/--color-canvas-subtle/--color-surface-subtle/g; s/--color-sidebar/--color-chrome/g' "$f"
 done
 ```
 
-Verify no stale names remain in consumers:
+(The `canvas-subtle` / `sidebar` patterns are no-ops in the TS files — only `border-soft` appears there — but running all three uniformly is harmless and keeps one loop. The JS property name `chartTokens.borderSoft` is NOT a token string and stays unchanged; only the `cssVar("--color-border-soft")` value mutates.)
+
+Verify no stale names remain anywhere:
 
 ```bash
-rg -n --color-border-soft|--color-canvas-subtle|--color-sidebar apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css
+rg -n -e '--color-border-soft|--color-canvas-subtle|--color-sidebar' apps/gui/src --glob '!**/tokens.test.ts'
 ```
 
 Expected: no output.
@@ -128,7 +138,7 @@ Expected: typecheck clean; all tests PASS (no broken `var()` refs because CSS cu
 - [ ] **Step 7: Commit**
 
 ```bash
-git add apps/gui/src/styles/tokens.css apps/gui/src/styles/tokens.test.ts apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css
+git add apps/gui/src/styles/tokens.css apps/gui/src/styles/tokens.test.ts apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css apps/gui/src/lib/chartTokens.ts apps/gui/src/lib/chartTokens.test.ts apps/gui/src/components/overview/LiveCurvePanel.tsx apps/gui/src/components/overview/LiveCurvePanel.test.tsx
 git commit -m "refactor(gui): rename border-soft/canvas-subtle/sidebar tokens; add hover tokens
 
 Pure rename (values unchanged). Renames: --color-border-soft →
@@ -164,10 +174,14 @@ Add a new `it(...)` block to the `describe("tokens.css contract", ...)` in `apps
     // collapsed tiers are gone
     expect(tokensCss).not.toContain("--color-surface-strong:");
     expect(tokensCss).not.toContain("--color-surface-elevated:");
-    // chrome blur only; subtle scrim blur retained for modal backdrops
+    // chrome blur only; subtle (content/scrim) blur is 0 per spec §4.1 —
+    // modal-backdrop blur becomes a Phase 2 per-component concern
     expect(tokensCss).toContain("--material-glass-blur: 8px;");
     expect(tokensCss).toContain("--material-glass-blur-strong: 8px;");
-    expect(tokensCss).toContain("--material-glass-blur-subtle: 6px;");
+    expect(tokensCss).toContain("--material-glass-blur-subtle: 0px;");
+    // dead translucent-alpha tokens removed (no consumers)
+    expect(tokensCss).not.toContain("--material-surface-alpha:");
+    expect(tokensCss).not.toContain("--material-surface-strong-alpha:");
     // Geist raised-card shadow
     expect(tokensCss).toContain(
       "--material-shadow-card: 0 2px 2px rgba(15, 23, 42, 0.04);",
@@ -206,26 +220,34 @@ Replace the light material declarations (currently lines 91–97) with:
 ```css
   --material-glass-blur: 8px;
   --material-glass-blur-strong: 8px;
-  --material-glass-blur-subtle: 6px;
+  --material-glass-blur-subtle: 0px;
   --material-glass-saturate: 1.08;
   --material-overlay-scrim: rgba(17, 24, 39, 0.32);
   --material-shadow-card: 0 2px 2px rgba(15, 23, 42, 0.04);
 ```
 
-(Leave light `--material-shadow-elevated`, `--material-tint-*`, `--material-surface-alpha*` untouched this task — elevated shadow becomes Geist popover in Task 3 alongside dark.)
+Then **delete the two dead alpha tokens** (currently lines 85–86 — they encoded the old translucent-surface alphas and have zero consumers once the tiers collapse):
+
+```css
+  --material-surface-alpha: 0.85;          /* delete */
+  --material-surface-strong-alpha: 0.96;   /* delete */
+```
+
+(Leave light `--material-shadow-elevated` and `--material-tint-*` untouched this task — elevated shadow becomes the Geist popover in Task 3 alongside dark.)
 
 - [ ] **Step 4: Repoint collapsed-tier consumers**
 
-Run from repo root:
+Run from repo root. **Include the TS consumers** — `nivoTheme.ts` (tooltip background) and `LiveCurvePanel.tsx` (loading overlay) resolve `--color-surface-strong` at runtime:
 
 ```bash
-for f in apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css; do
+for f in apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css \
+         apps/gui/src/lib/nivoTheme.ts apps/gui/src/components/overview/LiveCurvePanel.tsx; do
   perl -0pi -e 's/--color-surface-strong/--color-surface/g; s/--color-surface-elevated/--color-surface-subtle/g' "$f"
 done
-rg -n --color-surface-strong|--color-surface-elevated apps/gui/src/styles
+rg -n -e '--color-surface-strong|--color-surface-elevated' apps/gui/src --glob '!**/tokens.test.ts'
 ```
 
-Expected: final `rg` prints only the (now-deleted) absence — i.e. no matches. If any match remains, it is a comment; update the comment text to the new vocabulary.
+Expected: the final `rg` produces no matches (the `--color-` prefix keeps `--material-surface-strong-alpha` out of the substitution, and that token is deleted in Step 3 anyway). If any match remains it is a comment; update it to the new vocabulary.
 
 - [ ] **Step 5: Drop `backdrop-filter` from `.page-surface`**
 
@@ -245,7 +267,7 @@ Expected: test PASS; build succeeds (Vite compiles the CSS).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add apps/gui/src/styles/tokens.css apps/gui/src/styles/tokens.test.ts apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css
+git add apps/gui/src/styles/tokens.css apps/gui/src/styles/tokens.test.ts apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css apps/gui/src/lib/nivoTheme.ts apps/gui/src/components/overview/LiveCurvePanel.tsx
 git commit -m "refactor(gui): collapse surface tiers, de-glass light theme
 
 Light content surfaces become opaque (#FFFFFF / #F7F8FA); surface-strong
@@ -400,20 +422,20 @@ In `apps/gui/src/styles/tokens.css`, replace the entire radius block (currently 
 perl -0pi -e 's/var\(--radius-xl\)/var(--radius-lg)/g' apps/gui/src/styles/surfaces.css
 ```
 
-Replace outlier literals in consumer CSS (heatmap cell `3px` is intentionally excluded — it is not in the `(18|20|22|24|32)` set):
+Replace outlier literals in consumer CSS (heatmap cell `3px` is intentionally excluded — it is not in the set):
 
 ```bash
 for f in apps/gui/src/styles/components.css apps/gui/src/styles/pages.css; do
-  perl -0pi -e 's/border-radius:\s*22px/border-radius: var(--radius-lg)/g; s/border-radius:\s*32px/border-radius: var(--radius-lg)/g; s/border-radius:\s*24px/border-radius: var(--radius-md)/g' "$f"
+  perl -0pi -e 's/border-radius:\s*22px/border-radius: var(--radius-lg)/g; s/border-radius:\s*26px/border-radius: var(--radius-lg)/g; s/border-radius:\s*32px/border-radius: var(--radius-lg)/g; s/border-radius:\s*24px/border-radius: var(--radius-md)/g' "$f"
 done
 ```
 
-(`prompt-overlay__surface` 32px and `prompt-dialog`/`confirm-dialog` 22px → `--radius-lg` 16; trend/live card 24px → `--radius-md` 12. These align with spec §7.3/§6.4. The palette row radius and heatmap are Phase 2 — not touched here.)
+(`prompt-overlay__surface` 32px (and its responsive `26px` override) and `prompt-dialog`/`confirm-dialog` 22px → `--radius-lg` 16; trend/live card 24px → `--radius-md` 12. These align with spec §7.3/§6.4. The palette row radius and heatmap are Phase 2 — not touched here.)
 
 Verify no outlier literals remain:
 
 ```bash
-rg -n 'border-radius:\s*(18|20|22|24|32)px' apps/gui/src/styles
+rg -n -e 'border-radius:\s*(18|20|22|24|26|32)px' apps/gui/src/styles
 ```
 
 Expected: no output.
@@ -424,8 +446,8 @@ In `scripts/check-busytok-gui-surfaces.sh`, append after the existing GUI-surfac
 
 ```bash
 # ── Geist refactor Phase 1: radius outliers forbidden ───────────────
-if rg -n 'border-radius:[[:space:]]*(18|20|22|24|32)px' apps/gui/src --glob '*.css'; then
-  echo "Forbidden radius outlier (18/20/22/24/32) in CSS — use --radius-sm/md/lg"
+if rg -n -e 'border-radius:[[:space:]]*(18|20|22|24|26|32)px' apps/gui/src --glob '*.css'; then
+  echo "Forbidden radius outlier (18/20/22/24/26/32) in CSS — use --radius-sm/md/lg"
   exit 1
 fi
 ```
@@ -465,9 +487,11 @@ In `scripts/check-busytok-gui-surfaces.sh`, append:
 
 ```bash
 # ── Geist refactor Phase 1: shadow-elevated is floating-only ────────
-# Resting panels must not carry the elevated (popover/dialog) shadow.
-if rg -n -- '--material-shadow-elevated' apps/gui/src/styles/pages.css \
-  | rg -i 'overview-console__trend|live-curve-panel|overview-heatmap'; then
+# Resting overview panels must not carry the elevated (popover/dialog)
+# shadow. The pattern `selector [^{]*\{ [^}]* shadow-elevated` bounds the
+# match to a single CSS rule block, correlating the selector with its own
+# box-shadow without false-matching the tooltip rules further down.
+if rg -nU -e '(\.overview-console__trend|\.live-curve-panel|\.overview-heatmap)[^{]*\{[^}]*--material-shadow-elevated' apps/gui/src/styles/pages.css; then
   echo "Resting overview panel uses --material-shadow-elevated (floating-only)"
   exit 1
 fi
@@ -588,11 +612,13 @@ Create `apps/gui/src/logging/designSystem.test.ts`:
 ```ts
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const reportMock = vi.fn();
-vi.mock("../logging/reporter", () => ({
-  get safeReportEvent() {
-    return reportMock;
-  },
+// vi.hoisted is the repo's mock idiom (see reporter.test.ts /
+// PromptPalettePage.test.tsx): it binds the mock before vi.mock's hoisted
+// factory runs, so there is no TDZ on the `reportMock` reference.
+const { reportMock } = vi.hoisted(() => ({ reportMock: vi.fn() }));
+
+vi.mock("./reporter", () => ({
+  safeReportEvent: reportMock,
 }));
 
 import { DESIGN_SYSTEM_VERSION, reportDesignSystemApplied } from "./designSystem";
@@ -712,11 +738,12 @@ never throws into bootstrap. Phase 1."
 In `scripts/check-busytok-gui-surfaces.sh`, append (after the radius block added in Task 4):
 
 ```bash
-# ── Geist refactor Phase 1: stale token names forbidden in consumers ─
-if rg -n -- \
-  '--color-surface-strong|--color-surface-elevated|--color-canvas-subtle|--color-border-soft|--color-sidebar|--radius-xs|--radius-xl' \
-  apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css; then
-  echo "Found stale/removed token name in consumer CSS"
+# ── Geist refactor Phase 1: stale token names forbidden (CSS + TS) ───
+# Scans all of apps/gui/src, not just CSS — chartTokens.ts / nivoTheme.ts /
+# LiveCurvePanel.tsx consume tokens at runtime and must migrate too.
+if rg -n -e '--color-surface-strong|--color-surface-elevated|--color-canvas-subtle|--color-border-soft|--color-sidebar|--radius-xs|--radius-xl' \
+  apps/gui/src --glob '!**/tokens.css' --glob '!**/tokens.test.ts'; then
+  echo "Found stale/removed token name"
   exit 1
 fi
 
@@ -728,12 +755,11 @@ if rg -n 'backdrop-filter' apps/gui/src/styles/surfaces.css apps/gui/src/styles/
 fi
 
 # ── Geist refactor Phase 1: no raw hex outside tokens.css ────────────
-# Default-deny. Whitelist (legitimate inline hex) lives in the exception
-# below; expand it only with a documented reason.
-hex_whitelist='apps/gui/src/styles/tokens.css'
-if rg -n --glob '*.css' --glob '!tokens.css' '#[0-9a-fA-F]{3,8}\b' apps/gui/src/styles \
-  | rg -v "$hex_whitelist"; then
-  echo "Raw hex outside tokens.css — consume a token (or document a whitelist exception)"
+# Default-deny. `--glob '!tokens.css'` is the sole exception; if a future
+# legitimate inline hex (e.g. a chart-lib fallback) must appear in a
+# consumer file, consume a token for it instead of whitelisting the path.
+if rg -n --glob '*.css' --glob '!tokens.css' -e '#[0-9a-fA-F]{3,8}' apps/gui/src/styles; then
+  echo "Raw hex outside tokens.css — consume a token"
   exit 1
 fi
 ```
@@ -741,9 +767,7 @@ fi
 - [ ] **Step 2: Run guard to verify current state**
 
 Run: `pnpm check:gui-surfaces`
-Expected: exit 0. If the raw-hex rule fails, inspect each hit:
-- If it is a legitimately-inline value (e.g. a third-party chart fallback or an opaque white inside a `color-mix`), migrate it to a token if possible; if migration is genuinely impossible, append the file to a documented whitelist comment above the rule and re-run.
-- Do not silence the rule by deleting it.
+Expected: exit 0. (Audited: there are currently zero raw-hex literals in `surfaces.css` / `components.css` / `pages.css`, so all three new rules pass cleanly on application.) If a future change introduces a raw hex in a consumer file, migrate it to a token rather than whitelisting the path.
 
 - [ ] **Step 3: Full Phase 1 verification gate**
 
@@ -794,6 +818,16 @@ chrome/modal selectors, no radius outliers, no raw hex outside tokens.css
 **2. Placeholder scan:** none — every step has exact paths, code, commands, expected output.
 
 **3. Type consistency:** `DESIGN_SYSTEM_VERSION` / `reportDesignSystemApplied` defined in Task 7 step 3, imported in step 5, asserted in step 1 by the same names. `--color-hover` / `--color-hover-strong` defined Task 1, asserted Task 1, consumed Phase 2. Remap rules stated once in File Structure and reused verbatim in Tasks 1–2.
+
+**4. Review-driven fixes applied (subagent review):**
+- **TS consumers migrated** (P0): Tasks 1 & 2 substitution loops now include `chartTokens.ts` / `chartTokens.test.ts` / `nivoTheme.ts` / `LiveCurvePanel.tsx` / `LiveCurvePanel.test.tsx` — runtime CSS-var refs that would otherwise silently break chart theming.
+- **Guard covers TS** (P0): Task 8 stale-token guard scans all of `apps/gui/src`, not just CSS.
+- **Task 5 guard rewritten** (P0): the old `rg | rg` pipeline could never correlate a selector with its `box-shadow`; replaced with a multiline rule-bounded pattern.
+- **`26px` radius** (P1): added to Task 4 perl + guard (responsive palette shell).
+- **`--material-glass-blur-subtle` light → `0px`** (P1): follows spec §4.1; modal-backdrop blur deferred to Phase 2 per-component.
+- **Dead tokens removed** (P1): `--material-surface-alpha` / `-strong-alpha` deleted in Task 2 (zero consumers).
+- **Task 7 mock** (P1): uses repo idiom `vi.hoisted` + `./reporter`.
+- **Task 8 raw-hex guard** (P2): dropped redundant `| rg -v` pipe.
 
 **Phase 2/3 outlook (separate plans, written after this lands):**
 - **Phase 2** (component behavior): Titlebar single calm chip + read-only popover bound to `shell.status`; sidebar active rail + `--color-hover`; metric-card neutralization (delete `--success` variant, flag/dot exceptions); Overview 3-tier via border-strength (Tier A `--color-border`); chart readout-ification (single indigo line, ≤8% fill, no vertical grid, explicit chart-token stroke); rankings neutral bars + one accent; Prompt Palette command-surface across all 4 carriers; migrate hover states to `--color-hover`. Each component = its own task with component tests (Testing Library) + `safeReportEvent` hooks at escalation/surface-mode points.
