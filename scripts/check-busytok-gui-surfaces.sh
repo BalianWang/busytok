@@ -10,6 +10,12 @@ if rg -n "$forbidden" apps/gui/src \
   exit 1
 fi
 
+# ── Geist refactor Phase 1: radius outliers forbidden ───────────────
+if rg -n -e 'border-radius:[[:space:]]*(18|20|22|24|26|32)px' apps/gui/src --glob '*.css'; then
+  echo "Forbidden radius outlier (18/20/22/24/26/32) in CSS — use --radius-sm/md/lg"
+  exit 1
+fi
+
 # ── Desktop host capability checks ──────────────────────────────────
 CAP="apps/gui/src-tauri/capabilities/default.json"
 CONF="apps/gui/src-tauri/tauri.conf.json"

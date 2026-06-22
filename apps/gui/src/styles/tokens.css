@@ -105,12 +105,10 @@
   --toggle-thumb-active: var(--color-text-reverse);
   --toggle-track-inactive: var(--color-border);
 
-  /* ── Radii ──────────────────────────────────────────────────── */
-  --radius-xs: 8px;
-  --radius-sm: 10px;
-  --radius-md: 14px;
-  --radius-lg: 18px;
-  --radius-xl: 22px;
+  /* ── Radii — role map (6 control / 12 card / 16 dialog) ─────── */
+  --radius-sm: 6px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
   --radius-pill: 999px;
 
   /* ── Spacing ────────────────────────────────────────────────── */
