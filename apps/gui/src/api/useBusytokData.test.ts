@@ -1,0 +1,205 @@
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import type { RangePresetDto } from "@busytok/protocol-types";
+
+const { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, mockClient } = vi.hoisted(() => {
+  const useQuerySpy = vi.fn();
+  const useMutationSpy = vi.fn();
+  const prefetchQuerySpy = vi.fn();
+  const useQueryClientSpy = vi.fn(() => ({
+    invalidateQueries: vi.fn(),
+    prefetchQuery: prefetchQuerySpy,
+  }));
+  const mockClient = {
+    shellStatus: vi.fn(),
+    overviewSummary: vi.fn(),
+    overviewTrend: vi.fn(),
+    overviewHeatmap: vi.fn(),
+    overviewRankings: vi.fn(),
+    activityRecent: vi.fn(),
+    activityList: vi.fn(),
+    activityDetail: vi.fn(),
+    breakdownList: vi.fn(),
+    breakdownDetail: vi.fn(),
+    settingsSnapshot: vi.fn(),
+    settingsUpdate: vi.fn(),
+    settingsDiagnostics: vi.fn(),
+    settingsRecoveryAction: vi.fn(),
+    promptsList: vi.fn(),
+    promptsGet: vi.fn(),
+    promptsCreate: vi.fn(),
+    promptsUpdate: vi.fn(),
+    promptsDelete: vi.fn(),
+    promptsUse: vi.fn(),
+    liveWindow: vi.fn(),
+  };
+  return { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, mockClient };
+});
+
+vi.mock("@tanstack/react-query", () => ({
+  useQuery: (options: unknown) => useQuerySpy(options),
+  useMutation: (options: unknown) => useMutationSpy(options),
+  useQueryClient: () => useQueryClientSpy(),
+}));
+
+vi.mock("./BusytokClientContext", () => ({
+  useBusytokClient: () => mockClient,
+}));
+
+vi.mock("./busytokClient", () => ({
+  busytokClient: mockClient,
+  createBusytokClient: () => mockClient,
+}));
+
+import {
+  envelopeQueryOptions,
+  prefetchStartupQueries,
+  useActivityList,
+  useActivityRecent,
+  useBreakdownDetail,
+  useBreakdownList,
+  useOverviewSummary,
+  useOverviewTrend,
+  useOverviewHeatmap,
+  useOverviewRankings,
+  useShellStatus,
+} from "./useBusytokData";
+
+describe("useBusytokData", () => {
+  beforeEach(() => {
+    useQuerySpy.mockReset();
+    prefetchQuerySpy.mockReset();
+  });
+
+  it("exports shared envelope query options that retain stale data and skip polling", () => {
+    const queryFn = vi.fn();
+    const options = envelopeQueryOptions({
+      queryKey: ["overview", "summary", "day"],
+      queryFn,
+    });
+
+    const previousEnvelope = {
+      data: { total: 1 },
+      generated_at_ms: 1,
+      generation_id: "gen-1",
+      readiness: "ready_exact" as const,
+      is_exact: true,
+      is_stale: false,
+      watermark_ms: null,
+      progress: null,
+      degraded_reason: null,
+    };
+    expect(options.queryKey).toEqual(["overview", "summary", "day"]);
+    expect(options.queryFn).toBe(queryFn);
+    expect(options.staleTime).toBe(30_000);
+    expect("refetchInterval" in options).toBe(false);
+    expect(options.placeholderData?.(previousEnvelope)).toBe(previousEnvelope);
+  });
+
+  it("does not prefetch overview startup queries (scan-window guard)", () => {
+    // prefetchStartupQueries is intentionally a no-op: prefetching overview
+    // data at GUI startup can poison the TanStack Query cache with an error
+    // state during the scan window, which invalidateQueries does not reliably
+    // reset. Dashboard components fetch their own data on mount instead.
+    const queryClient = useQueryClientSpy();
+
+    prefetchStartupQueries(queryClient);
+
+    expect(prefetchQuerySpy).not.toHaveBeenCalled();
+  });
+
+  // ── Shell ────────────────────────────────────────────────────────
+
+  it("configures shell status with stale time and no background polling", () => {
+    useShellStatus();
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(["shell", "status"]);
+    expect(options.staleTime).toBe(5_000);
+    expect("refetchInterval" in options).toBe(false);
+    expect(options.placeholderData).toBeUndefined();
+  });
+
+  // ── Overview — modular envelopes ─────────────────────────────────
+
+  it("configures overview summary with stale time and no polling", () => {
+    useOverviewSummary("day" as RangePresetDto);
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(["overview", "summary", "day"]);
+    expect(options.staleTime).toBe(30_000);
+    expect("refetchInterval" in options).toBe(false);
+    expect(options.placeholderData).toBeTypeOf("function");
+  });
+
+  it("configures overview trend with correct query key and no polling", () => {
+    useOverviewTrend("week" as RangePresetDto);
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(["overview", "trend", "week"]);
+    expect("refetchInterval" in options).toBe(false);
+  });
+
+  it("configures overview heatmap with correct query key and no polling", () => {
+    useOverviewHeatmap("month" as RangePresetDto);
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(["overview", "heatmap", "month"]);
+    expect("refetchInterval" in options).toBe(false);
+  });
+
+  it("configures overview rankings with correct query key and no polling", () => {
+    useOverviewRankings("year" as RangePresetDto);
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(["overview", "rankings", "year"]);
+    expect("refetchInterval" in options).toBe(false);
+  });
+
+  // ── Activity ─────────────────────────────────────────────────────
+
+  it("configures activity recent with correct query key and no polling", () => {
+    useActivityRecent("day" as RangePresetDto);
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(["activity", "recent", "day"]);
+    expect("refetchInterval" in options).toBe(false);
+  });
+
+  it("configures activity list with correct query key and no polling", () => {
+    useActivityList({
+      range: "day",
+      cursor: null,
+      limit: 100,
+      client_id: null,
+      source_id: null,
+      project_hash: null,
+      model_id: null,
+    });
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey[0]).toBe("activity");
+    expect(options.queryKey[1]).toBe("list");
+    expect("refetchInterval" in options).toBe(false);
+  });
+
+  // ── Breakdown ─────────────────────────────────────────────────────
+
+  it("configures breakdown queries without polling", () => {
+    useBreakdownList({
+      kind: "project",
+      range: "day",
+      cursor: null,
+      limit: 100,
+    });
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey[0]).toBe("breakdown");
+    expect("refetchInterval" in options).toBe(false);
+  });
+
+  // ── Detail drawers ──────────────────────────────────────────────
+
+  it("configures breakdown detail queries without polling", () => {
+    useBreakdownDetail({
+      kind: "project",
+      id: "project-1",
+      range: "day",
+    });
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey[0]).toBe("breakdown");
+    expect(options.queryKey[1]).toBe("detail");
+    expect("refetchInterval" in options).toBe(false);
+  });
+});

@@ -1,0 +1,18 @@
+[package]
+name = "busytok-adapters"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+busytok-domain = { path = "../busytok-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["formatting", "parsing"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

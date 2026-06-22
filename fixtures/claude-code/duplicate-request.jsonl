@@ -1,0 +1,2 @@
+{"cwd":"/tmp/project-a","sessionId":"session-a","timestamp":"2026-05-15T10:00:00Z","message":{"id":"msg-c","model":"claude-sonnet-4-20250514","usage":{"input_tokens":10,"output_tokens":5}},"requestId":"req-dup","costUSD":0.001}
+{"cwd":"/tmp/project-a","sessionId":"session-a","timestamp":"2026-05-15T10:00:01Z","message":{"id":"msg-c2","model":"claude-sonnet-4-20250514","usage":{"input_tokens":20,"output_tokens":10}},"requestId":"req-dup","costUSD":0.002}

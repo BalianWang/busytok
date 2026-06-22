@@ -1,0 +1,31 @@
+[package]
+name = "busytok"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+busytok-config = { path = "../../crates/busytok-config" }
+dirs.workspace = true
+busytok-control = { path = "../../crates/busytok-control" }
+busytok-discovery = { path = "../../crates/busytok-discovery" }
+busytok-domain = { path = "../../crates/busytok-domain" }
+busytok-platform = { path = "../../crates/busytok-platform" }
+busytok-protocol = { path = "../../crates/busytok-protocol" }
+busytok-runtime = { path = "../../crates/busytok-runtime" }
+busytok-store = { path = "../../crates/busytok-store" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+async-trait.workspace = true
+busytok-events = { path = "../../crates/busytok-events" }
+predicates = "3"
+tempfile.workspace = true

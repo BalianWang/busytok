@@ -1,0 +1,6 @@
+model_provider = "any"
+base_url = "https://top.example.com"
+
+[model_providers.any]
+wire_api = "responses"
+base_url = "https://provider.example.com"

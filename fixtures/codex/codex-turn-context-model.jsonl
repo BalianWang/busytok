@@ -1,0 +1,2 @@
+{"timestamp":"2026-05-20T01:27:01.769Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.3-codex-spark"}}
+{"timestamp":"2026-05-20T01:27:01.770Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17860,"cached_input_tokens":4096,"output_tokens":295,"reasoning_output_tokens":178,"total_tokens":18155},"last_token_usage":{"input_tokens":17860,"cached_input_tokens":4096,"output_tokens":295,"reasoning_output_tokens":178,"total_tokens":18155},"model_context_window":121600}}}

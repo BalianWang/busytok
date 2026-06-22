@@ -1,0 +1,18 @@
+{
+  "name": "busytok-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev:gui": "pnpm --filter @busytok/gui dev",
+    "typecheck": "pnpm -r typecheck",
+    "test:gui": "pnpm --filter @busytok/gui test",
+    "coverage:gui": "pnpm --filter @busytok/gui test -- --coverage.enabled true --coverage.thresholds.lines 90",
+    "coverage:rust": "cargo llvm-cov --workspace --fail-under-lines 90",
+    "check:naming": "bash scripts/check-busytok-naming.sh",
+    "check:gui-surfaces": "bash scripts/check-busytok-gui-surfaces.sh",
+    "package:macos:dmg": "packaging/macos/scripts/package_dmg.sh",
+    "release:macos:dmg": "packaging/macos/scripts/package_release_dmg.sh",
+    "package:macos:dmg:release": "packaging/macos/scripts/package_release_dmg.sh"
+  },
+  "devDependencies": {}
+}

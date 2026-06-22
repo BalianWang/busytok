@@ -1,0 +1,1 @@
+{"cwd":"/tmp/project-a","sessionId":"session-d","timestamp":"2026-05-15T10:00:00Z","message":{"id":"msg-d","model":"deepseek-v4-pro","usage":{"input_tokens":1407288,"output_tokens":50000,"cache_read_input_tokens":111080192}},"requestId":"req-d","costUSD":0.0}

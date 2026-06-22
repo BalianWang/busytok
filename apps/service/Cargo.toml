@@ -1,0 +1,18 @@
+[package]
+name = "busytok-service"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+busytok-platform = { path = "../../crates/busytok-platform" }
+busytok-runtime = { path = "../../crates/busytok-runtime" }
+busytok-config = { path = "../../crates/busytok-config" }
+busytok-store = { path = "../../crates/busytok-store" }
+busytok-control = { path = "../../crates/busytok-control" }
+busytok-protocol = { path = "../../crates/busytok-protocol" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { workspace = true }

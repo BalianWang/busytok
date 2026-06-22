@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Busytok</title>
+    <!--
+      Inline theme-resolution script (runs synchronously before paint).
+      Must execute BEFORE the stylesheet and React bundle so the correct
+      `data-theme` / `color-scheme` is on <html> for first paint — otherwise
+      dark-OS users see a light-token flash before React boots. This cannot
+      be deferred to React because the CSS cascade resolves at first paint,
+      which beats any post-hydration effect.
+    -->
+    <script>
+      (function () {
+        var preference = "system";
+        try {
+          var raw = localStorage.getItem("busytok.consumer.preferences.v1");
+          if (raw) {
+            var parsed = JSON.parse(raw);
+            var pref = parsed && parsed.themePreference;
+            if (pref === "light" || pref === "dark" || pref === "system") {
+              preference = pref;
+            }
+          }
+        } catch (_) {
+          // localStorage may throw (private browsing / disabled); default to system.
+        }
+        var resolved = preference;
+        if (preference === "system") {
+          try {
+            resolved =
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          } catch (_) {
+            resolved = "light";
+          }
+        }
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.style.colorScheme = resolved;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

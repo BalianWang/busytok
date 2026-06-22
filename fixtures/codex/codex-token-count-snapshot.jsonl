@@ -1,0 +1,2 @@
+{"session_id":"codex-session-2","timestamp":"2026-05-15T09:00:00Z","model":"gpt-5.1-codex","last_token_usage":{"input_tokens":300,"output_tokens":150,"reasoning_output_tokens":50},"total_token_usage":{"input_tokens":800,"output_tokens":350,"reasoning_output_tokens":50},"costUSD":0.02}
+{"session_id":"codex-session-2","timestamp":"2026-05-15T09:01:00Z","model":"gpt-5.1-codex","last_token_usage":{"input_tokens":200,"output_tokens":100,"reasoning_output_tokens":30},"total_token_usage":{"input_tokens":1000,"output_tokens":450,"reasoning_output_tokens":80},"costUSD":0.03}
