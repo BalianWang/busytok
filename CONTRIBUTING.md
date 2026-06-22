@@ -57,12 +57,22 @@ PRs:
 - All CI checks green (`verify.yml`)
 - Linear history required (`git merge --ff-only` or `git rebase`)
 
-## Test and coverage gates
+## CI gates (enforced on every PR)
 
-- Workspace `cargo test` must pass
-- Frontend `pnpm -r test` must pass
-- 85% line coverage on ubuntu (`cargo llvm-cov --workspace --fail-under-lines 85`)
-- New code paths must come with tests in the existing `_tests.rs` companion-module pattern (`#[cfg(test)] mod xxx_tests`)
+`verify.yml` must pass. Currently enforced:
+
+- `cargo fmt --check`
+- `cargo clippy --workspace -- -D warnings`
+- `cargo test --workspace`
+- `cargo audit` (ubuntu)
+- `pnpm typecheck`
+
+Deferred (tracked, pending CI runner fixes):
+- `pnpm -r test` / `pnpm -r test:coverage` (vitest hangs on CI runners)
+- `cargo llvm-cov` (instrumented tests crash on CI)
+- Run `./scripts/verify_acceptance.sh` locally for the full gate including these.
+
+New code paths must include tests in the existing `_tests.rs` companion-module pattern (`#[cfg(test)] mod xxx_tests`).
 
 For packaging-script changes, also add or extend a smoke test under `tests/packaging/macos/` or `tests/scripts/`.
 

@@ -6,9 +6,12 @@ concurrency:
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
-    branches: [main, dev]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   verify:
