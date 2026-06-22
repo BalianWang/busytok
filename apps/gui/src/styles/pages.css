@@ -37,7 +37,7 @@
   flex-direction: column;
   padding: 18px 22px 16px;
   border-radius: 24px;
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   border: 1px solid var(--color-border-subtle);
   box-shadow: var(--material-shadow-elevated);
   overflow: hidden;
@@ -624,7 +624,7 @@
 }
 
 .prompt-row__icon-btn:hover {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   color: var(--color-text);
 }
 
@@ -660,7 +660,7 @@
 .prompt-row__tooltip {
   padding: 4px 8px;
   border-radius: var(--radius-sm);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   color: var(--color-text);
   font-size: 12px;
   line-height: 1;
@@ -670,7 +670,7 @@
 }
 
 .prompt-row__tooltip-arrow {
-  fill: var(--color-surface-strong);
+  fill: var(--color-surface);
 }
 
 @media (max-width: 980px) {
@@ -926,7 +926,7 @@
 .overview-heatmap {
   padding: 18px 20px;
   border-radius: var(--radius-lg);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   border: 1px solid var(--color-border-subtle);
   box-shadow: var(--material-shadow-elevated);
 }
@@ -1095,7 +1095,7 @@
 .overview-heatmap__tooltip {
   padding: 8px 12px;
   border-radius: var(--radius-sm);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   border: 1px solid var(--color-border);
   box-shadow: var(--material-shadow-elevated);
   z-index: 200;
@@ -1135,7 +1135,7 @@
 .chart-tooltip {
   padding: 8px 12px;
   border-radius: var(--radius-sm);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   border: 1px solid var(--color-border);
   box-shadow: var(--material-shadow-elevated);
 }

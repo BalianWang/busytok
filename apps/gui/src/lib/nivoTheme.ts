@@ -30,7 +30,7 @@ export const nivoTheme = {
 
   tooltip: {
     container: {
-      background: "var(--color-surface-strong)",
+      background: "var(--color-surface)",
       color: "var(--color-text)",
       fontSize: "16px",
       borderRadius: "12px",

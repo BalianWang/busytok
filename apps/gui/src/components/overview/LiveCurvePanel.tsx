@@ -237,7 +237,7 @@ export function LiveCurvePanel() {
               alignItems: "center",
               justifyContent: "center",
               color: chartTokens.textMuted,
-              background: "color-mix(in srgb, var(--color-surface-strong) 60%, transparent)",
+              background: "color-mix(in srgb, var(--color-surface) 60%, transparent)",
             }}
           >
             Loading...

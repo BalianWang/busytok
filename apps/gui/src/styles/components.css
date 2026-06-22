@@ -130,7 +130,7 @@
 }
 
 .status-chip:hover {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 .status-chip__dot {
@@ -171,7 +171,7 @@
   inline-size: 280px;
   padding: 16px;
   border-radius: var(--radius-md);
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
   border: 1px solid var(--color-border);
   z-index: 200;
@@ -191,7 +191,7 @@
 }
 
 .status-popover__arrow {
-  fill: var(--color-surface-strong);
+  fill: var(--color-surface);
 }
 
 /* ── Segmented control ───────────────────────────────────── */
@@ -260,13 +260,13 @@
 }
 
 .desktop-button--secondary {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   border: 1px solid var(--color-border-subtle);
   color: var(--color-text);
 }
 
 .desktop-button--secondary:hover {
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
 }
 
 /* ── Ledger table ────────────────────────────────────────── */
@@ -291,7 +291,7 @@
   text-align: left;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 .ledger-table td {
@@ -314,7 +314,7 @@
    not accent, per spec. */
 .ledger-table tbody tr.is-selected,
 .ledger-table tbody tr[aria-selected="true"] {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 .ledger-table.is-readonly tbody tr {
@@ -341,7 +341,7 @@
   bottom: 0;
   width: 460px;
   max-width: 100%;
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
   border-left: 1px solid var(--color-border);
   display: flex;
@@ -391,7 +391,7 @@
 }
 
 .desktop-icon-button:hover {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   color: var(--color-text);
 }
 
@@ -514,7 +514,7 @@
 }
 
 .btn--secondary:hover:not(:disabled) {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 .btn--danger {
@@ -608,7 +608,7 @@
 }
 
 .track-toggle:hover:not(:disabled) {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   color: var(--color-text);
   transform: scale(1.06);
 }
@@ -711,7 +711,7 @@
 .ranking-list__bar {
   position: absolute;
   inset: 0;
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   border-radius: 4px;
 }
 
@@ -755,7 +755,7 @@
   flex-direction: column;
   border: 1px solid var(--color-border);
   border-radius: 22px;
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
 }
 
@@ -877,7 +877,7 @@
   padding: var(--space-5);
   border: 1px solid var(--color-border);
   border-radius: 22px;
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
   animation: confirm-dialog-in 150ms ease-out;
 
@@ -1011,7 +1011,7 @@
 }
 
 .refresh-button:hover:not(:disabled) {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   border-color: var(--color-border);
   transform: translateY(-1px);
 }
@@ -1110,7 +1110,7 @@ body.prompt-palette-window-body #root {
   overflow: hidden;
   border: 1px solid var(--color-border-strong);
   border-radius: 32px;
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
 }
 
@@ -1177,7 +1177,7 @@ body.prompt-palette-window-body #root {
 }
 
 .prompt-overlay__close:hover {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 .prompt-overlay__close:focus-visible {
@@ -1331,7 +1331,7 @@ body.prompt-palette-window-body #root {
 }
 
 .prompt-overlay__row:hover {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 /* Low-density palette surface — accent-led selection is permitted. */
@@ -1408,7 +1408,7 @@ body.prompt-palette-window-body #root {
   gap: 3px;
   border: 1px solid var(--color-border);
   border-radius: 16px;
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
   padding: 6px;
 }
@@ -1428,7 +1428,7 @@ body.prompt-palette-window-body #root {
 }
 
 .prompt-overlay__menu-item:hover:not([aria-disabled="true"]) {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
 }
 
 .prompt-overlay__menu-item[aria-disabled="true"] {
@@ -1521,7 +1521,7 @@ body.prompt-palette-window-body #root {
 }
 
 .app-select__content {
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   box-shadow: var(--material-shadow-elevated);
@@ -1549,6 +1549,6 @@ body.prompt-palette-window-body #root {
 }
 
 .app-select__item[data-highlighted] {
-  background: var(--color-surface-elevated);
+  background: var(--color-surface-subtle);
   color: var(--color-accent-600);
 }
