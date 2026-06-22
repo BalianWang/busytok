@@ -23,7 +23,7 @@ Busytok is `0.x`: real and usable, but **minors may break**. Auto-update is on, 
 - Reads local agent logs (Claude Code, Codex, Gemini CLI)
 - Persists metadata-only token usage to local SQLite (no prompt/response bodies)
 - Serves a desktop GUI (Dashboard, Agents, Settings pages) and a CLI (`busytok`)
-- Bundles a background service (`busytok-service`) managed via launchd (LaunchAgent)
+- Bundles a background service (`busytok-service`) running as a launchd LaunchAgent, registered from the app bundle via `SMAppService`
 
 ## What it does NOT do
 
