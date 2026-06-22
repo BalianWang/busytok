@@ -4,14 +4,16 @@
    - Open the Busytok menu bar item and choose **Quit Busytok Desktop**, or
      quit the app from the Dock / `Cmd-Q`.
    - This stops the GUI, desktop-host, and `busytok-service` for the current
-     session. `SMAppService` registrations are left in place until the bundle
-     itself is removed in the next step, so they do not respawn.
+     session. The launchd registration (via `SMAppService`) is left in place
+     until the bundle itself is removed in the next step, so the service does
+     not respawn.
 
 2. Delete the application:
    - Move `Busytok.app` to Trash.
-   - Removing the bundle also removes the bundled service LaunchAgent plist
-     at `Contents/Library/LaunchAgents/com.busytok.service.plist`, so
-     `SMAppService` no longer has a bundle to register from on next login.
+   - Removing the bundle also removes the bundled LaunchAgent plist at
+     `Contents/Library/LaunchAgents/com.busytok.service.plist`, so launchd
+     no longer has a plist to register from on next login (the registration
+     API is `SMAppService.agent(plistName:)`, reading from the bundle).
 
 3. Optional: remove the CLI shim (if installed):
    ```
