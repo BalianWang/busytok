@@ -51,5 +51,5 @@ export const chartTokens = Object.freeze({
   lineAttention: cssVar("--color-data-attention"),
   lineNeutral: cssVar("--color-data-neutral"),
   textMuted: cssVar("--color-text-muted"),
-  borderSoft: cssVar("--color-border-soft"),
+  borderSoft: cssVar("--color-border-subtle"),
 } as const);

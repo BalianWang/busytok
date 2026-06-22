@@ -51,6 +51,16 @@ describe("tokens.css contract", () => {
     expect(css).toContain("--radius-pill: 999px;");
     expect(css).toContain("--space-6: 24px;");
     expect(css).toContain("--font-ui:");
+
+    // Phase 1 rename: new vocabulary exists, old names are gone.
+    expect(css).toContain("--color-border-subtle:");
+    expect(css).toContain("--color-surface-subtle:");
+    expect(css).toContain("--color-chrome:");
+    expect(css).toContain("--color-hover:");
+    expect(css).toContain("--color-hover-strong:");
+    expect(css).not.toContain("--color-border-soft:");
+    expect(css).not.toContain("--color-canvas-subtle:");
+    expect(css).not.toContain("--color-sidebar:");
   });
 
   it("defines a dark theme block that overrides key tokens", () => {

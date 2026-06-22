@@ -135,7 +135,7 @@ describe("LiveCurvePanel", () => {
                 return "rgba(79, 99, 246, 0.22)";
               case "--color-text-muted":
                 return "#6e7681";
-              case "--color-border-soft":
+              case "--color-border-subtle":
                 return "rgba(255, 255, 255, 0.06)";
               default:
                 return "";
@@ -196,7 +196,7 @@ describe("LiveCurvePanel", () => {
             if (name === "--color-text-muted") {
               return theme === "dark" ? "#8b949e" : "#6e7480";
             }
-            if (name === "--color-border-soft") {
+            if (name === "--color-border-subtle") {
               return theme === "dark"
                 ? "rgba(255, 255, 255, 0.06)"
                 : "rgba(17, 24, 39, 0.08)";

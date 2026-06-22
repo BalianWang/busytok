@@ -31,7 +31,7 @@ function resolveLiveCurveThemeColors() {
     lineColor: resolveCssColor("--color-data-live-primary", "#4f63f6"),
     topColor: resolveCssColor("--color-data-live-primary-soft", "rgba(79, 99, 246, 0.22)"),
     textColor: resolveCssColor("--color-text-muted", "#6e7480"),
-    gridColor: resolveCssColor("--color-border-soft", "rgba(17, 24, 39, 0.08)"),
+    gridColor: resolveCssColor("--color-border-subtle", "rgba(17, 24, 39, 0.08)"),
   };
 }
 
