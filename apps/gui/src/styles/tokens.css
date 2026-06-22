@@ -9,14 +9,16 @@
   /* Light: cool paper-gray canvas, translucent white surfaces,     */
   /* deep ink text.                                                 */
   --color-canvas: #EEF1F4;
-  --color-canvas-subtle: #F5F7FA;
+  --color-surface-subtle: #F5F7FA;
   --color-surface: rgba(255, 255, 255, 0.85);
   --color-surface-strong: rgba(255, 255, 255, 0.96);
   --color-surface-elevated: rgba(255, 255, 255, 0.92);
-  --color-sidebar: rgba(238, 241, 244, 0.88);
-  --color-border-soft: rgba(15, 23, 42, 0.06);
+  --color-chrome: rgba(238, 241, 244, 0.88);
+  --color-border-subtle: rgba(15, 23, 42, 0.06);
   --color-border: rgba(15, 23, 42, 0.12);
   --color-border-strong: rgba(15, 23, 42, 0.20);
+  --color-hover: rgba(15, 23, 42, 0.04);
+  --color-hover-strong: rgba(15, 23, 42, 0.07);
   --color-text: #111827;
   --color-text-muted: #6b7280;
   --color-text-faint: #9ca3af;
@@ -142,14 +144,16 @@
 :root[data-theme="dark"] {
   /* ── Neutral: deep slate, layered surfaces ──────────────────── */
   --color-canvas: #0d1117;
-  --color-canvas-subtle: #11161d;
+  --color-surface-subtle: #11161d;
   --color-surface: rgba(22, 27, 34, 0.92);
   --color-surface-strong: #161b22;
   --color-surface-elevated: #1f262e;
-  --color-sidebar: rgba(13, 17, 23, 0.92);
-  --color-border-soft: rgba(255, 255, 255, 0.06);
+  --color-chrome: rgba(13, 17, 23, 0.92);
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
   --color-border: rgba(255, 255, 255, 0.10);
   --color-border-strong: rgba(255, 255, 255, 0.16);
+  --color-hover: rgba(255, 255, 255, 0.05);
+  --color-hover-strong: rgba(255, 255, 255, 0.08);
   --color-text: #e6edf3;
   --color-text-muted: #8b949e;
   --color-text-faint: #6e7681;
