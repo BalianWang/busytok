@@ -100,6 +100,9 @@ jobs:
             target/aarch64-apple-darwin/release/busytok \
             target/x86_64-apple-darwin/release/busytok
 
+      - name: Install create-dmg (DMG authoring tool)
+        run: brew install create-dmg
+
       - name: Run repo-owned packaging pipeline (bundle .app + DMG + helper injection + two-tier signing)
         env:
           DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_SIGNING_IDENTITY }}
