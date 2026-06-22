@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   publish-macos:
+    environment: release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
