@@ -25,7 +25,6 @@ describe("tokens.css contract", () => {
 
     // Other key roles that must exist
     expect(css).toContain("--color-canvas:");
-    expect(css).toContain("--color-surface-elevated:");
     expect(css).toContain("--color-border-strong:");
     expect(css).toContain("--color-text-reverse:");
     expect(css).toContain("--color-status-success-soft:");
@@ -125,5 +124,30 @@ describe("tokens.css contract", () => {
     expect(darkBlock).toContain("--material-glass-blur: 0px;");
     expect(darkBlock).toContain("--material-glass-blur-strong: 0px;");
     expect(darkBlock).toContain("--material-glass-blur-subtle: 0px;");
+  });
+
+  it("light theme: opaque surfaces, chrome vibrancy, Geist shadow (Phase 1)", () => {
+    // content surface is opaque white, not translucent
+    expect(tokensCss).toContain("--color-surface: #FFFFFF;");
+    expect(tokensCss).toContain("--color-surface-subtle: #F7F8FA;");
+    expect(tokensCss).toContain("--color-canvas: #F4F5F7;");
+    expect(tokensCss).toContain("--color-chrome: rgba(255, 255, 255, 0.94);");
+    // collapsed tiers are gone
+    expect(tokensCss).not.toContain("--color-surface-strong:");
+    expect(tokensCss).not.toContain("--color-surface-elevated:");
+    // chrome blur only; subtle (content/scrim) blur is 0 per spec §4.1 —
+    // modal-backdrop blur becomes a Phase 2 per-component concern
+    expect(tokensCss).toContain("--material-glass-blur: 8px;");
+    expect(tokensCss).toContain("--material-glass-blur-strong: 8px;");
+    expect(tokensCss).toContain("--material-glass-blur-subtle: 0px;");
+    // dead translucent-alpha tokens removed (no consumers)
+    expect(tokensCss).not.toContain("--material-surface-alpha:");
+    expect(tokensCss).not.toContain("--material-surface-strong-alpha:");
+    // Geist raised-card shadow
+    expect(tokensCss).toContain(
+      "--material-shadow-card: 0 2px 2px rgba(15, 23, 42, 0.04);",
+    );
+    // text de-blued
+    expect(tokensCss).toContain("--color-text: #1A1D23;");
   });
 });

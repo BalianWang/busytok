@@ -5,7 +5,6 @@
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-xl);
   box-shadow: var(--material-shadow-card);
-  backdrop-filter: blur(var(--material-glass-blur)) saturate(var(--material-glass-saturate));
 }
 
 .surface-inset {
