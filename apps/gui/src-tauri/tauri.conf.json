@@ -54,7 +54,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYwQjVCRUFBRkI3M0VFMkUKUldRdTduUDdxcjYxOEl0Ukc5WkN2OTZZQVllVFptcU5IbkZ1a3lBdk81TFcrcTNzOVNzUjNncE8K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBOUNBRDU0Mzc5MEIyRjUKUldUMXNwQTNWSzJjK2h4aUdsdUdGSGhxbGVQNzdMRUtueWh3b3lIb1FQY21adkhLd2VsY0dzc0EK",
       "endpoints": [
         "https://github.com/BalianWang/busytok/releases/latest/download/latest.json"
       ]
