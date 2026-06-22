@@ -15,6 +15,7 @@ import {
 } from "./logging/reporter";
 import { initThemeRuntime } from "./lib/themeRuntime";
 import { initUpdaterAutoCheck } from "./lib/updaterClient";
+import { reportDesignSystemApplied } from "./logging/designSystem";
 
 function isPromptPaletteWindow() {
   return (
@@ -41,6 +42,12 @@ reportFrontendEvent({
 // document.documentElement, so one init covers App and prompt-palette windows.
 // StrictMode double-mount in development will not re-run this module-level init.
 initThemeRuntime();
+
+// Design-system token-layer marker — main app only. The prompt-palette
+// window is a child of the same app/version, so it does not emit its own.
+if (!promptPaletteWindow) {
+  reportDesignSystemApplied();
+}
 
 // Tauri 2 updater silent auto-check. Module-level latch survives StrictMode.
 // MAIN APP ONLY — prompt-palette must not trigger update probes.
