@@ -80,7 +80,7 @@ describe("tokens.css contract", () => {
   it("defines dedicated heatmap tokens (neutral empty + indigo ramp) for both themes", () => {
     // Light theme: empty is a neutral substrate, levels are an indigo ramp
     // that darkens with intensity.
-    expect(tokensCss).toContain("--color-heatmap-empty: #ebedf2;");
+    expect(tokensCss).toContain("--color-heatmap-empty: #EDF0F3;");
     expect(tokensCss).toContain("--color-heatmap-level-1: #a5b4fc;");
     expect(tokensCss).toContain("--color-heatmap-level-2: #6366f1;");
     expect(tokensCss).toContain("--color-heatmap-level-3: #4338ca;");
@@ -90,7 +90,7 @@ describe("tokens.css contract", () => {
     const darkBlockStart = tokensCss.indexOf(':root[data-theme="dark"]');
     expect(darkBlockStart).toBeGreaterThan(-1);
     const darkBlock = tokensCss.slice(darkBlockStart);
-    expect(darkBlock).toContain("--color-heatmap-empty: #232a35;");
+    expect(darkBlock).toContain("--color-heatmap-empty: #202732;");
     expect(darkBlock).toContain("--color-heatmap-level-1: #4338ca;");
     expect(darkBlock).toContain("--color-heatmap-level-2: #6366f1;");
     expect(darkBlock).toContain("--color-heatmap-level-3: #818cf8;");
