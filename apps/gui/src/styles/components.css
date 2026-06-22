@@ -754,7 +754,7 @@
   display: flex;
   flex-direction: column;
   border: 1px solid var(--color-border);
-  border-radius: 22px;
+  border-radius: var(--radius-lg);
   background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
 }
@@ -876,7 +876,7 @@
   gap: var(--space-3);
   padding: var(--space-5);
   border: 1px solid var(--color-border);
-  border-radius: 22px;
+  border-radius: var(--radius-lg);
   background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
   animation: confirm-dialog-in 150ms ease-out;
@@ -1109,7 +1109,7 @@ body.prompt-palette-window-body #root {
   grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   overflow: hidden;
   border: 1px solid var(--color-border-strong);
-  border-radius: 32px;
+  border-radius: var(--radius-lg);
   background: var(--color-surface);
   box-shadow: var(--material-shadow-elevated);
 }
@@ -1119,7 +1119,7 @@ body.prompt-palette-window-body #root {
   height: 100vh;
   min-height: 0;
   max-height: none;
-  border-radius: 32px;
+  border-radius: var(--radius-lg);
   box-shadow: none;
 }
 
@@ -1443,7 +1443,7 @@ body.prompt-palette-window-body #root {
 
   .prompt-overlay__surface {
     max-height: min(640px, calc(100vh - 24px));
-    border-radius: 26px;
+    border-radius: var(--radius-lg);
   }
 
   .prompt-overlay__header {

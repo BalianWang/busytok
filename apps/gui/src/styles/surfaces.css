@@ -3,7 +3,7 @@
 .page-surface {
   background: var(--color-surface);
   border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-lg);
   box-shadow: var(--material-shadow-card);
 }
 

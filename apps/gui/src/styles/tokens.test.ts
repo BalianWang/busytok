@@ -168,6 +168,15 @@ describe("tokens.css contract", () => {
     expect(dark).not.toContain("--color-surface-elevated:");
   });
 
+  it("radius role map: 6/12/16/pill, xs and xl removed (Phase 1)", () => {
+    expect(tokensCss).toContain("--radius-sm: 6px;");
+    expect(tokensCss).toContain("--radius-md: 12px;");
+    expect(tokensCss).toContain("--radius-lg: 16px;");
+    expect(tokensCss).toContain("--radius-pill: 999px;");
+    expect(tokensCss).not.toContain("--radius-xs:");
+    expect(tokensCss).not.toContain("--radius-xl:");
+  });
+
   it("elevated shadow is the Geist popover stack (floating layers only)", () => {
     const popover =
       "0 1px 1px rgba(0, 0, 0, 0.02), 0 4px 8px -4px rgba(0, 0, 0, 0.04), 0 16px 24px -8px rgba(0, 0, 0, 0.06)";
