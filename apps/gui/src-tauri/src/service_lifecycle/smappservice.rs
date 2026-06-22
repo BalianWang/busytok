@@ -35,8 +35,8 @@
 //!
 //! [`stop_for_current_session`] issues `launchctl bootout` against the
 //! current Aqua domain — this stops the running instance for the current
-//! session. The next app launch will bootstrap the bundled plist again when
-//! background service startup is enabled.
+//! session. The next app launch will bootstrap the managed user-domain
+//! plist again when background service startup is enabled.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,7 @@ use super::command_runner::{
     CommandStatus,
 };
 use super::launchd_job_snapshot::LaunchdJobSnapshot;
-use super::managed_launch_agent::ensure_managed_plist_current;
+use super::managed_launch_agent::{ensure_managed_plist_current, managed_plist_path};
 use super::smappservice_bridge::{MainThreadExecutor, SMAppServiceHandle, SMServiceStatus};
 use super::{EnsureRunningOutcome, InstallOutcome, LifecycleStatus, ServiceLifecycle};
 
@@ -721,6 +721,37 @@ impl ServiceLifecycle for SmAppServiceLifecycle {
             }
         }
         let _ = busytok_config::service_marker::remove(self.paths.data_dir());
+
+        // Architecture B: the production registration source is the
+        // runtime-rendered user-domain plist.  Remove it so that a
+        // future login does not attempt to load a job pointing at a
+        // no-longer-present bundle.  NotFound is expected (the user may
+        // have already deleted the plist manually, or this is a
+        // pre-Architecture-B install that never wrote one).
+        let managed_path = managed_plist_path(&self.platform);
+        match std::fs::remove_file(&managed_path) {
+            Ok(()) => {
+                info!(
+                    event_code = "service_lifecycle.smappservice.uninstalled.managed_plist_removed",
+                    session_id = %crate::logging::tauri_session_id(),
+                    path = %managed_path.display(),
+                    "removed managed launch agent plist"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already absent — post-condition satisfied.
+            }
+            Err(e) => {
+                // Non-fatal: the job is already booted-out.
+                warn!(
+                    event_code = "service_lifecycle.smappservice.uninstalled.managed_plist_remove_failed",
+                    session_id = %crate::logging::tauri_session_id(),
+                    path = %managed_path.display(),
+                    error = %e,
+                    "failed to remove managed launch agent plist during uninstall"
+                );
+            }
+        }
 
         info!(
             event_code = "service_lifecycle.smappservice.uninstalled",
@@ -1659,6 +1690,53 @@ mod tests {
         // Remove marker but keep socket -> not ready (marker is primary signal).
         busytok_config::service_marker::remove(paths.data_dir()).unwrap();
         assert!(!lc.socket_ready().unwrap());
+    }
+
+    // ── uninstall managed-plist regression ──────────────────────────
+
+    #[test]
+    fn uninstall_removes_managed_plist_when_present() {
+        let temp_home = tempdir().unwrap();
+        let launch_agents = temp_home.path().join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        let managed = launch_agents.join("com.busytok.service.plist");
+        fs::write(&managed, "<fake/>").unwrap();
+        assert!(managed.exists());
+
+        let layout = BundleLayout::for_app_root("/Applications/Busytok.app");
+        let paths = BusytokPaths::for_test(temp_home.path());
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp_home.path().to_path_buf());
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(PermissiveRunner);
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout, paths, platform, executor, probe, runner,
+        );
+        lc.uninstall().expect("uninstall must succeed");
+        assert!(
+            !managed.exists(),
+            "uninstall must remove the managed user-domain plist"
+        );
+    }
+
+    #[test]
+    fn uninstall_tolerates_missing_managed_plist() {
+        let temp_home = tempdir().unwrap();
+        let layout = BundleLayout::for_app_root("/Applications/Busytok.app");
+        let paths = BusytokPaths::for_test(temp_home.path());
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp_home.path().to_path_buf());
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(PermissiveRunner);
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout, paths, platform, executor, probe, runner,
+        );
+        // Must not panic or return Err just because the managed plist is
+        // absent (fresh install, or user already removed it manually).
+        lc.uninstall()
+            .expect("uninstall must tolerate missing managed plist");
     }
 
     // ── ServiceBuildIdentity ────────────────────────────────────────
