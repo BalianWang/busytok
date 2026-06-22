@@ -603,7 +603,7 @@ L1 indigo step. Phase 1."
 
 **Interfaces:**
 - Consumes: `safeReportEvent` from `apps/gui/src/logging/reporter.ts` (canonical fire-and-forget INFO wrapper).
-- Produces: `reportDesignSystemApplied()` — emits a one-shot `gui.design_system.applied` event with the token-layer version, so field-reported visual behavior can be correlated to this refactor. DRY: one constant, one exported function, reused by bootstrap.
+- Produces: `reportDesignSystemApplied()` — emits a `gui.design_system.applied` event with the token-layer version, so field-reported visual behavior can be correlated to this refactor. DRY: one constant, one exported function. Wired **main-window-only** in `main.tsx` (the prompt-palette window shares the bootstrap; gating matches the existing updater pattern) so it fires once per app launch, not once per palette-window open.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -690,7 +690,7 @@ export function reportDesignSystemApplied(): void {
 Run: `pnpm --filter @busytok/gui test -- src/logging/designSystem.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Wire it into bootstrap (exactly once)**
+- [ ] **Step 5: Wire it into bootstrap (main window only)**
 
 In `apps/gui/src/main.tsx`, add the import alongside the existing logging/theme imports:
 
@@ -698,13 +698,15 @@ In `apps/gui/src/main.tsx`, add the import alongside the existing logging/theme 
 import { reportDesignSystemApplied } from "./logging/designSystem";
 ```
 
-Immediately after the `initThemeRuntime();` call (which the existing bootstrap runs before first React render), add:
+`main.tsx` is the **shared** bootstrap for both the main app window and the prompt-palette window (distinguished by `promptPaletteWindow`, currently line 27). `initThemeRuntime()` runs for both. To emit the marker **once per app launch (main window only)** — not once per palette-window open — gate it exactly like the updater (`if (!promptPaletteWindow)`, currently line 47). Add this block immediately after the `initThemeRuntime();` call:
 
 ```ts
-reportDesignSystemApplied();
+// Design-system token-layer marker — main app only. The prompt-palette
+// window is a child of the same app/version, so it does not emit its own.
+if (!promptPaletteWindow) {
+  reportDesignSystemApplied();
+}
 ```
-
-(If `main.tsx` already wraps bootstrap in a try/catch or calls other `report*` helpers, place this call in the same bootstrap sequence so it fires exactly once per app launch.)
 
 - [ ] **Step 6: Run typecheck + full suite**
 
@@ -717,10 +719,11 @@ Expected: typecheck clean; all tests PASS.
 git add apps/gui/src/logging/designSystem.ts apps/gui/src/logging/designSystem.test.ts apps/gui/src/main.tsx
 git commit -m "feat(gui): design-system correlation telemetry marker
 
-reportDesignSystemApplied() emits gui.design_system.applied once at
-bootstrap with DESIGN_SYSTEM_VERSION, so field-reported visual behavior
-can be correlated to the active token layer. Reuses safeReportEvent;
-never throws into bootstrap. Phase 1."
+reportDesignSystemApplied() emits gui.design_system.applied once per
+main-window bootstrap (gated like the updater; the prompt-palette window
+shares bootstrap but does not emit) with DESIGN_SYSTEM_VERSION, so
+field-reported visual behavior can be correlated to the active token
+layer. Reuses safeReportEvent; never throws into bootstrap. Phase 1."
 ```
 
 ---
@@ -748,18 +751,34 @@ if rg -n -e '--color-surface-strong|--color-surface-elevated|--color-canvas-subt
 fi
 
 # ── Geist refactor Phase 1: backdrop-filter is chrome/modal-only ─────
-# Allowed only in components.css (titlebar, sidebar, dialog/palette scrims).
-if rg -n 'backdrop-filter' apps/gui/src/styles/surfaces.css apps/gui/src/styles/pages.css; then
-  echo "backdrop-filter appears in surfaces.css/pages.css (content surfaces must be opaque)"
+# Positive allowlist (spec §3): backdrop-filter may appear ONLY inside a
+# rule whose selector is .desktop-sidebar / .desktop-titlebar /
+# .prompt-dialog__overlay / .confirm-dialog__overlay / .prompt-overlay__backdrop.
+# The awk tracks the current selector (set on `{`, reset on `}`) so each
+# backdrop-filter is correlated with its own rule — a new content component
+# added to components.css that sneaks in a blur is caught, not just
+# surfaces.css/pages.css.
+if ! awk '
+  /\}/ { sel = ""; next }
+  /\{/ { sel = $0; sub(/\{.*/, "", sel); next }
+  /backdrop-filter/ {
+    if (sel ~ /\.desktop-sidebar/ || sel ~ /\.desktop-titlebar/ || sel ~ /\.prompt-dialog__overlay/ || sel ~ /\.confirm-dialog__overlay/ || sel ~ /\.prompt-overlay__backdrop/) next
+    print FILENAME ": backdrop-filter outside chrome/modal allowlist: " sel; bad = 1
+  }
+  END { exit bad ? 1 : 0 }
+' apps/gui/src/styles/surfaces.css apps/gui/src/styles/components.css apps/gui/src/styles/pages.css; then
+  echo "backdrop-filter outside chrome/modal allowlist (spec §3)"
   exit 1
 fi
 
-# ── Geist refactor Phase 1: no raw hex outside tokens.css ────────────
-# Default-deny. `--glob '!tokens.css'` is the sole exception; if a future
-# legitimate inline hex (e.g. a chart-lib fallback) must appear in a
-# consumer file, consume a token for it instead of whitelisting the path.
+# ── Geist refactor Phase 1: no raw hex in CSS consumer files ─────────
+# Scope: CSS consumer layer only (spec §8.3). TS chart-runtime fallback
+# colors — e.g. LiveCurvePanel.tsx resolveCssColor("--color-data-live-
+# primary", "#4f63f6") — are the spec §8.3 "third-party chart-lib inline
+# fallback" whitelist case and are intentionally OUT of this guard's scope.
+# If a CSS consumer needs a color, consume a token.
 if rg -n --glob '*.css' --glob '!tokens.css' -e '#[0-9a-fA-F]{3,8}' apps/gui/src/styles; then
-  echo "Raw hex outside tokens.css — consume a token"
+  echo "Raw hex in CSS consumer file — consume a token"
   exit 1
 fi
 ```
@@ -828,6 +847,9 @@ chrome/modal selectors, no radius outliers, no raw hex outside tokens.css
 - **Dead tokens removed** (P1): `--material-surface-alpha` / `-strong-alpha` deleted in Task 2 (zero consumers).
 - **Task 7 mock** (P1): uses repo idiom `vi.hoisted` + `./reporter`.
 - **Task 8 raw-hex guard** (P2): dropped redundant `| rg -v` pipe.
+- **Task 7 main-window gating** (P1, second review): `reportDesignSystemApplied()` is now wrapped in `if (!promptPaletteWindow)` — `main.tsx` is the shared bootstrap for both window types, so an ungated call would emit once per palette-window open, not once per app launch.
+- **Task 8 backdrop-filter allowlist** (P1, second review): the file-name-only `rg` rule (surfaces/pages) was too weak — a new content component in `components.css` could sneak in a blur. Replaced with a positive awk allowlist that correlates each `backdrop-filter` with its enclosing selector; only the 5 chrome/modal selectors pass.
+- **Task 8 raw-hex scope** (P2, second review): guard comment now states CSS-consumer-only scope; TS chart-runtime fallbacks (`LiveCurvePanel.tsx`) are the spec §8.3 whitelist and out of scope.
 
 **Phase 2/3 outlook (separate plans, written after this lands):**
 - **Phase 2** (component behavior): Titlebar single calm chip + read-only popover bound to `shell.status`; sidebar active rail + `--color-hover`; metric-card neutralization (delete `--success` variant, flag/dot exceptions); Overview 3-tier via border-strength (Tier A `--color-border`); chart readout-ification (single indigo line, ≤8% fill, no vertical grid, explicit chart-token stroke); rankings neutral bars + one accent; Prompt Palette command-surface across all 4 carriers; migrate hover states to `--color-hover`. Each component = its own task with component tests (Testing Library) + `safeReportEvent` hooks at escalation/surface-mode points.
