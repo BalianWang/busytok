@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-palette-panel-message"
+description = "Enables the palette_panel_message command without any pre-configured scope."
+commands.allow = ["palette_panel_message"]
+
+[[permission]]
+identifier = "deny-palette-panel-message"
+description = "Denies the palette_panel_message command without any pre-configured scope."
+commands.deny = ["palette_panel_message"]

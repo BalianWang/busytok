@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-invoke-busytok"
+description = "Enables the invoke_busytok command without any pre-configured scope."
+commands.allow = ["invoke_busytok"]
+
+[[permission]]
+identifier = "deny-invoke-busytok"
+description = "Denies the invoke_busytok command without any pre-configured scope."
+commands.deny = ["invoke_busytok"]

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Bundle-native LaunchAgent plist for `busytok-service`.
+
+    This file is bundled into `Busytok.app/Contents/Library/LaunchAgents/` at
+    build time and registered via `SMAppService.agent(plistName:)` at runtime.
+    `SMAppService` reads the plist from the bundle location; the app never
+    writes a copy to `~/Library/LaunchAgents/`.
+
+    Build-time substitution is performed by
+    `packaging/macos/scripts/_bundle_helpers.sh`:
+      SERVICE_BINARY_PATH      -> absolute path to the bundled busytok-service
+      BUSYTOK_LOGS_DIR         -> per-user log directory (~/Library/Logs/Busytok)
+      BUSYTOK_APP_SUPPORT_DIR  -> per-user app data dir (~/Library/Application Support/Busytok)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.busytok.service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>SERVICE_BINARY_PATH</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>BUSYTOK_LOGS_DIR/service.log</string>
+    <key>StandardErrorPath</key>
+    <string>BUSYTOK_LOGS_DIR/service.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BUSYTOK_APP_DATA_DIR</key>
+        <string>BUSYTOK_APP_SUPPORT_DIR</string>
+    </dict>
+</dict>
+</plist>

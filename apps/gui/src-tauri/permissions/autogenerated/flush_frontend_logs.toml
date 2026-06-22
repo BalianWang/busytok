@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-flush-frontend-logs"
+description = "Enables the flush_frontend_logs command without any pre-configured scope."
+commands.allow = ["flush_frontend_logs"]
+
+[[permission]]
+identifier = "deny-flush-frontend-logs"
+description = "Denies the flush_frontend_logs command without any pre-configured scope."
+commands.deny = ["flush_frontend_logs"]

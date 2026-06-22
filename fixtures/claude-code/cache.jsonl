@@ -1,0 +1,1 @@
+{"cwd":"/tmp/project-a","sessionId":"session-a","timestamp":"2026-05-15T09:00:00Z","message":{"id":"msg-b","model":"claude-sonnet-4-20250514","usage":{"input_tokens":200,"output_tokens":75,"cache_creation_input_tokens":20,"cache_read_input_tokens":80}},"requestId":"req-b","costUSD":0.002}

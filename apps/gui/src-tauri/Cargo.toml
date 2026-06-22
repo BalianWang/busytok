@@ -1,0 +1,48 @@
+[package]
+name = "busytok-gui"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+busytok-config = { path = "../../../crates/busytok-config" }
+busytok-control = { path = "../../../crates/busytok-control" }
+busytok-events = { path = "../../../crates/busytok-events" }
+busytok-platform = { path = "../../../crates/busytok-platform" }
+busytok-protocol = { path = "../../../crates/busytok-protocol" }
+fs2 = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+tauri-plugin-global-shortcut = "=2.3.1"
+tauri-plugin-clipboard-manager = "=2.3.2"
+tauri-plugin-process = "=2.3.1"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "=2.10.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25.0"
+libc = "0.2"
+objc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }

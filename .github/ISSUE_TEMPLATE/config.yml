@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Q&A
+    url: https://github.com/BalianWang/busytok/discussions
+    about: Open-ended questions belong in Discussions, not in issues.
+  - name: Security report
+    url: https://github.com/BalianWang/busytok/security/advisories/new
+    about: Security vulnerabilities must be reported privately via the Security tab. Do not open public issues.

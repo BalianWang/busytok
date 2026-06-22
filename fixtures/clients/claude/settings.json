@@ -1,0 +1,7 @@
+{
+  "baseUrl": "https://api.anthropic.com",
+  "primaryApiKey": "sk-ant-test123",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+  }
+}
