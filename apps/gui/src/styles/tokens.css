@@ -75,7 +75,7 @@
   /* rises. Separating "no activity" from "activity intensity" is what makes  */
   /* empty vs level-1 readable — the spacing that matters most for sparse     */
   /* years. level-2 intentionally equals accent-400 for palette harmony.      */
-  --color-heatmap-empty: #ebedf2;
+  --color-heatmap-empty: #EDF0F3;
   --color-heatmap-level-1: #a5b4fc;
   --color-heatmap-level-2: #6366f1;
   --color-heatmap-level-3: #4338ca;
@@ -187,7 +187,7 @@
 
   /* Heatmap: empty is a neutral dark slate (substrate, NOT indigo); the    */
   /* active ramp BRIGHTENS as intensity rises so dense days pop on dark.     */
-  --color-heatmap-empty: #232a35;
+  --color-heatmap-empty: #202732;
   --color-heatmap-level-1: #4338ca;
   --color-heatmap-level-2: #6366f1;
   --color-heatmap-level-3: #818cf8;
