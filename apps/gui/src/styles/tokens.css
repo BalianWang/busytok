@@ -93,7 +93,7 @@
   --material-glass-saturate: 1.08;
   --material-overlay-scrim: rgba(17, 24, 39, 0.32);
   --material-shadow-card: 0 2px 2px rgba(15, 23, 42, 0.04);
-  --material-shadow-elevated: 0 18px 44px rgba(17, 24, 39, 0.12);
+  --material-shadow-elevated: 0 1px 1px rgba(0, 0, 0, 0.02), 0 4px 8px -4px rgba(0, 0, 0, 0.04), 0 16px 24px -8px rgba(0, 0, 0, 0.06);
   --material-tint-accent: rgba(79, 70, 229, 0.08);
   --material-tint-success: rgba(109, 186, 120, 0.10);
   --material-tint-warning: rgba(194, 154, 85, 0.10);
@@ -140,10 +140,10 @@
 /* ══════════════════════════════════════════════════════════════════ */
 :root[data-theme="dark"] {
   /* ── Neutral: deep slate, layered surfaces ──────────────────── */
-  --color-canvas: #0d1117;
-  --color-surface-subtle: #11161d;
-  --color-surface: rgba(22, 27, 34, 0.92);
-  --color-chrome: rgba(13, 17, 23, 0.92);
+  --color-canvas: #0D1117;
+  --color-surface-subtle: #202732;
+  --color-surface: #171C24;
+  --color-chrome: rgba(22, 27, 34, 0.96);
   --color-border-subtle: rgba(255, 255, 255, 0.06);
   --color-border: rgba(255, 255, 255, 0.10);
   --color-border-strong: rgba(255, 255, 255, 0.16);
@@ -204,8 +204,8 @@
   --material-glass-blur-subtle: 0px;
   --material-glass-saturate: 1;
   --material-overlay-scrim: rgba(0, 0, 0, 0.52);
-  --material-shadow-card: 0 10px 24px rgba(0, 0, 0, 0.36);
-  --material-shadow-elevated: 0 18px 44px rgba(0, 0, 0, 0.48);
+  --material-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.16);
+  --material-shadow-elevated: 0 1px 1px rgba(0, 0, 0, 0.02), 0 4px 8px -4px rgba(0, 0, 0, 0.04), 0 16px 24px -8px rgba(0, 0, 0, 0.06);
   --material-tint-accent: rgba(129, 140, 248, 0.10);
   --material-tint-success: rgba(126, 201, 138, 0.10);
   --material-tint-warning: rgba(214, 169, 100, 0.10);
