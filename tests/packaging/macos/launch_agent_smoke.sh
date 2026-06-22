@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# LaunchAgent smoke test — verifies the SMAppService model for Busytok.
+# LaunchAgent smoke test — verifies the Architecture-B managed-plist model.
 #
-# Under SMAppService the service LaunchAgent plist is bundled into
-# Busytok.app/Contents/Library/LaunchAgents/ and read from that bundle
-# location at registration time. The app does NOT install a copy to
-# ~/Library/LaunchAgents/.
+# Production registration bootstraps from a runtime-rendered plist in
+# ~/Library/LaunchAgents/com.busytok.service.plist (see
+# apps/gui/src-tauri/src/service_lifecycle/managed_launch_agent.rs).
+# The bundled plist (Contents/Library/LaunchAgents/) is a static reference
+# copy only — production does not bootstrap from it.
 #
-# desktop-host login-start is registered through SMAppService.mainApp, so
-# there must be no com.busytok.desktop-host.plist anywhere in the bundle.
+# This smoke validates:
+#   - Bundle plist exists (reference copy).
+#   - After first launch, the user-domain managed plist exists.
+#   - The managed plist's ProgramArguments[0] points at the current
+#     install location.
+#   - The managed plist contains no build-machine paths (/Users/runner).
+#   - No desktop-host plist exists anywhere (uses SMAppService.mainApp).
 
 APP_PATH="${BUSYTOK_APP_PATH:-target/release/bundle/macos/Busytok.app}"
 BUNDLE_SERVICE_PLIST="$APP_PATH/Contents/Library/LaunchAgents/com.busytok.service.plist"
@@ -25,7 +31,7 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-echo "=== LaunchAgent Smoke Test (SMAppService model) ==="
+echo "=== LaunchAgent Smoke Test (Architecture-B managed-plist model) ==="
 echo "  app bundle: $APP_PATH"
 
 if [ ! -d "$APP_PATH" ]; then
@@ -36,19 +42,29 @@ if [ ! -d "$APP_PATH" ]; then
 fi
 
 echo ""
-echo "--- Bundle-native service plist ---"
+echo "--- Bundle reference plist ---"
 if [ -f "$BUNDLE_SERVICE_PLIST" ]; then
-    echo "  bundle service plist: OK"
+    echo "  bundle service plist (reference): OK"
 else
-    fail "bundle service plist missing at $BUNDLE_SERVICE_PLIST"
+    fail "bundle reference plist missing at $BUNDLE_SERVICE_PLIST"
 fi
 
-# Bundle plist is what SMAppService reads, so it must NOT also exist in
-# user home as a handwritten artifact on the supported path.
+echo ""
+echo "--- User-domain managed plist ---"
 if [ -f "$USER_SERVICE_PLIST" ]; then
-    fail "user-home service plist must not exist on the supported path: $USER_SERVICE_PLIST"
+    echo "  user-domain managed plist present: OK"
+    # Architecture-B contract: ProgramArguments[0] must point at the
+    # current install location, NOT at a build-machine path.
+    if grep -q '/Users/runner' "$USER_SERVICE_PLIST"; then
+        fail "managed plist contains build-machine path /Users/runner"
+    elif grep -q 'SERVICE_BINARY_PATH' "$USER_SERVICE_PLIST"; then
+        fail "managed plist contains unsubstituted placeholder SERVICE_BINARY_PATH"
+    else
+        echo "  managed plist content: clean (no build-machine paths, no unsubstituted placeholders)"
+    fi
 else
-    echo "  no user-home service plist: OK"
+    echo "  user-domain managed plist not present"
+    echo "  (launch Busytok.app once — it renders the plist on first bootstrap)"
 fi
 
 echo ""
@@ -69,7 +85,7 @@ echo "--- Service launchd label (if registered this session) ---"
 if launchctl print "$SERVICE_LABEL" >/dev/null 2>&1; then
     echo "  service label visible to launchctl: OK"
 else
-    echo "  service label not currently registered (run Busytok.app once to register via SMAppService)"
+    echo "  service label not currently registered (run Busytok.app once to register via managed plist)"
 fi
 
 echo ""
