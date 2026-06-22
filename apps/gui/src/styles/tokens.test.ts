@@ -150,4 +150,27 @@ describe("tokens.css contract", () => {
     // text de-blued
     expect(tokensCss).toContain("--color-text: #1A1D23;");
   });
+
+  it("dark theme: opaque surfaces, Geist shadow, blur stays zero (Phase 1)", () => {
+    const start = tokensCss.indexOf(':root[data-theme="dark"]');
+    expect(start).toBeGreaterThan(-1);
+    const dark = tokensCss.slice(start);
+    expect(dark).toContain("--color-surface: #171C24;");
+    expect(dark).toContain("--color-surface-subtle: #202732;");
+    expect(dark).toContain("--color-chrome: rgba(22, 27, 34, 0.96);");
+    expect(dark).toContain("--material-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.16);");
+    // dark blur remains zero (supporting-only → 0 for maximum calm)
+    expect(dark).toContain("--material-glass-blur: 0px;");
+    expect(dark).toContain("--material-glass-blur-strong: 0px;");
+    expect(dark).toContain("--material-glass-blur-subtle: 0px;");
+    // collapsed tiers gone from dark block too
+    expect(dark).not.toContain("--color-surface-strong:");
+    expect(dark).not.toContain("--color-surface-elevated:");
+  });
+
+  it("elevated shadow is the Geist popover stack (floating layers only)", () => {
+    const popover =
+      "0 1px 1px rgba(0, 0, 0, 0.02), 0 4px 8px -4px rgba(0, 0, 0, 0.04), 0 16px 24px -8px rgba(0, 0, 0, 0.06)";
+    expect(tokensCss).toContain(`--material-shadow-elevated: ${popover};`);
+  });
 });
