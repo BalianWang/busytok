@@ -18,6 +18,8 @@ pub mod command_runner;
 #[cfg(target_os = "macos")]
 pub mod launchd_job_snapshot;
 #[cfg(target_os = "macos")]
+pub mod managed_launch_agent;
+#[cfg(target_os = "macos")]
 pub mod smappservice;
 #[cfg(target_os = "macos")]
 pub mod smappservice_bridge;

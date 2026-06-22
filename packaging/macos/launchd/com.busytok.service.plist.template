@@ -1,18 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-    Bundle-native LaunchAgent plist for `busytok-service`.
+    REFERENCE ONLY — not consumed by the production launchd lifecycle.
 
-    This file is bundled into `Busytok.app/Contents/Library/LaunchAgents/` at
-    build time and registered via `SMAppService.agent(plistName:)` at runtime.
-    `SMAppService` reads the plist from the bundle location; the app never
-    writes a copy to `~/Library/LaunchAgents/`.
+    The production service lifecycle does NOT bootstrap from this file. It
+    renders a minimal plist into the current user's
+    `~/Library/LaunchAgents/com.busytok.service.plist` at runtime, using the
+    install location resolved from the running GUI's own bundle path. See
+    `apps/gui/src-tauri/src/service_lifecycle/managed_launch_agent.rs`.
 
-    Build-time substitution is performed by
-    `packaging/macos/scripts/_bundle_helpers.sh`:
-      SERVICE_BINARY_PATH      -> absolute path to the bundled busytok-service
-      BUSYTOK_LOGS_DIR         -> per-user log directory (~/Library/Logs/Busytok)
-      BUSYTOK_APP_SUPPORT_DIR  -> per-user app data dir (~/Library/Application Support/Busytok)
+    This file is shipped inside the bundle for documentation / future
+    SMAppService migration only. It deliberately contains NO absolute paths,
+    NO build-machine paths, and NO user paths — earlier builds substituted
+    `SERVICE_BINARY_PATH` / `BUSYTOK_LOGS_DIR` / `BUSYTOK_APP_SUPPORT_DIR`
+    here at packaging time, which baked `/Users/runner/...` into the shipped
+    plist and broke launchd registration on end-user machines (EX_CONFIG).
+    That substitution has been removed.
+
+    `busytok-service` resolves its own data and log directories at runtime
+    via `BusytokPaths::new()`, so no EnvironmentVariables / StandardOutPath /
+    StandardErrorPath are needed.
 -->
 <plist version="1.0">
 <dict>
@@ -20,20 +27,11 @@
     <string>com.busytok.service</string>
     <key>ProgramArguments</key>
     <array>
-        <string>SERVICE_BINARY_PATH</string>
+        <string>Contents/MacOS/busytok-service</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>BUSYTOK_LOGS_DIR/service.log</string>
-    <key>StandardErrorPath</key>
-    <string>BUSYTOK_LOGS_DIR/service.err</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>BUSYTOK_APP_DATA_DIR</key>
-        <string>BUSYTOK_APP_SUPPORT_DIR</string>
-    </dict>
 </dict>
 </plist>

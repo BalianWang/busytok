@@ -38,16 +38,20 @@ bundle_helpers_into_app() {
     echo "Helper bundling complete."
 }
 
-# Render the bundle-native service LaunchAgent plist into
+# Copy the (static, reference-only) service LaunchAgent plist into
 # Busytok.app/Contents/Library/LaunchAgents/com.busytok.service.plist.
 #
-# launchctl bootstraps the plist from this bundle location.
-# The app does NOT write a copy to ~/Library/LaunchAgents/.
+# IMPORTANT: production launchd lifecycle does NOT consume this file.
+# The GUI renders the real, install-location-correct plist into
+# ~/Library/LaunchAgents/ at runtime — see
+# apps/gui/src-tauri/src/service_lifecycle/managed_launch_agent.rs.
 #
-# Substitution tokens (see com.busytok.service.plist.template):
-#   SERVICE_BINARY_PATH      -> absolute path to the bundled busytok-service
-#   BUSYTOK_LOGS_DIR         -> per-user log directory
-#   BUSYTOK_APP_SUPPORT_DIR  -> per-user app data directory
+# This bundle copy is shipped for documentation / future SMAppService
+# migration only. It is copied verbatim (NO substitution): an earlier
+# build substituted SERVICE_BINARY_PATH / BUSYTOK_LOGS_DIR /
+# BUSYTOK_APP_SUPPORT_DIR here, which baked /Users/runner/... absolute
+# paths into the shipped plist and broke launchd registration on
+# end-user machines. That substitution has been removed.
 bundle_service_plist_into_app() {
     local app_bundle
     app_bundle="$(_absolute_app_bundle_path "$1")"
@@ -64,22 +68,8 @@ bundle_service_plist_into_app() {
     fi
 
     mkdir -p "$launchagents_dir"
+    # Verbatim copy — no path substitution.
+    cp "$template" "$plist_path"
 
-    local service_binary="$app_bundle/Contents/MacOS/busytok-service"
-    if [ ! -f "$service_binary" ]; then
-        echo "bundled busytok-service not found at $service_binary"
-        return 1
-    fi
-
-    # Per-user paths. launchd evaluates these in the user's Aqua session,
-    # so user-relative paths are correct here.
-    local logs_dir="${HOME}/Library/Logs/Busytok"
-    local app_support_dir="${HOME}/Library/Application Support/Busytok"
-
-    sed -e "s|SERVICE_BINARY_PATH|$service_binary|g" \
-        -e "s|BUSYTOK_LOGS_DIR|$logs_dir|g" \
-        -e "s|BUSYTOK_APP_SUPPORT_DIR|$app_support_dir|g" \
-        "$template" > "$plist_path"
-
-    echo "  bundled service plist -> $plist_path"
+    echo "  bundled service plist (reference only) -> $plist_path"
 }
