@@ -758,6 +758,9 @@ fi
 # backdrop-filter is correlated with its own rule — a new content component
 # added to components.css that sneaks in a blur is caught, not just
 # surfaces.css/pages.css.
+# Assumption: selector and `{` are on one line (true for current CSS style);
+# if CSS later moves to multi-line selectors, extend this script to track
+# the full selector across lines.
 if ! awk '
   /\}/ { sel = ""; next }
   /\{/ { sel = $0; sub(/\{.*/, "", sel); next }
