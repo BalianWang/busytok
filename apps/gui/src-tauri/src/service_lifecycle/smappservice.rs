@@ -59,6 +59,7 @@ use super::command_runner::{
     CommandStatus,
 };
 use super::launchd_job_snapshot::LaunchdJobSnapshot;
+use super::managed_launch_agent::ensure_managed_plist_current;
 use super::smappservice_bridge::{MainThreadExecutor, SMAppServiceHandle, SMServiceStatus};
 use super::{EnsureRunningOutcome, InstallOutcome, LifecycleStatus, ServiceLifecycle};
 
@@ -161,8 +162,14 @@ pub fn cleanup_legacy_launch_agents(
     };
 
     // First pass: identify candidate plist files. We bootout any matching
-    // job so a still-loaded legacy agent does not race the SMAppService
-    // registration.
+    // job so a still-loaded legacy agent does not race the bootstrap.
+    //
+    // IMPORTANT: the current managed agent plist (`com.busytok.service.plist`,
+    // rendered at runtime by `managed_launch_agent`) MUST be preserved here —
+    // it is the file production bootstraps from. A blanket "delete all
+    // com.busytok.*.plist" would wipe it and reintroduce the "service can't
+    // register" failure. We only remove OTHER legacy com.busytok.* plists.
+    let managed_name = format!("{}.plist", SERVICE_LABEL);
     let mut to_remove: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
@@ -175,6 +182,12 @@ pub fn cleanup_legacy_launch_agents(
             continue;
         };
         if !file_name.starts_with("com.busytok.") || !file_name.ends_with(".plist") {
+            continue;
+        }
+        if file_name == managed_name {
+            // Preserve the runtime-managed agent plist. If it is stale (e.g.
+            // left by an older build), ensure_managed_plist_current() in the
+            // upcoming bootstrap overwrites it with the correct content.
             continue;
         }
         let label_stem = file_name.trim_end_matches(".plist");
@@ -279,39 +292,28 @@ impl SmAppServiceLifecycle {
         SMAppServiceHandle::agent(self.layout.service_plist_name())
     }
 
-    /// Preflight: validate the bundle contains the artifacts SMAppService
-    /// requires before entering the FFI. SMAppService throws an NSException
-    /// (not an NSError) when the bundle is missing the agent plist, the
-    /// service binary, or the bundle is unsigned/unsealed — and that
-    /// foreign exception crosses the Rust FFI boundary, aborting the
-    /// process. This gate converts those states into structured errors.
+    /// Preflight: validate the bundle contains the service binary before we
+    /// bootstrap a managed plist that points at it. The production lifecycle
+    /// bootstraps from the runtime-rendered user-domain plist (see
+    /// [`managed_launch_agent`]), NOT the plist baked into the bundle at
+    /// build time — so the only bundle artifact the launchd path depends on
+    /// is the `busytok-service` executable.
     ///
-    /// Returns Ok(()) if the bundle is a valid SMAppService host.
+    /// (SMAppService throws an NSException, not an NSError, when the bundle
+    /// is missing the agent plist / binary or is unsigned/unsealed, and that
+    /// foreign exception cannot safely cross the Rust FFI boundary. The
+    /// launchd-backed production path does not enter that FFI, but we still
+    /// refuse to bootstrap a plist whose target binary is absent.)
     fn preflight_bundle(&self, stage: &str) -> Result<()> {
-        let plist_path = self.layout.service_plist_path();
         let binary_path = self.layout.service_binary_path();
 
-        if !plist_path.exists() {
-            warn!(
-                event_code = "service_lifecycle.smappservice.bundle_preflight_failed",
-                stage = stage,
-                reason = "agent_plist_missing",
-                plist_path = %plist_path.display(),
-                "SMAppService agent plist not found; skipping FFI to avoid NSException abort"
-            );
-            anyhow::bail!(
-                "bundle preflight failed ({}): agent plist missing at {}",
-                stage,
-                plist_path.display()
-            );
-        }
         if !binary_path.exists() {
             warn!(
                 event_code = "service_lifecycle.smappservice.bundle_preflight_failed",
                 stage = stage,
                 reason = "service_binary_missing",
                 service_binary_path = %binary_path.display(),
-                "service binary not found; skipping FFI to avoid NSException abort"
+                "service binary not found; refusing to bootstrap"
             );
             anyhow::bail!(
                 "bundle preflight failed ({}): service binary missing at {}",
@@ -352,11 +354,13 @@ impl SmAppServiceLifecycle {
 
     fn bootstrap_via_launchctl(&self) -> Result<()> {
         self.preflight_bundle("bootstrap")?;
-        launchctl_bootstrap_strict(
-            &*self.runner,
-            &self.service_domain(),
-            &self.layout.service_plist_path(),
-        )
+        // Bootstrap the runtime-rendered user-domain plist, NOT the plist
+        // baked into the bundle at build time. The bundled plist carried
+        // build-machine absolute paths and pointed at /Users/runner/... on
+        // end-user machines; the managed plist is rendered from the current
+        // install location so it always points at the real service binary.
+        let plist_path = ensure_managed_plist_current(&self.layout, &self.platform)?;
+        launchctl_bootstrap_strict(&*self.runner, &self.service_domain(), &plist_path)
     }
 
     // SMAppService-backed helpers. Retained for the login-item bridge
@@ -1395,12 +1399,21 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_legacy_launch_agents_removes_handwritten_user_plists() {
+    fn cleanup_legacy_launch_agents_preserves_managed_removes_others() {
         let temp_home = tempdir().unwrap();
         let launch_agents = temp_home.path().join("Library/LaunchAgents");
         fs::create_dir_all(&launch_agents).unwrap();
+        // The managed agent plist MUST be preserved — production bootstraps
+        // from it. A blanket "delete all com.busytok.*.plist" would wipe it
+        // and reintroduce the registration failure.
         fs::write(
             launch_agents.join("com.busytok.service.plist"),
+            "managed plist (current)",
+        )
+        .unwrap();
+        // A genuinely-legacy com.busytok.* plist from an older build IS removed.
+        fs::write(
+            launch_agents.join("com.busytok.legacy.plist"),
             "legacy plist",
         )
         .unwrap();
@@ -1409,10 +1422,21 @@ mod tests {
 
         let runner = PermissiveRunner;
         let result = cleanup_legacy_launch_agents(&launch_agents, &runner).unwrap();
-        assert!(result
-            .removed_files
-            .contains(&"com.busytok.service.plist".to_string()));
-        assert!(!launch_agents.join("com.busytok.service.plist").exists());
+        assert!(
+            !result
+                .removed_files
+                .contains(&"com.busytok.service.plist".to_string()),
+            "managed plist must be preserved, got removed_files: {:?}",
+            result.removed_files
+        );
+        assert!(launch_agents.join("com.busytok.service.plist").exists());
+        assert!(
+            result
+                .removed_files
+                .contains(&"com.busytok.legacy.plist".to_string()),
+            "legacy com.busytok.* plist must be removed"
+        );
+        assert!(!launch_agents.join("com.busytok.legacy.plist").exists());
         // Untouched file is preserved.
         assert!(launch_agents.join("com.other.dev.plist").exists());
     }
@@ -1422,8 +1446,10 @@ mod tests {
         let temp_home = tempdir().unwrap();
         let launch_agents = temp_home.path().join("Library/LaunchAgents");
         fs::create_dir_all(&launch_agents).unwrap();
+        // Use a NON-managed legacy name so cleanup actually bootouts it
+        // (the managed com.busytok.service.plist is now preserved/skipped).
         fs::write(
-            launch_agents.join("com.busytok.service.plist"),
+            launch_agents.join("com.busytok.legacy.plist"),
             "legacy plist",
         )
         .unwrap();
@@ -1565,19 +1591,32 @@ mod tests {
             runner,
         );
 
-        // Pre-create a fake legacy LaunchAgents directory with a stale
-        // com.busytok.service.plist to prove the production cleanup path
-        // removes it.
+        // Pre-create the LaunchAgents directory with the managed agent
+        // plist (which production bootstraps from and cleanup MUST
+        // preserve) plus a genuinely-legacy com.busytok.* plist (which
+        // cleanup must remove).
         let launch_agents_dir = lc.platform.service_install_root();
         std::fs::create_dir_all(&launch_agents_dir).unwrap();
-        let stale_plist = launch_agents_dir.join("com.busytok.service.plist");
-        std::fs::write(&stale_plist, "stale").unwrap();
+        let managed_plist = launch_agents_dir.join("com.busytok.service.plist");
+        std::fs::write(&managed_plist, "managed (current)").unwrap();
+        let legacy_plist = launch_agents_dir.join("com.busytok.legacy.plist");
+        std::fs::write(&legacy_plist, "stale").unwrap();
 
         let result = cleanup_legacy_launch_agents(&launch_agents_dir, &*lc.runner).unwrap();
-        assert!(result
-            .removed_files
-            .contains(&"com.busytok.service.plist".to_string()));
-        assert!(!stale_plist.exists());
+        assert!(
+            !result
+                .removed_files
+                .contains(&"com.busytok.service.plist".to_string()),
+            "production cleanup must preserve the managed plist"
+        );
+        assert!(managed_plist.exists(), "managed plist must survive cleanup");
+        assert!(
+            result
+                .removed_files
+                .contains(&"com.busytok.legacy.plist".to_string()),
+            "production cleanup must remove legacy com.busytok.* plists"
+        );
+        assert!(!legacy_plist.exists());
     }
 
     #[test]
@@ -1799,23 +1838,26 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn preflight_rejects_missing_service_plist() {
+    fn preflight_no_longer_requires_bundled_plist() {
+        // Production bootstraps from the runtime-rendered user-domain plist
+        // (managed_launch_agent), NOT the plist baked into the bundle. So a
+        // missing bundle plist is no longer a preflight failure — only the
+        // service binary is required (see preflight_rejects_missing_service_binary).
         let temp = tempdir().unwrap();
         let root = temp.path().join("Busytok.app");
-        let plist_dir = root.join("Contents/Library/LaunchAgents");
-        fs::create_dir_all(&plist_dir).unwrap();
-        // Plist is NOT written. Status should fail at preflight.
+        let macos_dir = root.join("Contents/MacOS");
+        fs::create_dir_all(&macos_dir).unwrap();
+        // Binary present, bundle plist deliberately absent.
+        std::fs::write(macos_dir.join("busytok-service"), "#!/bin/sh\n").unwrap();
 
         let lc = preflight_lifecycle(&root);
-        let result = lc.status_via_executor();
+        // Exercise preflight directly (not status_via_executor, which is the
+        // test-only SMAppService path that still expects a bundle plist).
+        let result = lc.preflight_bundle("status");
         assert!(
-            result.is_err(),
-            "status_via_executor without a service plist must return Err"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("agent plist missing"),
-            "error must mention the plist, got: {msg}"
+            result.is_ok(),
+            "preflight must pass when the binary is present even without a bundle plist; got: {:?}",
+            result.err()
         );
     }
 

@@ -63,14 +63,26 @@ Gemini CLI logs ───┼──→│ busytok-     │───→│SQLite�
 
 ## macOS service lifecycle
 
-The background service (`busytok-service`) runs as a **launchd LaunchAgent**.
-The Tauri app registers it at startup via `SMAppService.agent(plistName:)`,
-pointing at a plist bundled inside `Busytok.app/Contents/Library/LaunchAgents/`.
+The background service (`busytok-service`) runs as a **launchd LaunchAgent**
+in the user's Aqua domain. At startup the GUI renders a minimal agent plist
+into the current user's `~/Library/LaunchAgents/com.busytok.service.plist`
+and registers it with `launchctl bootstrap`.
 
-- **Registration**: `SMAppService.agent(plistName:)` is the macOS API;
-  launchd is the runtime that manages the process. The app never writes
-  a plist to `~/Library/LaunchAgents/` — launchd reads it directly from
-  the app bundle.
+- **Registration**: the GUI renders the plist at **runtime** from the
+  current install location (`ProgramArguments[0]` =
+  `<install>/Busytok.app/Contents/MacOS/busytok-service`), then
+  `launchctl bootstrap gui/<uid> <plist>`. Production does NOT call
+  `SMAppService.register/status/unregister` — ServiceManagement can throw
+  Objective-C exceptions that do not safely cross the Rust FFI boundary, so
+  the lifecycle is `launchctl`-backed end to end. The plist carries only
+  `Label`, `ProgramArguments`, `RunAtLoad`, `KeepAlive` — no log paths or
+  env vars; the service resolves its own data/log dirs at runtime via
+  `BusytokPaths::new()`.
+- **Install-location invariance**: because the plist is rendered from the
+  running GUI's own bundle path, moving `Busytok.app` self-heals on next
+  launch. The stale-bundle repair (`launchctl print` detects `registered ≠
+  desired`) rewrites the plist to the current path, then bootout →
+  bootstrap → kickstart.
 - **Lifecycle**: `RunAtLoad` + `KeepAlive` — the service starts at login
   and is restarted if it exits. The GUI polls a `service.ready` marker
   file written by the service after bootstrap completes.
