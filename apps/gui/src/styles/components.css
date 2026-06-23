@@ -184,89 +184,12 @@
   display: none;
 }
 
-/* ── Status chip ─────────────────────────────────────────── */
-
-.status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 28px;
-  padding: 0 12px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-pill);
-  background: var(--color-surface);
-  color: var(--color-text);
-  font-size: 12.5px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease;
-  white-space: nowrap;
-}
-
-.status-chip:hover {
-  background: var(--color-hover);
-}
-
-.status-chip__dot {
-  inline-size: 7px;
-  block-size: 7px;
-  border-radius: 50%;
-  background: var(--color-text-muted);
-  flex-shrink: 0;
-}
-
-/* Semantic tone variants — strength comes from tinted material, not
-   saturated fills. Visual treatment is shared with StatusPill via the
-   same status tokens even though the source enums differ (ToneDto vs
-   ActivityStatusDto). */
-.status-chip--neutral .status-chip__dot { background: var(--color-text-muted); }
-.status-chip--neutral { border-color: var(--color-border-subtle); }
-
-.status-chip--success .status-chip__dot { background: var(--color-status-success); }
-.status-chip--success {
-  border-color: color-mix(in srgb, var(--color-status-success) 30%, transparent);
-  background: var(--color-status-success-soft);
-}
-
-.status-chip--warning .status-chip__dot { background: var(--color-status-warning); }
-.status-chip--warning {
-  border-color: color-mix(in srgb, var(--color-status-warning) 30%, transparent);
-  background: var(--color-status-warning-soft);
-}
-
-.status-chip--danger .status-chip__dot { background: var(--color-status-danger); }
-.status-chip--danger {
-  border-color: color-mix(in srgb, var(--color-status-danger) 28%, transparent);
-  background: var(--color-status-danger-soft);
-}
-
-/* Status popover */
-.status-popover {
-  inline-size: 280px;
-  padding: 16px;
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  box-shadow: var(--material-shadow-elevated);
-  border: 1px solid var(--color-border);
-  z-index: 200;
-}
-
-.status-popover__title {
-  margin: 0 0 4px;
-  font-weight: 600;
-  font-size: 14px;
-}
-
-.status-popover__detail {
-  margin: 0 0 12px;
-  color: var(--color-text-muted);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.status-popover__arrow {
-  fill: var(--color-surface);
-}
+/* ── Status chip / status popover ──────────────────────────
+   Removed: the StatusChip component was deleted (orphaned by the Phase 2
+   titlebar rewire → single TitlebarStatusChip). Its .status-chip* /
+   .status-popover* styles had no remaining markup consumers. StatusPill
+   (table rows) uses its own .status-pill* classes + the shared status
+   tokens, unaffected. */
 
 /* ── Segmented control ───────────────────────────────────── */
 

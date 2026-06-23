@@ -366,11 +366,10 @@
 }
 
 /* ── Status pills for ledger tables ───────────────────────────── */
-/* StatusPill uses ActivityStatusDto (ok/warning/error) — a different
-   source enum from StatusChip's ToneDto. The CSS maps each pill tone
-   to the SAME status token family as the corresponding chip, so both
-   components share visual treatment at the token layer without
-   forcing the underlying TS enums to merge. */
+/* StatusPill uses ActivityStatusDto (ok/warning/error). Each pill tone
+   maps to the shared status token family (--color-status-*), so pills
+   share the canonical semantic colors without coupling to any chip
+   component. */
 .status-pill {
   display: inline-block;
   padding: 2px 8px;
@@ -381,8 +380,7 @@
   white-space: nowrap;
 }
 
-/* status-pill--ok maps to the same success treatment as
-   status-chip--success. */
+/* status-pill--ok maps to the success token family. */
 .status-pill--ok {
   background: var(--color-status-success-soft);
   color: var(--color-status-success);
@@ -393,8 +391,7 @@
   color: var(--color-status-warning);
 }
 
-/* status-pill--error maps to the same danger treatment as
-   status-chip--danger. */
+/* status-pill--error maps to the danger token family. */
 .status-pill--error {
   background: var(--color-status-danger-soft);
   color: var(--color-status-danger);
