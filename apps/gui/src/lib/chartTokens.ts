@@ -36,7 +36,7 @@ const cssVar = (name: string) => `var(${name})`;
  *   system-health indicators.
  * - `lineNeutral`: inactive / no-data series.
  * - Soft variants: low-opacity fills and gradient stops.
- * - `textMuted` / `borderSoft`: neutral surface tokens for axis labels,
+ * - `textMuted` / `borderSubtle`: neutral surface tokens for axis labels,
  *   grid lines, and tooltip text.
  */
 export const chartTokens = Object.freeze({
@@ -51,5 +51,5 @@ export const chartTokens = Object.freeze({
   lineAttention: cssVar("--color-data-attention"),
   lineNeutral: cssVar("--color-data-neutral"),
   textMuted: cssVar("--color-text-muted"),
-  borderSoft: cssVar("--color-border-subtle"),
+  borderSubtle: cssVar("--color-border-subtle"),
 } as const);
