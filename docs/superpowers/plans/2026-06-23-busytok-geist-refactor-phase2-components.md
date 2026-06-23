@@ -31,6 +31,7 @@
 | `apps/gui/src/components/desktop/titlebarStatus.ts` | **New** — pure view-model: derive single escalatable status from `shell.status` | Created (Task 1) |
 | `apps/gui/src/components/desktop/titlebarStatus.test.ts` | **New** — view-model unit tests | Created (Task 1) |
 | `apps/gui/src/components/desktop/TitlebarStatusChip.tsx` | **New** — single calm chip + read-only Radix popover | Created (Task 2) |
+| `apps/gui/src/components/desktop/statusAction.ts` | **New** — shared `statusActionToPage(action): DesktopPage \| undefined` (unknown → undefined, no fallback) | Created (Task 2); `StatusChip.tsx` refactored to use it |
 | `apps/gui/src/components/desktop/TitlebarStatusChip.test.tsx` | **New** — chip + popover rendering | Created (Task 2) |
 | `apps/gui/src/components/AppShell.tsx` | Titlebar composition | Wire view-model + single chip (Task 2) |
 | `apps/gui/src/components/desktop/Sidebar.tsx` | Nav | Group rename `Primary`→`MONITORING` (Task 3) |
@@ -50,7 +51,7 @@
 - Escalation thresholds: `aggregateLagStatus.ts` exports `AGGREGATE_LAG_WARNING_THRESHOLD_MS` (5_000) / `AGGREGATE_LAG_CRITICAL_THRESHOLD_MS` (30_000) + `aggregateLagStatusChip` + `formatAggregateLagLabel` — reuse for the view-model.
 - Logging: `safeReportEvent(event_code, message, details)` (reporter.ts). For transition telemetry with severity, the existing `aggregateLagStatus.syncAggregateLagTelemetry` is the reference pattern (module-scoped last-seen state + `resetAggregateLagTelemetryStateForTests()`).
 - Test mocks: `vi.hoisted(() => ({...}))` + `vi.mock("../api/useBusytokData", ...)` + `vi.mock("../logging/reporter", ...)` (see `AppShellStatus.test.tsx`).
-- `StatusActionDto` → `DesktopPage` mapping already exists in `StatusChip.tsx` (`actionToPage`).
+- `StatusActionDto` → `DesktopPage` mapping already exists in `StatusChip.tsx` (`actionToPage`, returns `undefined` for unknown). Task 2 **extracts it to a shared `statusAction.ts`** (`statusActionToPage`) used by both `StatusChip` and `TitlebarStatusChip` — unknown action → `undefined` → no navigation, **no fallback**.
 
 ---
 
@@ -116,14 +117,23 @@ describe("deriveTitlebarStatus", () => {
     expect(s.auxiliary).toBeUndefined();
   });
 
-  it("adds the +1 danger auxiliary only for a blocking danger chip (service-down/permission)", () => {
+  it("adds the +1 danger auxiliary only for an allowlisted blocking chip (scan offline = service down)", () => {
+    // The backend (supervisor.rs:1397) emits exactly one danger-tone chip:
+    // id "scan" when scan_state == "offline". Only allowlisted ids get +1.
     const s = deriveTitlebarStatus(
-      baseInput({ statusChips: [{ id: "service_down", label: "Service unreachable", tone: "danger", detail: "Cannot reach busytok-service.", action: null }] }),
+      baseInput({ statusChips: [{ id: "scan", label: "Service offline", tone: "danger", detail: "Realtime capture is not running", action: null }] }),
     );
     expect(s.tone).toBe("warning"); // primary stays the consolidated status
     expect(s.auxiliary).toBeDefined();
     expect(s.auxiliary?.tone).toBe("danger");
-    expect(s.auxiliary?.label).toBe("Service unreachable");
+    expect(s.auxiliary?.label).toBe("Service offline");
+  });
+
+  it("does NOT +1 a non-allowlisted danger chip (perceivable-non-blocking stays single warning, no auxiliary)", () => {
+    const s = deriveTitlebarStatus(
+      baseInput({ statusChips: [{ id: "budget", label: "Budget at 90%", tone: "danger", detail: null, action: null }] }),
+    );
+    expect(s.auxiliary).toBeUndefined();
   });
 
   it("exposes read-only popover sections (Service / Live) and existing nav actions only", () => {
@@ -225,10 +235,17 @@ function hasWarningChip(chips: StatusChipDto[]): StatusChipDto | undefined {
   return chips.find((c) => c.tone === "warning");
 }
 
+// Blocking-danger chip IDs — only these warrant the +1 auxiliary entry.
+// "scan" with danger tone = service offline, the one blocking condition the
+// backend emits today (supervisor.rs:1397). Explicit allowlist by id so a
+// future non-blocking danger chip does NOT silently trigger +1 (spec: only
+// service-down / permission / must-decide get +1; perceivable-non-blocking
+// issues stay a single warning). Extend this set only when the backend adds a
+// new genuinely-blocking danger chip.
+const BLOCKING_DANGER_CHIP_IDS = new Set(["scan"]);
+
 function blockingDangerChip(chips: StatusChipDto[]): StatusChipDto | undefined {
-  // +1 danger only for blocking issues (service down / permission / must-decide).
-  // Non-blocking perceivable issues stay single warning (no auxiliary).
-  return chips.find((c) => c.tone === "danger");
+  return chips.find((c) => c.tone === "danger" && BLOCKING_DANGER_CHIP_IDS.has(c.id));
 }
 
 function formatLag(ms: number | null): string {
@@ -334,7 +351,9 @@ No parallel health state machine; pure projection of shell.status. Phase 2."
 ### Task 2: Titlebar single calm chip + read-only popover
 
 **Files:**
+- Create: `apps/gui/src/components/desktop/statusAction.ts` (shared `statusActionToPage`)
 - Create: `apps/gui/src/components/desktop/TitlebarStatusChip.tsx`, `TitlebarStatusChip.test.tsx`
+- Modify: `apps/gui/src/components/desktop/StatusChip.tsx` (use shared `statusActionToPage`, delete local `actionToPage`)
 - Modify: `apps/gui/src/components/AppShell.tsx` (replace the chip-stack with one chip)
 - Modify: `apps/gui/src/styles/components.css` (calm-chip + popover styling)
 
@@ -388,7 +407,27 @@ describe("TitlebarStatusChip", () => {
 Run: `cd apps/gui && npx vitest run src/components/desktop/TitlebarStatusChip.test.tsx`
 Expected: FAIL — `./TitlebarStatusChip` does not exist.
 
-- [ ] **Step 3: Implement the chip + popover**
+- [ ] **Step 3: Shared action helper + refactor StatusChip + implement the chip**
+
+Create `apps/gui/src/components/desktop/statusAction.ts` (extracts the typed action→page map; unknown → `undefined`, **no fallback**):
+
+```ts
+//! statusAction — shared StatusActionDto → DesktopPage mapping. Unknown
+//! actions return undefined so callers skip navigation rather than falling
+//! back to a default page.
+import type { StatusActionDto } from "@busytok/protocol-types";
+import type { DesktopPage } from "../AppShell";
+
+export function statusActionToPage(action: StatusActionDto): DesktopPage | undefined {
+  switch (action) {
+    case "open_activity": return "usage";
+    case "open_settings": return "settings";
+    default: return undefined;
+  }
+}
+```
+
+Refactor `apps/gui/src/components/desktop/StatusChip.tsx`: delete its local `actionToPage` function, import `statusActionToPage` from `./statusAction`, and replace the call site (`actionToPage(model.action)` → `statusActionToPage(model.action)`). Behavior is identical (same switch, same undefined-for-unknown).
 
 Create `apps/gui/src/components/desktop/TitlebarStatusChip.tsx`:
 
@@ -401,11 +440,7 @@ Create `apps/gui/src/components/desktop/TitlebarStatusChip.tsx`:
 import * as Popover from "@radix-ui/react-popover";
 import type { DesktopPage } from "../AppShell";
 import type { TitlebarStatus } from "./titlebarStatus";
-
-const ACTION_TO_PAGE: Record<string, DesktopPage> = {
-  open_activity: "usage",
-  open_settings: "settings",
-};
+import { statusActionToPage } from "./statusAction";
 
 interface TitlebarStatusChipProps {
   status: TitlebarStatus;
@@ -444,16 +479,20 @@ export function TitlebarStatusChip({ status, onAction }: TitlebarStatusChipProps
             ))}
             {status.actions.length > 0 ? (
               <div className="titlebar-popover__actions">
-                {status.actions.map((a) => (
-                  <button
-                    key={a.action}
-                    type="button"
-                    className="desktop-button desktop-button--small desktop-button--secondary"
-                    onClick={() => onAction(ACTION_TO_PAGE[a.action] ?? "overview")}
-                  >
-                    {a.label}
-                  </button>
-                ))}
+                {status.actions.map((a) => {
+                  const page = statusActionToPage(a.action);
+                  if (!page) return null; // unknown action → no button, no navigation (no fallback)
+                  return (
+                    <button
+                      key={a.action}
+                      type="button"
+                      className="desktop-button desktop-button--small desktop-button--secondary"
+                      onClick={() => onAction(page)}
+                    >
+                      {a.label}
+                    </button>
+                  );
+                })}
               </div>
             ) : null}
             <Popover.Arrow className="titlebar-popover__arrow" />
@@ -526,7 +565,7 @@ In `apps/gui/src/components/AppShell.tsx`:
   }, [status.tone, status.reason]);
 ```
 
-(Add `TitlebarTone` to the import from `./titlebarStatus`, and `useEffect, useRef` are already imported. Delete the now-unused local `readinessChip` helper, `VISUALLY_HIDDEN_STYLE`, the `readinessAnnouncement` block, and the `aggregateLagStatusChip` import + its render — keep `aggregateLagStatus` import only if `syncAggregateLagTelemetry` is still called; if not, remove it. The aggregate-lag telemetry side-effect (`syncAggregateLagTelemetry`) can stay as a separate `useEffect` on `aggregateLagMs` if you want to preserve its transition logging — otherwise remove and rely on the new escalation event.)
+(Add `TitlebarTone` to the import from `./titlebarStatus`, and `useEffect, useRef` are already imported. Delete the now-unused local `readinessChip` helper, `VISUALLY_HIDDEN_STYLE`, the `readinessAnnouncement` block, and the `aggregateLagStatusChip` usage in render. **KEEP `syncAggregateLagTelemetry(aggregateLagMs)`** in its own `useEffect` on `aggregateLagMs` — it emits the dedicated `gui.shell.aggregate_lag_warning_visible` / `critical_visible` / `recovered` events with the 5s/30s threshold semantics that the coarser UI-level `gui.titlebar.status_escalated` does NOT capture. The new titlebar event is ADDITIVE (UI consolidation), not a replacement — dual-track observability. Do not remove the lag-specific telemetry.)
 
 - [ ] **Step 6: Add calm-chip + popover CSS**
 
@@ -1215,6 +1254,11 @@ git commit -am "test(gui): phase 2 verification gate — full suite + coverage +
 **4. Coverage discipline:** every new TS module (`titlebarStatus.ts`, `TitlebarStatusChip.tsx`, `PanelSkeleton.tsx`) ships with tests; Task 11 step 2 asserts ≥90% on the new files. CSS-only tasks don't lower TS coverage.
 
 **5. Out of scope (explicit):** shared Prompt-Palette row *component* (overlay-listbox vs page-table have different interaction models — YAGNI); new backend/protocol fields (last-event time, last-sync) — popover shows available fields only per the spec's data-boundary rule; a `--color-chart-grid` token (reuses `--color-border-subtle`).
+
+**6. Review-driven hardening (applied before execution):**
+- **`+1 danger` is gated by an explicit ID allowlist** (`BLOCKING_DANGER_CHIP_IDS = {"scan"}`, the only danger emitter per `supervisor.rs:1397` — `scan_state == "offline"`), not bare `tone === "danger"`. Non-allowlisted danger chips stay a single warning (spec: only blocking issues get `+1`).
+- **`syncAggregateLagTelemetry` is mandated to stay (dual-track):** it emits the threshold/recovered events the new UI-level `gui.titlebar.status_escalated` cannot replace. The new event is additive.
+- **Action routing uses a shared `statusActionToPage`** (extracted from `StatusChip`); unknown actions → `undefined` → no button rendered, no navigation, **no `overview` fallback**.
 
 ---
 
