@@ -20,6 +20,7 @@ use busytok_aggregator::{
     model_rollups_to_rows, project_rollups_to_rows, session_rollups_to_rows, RollupOptions,
 };
 use busytok_domain::{
+    cache_metrics::{ProviderPayloadShape, UnifiedCacheMetrics},
     metadata_event_hash, now_ms, AgentKind, CodexTokenSnapshot, MetadataFingerprint,
     NormalizedEvent, NormalizedUsageEvent, OperationalDiagnosticEvent, ParsedLogEvent,
     ReportingTimezone, ToolEvent,
@@ -896,6 +897,13 @@ pub fn build_codex_delta_events(
                 .total_tokens(delta_total);
             let raw_event_hash = metadata_event_hash(&fingerprint);
 
+            let unified = UnifiedCacheMetrics::from_raw(
+                ProviderPayloadShape::Codex,
+                delta_input,
+                delta_cached,
+                0, // Codex has no cache-creation concept
+            );
+
             let event = NormalizedUsageEvent {
                 id: event_id.clone(),
                 agent: AgentKind::Codex,
@@ -923,6 +931,9 @@ pub fn build_codex_delta_events(
                 cached_input_tokens: delta_cached,
                 cache_creation_tokens: 0,
                 cache_read_tokens: delta_cached,
+                provider_payload_shape: ProviderPayloadShape::Codex,
+                prompt_input_total_tokens: unified.prompt_input_total_tokens,
+                prompt_input_non_cached_tokens: unified.prompt_input_non_cached_tokens,
                 reasoning_tokens: delta_reasoning,
                 thoughts_tokens: 0,
                 tool_tokens: 0,
@@ -1599,5 +1610,63 @@ mod tests {
             Some("gpt-5.4"),
             "second snapshot should inherit model from the first"
         );
+    }
+
+    #[test]
+    fn codex_delta_event_carries_unified_metrics() {
+        // delta_input=1000, delta_cached=800 (cache hit portion of the 1000).
+        let events = build_codex_delta_events_for_test(1000, 800, 200, 0, 1400 /* total */);
+        let usage = first_usage_event(&events);
+        assert_eq!(
+            usage.provider_payload_shape,
+            busytok_domain::cache_metrics::ProviderPayloadShape::Codex
+        );
+        assert_eq!(usage.prompt_input_total_tokens, 1000);
+        assert_eq!(usage.prompt_input_non_cached_tokens, 200);
+    }
+
+    /// Drive `build_codex_delta_events` with a single synthetic snapshot
+    /// whose `delta_*` fields are pre-populated, mirroring how production
+    /// snapshots arrive from the Codex adapter.
+    fn build_codex_delta_events_for_test(
+        delta_input: i64,
+        delta_cached: i64,
+        delta_output: i64,
+        delta_reasoning: i64,
+        delta_total: i64,
+    ) -> Vec<NormalizedUsageEvent> {
+        let db = Database::open_in_memory().expect("db");
+        let snap = CodexTokenSnapshot {
+            source_file_id: "file-codex-unified".to_string(),
+            source_path: "codex.jsonl".to_string(),
+            source_line: 1,
+            source_offset_start: 0,
+            source_offset_end: 0,
+            session_id: "sess-codex-unified".to_string(),
+            turn_id: None,
+            token_event_ordinal: 1,
+            input_tokens: delta_input,
+            cached_input_tokens: delta_cached,
+            output_tokens: delta_output,
+            reasoning_tokens: delta_reasoning,
+            total_tokens: delta_total,
+            delta_input_tokens: Some(delta_input),
+            delta_cached_input_tokens: Some(delta_cached),
+            delta_output_tokens: Some(delta_output),
+            delta_reasoning_tokens: Some(delta_reasoning),
+            delta_total_tokens: Some(delta_total),
+            model: Some("gpt-5.4".to_string()),
+            model_provider: Some("openai".to_string()),
+            cost_usd: None,
+            raw_usage_json: "{}".to_string(),
+            timestamp_ms: 1,
+        };
+        let (events, _rows) =
+            build_codex_delta_events(&db, std::slice::from_ref(&snap), false).expect("events");
+        events
+    }
+
+    fn first_usage_event(events: &[NormalizedUsageEvent]) -> &NormalizedUsageEvent {
+        events.first().expect("at least one usage event")
     }
 }
