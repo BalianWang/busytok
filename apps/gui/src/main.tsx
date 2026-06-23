@@ -14,7 +14,6 @@ import {
   reportFrontendEvent,
 } from "./logging/reporter";
 import { initThemeRuntime } from "./lib/themeRuntime";
-import { initUpdaterAutoCheck } from "./lib/updaterClient";
 import { reportDesignSystemApplied } from "./logging/designSystem";
 
 function isPromptPaletteWindow() {
@@ -47,12 +46,6 @@ initThemeRuntime();
 // window is a child of the same app/version, so it does not emit its own.
 if (!promptPaletteWindow) {
   reportDesignSystemApplied();
-}
-
-// Tauri 2 updater silent auto-check. Module-level latch survives StrictMode.
-// MAIN APP ONLY — prompt-palette must not trigger update probes.
-if (!promptPaletteWindow) {
-  initUpdaterAutoCheck();
 }
 
 // Global error handlers — installed before React mounts.

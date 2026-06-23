@@ -72,6 +72,17 @@ vi.mock("./api/EventSubscriptionProvider", () => ({
   },
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ onFocusChanged: vi.fn().mockResolvedValue(() => {}) }),
+}));
+
+vi.mock("./lib/updaterClient", () => ({
+  checkForUpdate: async () => ({ kind: "up-to-date" }),
+  applyUpdate: async () => {},
+  CHECK_TIMEOUT_MS: 20_000,
+  DOWNLOAD_TIMEOUT_MS: 120_000,
+}));
+
 vi.mock("./api/busytokClient", () => ({
   busytokClient: {},
 }));

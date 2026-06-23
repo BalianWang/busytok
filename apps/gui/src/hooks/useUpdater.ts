@@ -1,22 +1,13 @@
-import { useState } from "react";
-import { checkAndApplyUpdate, type UpdaterResult } from "../lib/updaterClient";
+import { useContext } from "react";
+import { UpdaterContext, type UpdaterContextValue, type UpdaterStatus } from "../api/UpdaterProvider";
 
-export type UpdaterStatus =
-  | { state: "idle" }
-  | { state: "checking" }
-  | { state: "done"; result: UpdaterResult };
+export type { UpdaterContextValue, UpdaterStatus };
 
-export interface UseUpdaterApi {
-  status: UpdaterStatus;
-  checkNow: () => Promise<void>;
-}
-
-export function useUpdater(): UseUpdaterApi {
-  const [status, setStatus] = useState<UpdaterStatus>({ state: "idle" });
-  const checkNow = async () => {
-    setStatus({ state: "checking" });
-    const result = await checkAndApplyUpdate();
-    setStatus({ state: "done", result });
-  };
-  return { status, checkNow };
+/**
+ * Single consumer hook for update state. Reads the context's safe idle default
+ * when no provider is present (mirrors EventSubscriptionProvider) — so the badge
+ * renders null in isolation tests rather than throwing.
+ */
+export function useUpdater(): UpdaterContextValue {
+  return useContext(UpdaterContext);
 }

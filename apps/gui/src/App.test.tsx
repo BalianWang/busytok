@@ -59,7 +59,17 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: vi.fn(() => ({ hide: mockHideWindow })),
+  getCurrentWindow: vi.fn(() => ({ hide: mockHideWindow, onFocusChanged: vi.fn().mockResolvedValue(() => {}) })),
+}));
+
+vi.mock("./lib/updaterClient", () => ({
+  // Plain async fns (not vi.fn) so the boot check survives afterEach's
+  // restoreAllMocks(), which would otherwise clear a mockResolvedValue and
+  // leave checkForUpdate() returning undefined → unhandled rejection.
+  checkForUpdate: async () => ({ kind: "up-to-date" }),
+  applyUpdate: async () => {},
+  CHECK_TIMEOUT_MS: 20_000,
+  DOWNLOAD_TIMEOUT_MS: 120_000,
 }));
 
 // Mock liveWindow — useLiveSamples calls it on mount.
