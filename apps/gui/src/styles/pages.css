@@ -624,7 +624,7 @@
 }
 
 .prompt-row__icon-btn:hover {
-  background: var(--color-surface-subtle);
+  background: var(--color-hover);
   color: var(--color-text);
 }
 
