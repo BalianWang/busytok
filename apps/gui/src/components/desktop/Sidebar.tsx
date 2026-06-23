@@ -13,7 +13,7 @@ interface SidebarGroup {
 
 const GROUPS: SidebarGroup[] = [
   {
-    label: "Primary",
+    label: "Monitoring",
     items: [
       { id: "overview", label: "Overview", icon: BarChart3 },
       { id: "usage", label: "Usage", icon: Activity },
