@@ -42,6 +42,8 @@ const AREA_BOTTOM_COLOR = "transparent";
 const LIVE_WINDOW_SECONDS = 15 * 60;
 const CURVED_LINE_TYPE =
   "LineType" in LightweightCharts ? LightweightCharts.LineType.Curved : 2;
+const DOTTED_LINE_STYLE =
+  "LineStyle" in LightweightCharts ? LightweightCharts.LineStyle.Dotted : 1;
 
 function liveVisibleRange(): { from: Time; to: Time } {
   const to = Math.floor(Date.now() / 1000);
@@ -87,7 +89,7 @@ export function LiveCurvePanel() {
       // reads them as discrete reference marks rather than a full grid).
       grid: {
         vertLines: { visible: false },
-        horzLines: { color: themeColors.gridColor, style: LightweightCharts.LineStyle.Dotted },
+        horzLines: { color: themeColors.gridColor, style: DOTTED_LINE_STYLE },
       },
       crosshair: {
         mode: CrosshairMode.Magnet,
@@ -136,7 +138,7 @@ export function LiveCurvePanel() {
         layout: { textColor: themeColors.textColor },
         grid: {
           vertLines: { visible: false },
-          horzLines: { color: themeColors.gridColor, style: LightweightCharts.LineStyle.Dotted },
+          horzLines: { color: themeColors.gridColor, style: DOTTED_LINE_STYLE },
         },
         rightPriceScale: { borderColor: themeColors.gridColor },
       });
