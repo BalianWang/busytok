@@ -25,8 +25,9 @@ fn init_updater_logging_does_not_panic() {
 
 #[test]
 fn parse_manifest_endpoint_accepts_https_url() {
-    let eps = parse_manifest_endpoint("https://github.com/x/y/releases/download/v0.1.0/latest.json")
-        .expect("valid url");
+    let eps =
+        parse_manifest_endpoint("https://github.com/x/y/releases/download/v0.1.0/latest.json")
+            .expect("valid url");
     assert_eq!(eps.len(), 1);
     assert_eq!(
         eps[0].as_str(),
