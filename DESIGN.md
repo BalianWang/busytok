@@ -135,7 +135,7 @@ and registers it with `launchctl bootstrap`.
 
 ## Visual design
 
-The visual design system ("Sentri Inspired") is documented in
-[`THEME.md`](THEME.md) — a dark violet-and-lime design language
-with a proprietary display sans, Rubik for UI copy, and Monaco
-for code.
+The visual design system (a calm, Geist-calibrated desktop audit-tool
+aesthetic, indigo accent, SF Pro system font) is canonically documented in
+[`DESIGN-SYSTEM.md`](DESIGN-SYSTEM.md). This section is non-normative for
+visuals — the design-system document is authoritative.
