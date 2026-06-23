@@ -29,13 +29,11 @@ describe("StatusPill", () => {
     expect(screen.getByText("idle")).toBeDefined();
   });
 
-  it("maps the ok activity status to the same semantic success treatment as StatusChip success", () => {
+  it("maps the ok activity status to the success token family", () => {
     render(<StatusPill tone="ok" label="Healthy" />);
 
-    // The StatusPill enum is ActivityStatusDto (ok/warning/error), distinct
-    // from StatusChip's ToneDto (neutral/success/warning/danger). The shared
-    // semantic mapping is preserved at the CSS layer — `status-pill--ok`
-    // consumes the same success tokens as `status-chip--success`.
+    // StatusPill's enum is ActivityStatusDto (ok/warning/error); the ok tone
+    // consumes the shared success tokens (--color-status-success[-soft]).
     expect(screen.getByText("Healthy").className).toContain("ok");
   });
 
