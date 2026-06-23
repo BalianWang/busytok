@@ -105,14 +105,15 @@ describe("PromptPaletteOverlay", () => {
     const selected = rows[0];
     expect(selected.classList.contains("is-selected")).toBe(true);
 
-    // Surface-lift-first / accent-second is a CSS contract pinned in
-    // components.css. Assert both rules are wired to the row class so a
-    // refactor can't silently drop either layer of the selection cue.
+    // Neutral-lift-first / accent-rail-second is a CSS contract pinned in
+    // components.css. Assert the surface lift uses the neutral hover-strong
+    // token (not an accent tint) and the ::before rail carries the accent,
+    // so a refactor can't silently drop either layer of the selection cue.
     const css = readFileSync(
       pathToFileURL("./src/styles/components.css"),
       "utf8",
     );
-    expect(css).toMatch(/\.prompt-overlay__row\.is-selected\s*{[\s\S]*?--material-tint-accent/);
+    expect(css).toMatch(/\.prompt-overlay__row\.is-selected\s*{[\s\S]*?--color-hover-strong/);
     expect(css).toMatch(/\.prompt-overlay__row\.is-selected::before\s*{[\s\S]*?--color-accent-500/);
   });
 

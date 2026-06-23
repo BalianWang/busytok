@@ -1099,11 +1099,12 @@
 }
 
 /* ── Prompt Palette overlay ─────────────────────────────────── */
-/* Keyboard-first command surface. Selection is surface-lift first
-   (--material-tint-accent), accent second (the ::before focus-edge
-   bar). Keyboard affordances share one .prompt-overlay__keycap
-   vocabulary. Empty/loading/error states stay materially native to
-   the floating shell rather than transplanted page states. */
+/* Keyboard-first command surface. Selection is a neutral surface lift
+   (--color-hover-strong) with a focus-edge accent rail (the ::before
+   bar); the title stays neutral — the rail + bg-lift carry selection.
+   Keyboard affordances share one .prompt-overlay__keycap vocabulary.
+   Empty/loading/error states stay materially native to the floating
+   shell rather than transplanted page states. */
 
 .prompt-overlay {
   position: fixed;
@@ -1200,7 +1201,6 @@ body.prompt-palette-window-body #root {
   font-weight: 700;
   line-height: 1;
   letter-spacing: 0.01em;
-  box-shadow: var(--material-shadow-card);
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
 
@@ -1220,7 +1220,6 @@ body.prompt-palette-window-body #root {
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
-  box-shadow: var(--material-shadow-card);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1384,10 +1383,12 @@ body.prompt-palette-window-body #root {
   background: var(--color-surface-subtle);
 }
 
-/* Low-density palette surface — accent-led selection is permitted. */
+/* Low-density palette surface — selection reads as a neutral lift with a
+   focus-edge accent rail; the title stays neutral high-contrast so the
+   rail + bg-lift carry selection (no accent recolor of content). */
 .prompt-overlay__row.is-selected {
-  background: var(--material-tint-accent);
-  border-color: color-mix(in srgb, var(--color-accent-500) 22%, transparent);
+  background: var(--color-hover-strong);
+  border-color: var(--color-border-subtle);
 }
 
 .prompt-overlay__row.is-selected::before {
@@ -1400,10 +1401,6 @@ body.prompt-palette-window-body #root {
   height: 60%;
   border-radius: 999px;
   background: var(--color-accent-500);
-}
-
-.prompt-overlay__row.is-selected .prompt-overlay__title {
-  color: var(--color-accent-600);
 }
 
 .prompt-overlay__row.is-selected .prompt-overlay__tags {
@@ -1440,13 +1437,14 @@ body.prompt-palette-window-body #root {
 }
 
 .prompt-overlay__pin {
-  border-radius: var(--radius-pill);
-  background: var(--color-status-success-soft);
-  color: var(--color-status-success);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-subtle);
+  color: var(--color-text-faint);
   padding: 3px 8px;
   font-size: 10px;
-  font-weight: 800;
+  font-weight: 600;
   text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .prompt-overlay__menu {
