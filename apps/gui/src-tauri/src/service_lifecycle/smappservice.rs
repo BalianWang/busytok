@@ -474,10 +474,10 @@ impl SmAppServiceLifecycle {
                         // Canonicalize both for comparison — /Applications
                         // vs /private/var/.../Trash resolve differently
                         // even after symlink resolution.
-                        let desired_canon = std::fs::canonicalize(&desired)
-                            .unwrap_or_else(|_| desired.clone());
-                        let live_canon = std::fs::canonicalize(&live_path)
-                            .unwrap_or_else(|_| live_path.clone());
+                        let desired_canon =
+                            std::fs::canonicalize(&desired).unwrap_or_else(|_| desired.clone());
+                        let live_canon =
+                            std::fs::canonicalize(&live_path).unwrap_or_else(|_| live_path.clone());
                         if live_canon != desired_canon {
                             info!(
                                 event_code = "service_lifecycle.smappservice.detected_stale_live_process",
