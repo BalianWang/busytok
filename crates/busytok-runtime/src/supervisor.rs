@@ -961,15 +961,27 @@ fn prompt_list_query_to_row(req: PromptListQueryDto) -> busytok_store::PromptLis
 // ── Private helpers ──────────────────────────────────────────────────
 
 impl BusytokSupervisor {
+    /// Unified cache-hit rate for a list row, null on invariant violation.
+    /// Reads the row's persisted unified fields directly — `from_raw` is
+    /// ingest-only; the read path consumes stored fields and never re-derives
+    /// the provider payload shape.
+    fn list_cache_hit_rate(
+        row: &busytok_store::read_models::ActivityListRow,
+    ) -> Option<f64> {
+        let m = busytok_domain::cache_metrics::UnifiedCacheMetrics {
+            prompt_input_total_tokens: row.prompt_input_total_tokens,
+            prompt_input_non_cached_tokens: row.prompt_input_non_cached_tokens,
+            cache_read_tokens: row.cache_read_tokens,
+            cache_write_tokens: row.cache_creation_tokens,
+        };
+        busytok_domain::cache_metrics::cache_hit_rate(m)
+    }
+
     fn activity_item_from_read_row(
         item: &busytok_store::read_models::ActivityListRow,
     ) -> ActivityListItemDto {
         let cost_status = ui_models::cost_status(item.cost_usd.is_some(), item.cost_usd.is_none());
-        let cache_hit_rate = if item.input_tokens > 0 {
-            Some(item.cached_input_tokens as f64 / item.input_tokens as f64)
-        } else {
-            None
-        };
+        let cache_hit_rate = Self::list_cache_hit_rate(item);
         ActivityListItemDto {
             id: item.id.clone(),
             happened_at_ms: item.happened_at_ms,
@@ -1006,7 +1018,22 @@ impl BusytokSupervisor {
             || event.cache_creation_tokens > 0
             || event.cache_read_tokens > 0;
 
+        let unified = busytok_domain::cache_metrics::UnifiedCacheMetrics {
+            prompt_input_total_tokens: event.prompt_input_total_tokens,
+            prompt_input_non_cached_tokens: event.prompt_input_non_cached_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_creation_tokens,
+        };
+        let detail_rate = busytok_domain::cache_metrics::cache_hit_rate(unified);
         let token_breakdown = has_components.then(|| TokenBreakdownDto {
+            prompt_input_total_tokens: (event.prompt_input_total_tokens > 0)
+                .then_some(event.prompt_input_total_tokens),
+            prompt_input_non_cached_tokens: (event.prompt_input_non_cached_tokens > 0)
+                .then_some(event.prompt_input_non_cached_tokens),
+            cache_read_tokens: (event.cache_read_tokens > 0).then_some(event.cache_read_tokens),
+            cache_write_tokens: (event.cache_creation_tokens > 0)
+                .then_some(event.cache_creation_tokens),
+            cache_hit_rate: detail_rate,
             input_tokens: (event.input_tokens > 0).then_some(event.input_tokens),
             output_tokens: (event.output_tokens > 0).then_some(event.output_tokens),
             cached_input_tokens: (event.cached_input_tokens > 0)
@@ -2408,15 +2435,34 @@ impl RuntimeControl for BusytokSupervisor {
                                 range.start_ms,
                                 range.end_ms,
                             )?;
+                        let agg = busytok_domain::cache_metrics::UnifiedCacheMetrics {
+                            prompt_input_total_tokens: token_breakdown_row.prompt_input_total_tokens,
+                            prompt_input_non_cached_tokens:
+                                token_breakdown_row.prompt_input_non_cached_tokens,
+                            cache_read_tokens: token_breakdown_row.cache_read_tokens,
+                            cache_write_tokens: token_breakdown_row.cache_creation_tokens,
+                        };
                         let token_breakdown = TokenBreakdownDto {
-                            input_tokens: (token_breakdown_row.input_tokens > 0)
-                                .then_some(token_breakdown_row.input_tokens),
-                            output_tokens: (token_breakdown_row.output_tokens > 0)
-                                .then_some(token_breakdown_row.output_tokens),
-                            cached_input_tokens: (token_breakdown_row.cached_input_tokens > 0)
-                                .then_some(token_breakdown_row.cached_input_tokens),
-                            reasoning_tokens: (token_breakdown_row.reasoning_tokens > 0)
-                                .then_some(token_breakdown_row.reasoning_tokens),
+                            prompt_input_total_tokens: Some(
+                                token_breakdown_row.prompt_input_total_tokens,
+                            )
+                            .filter(|&v| v > 0),
+                            prompt_input_non_cached_tokens: Some(
+                                token_breakdown_row.prompt_input_non_cached_tokens,
+                            )
+                            .filter(|&v| v > 0),
+                            cache_read_tokens: Some(token_breakdown_row.cache_read_tokens)
+                                .filter(|&v| v > 0),
+                            cache_write_tokens: Some(token_breakdown_row.cache_creation_tokens)
+                                .filter(|&v| v > 0),
+                            cache_hit_rate: busytok_domain::cache_metrics::cache_hit_rate(agg),
+                            input_tokens: Some(token_breakdown_row.input_tokens).filter(|&v| v > 0),
+                            output_tokens: Some(token_breakdown_row.output_tokens)
+                                .filter(|&v| v > 0),
+                            cached_input_tokens: Some(token_breakdown_row.cached_input_tokens)
+                                .filter(|&v| v > 0),
+                            reasoning_tokens: Some(token_breakdown_row.reasoning_tokens)
+                                .filter(|&v| v > 0),
                             total_tokens,
                         };
 
@@ -2585,12 +2631,40 @@ impl RuntimeControl for BusytokSupervisor {
                             project_hash,
                             last_active_at_ms: recent_activity.first().map(|e| e.happened_at_ms),
                             metrics,
-                            token_breakdown: TokenBreakdownDto {
-                                input_tokens: None,
-                                output_tokens: None,
-                                cached_input_tokens: None,
-                                reasoning_tokens: None,
-                                total_tokens,
+                            token_breakdown: {
+                                let sums = activity_rows.iter().fold(
+                                    (0i64, 0i64, 0i64, 0i64, 0i64),
+                                    // total, non_cached, read, write, cached_input(raw)
+                                    |(t, nc, r, w, ci), row| {
+                                        (
+                                            t + row.prompt_input_total_tokens,
+                                            nc + row.prompt_input_non_cached_tokens,
+                                            r + row.cache_read_tokens,
+                                            w + row.cache_creation_tokens,
+                                            ci + row.cached_input_tokens,
+                                        )
+                                    },
+                                );
+                                let agg = busytok_domain::cache_metrics::UnifiedCacheMetrics {
+                                    prompt_input_total_tokens: sums.0,
+                                    prompt_input_non_cached_tokens: sums.1,
+                                    cache_read_tokens: sums.2,
+                                    cache_write_tokens: sums.3,
+                                };
+                                TokenBreakdownDto {
+                                    prompt_input_total_tokens: Some(sums.0).filter(|&v| v > 0),
+                                    prompt_input_non_cached_tokens: Some(sums.1)
+                                        .filter(|&v| v > 0),
+                                    cache_read_tokens: Some(sums.2).filter(|&v| v > 0),
+                                    cache_write_tokens: Some(sums.3).filter(|&v| v > 0),
+                                    cache_hit_rate:
+                                        busytok_domain::cache_metrics::cache_hit_rate(agg),
+                                    input_tokens: None,
+                                    output_tokens: None,
+                                    cached_input_tokens: Some(sums.4).filter(|&v| v > 0),
+                                    reasoning_tokens: None,
+                                    total_tokens,
+                                }
                             },
                             timeline,
                             models_used,
@@ -3663,5 +3737,43 @@ mod tests {
         assert_eq!(samples[2].tokens_per_sec, 150.0);
         assert_eq!(samples[2].events_per_sec, 0.5);
         assert_eq!(samples[3].tokens_per_sec, 0.0);
+    }
+
+    /// Build an `ActivityListRow` with unified fields filled for a
+    /// cache-heavy event (cache_read=990 of prompt_input_total=1000).
+    fn activity_list_row_fixture() -> busytok_store::read_models::ActivityListRow {
+        use busytok_store::read_models::ActivityListRow;
+        ActivityListRow {
+            id: "row-1".to_string(),
+            happened_at_ms: 0,
+            client_kind: "claude".to_string(),
+            session_id: "session-1".to_string(),
+            source_file_id: "src-1".to_string(),
+            source_path: "src-1".to_string(),
+            project_hash: None,
+            project_path: None,
+            model: Some("claude-3-5-sonnet".to_string()),
+            total_tokens: 1000,
+            input_tokens: 1000,
+            cached_input_tokens: 990,
+            prompt_input_total_tokens: 1000,
+            prompt_input_non_cached_tokens: 10,
+            cache_read_tokens: 990,
+            cache_creation_tokens: 0,
+            cost_usd: None,
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn activity_item_rate_uses_unified_denominator() {
+        let row = activity_list_row_fixture();
+        let rate = BusytokSupervisor::list_cache_hit_rate(&row).expect("rate present");
+        assert!(rate <= 1.0);
+        assert!((rate - 0.99).abs() < 1e-9);
+        // The unified helper drives the public DTO field as well.
+        let dto = BusytokSupervisor::activity_item_from_read_row(&row);
+        let dto_rate = dto.cache_hit_rate.expect("dto rate present");
+        assert!((dto_rate - rate).abs() < 1e-12);
     }
 }
