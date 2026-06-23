@@ -273,13 +273,19 @@ export function deriveTitlebarStatus(input: TitlebarStatusInput): TitlebarStatus
 
   const lagSeverity = aggregateLagSeverity(input.aggregateLagMs);
   if (lagSeverity != null) reasons.push(`lag:${input.aggregateLagMs}ms`);
+  if (dangerChip) reasons.push(`blocking-danger:${dangerChip.id}`);
 
+  // A blocking-danger chip (e.g. scan offline = service down) elevates the
+  // consolidated primary tone to warning AND surfaces separately as the +1
+  // danger auxiliary. Today only the allowlisted "scan" danger chip exists;
+  // perceivable non-blocking issues are warning-tone chips (warningChip, above).
   const isWarning =
     readinessLabel != null ||
     input.connection !== "connected" ||
     (input.queueDepth != null && input.queueDepth > 0) ||
     warningChip != null ||
-    lagSeverity != null;
+    lagSeverity != null ||
+    dangerChip != null;
 
   const tone: TitlebarTone = isWarning ? "warning" : "neutral";
   const label = isWarning
