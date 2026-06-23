@@ -49,14 +49,30 @@ fn table_info_map(
 // ── Baseline schema sanity ──────────────────────────────────────────────────
 
 #[test]
-fn baseline_single_migration() {
-    assert_eq!(
-        schema::migrations().len(),
-        1,
-        "expected single baseline migration"
+fn baseline_plus_cache_metrics_migrations() {
+    let migs = busytok_store::schema::migrations();
+    assert_eq!(migs.len(), 2);
+    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 2);
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(busytok_store::schema::CREATE_SCHEMA_VERSION_TABLE)
+        .unwrap();
+    for (_, sql) in &migs {
+        conn.execute_batch(sql).unwrap();
+    }
+    // v2 columns exist on usage_events.
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(usage_events)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(cols.contains(&"provider_payload_shape".to_string()));
+    assert!(cols.contains(&"prompt_input_total_tokens".to_string()));
+    assert!(
+        cols.contains(&"prompt_input_non_cached_tokens".to_string()),
+        "usage_events must have prompt_input_non_cached_tokens column"
     );
-    assert_eq!(schema::migrations()[0].0, 1);
-    assert_eq!(schema::SCHEMA_VERSION, 1);
 }
 
 #[test]

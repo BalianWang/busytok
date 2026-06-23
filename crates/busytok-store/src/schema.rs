@@ -2,7 +2,7 @@
 ///
 /// The baseline schema is applied as a single migration when a new database
 /// is created. Future schema changes will increment from v1.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// SQL to create the schema version tracking table.
 pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
@@ -15,7 +15,11 @@ pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
 /// Baseline schema SQL — creates all tables, indexes, and constraints for v1.
 pub const BASELINE_SQL: &str = include_str!("../migrations/0001_baseline.sql");
 
-/// All migrations in order. Currently only the v1 baseline.
+/// v2 cache-metrics migration SQL — adds unified cache-metric columns to
+/// `usage_events`.
+const CACHE_METRICS_SQL: &str = include_str!("../migrations/0002_cache_metrics.sql");
+
+/// All migrations in order, from the v1 baseline through the latest version.
 pub fn migrations() -> Vec<(u32, &'static str)> {
-    vec![(1, BASELINE_SQL)]
+    vec![(1, BASELINE_SQL), (2, CACHE_METRICS_SQL)]
 }
