@@ -425,6 +425,13 @@ pub struct ActivityDetailRequestDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct TokenBreakdownDto {
+    // Unified product metrics (shown by default in the UI):
+    pub prompt_input_total_tokens: Option<i64>,
+    pub prompt_input_non_cached_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub cache_hit_rate: Option<f64>,
+    // Raw audit fields (kept for technical-details/debug visibility):
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
@@ -1404,5 +1411,27 @@ mod tests {
         let req: ControlRequest = serde_json::from_str(json).unwrap();
         assert!(req.meta.session_id.is_none());
         assert!(req.meta.correlation_id.is_none());
+    }
+
+    #[test]
+    fn token_breakdown_dto_keeps_raw_and_adds_unified() {
+        let tb = TokenBreakdownDto {
+            prompt_input_total_tokens: Some(1000),
+            prompt_input_non_cached_tokens: Some(10),
+            cache_read_tokens: Some(990),
+            cache_write_tokens: None,
+            cache_hit_rate: Some(0.99),
+            input_tokens: Some(10),
+            output_tokens: Some(50),
+            cached_input_tokens: Some(990),
+            reasoning_tokens: None,
+            total_tokens: 1050,
+        };
+        let json = serde_json::to_string(&tb).unwrap();
+        // Unified additions:
+        assert!(json.contains("prompt_input_total_tokens"));
+        assert!(json.contains("cache_hit_rate"));
+        // Raw audit field still present (not collapsed away):
+        assert!(json.contains("cached_input_tokens"));
     }
 }
