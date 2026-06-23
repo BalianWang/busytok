@@ -39,6 +39,9 @@ GEMINI.md
 # ts-rs auto-generated per-type bindings (we use generated.ts instead)
 **/bindings/
 
+# Superpowers planning artifacts (generated per-session, not source of truth)
+docs/superpowers/
+
 # Worktree / planning scratch
 .worktrees/
 .spec-workflow/
