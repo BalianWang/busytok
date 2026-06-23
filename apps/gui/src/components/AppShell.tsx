@@ -72,12 +72,16 @@ export function AppShell({ currentPage, onNavigate, children }: AppShellProps) {
       <Sidebar currentPage={currentPage} onNavigate={onNavigate} />
       <main className="desktop-workspace">
         <div className="desktop-titlebar" data-tauri-drag-region>
+          {/* Left ~72px traffic-light gutter (reserved; window controls overlay here). */}
+          <div className="desktop-titlebar__gutter" data-tauri-drag-region aria-hidden="true" />
+          {/* Left group: the single calm status chip (+ optional auxiliary). */}
           <div className="desktop-titlebar__status">
             <TitlebarStatusChip status={status} onAction={onNavigate} />
-            {toolbarContext?.toolbar ? (
-              <div className="desktop-titlebar__toolbar">{toolbarContext.toolbar}</div>
-            ) : null}
           </div>
+          {/* Right group: the page toolbar (only when the page provides one). */}
+          {toolbarContext?.toolbar ? (
+            <div className="desktop-titlebar__toolbar">{toolbarContext.toolbar}</div>
+          ) : null}
         </div>
 
         <section className="desktop-workspace__content">{children}</section>

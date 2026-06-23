@@ -5,6 +5,7 @@
 
 import * as Popover from "@radix-ui/react-popover";
 import type { DesktopPage } from "../AppShell";
+import { safeReportEvent } from "../../logging/reporter";
 import type { TitlebarStatus } from "./titlebarStatus";
 import { statusActionToPage } from "./statusAction";
 
@@ -17,7 +18,13 @@ export function TitlebarStatusChip({ status, onAction }: TitlebarStatusChipProps
   const toneClass = status.tone === "neutral" ? "is-neutral" : "is-warning";
   return (
     <>
-      <Popover.Root>
+      <Popover.Root
+        onOpenChange={(open) => {
+          if (open) {
+            safeReportEvent("gui.titlebar.popover_opened", "Titlebar status popover opened", { tone: status.tone });
+          }
+        }}
+      >
         <Popover.Trigger asChild>
           <button
             type="button"
@@ -25,7 +32,8 @@ export function TitlebarStatusChip({ status, onAction }: TitlebarStatusChipProps
             aria-label={status.label}
           >
             <span className="titlebar-chip__dot" style={{ background: status.dotToken }} aria-hidden="true" />
-            <span className="titlebar-chip__label">{status.label}</span>
+            <span className="titlebar-chip__label-long">{status.label}</span>
+            <span className="titlebar-chip__label-short">{status.labelShort}</span>
           </button>
         </Popover.Trigger>
         <Popover.Portal>
@@ -53,7 +61,10 @@ export function TitlebarStatusChip({ status, onAction }: TitlebarStatusChipProps
                       key={a.action}
                       type="button"
                       className="desktop-button desktop-button--small desktop-button--secondary"
-                      onClick={() => onAction(page)}
+                      onClick={() => {
+                        safeReportEvent("gui.titlebar.action_clicked", "Titlebar nav action clicked", { action: a.action, page });
+                        onAction(page);
+                      }}
                     >
                       {a.label}
                     </button>
@@ -67,11 +78,18 @@ export function TitlebarStatusChip({ status, onAction }: TitlebarStatusChipProps
       </Popover.Root>
 
       {status.auxiliary ? (
-        <Popover.Root>
+        <Popover.Root
+          onOpenChange={(open) => {
+            if (open) {
+              safeReportEvent("gui.titlebar.popover_opened", "Titlebar status popover opened", { tone: "danger" });
+            }
+          }}
+        >
           <Popover.Trigger asChild>
             <button type="button" className="titlebar-chip is-danger" aria-label={status.auxiliary.label}>
               <span className="titlebar-chip__dot" style={{ background: "var(--color-status-danger)" }} aria-hidden="true" />
-              <span className="titlebar-chip__label">{status.auxiliary.label}</span>
+              <span className="titlebar-chip__label-long">{status.auxiliary.label}</span>
+              <span className="titlebar-chip__label-short">{status.auxiliary.label}</span>
             </button>
           </Popover.Trigger>
           {status.auxiliary.detail ? (
