@@ -307,8 +307,9 @@
   background: var(--color-hover);
 }
 
-/* Dense data surface — selection uses surface-ladder elevation,
-   not accent, per spec. */
+/* Dense data surface — selection uses surface-ladder elevation
+   (--color-hover-strong), not accent tint, per the design system
+   material contract: semantic color marks status, not structure. */
 .ledger-table tbody tr.is-selected,
 .ledger-table tbody tr[aria-selected="true"] {
   background: var(--color-surface-subtle);
