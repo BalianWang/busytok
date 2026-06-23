@@ -35,6 +35,10 @@ echo "notarytool submit: OK"
 grep -q "generate_updater_manifest.sh" "$WORKFLOW" || { echo "missing generate_updater_manifest.sh"; exit 1; }
 echo "manifest generation: OK"
 
+grep -q "generate_versions_manifest.sh" "$WORKFLOW" || { echo "missing generate_versions_manifest.sh"; exit 1; }
+grep -q "versions.json" "$WORKFLOW" || { echo "missing versions.json upload"; exit 1; }
+echo "versions.json index generation + upload: OK"
+
 if grep -q "tauri-apps/tauri-action" "$WORKFLOW"; then
     echo "unexpected tauri-action usage"
     exit 1
