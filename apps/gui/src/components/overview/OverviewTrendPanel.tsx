@@ -9,6 +9,7 @@ import { useMemo, useState } from "react";
 import { useOverviewTrend } from "../../api/useBusytokData";
 import { SegmentedControl } from "../desktop/SegmentedControl";
 import { NivoTimelineChart } from "../charts/NivoTimelineChart";
+import { PanelSkeleton } from "./PanelSkeleton";
 import { buildTimelineBars } from "../../lib/chartGrammar";
 import type { RangePresetDto, CostStatusDto } from "@busytok/protocol-types";
 
@@ -77,8 +78,7 @@ export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelP
           <h2>Usage Trend</h2>
         </div>
         <div className="overview-console__chart">
-          <span className="overview-console__chart-placeholder" />
-          <div className="overview-console__chart-empty">Loading trend data...</div>
+          <PanelSkeleton variant="chart" />
         </div>
       </section>
     );

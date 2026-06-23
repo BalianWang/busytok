@@ -97,7 +97,8 @@ describe("OverviewTrendPanel", () => {
       isFetching: false,
     });
     const { rerender } = render(<OverviewTrendPanel range="day" onRangeChange={() => {}} />);
-    expect(screen.getByText("Loading trend data...")).toBeDefined();
+    // Loading renders an in-frame chart skeleton (stable frame, no spinner text).
+    expect(document.querySelector(".panel-skeleton--chart")).not.toBeNull();
 
     mockUseOverviewTrend.mockReturnValue({
       data: trendEnvelope({ is_stale: true }),

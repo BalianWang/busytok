@@ -44,7 +44,8 @@ describe("OverviewSummaryPanel", () => {
   it("renders loading, error, and metric states without a panel-level degraded banner", () => {
     mockUseOverviewSummary.mockReturnValue({ data: null, isLoading: true, isError: false });
     render(<OverviewSummaryPanel range="day" />);
-    expect(screen.getByText("Loading summary data...")).toBeDefined();
+    // Loading renders an in-frame metrics skeleton (stable frame, no spinner).
+    expect(document.querySelector(".panel-skeleton--metrics")).not.toBeNull();
 
     cleanup();
     mockUseOverviewSummary.mockReturnValue({ data: null, isLoading: false, isError: true });
@@ -134,7 +135,8 @@ describe("OverviewHeatmapPanel", () => {
   it("renders loading, error, empty, and heatmap states", () => {
     mockUseOverviewHeatmap.mockReturnValue({ data: null, isLoading: true, isError: false });
     render(<OverviewHeatmapPanel range="day" />);
-    expect(screen.getByText("Loading heatmap...")).toBeDefined();
+    // Loading renders an in-frame chart skeleton (stable frame, no spinner).
+    expect(document.querySelector(".panel-skeleton--chart")).not.toBeNull();
 
     cleanup();
     mockUseOverviewHeatmap.mockReturnValue({ data: null, isLoading: false, isError: true });
@@ -179,7 +181,8 @@ describe("OverviewRankingsPanel", () => {
   it("renders loading, error, empty, section, and per-section empty states", () => {
     mockUseOverviewRankings.mockReturnValue({ data: null, isLoading: true, isError: false });
     render(<OverviewRankingsPanel range="day" />);
-    expect(screen.getByText("Loading rankings...")).toBeDefined();
+    // Loading renders an in-frame list skeleton (stable frame, no spinner).
+    expect(document.querySelector(".panel-skeleton--rows")).not.toBeNull();
 
     cleanup();
     mockUseOverviewRankings.mockReturnValue({ data: null, isLoading: false, isError: true });

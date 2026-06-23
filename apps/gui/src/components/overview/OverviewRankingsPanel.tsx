@@ -5,6 +5,7 @@
 //! and the panel handles loading / error / empty states.
 
 import { useOverviewRankings } from "../../api/useBusytokData";
+import { PanelSkeleton } from "./PanelSkeleton";
 import type { RangePresetDto } from "@busytok/protocol-types";
 
 interface OverviewRankingsPanelProps {
@@ -26,11 +27,8 @@ export function OverviewRankingsPanel({ range }: OverviewRankingsPanelProps) {
   // ── Loading ──────────────────────────────────────────────────────────
   if (isLoading || !envelope) {
     return (
-      <section className="overview-panel overview-panel--loading" aria-label="Rankings">
-        <div className="overview-panel__placeholder">
-          <span className="overview-panel__spinner" />
-          <p>Loading rankings...</p>
-        </div>
+      <section className="overview-panel" aria-label="Rankings">
+        <PanelSkeleton variant="list" rows={5} />
       </section>
     );
   }

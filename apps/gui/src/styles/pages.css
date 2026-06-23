@@ -1591,3 +1591,26 @@
 .tag-filter-combobox__popover .app-select__item.is-highlighted {
   background: var(--material-tint-accent);
 }
+
+/* ── Panel skeletons (in-frame loading; frame stays stable) ─────── */
+.panel-skeleton { opacity: 0.55; }
+.panel-skeleton--metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.panel-skeleton__metric { display: grid; gap: 8px; padding: 16px 18px; border: 1px solid var(--color-border-subtle); border-radius: var(--radius-md); }
+.panel-skeleton__bar { background: var(--color-surface-subtle); border-radius: 4px; }
+.panel-skeleton__bar--label { width: 40%; height: 10px; }
+.panel-skeleton__bar--value { width: 70%; height: 22px; }
+.panel-skeleton__bar--helper { width: 55%; height: 10px; }
+.panel-skeleton--chart { height: 220px; display: flex; align-items: end; gap: 6px; padding: 12px 0; }
+.panel-skeleton__curve { width: 100%; height: 70%; background: var(--color-surface-subtle); border-radius: var(--radius-sm); }
+.panel-skeleton--rows { display: grid; gap: 8px; padding: 8px 0; }
+.panel-skeleton__row { height: 14px; background: var(--color-surface-subtle); border-radius: 4px; }
+
+/* ── Degraded ribbon (page-level, non-blocking) ────────────────── */
+.overview-console__degraded-ribbon {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-radius: var(--radius-sm);
+  background: var(--color-status-warning-soft);
+  border: 1px solid color-mix(in srgb, var(--color-status-warning) 30%, transparent);
+  color: var(--color-text); font-size: 13px;
+}
+.overview-console__degraded-ribbon-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-status-warning); flex-shrink: 0; }

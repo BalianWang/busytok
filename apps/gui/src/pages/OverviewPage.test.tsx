@@ -207,10 +207,11 @@ describe("OverviewPage", () => {
     expect(screen.getByRole("group", { name: "Chart metric" })).toBeDefined();
   });
 
-  it("renders exactly one degraded banner (page-level owner) when the envelope is degraded", () => {
-    // Banner ownership lives on the page (PageState kind="degraded"), not on
-    // the summary panel — duplicate banners on the same screen were a
-    // regression. Verify exactly one banner surfaces for a degraded envelope.
+  it("renders exactly one degraded ribbon (page-level owner) when the envelope is degraded", () => {
+    // Degraded is now a thin page-level ribbon (dot + line), not a centered
+    // PageState card. Banner ownership stays on the page (not on the summary
+    // panel) — duplicate banners on the same screen were a regression. Verify
+    // exactly one ribbon surfaces for a degraded envelope.
     mockUseOverviewSummary.mockReturnValue({
       data: envelope(
         {
@@ -258,11 +259,16 @@ describe("OverviewPage", () => {
 
     render(<OverviewPage />);
 
-    // Page-level PageState surfaces the degraded banner.
-    const degradedBanners = document.querySelectorAll(
-      '.page-state[data-state-kind="degraded"]',
+    // Page-level degraded ribbon surfaces exactly once (no centered card).
+    const degradedRibbons = document.querySelectorAll(
+      ".overview-console__degraded-ribbon",
     );
-    expect(degradedBanners.length).toBe(1);
+    expect(degradedRibbons.length).toBe(1);
+    // The legacy centered PageState degraded card must not appear.
+    expect(
+      document.querySelectorAll('.page-state[data-state-kind="degraded"]')
+        .length,
+    ).toBe(0);
 
     // And the panel-level duplicate role="alert" banner must not appear.
     expect(screen.queryByRole("alert")).toBeNull();

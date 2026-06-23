@@ -188,26 +188,16 @@ export function OverviewPage() {
     summaryEnvelope &&
     (!summaryEnvelope.is_exact || summaryEnvelope.is_stale);
   const degradedReason = summaryEnvelope?.degraded_reason ?? null;
-  const diagnosticsCount =
-    summaryEnvelope?.progress != null ? 1 : 0; // progress present = diagnostics available
 
   // ── Render ───────────────────────────────────────────────────────────
   return (
     <div className="overview-console">
-      {/* Degraded banner (non-blocking) */}
+      {/* Degraded ribbon (non-blocking) */}
       {showDegraded && (
-        <PageState
-          kind="degraded"
-          title="Partial data"
-          message={
-            degradedReason
-              ? `Degraded: ${degradedReason}`
-              : summaryEnvelope?.is_stale
-                ? "Showing stale data — refresh in progress"
-                : "Data is approximate — exact aggregates not yet available"
-          }
-          diagnosticsCount={diagnosticsCount}
-        />
+        <div className="overview-console__degraded-ribbon" role="status">
+          <span className="overview-console__degraded-ribbon-dot" aria-hidden="true" />
+          <span>{degradedReason ?? (summaryEnvelope?.is_stale ? "Showing stale data — refresh in progress" : "Data is approximate — exact aggregates not yet available")}</span>
+        </div>
       )}
 
       {/* 1. Summary metric cards */}

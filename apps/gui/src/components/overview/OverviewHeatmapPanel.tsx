@@ -8,6 +8,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useOverviewHeatmap } from "../../api/useBusytokData";
 import { OverviewTokenHeatmap } from "./OverviewTokenHeatmap";
+import { PanelSkeleton } from "./PanelSkeleton";
 import {
   buildOverviewHeatmapModel,
   diagnosticsSignature,
@@ -62,11 +63,8 @@ export function OverviewHeatmapPanel({ range }: OverviewHeatmapPanelProps) {
   // ── Loading ──────────────────────────────────────────────────────────
   if (isLoading || !envelope) {
     return (
-      <section className="overview-panel overview-panel--loading" aria-label="Token activity heatmap">
-        <div className="overview-panel__placeholder">
-          <span className="overview-panel__spinner" />
-          <p>Loading heatmap...</p>
-        </div>
+      <section className="overview-panel" aria-label="Token activity heatmap">
+        <PanelSkeleton variant="chart" />
       </section>
     );
   }
