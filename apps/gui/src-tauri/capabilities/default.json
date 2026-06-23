@@ -21,6 +21,7 @@
     "allow-prompt-palette-open-accessibility-settings",
     "allow-desktop-host-shortcut-diagnostics",
     "allow-desktop-host-retry-shortcut-registration",
-    "allow-desktop-host-show-gui"
+    "allow-desktop-host-show-gui",
+    "allow-install-version"
   ]
 }

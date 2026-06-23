@@ -225,6 +225,12 @@
           "markdownDescription": "Enables the flush_frontend_logs command without any pre-configured scope."
         },
         {
+          "description": "Enables the install_version command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-version",
+          "markdownDescription": "Enables the install_version command without any pre-configured scope."
+        },
+        {
           "description": "Enables the invoke_busytok command without any pre-configured scope.",
           "type": "string",
           "const": "allow-invoke-busytok",
@@ -307,6 +313,12 @@
           "type": "string",
           "const": "deny-flush-frontend-logs",
           "markdownDescription": "Denies the flush_frontend_logs command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_version command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-version",
+          "markdownDescription": "Denies the install_version command without any pre-configured scope."
         },
         {
           "description": "Denies the invoke_busytok command without any pre-configured scope.",

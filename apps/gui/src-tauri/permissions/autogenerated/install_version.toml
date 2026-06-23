@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-install-version"
+description = "Enables the install_version command without any pre-configured scope."
+commands.allow = ["install_version"]
+
+[[permission]]
+identifier = "deny-install-version"
+description = "Denies the install_version command without any pre-configured scope."
+commands.deny = ["install_version"]
