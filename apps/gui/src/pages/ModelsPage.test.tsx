@@ -408,6 +408,44 @@ describe("ModelsPage", () => {
     expect(screen.getByText("my-app")).toBeDefined();
   });
 
+  it("displays recent activity in detail drawer", async () => {
+    const item = makeModelItem({ id: "model-recent", label: "recent-model" });
+    const detail = makeModelDetail({
+      id: "model-recent",
+      recent_activity: [
+        {
+          id: "a1",
+          happened_at_ms: Date.now() - 600_000,
+          client_id: "claude-code",
+          client_label: "Claude Code",
+          source_id: null,
+          source_label: null,
+          source_root_path: null,
+          project_hash: null,
+          project_label: "my-app",
+          model_id: "claude-sonnet-4",
+          model_label: "claude-sonnet-4",
+          tokens: 1234,
+          cost_usd: 0.01,
+          cost_status: "exact",
+          cache_hit_rate: 0.99,
+          status: "ok",
+          detail_available: true,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    mockSuccess(makeResponse({}, [item]), detail);
+    render(<ModelsPage />);
+
+    await user.click(screen.getByText("recent-model"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Recent Activity (1)")).toBeDefined();
+    });
+    expect(screen.getByText("claude-sonnet-4")).toBeDefined();
+  });
+
   it("displays technical details in drawer", async () => {
     const item = makeModelItem({ id: "model-tech", label: "tech-model" });
     const detail = makeModelDetail({
