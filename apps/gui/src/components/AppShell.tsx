@@ -12,6 +12,7 @@ import { safeReportEvent } from "../logging/reporter";
 import { syncAggregateLagTelemetry } from "./desktop/aggregateLagStatus";
 import { Sidebar } from "./desktop/Sidebar";
 import { TitlebarStatusChip } from "./desktop/TitlebarStatusChip";
+import { UpdateBadgeButton } from "./desktop/UpdateBadgeButton";
 import {
   deriveTitlebarStatus,
   type TitlebarTone,
@@ -78,10 +79,11 @@ export function AppShell({ currentPage, onNavigate, children }: AppShellProps) {
           <div className="desktop-titlebar__status">
             <TitlebarStatusChip status={status} onAction={onNavigate} />
           </div>
-          {/* Right group: the page toolbar (only when the page provides one). */}
-          {toolbarContext?.toolbar ? (
-            <div className="desktop-titlebar__toolbar">{toolbarContext.toolbar}</div>
-          ) : null}
+          {/* Right group: global update badge + per-page toolbar (clustered top-right). */}
+          <div className="desktop-titlebar__actions">
+            <UpdateBadgeButton />
+            {toolbarContext?.toolbar ?? null}
+          </div>
         </div>
 
         <section className="desktop-workspace__content">{children}</section>

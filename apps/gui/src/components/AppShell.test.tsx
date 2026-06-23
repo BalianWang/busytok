@@ -52,6 +52,12 @@ vi.mock("../api/useEventSubscription", () => ({
   }),
 }));
 
+// UpdateBadgeButton renders null when up-to-date/idle, so stub it to assert its
+// slot lives inside the right-aligned .desktop-titlebar__actions group.
+vi.mock("./desktop/UpdateBadgeButton", () => ({
+  UpdateBadgeButton: () => <div data-testid="update-badge" />,
+}));
+
 describe("AppShell", () => {
   afterEach(() => cleanup());
 
@@ -174,7 +180,23 @@ describe("AppShell", () => {
     );
 
     const toolbarButton = screen.getByRole("button", { name: "Refresh data" });
-    expect(toolbarButton.closest(".desktop-titlebar__toolbar")).not.toBeNull();
+    expect(toolbarButton.closest(".desktop-titlebar__actions")).not.toBeNull();
+  });
+
+  it("wraps the page toolbar in a right-aligned .desktop-titlebar__actions group", () => {
+    render(
+      <Wrapper>
+        <AppShell currentPage="overview" onNavigate={() => {}}>
+          <ToolbarRegistrant />
+        </AppShell>
+      </Wrapper>,
+    );
+
+    const actions = document.querySelector(".desktop-titlebar__actions");
+    expect(actions).not.toBeNull();
+    expect(actions?.querySelector('[data-testid="update-badge"]')).not.toBeNull();
+    // Toolbar content sits inside the same actions cluster.
+    expect(screen.getByRole("button", { name: "Refresh data" }).closest(".desktop-titlebar__actions")).not.toBeNull();
   });
 
   it("does not render a vestigial traffic-light gutter before the status chip", () => {
