@@ -17,5 +17,6 @@ export function useVersionHistory() {
     queryKey: ["version-history"],
     queryFn: fetchVersionHistory,
     staleTime: 60 * 60 * 1000, // 1h — the index rarely changes within a session
+    retry: 1, // one fast retry — versions.json is a small cached endpoint; don't pay the global 3x exponential backoff
   });
 }
