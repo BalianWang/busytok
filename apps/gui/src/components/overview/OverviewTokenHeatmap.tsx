@@ -202,9 +202,13 @@ export function OverviewTokenHeatmap({
       </div>
 
       {/* ── Legend ─────────────────────────────────────────────────── */}
+      {/* Fixed 5-cell legend (Less…More): intentionally hardcoded per the
+          design spec so sparse data never shrinks the legend. The cell
+          intensity ramp still comes from model.legendLevels (lib/heatmap.ts);
+          only the legend swatch count is fixed. */}
       <div className="overview-heatmap__legend">
         <span className="overview-heatmap__legend-label">Less</span>
-        {model.legendLevels.map((level) => (
+        {[0, 1, 2, 3, 4].map((level) => (
           <span
             key={level}
             className={`overview-heatmap__legend-swatch overview-heatmap__cell--${level}`}
