@@ -47,7 +47,7 @@ fn checkpoint_commit_persists_diagnostics_in_same_transaction() {
     batch.checkpoint_offset = Some(42);
     batch.diagnostic_events = vec![sample_diag("warning")];
 
-    db.ingest_store_batch(batch, "gen-test", |_inserted, _replaced, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -94,7 +94,7 @@ fn diagnostic_events_list_newest_first() {
     batch.source_file_path = "/tmp/test.jsonl".into();
     batch.diagnostic_events = vec![early, late];
 
-    db.ingest_store_batch(batch, "gen-test", |_inserted, _replaced, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();

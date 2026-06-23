@@ -34,7 +34,7 @@ fn scan_batch_commits_events_diagnostics_aggregates_summary_and_checkpoint_atomi
         .diagnostic(diagnostic)
         .checkpoint_offset(128);
 
-    db.ingest_store_batch(batch, "gen-test", |_ids, _replaced_ids, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows {
             daily_usage_rows: vec![daily],
             model_usage_rows: vec![model],
@@ -80,12 +80,10 @@ fn failed_aggregate_write_does_not_advance_checkpoint() {
         .checkpoint_offset(128);
 
     assert!(db
-        .ingest_store_batch(bad_batch, "gen-test", |_ids, _replaced_ids, _gen| Ok(
-            RollupRows {
-                daily_usage_rows: vec![bad_daily],
-                ..Default::default()
-            }
-        ))
+        .ingest_store_batch(bad_batch, "gen-test", |_effective, _gen| Ok(RollupRows {
+            daily_usage_rows: vec![bad_daily],
+            ..Default::default()
+        }))
         .is_err());
     assert!(db.get_log_file("source-file-1").unwrap().is_none());
     assert_eq!(db.usage_event_count().unwrap(), 0);
@@ -103,7 +101,7 @@ fn duplicate_diagnostic_write_replaces_existing_event_without_rolling_back_batch
         .usage_event(event1, UsageWritePolicy::InsertOnce)
         .diagnostic(diag1)
         .checkpoint_offset(100);
-    db.ingest_store_batch(batch1, "gen-test", |_ids, _replaced_ids, _gen| {
+    db.ingest_store_batch(batch1, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -118,7 +116,7 @@ fn duplicate_diagnostic_write_replaces_existing_event_without_rolling_back_batch
         .diagnostic(diag2)
         .checkpoint_offset(200);
 
-    db.ingest_store_batch(batch2, "gen-test", |_ids, _replaced_ids, _gen| {
+    db.ingest_store_batch(batch2, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -141,7 +139,7 @@ fn failed_summary_write_rolls_back_events_and_checkpoint() {
     let batch1 = StoreWriteBatch::for_test("source-1", "file-1")
         .usage_event(event1, UsageWritePolicy::InsertOnce)
         .checkpoint_offset(100);
-    db.ingest_store_batch(batch1, "gen-test", |_ids, _replaced_ids, _gen| {
+    db.ingest_store_batch(batch1, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -161,12 +159,10 @@ fn failed_summary_write_rolls_back_events_and_checkpoint() {
 
     // The invalid date in daily_usage_rows should cause the transaction to fail.
     assert!(db
-        .ingest_store_batch(batch2, "gen-test", |_ids, _replaced_ids, _gen| Ok(
-            RollupRows {
-                daily_usage_rows: vec![bad_daily],
-                ..Default::default()
-            }
-        ))
+        .ingest_store_batch(batch2, "gen-test", |_effective, _gen| Ok(RollupRows {
+            daily_usage_rows: vec![bad_daily],
+            ..Default::default()
+        }))
         .is_err());
     // The second event and checkpoint must NOT be committed.
     assert_eq!(db.usage_event_count().unwrap(), 1);

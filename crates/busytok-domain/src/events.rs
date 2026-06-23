@@ -46,6 +46,18 @@ pub struct NormalizedUsageEvent {
     pub error_type: Option<String>,
     pub usage_limit_reset_time_ms: Option<i64>,
     pub raw_event_hash: String,
+    /// True when the source line carried `isSidechain: true` (e.g. Claude Code
+    /// `/btw` subagent logs that replay a parent message). Sidechain replays
+    /// share a parent's `message_id` but carry a different `request_id`; they
+    /// must collapse onto the parent during dedup so its usage is not counted
+    /// twice. See [`crate::NormalizedUsageEvent::dedupe_key`].
+    pub is_sidechain: bool,
+    /// Identity used for cross-event dedup within a generation. For Claude
+    /// Code events this is `claude:msg:{message_id}` so a parent and its
+    /// sidechain replay collide on the `usage_events(generation_id,
+    /// dedupe_key)` unique index. When `None`, the store falls back to the
+    /// event `id` (per-row identity, no cross-event collapse).
+    pub dedupe_key: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -93,6 +105,8 @@ impl NormalizedUsageEvent {
             error_type: None,
             usage_limit_reset_time_ms: None,
             raw_event_hash: String::new(),
+            is_sidechain: false,
+            dedupe_key: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         }

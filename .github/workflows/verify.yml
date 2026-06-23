@@ -77,12 +77,20 @@ jobs:
       # cargo-deny check deferred: needs per-crate license tuning.
       # cargo-audit already catches security advisories.
 
-      # cargo-llvm-cov deferred: instrumented tests crash on CI runners
-      # (same subprocess/socket issues as regular tests, but under
-      # instrumentation they fault). Regular `cargo test` passes on all
-      # platforms. Coverage gate will be re-enabled post-launch.
+      - name: Install cargo-llvm-cov
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Coverage gate on the audit-critical crates (GUI excluded). The gate is a
+      # regression floor (default 80); bump COVERAGE_GATE toward 85 as legacy
+      # modules gain tests. See scripts/coverage.sh.
+      - name: Coverage gate
+        if: matrix.os == 'ubuntu-latest'
         env:
-          COVERAGE_GATE: ${{ vars.COVERAGE_GATE || '85' }}
+          COVERAGE_GATE: ${{ vars.COVERAGE_GATE || '80' }}
+        run: bash scripts/coverage.sh
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6

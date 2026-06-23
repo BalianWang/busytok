@@ -535,11 +535,6 @@ fn process_file_change(
         .iter()
         .map(|e| (e.id.clone(), e.agent.as_str().to_string()))
         .collect();
-    let events_by_id: std::collections::HashMap<String, busytok_domain::NormalizedUsageEvent> =
-        usage_events
-            .iter()
-            .map(|e| (e.id.clone(), e.clone()))
-            .collect();
 
     let store_batch = StoreWriteBatch {
         source_id: source_id.to_string(),
@@ -564,36 +559,23 @@ fn process_file_change(
     };
 
     let ro = rollup_opts;
-    let ingest_result = db.ingest_store_batch(store_batch, generation_id, |inserted_events, replaced_old, gen_id| {
-        let mut rollup_events: Vec<busytok_domain::NormalizedUsageEvent> = inserted_events
-            .iter()
-            .map(|(_, event)| (*event).clone())
-            .collect();
-
-        for old in replaced_old {
-            if let Some(new_event) = events_by_id.get(&old.event_id) {
-                rollup_events.push(old.compute_delta(new_event));
-            } else {
-                tracing::error!(
-                    old_event_id = %old.event_id,
-                    "replaced event has no corresponding new event in batch — rollup may be stale"
-                );
+    let ingest_result = db
+        .ingest_store_batch(store_batch, generation_id, |effective_events, gen_id| {
+            // `effective_events` already folds in new−old deltas for replacements.
+            if effective_events.is_empty() {
+                return Ok(busytok_store::RollupRows::default());
             }
-        }
-
-        if rollup_events.is_empty() {
-            return Ok(busytok_store::RollupRows::default());
-        }
-        let mutations = build_scan_mutations(&rollup_events, ro, gen_id)
-            .context("failed to build tail rollup mutations")?;
-        Ok(busytok_store::RollupRows {
-            daily_usage_rows: mutations.daily_usage,
-            model_usage_rows: Vec::new(),
-            session_rows: session_rollups_to_rows(&mutations.session_rollups),
-            project_rows: project_rollups_to_rows(&mutations.project_rollups),
-            model_summary_rows: model_rollups_to_rows(&mutations.model_rollups),
+            let mutations = build_scan_mutations(effective_events, ro, gen_id)
+                .context("failed to build tail rollup mutations")?;
+            Ok(busytok_store::RollupRows {
+                daily_usage_rows: mutations.daily_usage,
+                model_usage_rows: Vec::new(),
+                session_rows: session_rollups_to_rows(&mutations.session_rollups),
+                project_rows: project_rollups_to_rows(&mutations.project_rollups),
+                model_summary_rows: model_rollups_to_rows(&mutations.model_rollups),
+            })
         })
-    }).with_context(|| format!("failed to ingest tail batch for {}", path.display()))?;
+        .with_context(|| format!("failed to ingest tail batch for {}", path.display()))?;
 
     // Publish UsageEventInserted only for truly inserted events.
     let inserted_ids: std::collections::HashSet<&str> = ingest_result

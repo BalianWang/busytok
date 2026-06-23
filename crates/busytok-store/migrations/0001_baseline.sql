@@ -72,7 +72,8 @@ CREATE TABLE usage_events (
   speed TEXT,
   usage_limit_reset_time_ms INTEGER,
   generation_id TEXT,
-  dedupe_key TEXT
+  dedupe_key TEXT,
+  is_sidechain INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE sessions (
   id TEXT PRIMARY KEY,

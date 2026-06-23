@@ -34,6 +34,12 @@ struct ClaudeLine {
     cost_usd: Option<f64>,
     #[serde(rename = "isApiErrorMessage")]
     is_api_error_message: Option<bool>,
+    /// Claude Code marks `/btw` subagent replays of a parent message with
+    /// `isSidechain: true`. These reuse the parent's `message_id` with a fresh
+    /// `request_id` and would double-count the parent's usage unless collapsed
+    /// during dedup.
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
 }
 
 /// The `message` object within a Claude Code line.
@@ -109,16 +115,25 @@ impl AgentLogAdapter for ClaudeCodeAdapter {
         let cache_creation_tokens = usage_val.cache_creation_input_tokens.unwrap_or(0);
         let cached_input_tokens = cache_read_tokens;
 
-        // DeepSeek's Anthropic-format API returns input_tokens as
-        // non-cached-only, violating the Anthropic invariant
-        // cache_read + cache_creation ≤ input_tokens. When cache
-        // exceeds raw_input, add cache_read to restore the total-input
-        // semantic that downstream pricing expects.
-        let input_tokens = if cache_read_tokens + cache_creation_tokens > raw_input {
-            raw_input + cache_read_tokens
-        } else {
-            raw_input
-        };
+        // Match ccusage's total formula exactly: the raw reported
+        // `input_tokens` is used as-is (it already includes cached tokens for
+        // Anthropic models), and cache_creation/cache_read are summed in
+        // additively. DeepSeek's Anthropic-format API reports a non-cached-only
+        // `input_tokens` (cache_read + cache_creation > input_tokens); we do
+        // NOT normalize it, which previously double-counted cache_read. Keeping
+        // the raw value yields the same per-component breakdown ccusage uses.
+        let input_tokens = raw_input;
+        if cache_read_tokens + cache_creation_tokens > raw_input {
+            debug!(
+                model = ?message_ref.model,
+                raw_input,
+                cache_read_tokens,
+                cache_creation_tokens,
+                "non-anthropic cache invariant observed (deepseek-style); using ccusage total formula"
+            );
+        }
+
+        let is_sidechain = parsed.is_sidechain.unwrap_or(false);
 
         let session_id = derive_session_id(parsed.session_id.as_deref(), &ctx.source_file_id);
 
@@ -221,6 +236,11 @@ impl AgentLogAdapter for ClaudeCodeAdapter {
             error_type: None,
             usage_limit_reset_time_ms: usage_limit_reset,
             raw_event_hash,
+            is_sidechain,
+            dedupe_key: message_ref
+                .id
+                .as_deref()
+                .map(|mid| format!("claude:msg:{mid}")),
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -360,6 +380,14 @@ fn parse_iso8601_to_ms(ts: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unwrap the first parsed event as a usage event (panics otherwise).
+    fn unwrap_first_usage(events: &[ParsedLogEvent]) -> &busytok_domain::NormalizedUsageEvent {
+        match events.first().expect("at least one parsed event") {
+            ParsedLogEvent::Normalized(NormalizedEvent::Usage(event)) => event,
+            other => panic!("expected usage event, got {other:?}"),
+        }
+    }
     use std::io::Write;
 
     #[test]
@@ -407,6 +435,52 @@ mod tests {
             }
             other => panic!("expected usage event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_line_total_formula_matches_ccusage_for_deepseek_shape() {
+        // cache_read + cache_creation > input_tokens (DeepSeek-style payload).
+        // total must equal raw_input + output + cache_creation + cache_read,
+        // with cache_read counted exactly once.
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        let line = r#"{"sessionId":"sess-1","timestamp":"2026-05-15T08:00:00Z","message":{"id":"msg-ds","model":"deepseek-chat","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":20,"cache_read_input_tokens":100}}}"#;
+        let parsed = adapter.parse_line(&ctx, line).unwrap();
+        let event = unwrap_first_usage(&parsed);
+        assert_eq!(event.input_tokens, 10);
+        assert_eq!(event.total_tokens, 10 + 5 + 20 + 100);
+    }
+
+    #[test]
+    fn parse_line_sets_is_sidechain_from_field() {
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        let sc = r#"{"isSidechain":true,"sessionId":"sess-1","message":{"id":"msg-1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let plain = r#"{"sessionId":"sess-1","message":{"id":"msg-1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        assert!(unwrap_first_usage(&adapter.parse_line(&ctx, sc).unwrap()).is_sidechain);
+        let parsed_plain = adapter.parse_line(&ctx, plain).unwrap();
+        assert!(!unwrap_first_usage(&parsed_plain).is_sidechain);
+    }
+
+    #[test]
+    fn parse_line_sets_dedupe_key_from_message_id() {
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        let line = r#"{"sessionId":"sess-1","message":{"id":"msg-42","model":"claude-sonnet-4-20250514","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let parsed = adapter.parse_line(&ctx, line).unwrap();
+        let event = unwrap_first_usage(&parsed);
+        assert_eq!(event.dedupe_key.as_deref(), Some("claude:msg:msg-42"));
+    }
+
+    #[test]
+    fn parse_line_dedupe_key_none_when_no_message_id() {
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        // No message.id; request_id only. The store falls back to the event id.
+        let line = r#"{"requestId":"req-9","sessionId":"sess-1","message":{"model":"claude-sonnet-4-20250514","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let parsed = adapter.parse_line(&ctx, line).unwrap();
+        let event = unwrap_first_usage(&parsed);
+        assert!(event.dedupe_key.is_none());
     }
 
     #[test]
@@ -492,6 +566,7 @@ mod tests {
             request_id: None,
             cost_usd: None,
             is_api_error_message: Some(true),
+            is_sidechain: None,
         }
     }
 
@@ -530,6 +605,7 @@ mod tests {
             request_id: None,
             cost_usd: None,
             is_api_error_message: Some(true),
+            is_sidechain: None,
         };
         assert!(extract_usage_limit_reset(&line).is_none());
     }
@@ -546,6 +622,7 @@ mod tests {
             request_id: None,
             cost_usd: None,
             is_api_error_message: Some(true),
+            is_sidechain: None,
         };
         assert!(extract_usage_limit_reset(&line).is_none());
     }

@@ -120,7 +120,7 @@ fn duplicate_request_ids_with_different_message_ids_stay_distinct() {
 }
 
 #[test]
-fn deepseek_input_tokens_repaired_when_cache_exceeds_raw_input() {
+fn deepseek_total_matches_ccusage_formula_when_cache_exceeds_raw_input() {
     let adapter = ClaudeCodeAdapter;
     let line = include_str!("../../../fixtures/claude-code/deepseek-cache.jsonl")
         .lines()
@@ -130,16 +130,24 @@ fn deepseek_input_tokens_repaired_when_cache_exceeds_raw_input() {
     let events = adapter.parse_line(&ctx, line).unwrap();
     let usage = unwrap_usage(events);
 
-    // DeepSeek returns raw input as non-cached only (1,407,288) and
-    // cache_read as 111,080,192. The adapter must detect the invariant
-    // violation and restore input_tokens to the true total.
-    assert_eq!(usage.input_tokens, 1407288 + 111080192);
+    // DeepSeek's Anthropic-format API reports raw input as non-cached only
+    // (1,407,288) with cache_read = 111,080,192, so cache > input. busytok must
+    // NOT inflate input_tokens (that double-counted cache_read); instead the
+    // total mirrors ccusage's additive formula: raw_input + output +
+    // cache_creation + cache_read.
+    assert_eq!(usage.input_tokens, 1407288);
     assert_eq!(usage.cached_input_tokens, 111080192);
     assert_eq!(usage.cache_read_tokens, 111080192);
     assert_eq!(usage.cache_creation_tokens, 0);
-    // total_tokens = input + output + cache_read + cache_creation
-    let expected_total = (1407288 + 111080192) + 50000 + 111080192 + 0;
+    let expected_total = 1407288 + 50000 + 0 + 111080192;
     assert_eq!(usage.total_tokens, expected_total);
+    // The earlier double-count bug would have produced 112617480 + 111080192
+    // (cache_read added twice). Guard against regression.
+    assert_ne!(
+        usage.total_tokens,
+        expected_total + 111080192,
+        "cache_read must not be counted twice"
+    );
 }
 
 #[test]

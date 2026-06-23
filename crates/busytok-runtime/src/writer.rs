@@ -466,6 +466,7 @@ async fn flush_single_generation(
     generation_id: &str,
 ) {
     let mut all_events: Vec<NormalizedUsageEvent> = Vec::new();
+    let mut all_policies: Vec<busytok_domain::UsageWritePolicy> = Vec::new();
     let mut all_tools: Vec<ToolEvent> = Vec::new();
     let mut all_diags: Vec<OperationalDiagnosticEvent> = Vec::new();
     let mut all_snapshots: Vec<CodexTokenSnapshotRow> = Vec::new();
@@ -492,7 +493,10 @@ async fn flush_single_generation(
                 if seen_sources.insert(src.clone()) {
                     source_ids.push(src.clone());
                 }
+                let event_count = c.events.len();
+                let write_policy = c.write_policy;
                 all_events.extend(c.events);
+                all_policies.extend(std::iter::repeat(write_policy).take(event_count));
                 all_tools.extend(c.tool_events);
                 all_diags.extend(c.diagnostic_events);
                 all_snapshots.extend(c.codex_snapshots);
@@ -521,7 +525,10 @@ async fn flush_single_generation(
                 if seen_sources.insert(src.clone()) {
                     source_ids.push(src.clone());
                 }
+                let event_count = c.events.len();
+                let write_policy = c.write_policy;
                 all_events.extend(c.events);
+                all_policies.extend(std::iter::repeat(write_policy).take(event_count));
                 all_tools.extend(c.tool_events);
                 all_diags.extend(c.diagnostic_events);
                 all_snapshots.extend(c.codex_snapshots);
@@ -564,18 +571,26 @@ async fn flush_single_generation(
         let conn = db.conn();
         let tx = conn.unchecked_transaction()?;
 
-        let inserted_events = write_queries::insert_usage_events_batch_returning_inserted(&*tx, &all_events, &gen_id)?;
-        let inserted = inserted_events.len() as i64;
+        let outcome = write_queries::upsert_usage_events_dedup_aware(
+            &*tx,
+            &all_events,
+            &all_policies,
+            &gen_id,
+        )?;
+        let effective_events = outcome.effective_events;
+        let inserted = outcome.inserted;
+        let replaced = outcome.replaced;
+        let dropped = outcome.dropped;
 
         insert_supplementary_events(&tx, &all_tools, &all_diags, &all_snapshots)?;
-        write_queries::update_materialized_aggregates_from_events(&*tx, &inserted_events, &gen_id)?;
-        aggregates::apply_event_batch_aggregates(&*tx, &inserted_events, &gen_id)?;
+        write_queries::update_materialized_aggregates_from_events(&*tx, &effective_events, &gen_id)?;
+        aggregates::apply_event_batch_aggregates(&*tx, &effective_events, &gen_id)?;
 
         // Maintain daily_usage rollup for IANA timezone queries.
         // Failure here MUST abort the transaction — otherwise IANA read
         // paths diverge from generation-scoped fast-path reads.
-        if !inserted_events.is_empty() {
-            if let Err(e) = write_queries::upsert_daily_usage_for_events(&*tx, &inserted_events, &current_tz, &gen_id) {
+        if !effective_events.is_empty() {
+            if let Err(e) = write_queries::upsert_daily_usage_for_events(&*tx, &effective_events, &current_tz, &gen_id) {
                 tracing::error!(error = %e, "daily_usage upsert failed, rolling back transaction");
                 return Err(anyhow::anyhow!("daily_usage upsert failed: {e}"));
             }
@@ -586,13 +601,16 @@ async fn flush_single_generation(
             write_queries::upsert_log_file_checkpoint(&*tx, fid, sid, ag, path, inode.as_deref(), *off, *sz, None, "active", None)?;
         }
 
-        write_queries::refresh_source_summaries_for_inserted_events_tx(&tx, &gen_id, &inserted_events, &source_ids)?;
+        write_queries::refresh_source_summaries_for_inserted_events_tx(&tx, &gen_id, &effective_events, &source_ids)?;
 
-        let (seq_start, seq_end) = if inserted > 0 {
-            outbox_queries::allocate_event_sequence_batch(&*tx, inserted as i64 + 2)?
+        // Invalidate on inserts OR replacements (a sidechain parent displacing a
+        // replay changes totals even when no new row appears).
+        let mutated = inserted > 0 || replaced > 0;
+        let (seq_start, seq_end) = if mutated {
+            outbox_queries::allocate_event_sequence_batch(&*tx, inserted + 2)?
         } else { (0, -1) };
 
-        if inserted > 0 {
+        if mutated {
             let wm = now_ms();
             let scopes = canonical_invalidation_scopes();
             let mut entries: Vec<(i64, String)> = Vec::new();
@@ -608,20 +626,22 @@ async fn flush_single_generation(
         }
 
         tx.commit()?;
-        info!(inserted, total, files = file_count, sources = source_count, is_final = is_final_rebuild, gen = %gen_id, "batch flushed");
-        Ok::<_, anyhow::Error>((inserted, seq_start, seq_end, inserted_events))
+        info!(inserted, replaced, dropped, total, files = file_count, sources = source_count, is_final = is_final_rebuild, gen = %gen_id, "batch flushed");
+        Ok::<_, anyhow::Error>((inserted, replaced, seq_start, seq_end, effective_events))
     }).await;
 
     match result {
-        Ok(Ok((inserted, seq_start, seq_end, inserted_events))) => {
+        Ok(Ok((inserted, replaced, seq_start, seq_end, effective_events))) => {
             if seq_end > 0 {
                 let mut snap = status.write().await;
                 snap.latest_event_seq = Some(seq_end);
                 snap.total_usage_event_count += inserted;
                 snap.chip_data_hydrated = false;
             }
-            accumulate_live_bucket(status, event_bus, &inserted_events).await;
-            if inserted > 0 {
+            accumulate_live_bucket(status, event_bus, &effective_events).await;
+            // Invalidate on inserts OR replacements: a sidechain parent
+            // displacing a replay changes totals without growing the row count.
+            if inserted > 0 || replaced > 0 {
                 let wm = now_ms();
                 let scopes = canonical_invalidation_scopes();
                 let di_seq = seq_start + inserted as i64;

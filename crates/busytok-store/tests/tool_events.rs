@@ -50,7 +50,7 @@ fn ingest_persists_all_14_fields() {
     batch.source_file_path = "/tmp/test.jsonl".into();
     batch.tool_events = vec![tool];
 
-    db.ingest_store_batch(batch, "gen-test", |_inserted, _replaced, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -77,7 +77,7 @@ fn tool_events_source_columns_are_populated() {
     batch.source_file_path = "/tmp/test.jsonl".into();
     batch.tool_events = vec![tool];
 
-    db.ingest_store_batch(batch, "gen-test", |_inserted, _replaced, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -107,7 +107,7 @@ fn ingest_persists_tool_events_without_creating_usage_rows() {
     batch.source_file_path = "/tmp/test.jsonl".into();
     batch.tool_events = vec![tool];
 
-    db.ingest_store_batch(batch, "gen-test", |_inserted, _replaced, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
@@ -144,7 +144,7 @@ fn ingest_persists_multiple_tool_events() {
     batch.source_file_path = "/tmp/test.jsonl".into();
     batch.tool_events = vec![t1, t2];
 
-    db.ingest_store_batch(batch, "gen-test", |_inserted, _replaced, _gen| {
+    db.ingest_store_batch(batch, "gen-test", |_effective, _gen| {
         Ok(RollupRows::default())
     })
     .unwrap();
