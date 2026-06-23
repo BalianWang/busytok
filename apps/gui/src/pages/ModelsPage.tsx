@@ -15,7 +15,8 @@ import { BreakdownLedgerPage } from "./BreakdownLedgerPage";
 import { NivoTimelineChart } from "../components/charts/NivoTimelineChart";
 import { StatusPill } from "../components/desktop/StatusPill";
 import { buildTimelineBars } from "../lib/chartGrammar";
-import { formatRelativeTime, formatCost, formatCacheHitRate } from "../lib/formatters";
+import { formatRelativeTime, formatCost } from "../lib/formatters";
+import { TokenBreakdown } from "../components/TokenBreakdown";
 
 // ── Ledger row type and mapping ─────────────────────────────────────────────
 
@@ -92,51 +93,7 @@ function ModelDetailContent({
   return (
     <div className="detail-stack">
       {/* Token breakdown */}
-      <section>
-        <h3>Token Breakdown</h3>
-        <dl>
-          <dt>Total</dt>
-          <dd>{tk.total_tokens.toLocaleString()}</dd>
-          {tk.prompt_input_total_tokens != null && (
-            <>
-              <dt>Prompt Input (Total)</dt>
-              <dd>{tk.prompt_input_total_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.prompt_input_non_cached_tokens != null && (
-            <>
-              <dt>Prompt Input (Non-cached)</dt>
-              <dd>{tk.prompt_input_non_cached_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.cache_read_tokens != null && (
-            <>
-              <dt>Cache Read</dt>
-              <dd>{tk.cache_read_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.cache_write_tokens != null && (
-            <>
-              <dt>Cache Write</dt>
-              <dd>{tk.cache_write_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          <dt>Cache Hit Rate</dt>
-          <dd>{formatCacheHitRate(tk.cache_hit_rate)}</dd>
-          {tk.output_tokens != null && (
-            <>
-              <dt>Output</dt>
-              <dd>{tk.output_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.reasoning_tokens != null && (
-            <>
-              <dt>Reasoning</dt>
-              <dd>{tk.reasoning_tokens.toLocaleString()}</dd>
-            </>
-          )}
-        </dl>
-      </section>
+      <TokenBreakdown tk={tk} />
 
       {/* Trend chart */}
       {timelineBars.length > 0 && (

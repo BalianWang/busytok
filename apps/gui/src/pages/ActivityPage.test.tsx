@@ -377,9 +377,9 @@ describe("ActivityPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Activity Detail")).toBeDefined();
     });
-    // Token breakdown should be visible (appears in both table head and drawer)
-    const tokenHeadings = screen.getAllByText("Tokens");
-    expect(tokenHeadings.length).toBe(2);
+    // Token breakdown renders in the drawer via the shared TokenBreakdown
+    // component; the ledger table keeps its "Tokens" column header separately.
+    expect(screen.getByText("Token Breakdown")).toBeDefined();
     // Technical details should be visible
     expect(screen.getByText("Technical Details")).toBeDefined();
     expect(screen.getByText("Anthropic")).toBeDefined();
