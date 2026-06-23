@@ -79,7 +79,7 @@
   align-items: center;
   justify-content: flex-start;
   padding: 0 24px;
-  background: color-mix(in srgb, var(--color-canvas) 92%, transparent);
+  background: var(--color-chrome);
   backdrop-filter: blur(var(--material-glass-blur));
   border-bottom: 1px solid var(--color-border-subtle);
 }
