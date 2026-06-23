@@ -155,6 +155,17 @@ describe("OverviewPage", () => {
     expect(screen.getByTestId("mock-heatmap")).toBeDefined();
   });
 
+  it("renders an in-frame error message when recent activity fails to load", () => {
+    stubAllPanelsPopulated();
+    mockUseActivityRecent.mockReturnValue({ data: undefined, isLoading: false, isError: true });
+    render(<OverviewPage />);
+
+    // Explicit error copy — NOT an empty table that reads as "no data".
+    expect(screen.getByText("Recent activity unavailable")).toBeDefined();
+    // The stable shell + header are still present (frame doesn't jump on error).
+    expect(screen.getByRole("heading", { name: /recent activity/i })).toBeDefined();
+  });
+
   it("does not rely on a left-accent-bar-only treatment for summary metrics", () => {
     stubAllPanelsPopulated();
     render(<OverviewPage />);
