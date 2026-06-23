@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::cache_metrics::ProviderPayloadShape;
 use crate::AgentKind;
 
 /// Core fact table for user-visible metrics.
@@ -37,6 +38,13 @@ pub struct NormalizedUsageEvent {
     pub reasoning_tokens: i64,
     pub thoughts_tokens: i64,
     pub tool_tokens: i64,
+    /// Discriminator recording how the raw provider payload reported tokens.
+    /// Provider differences live here; downstream consumes unified fields.
+    pub provider_payload_shape: ProviderPayloadShape,
+    /// Unified: total prompt input INCLUDING the cacheable portion.
+    pub prompt_input_total_tokens: i64,
+    /// Unified: prompt input NOT served from cache.
+    pub prompt_input_non_cached_tokens: i64,
     pub cost_usd: Option<f64>,
     pub estimated_cost_usd: Option<f64>,
     pub cost_currency: Option<String>,
@@ -96,6 +104,9 @@ impl NormalizedUsageEvent {
             reasoning_tokens: 0,
             thoughts_tokens: 0,
             tool_tokens: 0,
+            provider_payload_shape: ProviderPayloadShape::Codex,
+            prompt_input_total_tokens: 0,
+            prompt_input_non_cached_tokens: 0,
             cost_usd: None,
             estimated_cost_usd: None,
             cost_currency: None,
@@ -333,5 +344,19 @@ impl NormalizedEvent {
             NormalizedEvent::Usage(u) => Some(*u),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod unified_field_tests {
+    use super::*;
+    use crate::cache_metrics::ProviderPayloadShape;
+
+    #[test]
+    fn minimal_event_has_default_unified_fields() {
+        let e = NormalizedUsageEvent::minimal_for_test("t", crate::AgentKind::ClaudeCode);
+        assert_eq!(e.provider_payload_shape, ProviderPayloadShape::Codex);
+        assert_eq!(e.prompt_input_total_tokens, 0);
+        assert_eq!(e.prompt_input_non_cached_tokens, 0);
     }
 }
