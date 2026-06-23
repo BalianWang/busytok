@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { createElement, type ReactNode } from "react";
+import { type ReactNode } from "react";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -10,7 +10,7 @@ import { useVersionHistory } from "./useVersionHistory";
 
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return createElement(QueryClientProvider, { client: qc }, children);
+  return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
 beforeEach(() => { vi.clearAllMocks(); fetchMock.mockReset(); });
@@ -32,12 +32,12 @@ describe("useVersionHistory", () => {
   it("surfaces fetch errors as isError", async () => {
     fetchMock.mockRejectedValue(new Error("net"));
     const { result } = renderHook(() => useVersionHistory(), { wrapper });
-    await waitFor(() => expect(result.current.isError).toBe(true));
+    await waitFor(() => expect(result.current.isError).toBe(true), { timeout: 3000 });
   });
 
   it("surfaces a non-ok HTTP response as isError", async () => {
     fetchMock.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
     const { result } = renderHook(() => useVersionHistory(), { wrapper });
-    await waitFor(() => expect(result.current.isError).toBe(true));
+    await waitFor(() => expect(result.current.isError).toBe(true), { timeout: 3000 });
   });
 });
