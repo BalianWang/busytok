@@ -456,7 +456,9 @@ impl Database {
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
              usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-             is_sidechain, dedupe_key \
+             is_sidechain, dedupe_key, \
+             provider_payload_shape, prompt_input_total_tokens, \
+             prompt_input_non_cached_tokens \
              FROM usage_events WHERE id = ?1",
         )?;
 
@@ -490,7 +492,9 @@ impl Database {
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
              usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-             is_sidechain, dedupe_key \
+             is_sidechain, dedupe_key, \
+             provider_payload_shape, prompt_input_total_tokens, \
+             prompt_input_non_cached_tokens \
              FROM usage_events ORDER BY timestamp_ms",
         )?;
 
@@ -521,7 +525,9 @@ impl Database {
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
              usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-             is_sidechain, dedupe_key \
+             is_sidechain, dedupe_key, \
+             provider_payload_shape, prompt_input_total_tokens, \
+             prompt_input_non_cached_tokens \
              FROM usage_events WHERE generation_id = ?1 ORDER BY timestamp_ms",
         )?;
 
@@ -1389,7 +1395,9 @@ impl Database {
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
              usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-             is_sidechain, dedupe_key \
+             is_sidechain, dedupe_key, \
+             provider_payload_shape, prompt_input_total_tokens, \
+             prompt_input_non_cached_tokens \
              FROM usage_events \
              WHERE (timestamp_ms < ?2) OR (timestamp_ms = ?2 AND id < ?3) \
              ORDER BY timestamp_ms DESC, id DESC LIMIT ?1";
@@ -1778,6 +1786,13 @@ impl Database {
 }
 
 /// Map a query row to a `NormalizedUsageEvent`.
+///
+/// Column indices follow the full-event SELECT (all 4 call sites share the
+/// same column order). Indices 0-41 are the legacy columns; 42-44 are the
+/// cache-metrics unified columns appended in Task 5's migration:
+///   42 = provider_payload_shape (TEXT)
+///   43 = prompt_input_total_tokens (INTEGER)
+///   44 = prompt_input_non_cached_tokens (INTEGER)
 fn row_to_usage_event(row: &rusqlite::Row<'_>) -> busytok_domain::NormalizedUsageEvent {
     let agent_str: String = row.get(1).unwrap_or_default();
     let agent = match agent_str.as_str() {
@@ -1829,6 +1844,11 @@ fn row_to_usage_event(row: &rusqlite::Row<'_>) -> busytok_domain::NormalizedUsag
         updated_at_ms: row.get(39).unwrap_or(0),
         is_sidechain: row.get::<_, i32>(40).unwrap_or(0) != 0,
         dedupe_key: row.get(41).unwrap_or_default(),
+        provider_payload_shape: busytok_domain::cache_metrics::ProviderPayloadShape::parse(
+            &row.get::<_, String>(42).unwrap_or_default(),
+        ),
+        prompt_input_total_tokens: row.get(43).unwrap_or(0),
+        prompt_input_non_cached_tokens: row.get(44).unwrap_or(0),
     }
 }
 

@@ -360,6 +360,10 @@ pub fn read_activity_list(
             total_tokens, \
             input_tokens, \
             cached_input_tokens, \
+            prompt_input_total_tokens, \
+            prompt_input_non_cached_tokens, \
+            cache_read_tokens, \
+            cache_creation_tokens, \
             cost_usd, \
             is_error \
          FROM usage_events \
@@ -382,6 +386,10 @@ pub fn read_activity_list(
             total_tokens, \
             input_tokens, \
             cached_input_tokens, \
+            prompt_input_total_tokens, \
+            prompt_input_non_cached_tokens, \
+            cache_read_tokens, \
+            cache_creation_tokens, \
             cost_usd, \
             is_error \
          FROM usage_events \
@@ -409,8 +417,12 @@ pub fn read_activity_list(
             total_tokens: row.get(9)?,
             input_tokens: row.get(10)?,
             cached_input_tokens: row.get(11)?,
-            cost_usd: row.get(12)?,
-            is_error: row.get::<_, i32>(13)? != 0,
+            prompt_input_total_tokens: row.get(12)?,
+            prompt_input_non_cached_tokens: row.get(13)?,
+            cache_read_tokens: row.get(14)?,
+            cache_creation_tokens: row.get(15)?,
+            cost_usd: row.get(16)?,
+            is_error: row.get::<_, i32>(17)? != 0,
         })
     };
 
@@ -455,6 +467,8 @@ pub fn read_breakdown_activity_list(
                 COALESCE(source_path, ''), \
                 project_hash, project_path, model, \
                 total_tokens, input_tokens, cached_input_tokens, \
+                prompt_input_total_tokens, prompt_input_non_cached_tokens, \
+                cache_read_tokens, cache_creation_tokens, \
                 cost_usd, is_error \
          FROM usage_events \
          WHERE generation_id = ?1 \
@@ -486,8 +500,12 @@ pub fn read_breakdown_activity_list(
                 total_tokens: row.get(9)?,
                 input_tokens: row.get(10)?,
                 cached_input_tokens: row.get(11)?,
-                cost_usd: row.get(12)?,
-                is_error: row.get::<_, i32>(13)? != 0,
+                prompt_input_total_tokens: row.get(12)?,
+                prompt_input_non_cached_tokens: row.get(13)?,
+                cache_read_tokens: row.get(14)?,
+                cache_creation_tokens: row.get(15)?,
+                cost_usd: row.get(16)?,
+                is_error: row.get::<_, i32>(17)? != 0,
             })
         },
     )?;
@@ -512,7 +530,9 @@ pub fn read_activity_detail(
             reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
             estimated_cost_usd, cost_currency, cost_source, \
             price_catalog_version, is_error, error_type, raw_event_hash, \
-            usage_limit_reset_time_ms, generation_id \
+            usage_limit_reset_time_ms, generation_id, \
+            provider_payload_shape, prompt_input_total_tokens, \
+            prompt_input_non_cached_tokens \
          FROM usage_events \
          WHERE id = ?1 AND generation_id = ?2",
         params![event_id, generation_id],
@@ -557,6 +577,9 @@ pub fn read_activity_detail(
                 raw_event_hash: row.get(36)?,
                 usage_limit_reset_time_ms: row.get(37)?,
                 generation_id: row.get(38)?,
+                provider_payload_shape: row.get(39)?,
+                prompt_input_total_tokens: row.get(40)?,
+                prompt_input_non_cached_tokens: row.get(41)?,
             })
         },
     )
@@ -795,6 +818,8 @@ pub fn read_client_source_recent_activity(
                 COALESCE(ue.source_path, ''), \
                 ue.project_hash, ue.project_path, ue.model, \
                 ue.total_tokens, ue.input_tokens, ue.cached_input_tokens, \
+                ue.prompt_input_total_tokens, ue.prompt_input_non_cached_tokens, \
+                ue.cache_read_tokens, ue.cache_creation_tokens, \
                 ue.cost_usd, ue.is_error \
          FROM usage_events ue \
          INNER JOIN log_files lf ON lf.id = ue.source_file_id \
@@ -816,8 +841,12 @@ pub fn read_client_source_recent_activity(
             total_tokens: row.get(9)?,
             input_tokens: row.get(10)?,
             cached_input_tokens: row.get(11)?,
-            cost_usd: row.get(12)?,
-            is_error: row.get::<_, i32>(13)? != 0,
+            prompt_input_total_tokens: row.get(12)?,
+            prompt_input_non_cached_tokens: row.get(13)?,
+            cache_read_tokens: row.get(14)?,
+            cache_creation_tokens: row.get(15)?,
+            cost_usd: row.get(16)?,
+            is_error: row.get::<_, i32>(17)? != 0,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -833,7 +862,11 @@ pub fn read_model_token_breakdown(
     end_ms: i64,
 ) -> Result<ModelTokenBreakdownRow> {
     conn.query_row(
-        "SELECT COALESCE(SUM(input_tokens), 0), \
+        "SELECT COALESCE(SUM(prompt_input_total_tokens), 0), \
+                COALESCE(SUM(prompt_input_non_cached_tokens), 0), \
+                COALESCE(SUM(cache_read_tokens), 0), \
+                COALESCE(SUM(cache_creation_tokens), 0), \
+                COALESCE(SUM(input_tokens), 0), \
                 COALESCE(SUM(output_tokens), 0), \
                 COALESCE(SUM(cached_input_tokens), 0), \
                 COALESCE(SUM(reasoning_tokens), 0) \
@@ -844,10 +877,14 @@ pub fn read_model_token_breakdown(
         params![generation_id, start_ms, end_ms, model],
         |row| {
             Ok(ModelTokenBreakdownRow {
-                input_tokens: row.get(0)?,
-                output_tokens: row.get(1)?,
-                cached_input_tokens: row.get(2)?,
-                reasoning_tokens: row.get(3)?,
+                prompt_input_total_tokens: row.get(0)?,
+                prompt_input_non_cached_tokens: row.get(1)?,
+                cache_read_tokens: row.get(2)?,
+                cache_creation_tokens: row.get(3)?,
+                input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cached_input_tokens: row.get(6)?,
+                reasoning_tokens: row.get(7)?,
             })
         },
     )
@@ -2319,6 +2356,79 @@ mod tests {
         assert_eq!(detail.id, "evt-1");
         assert_eq!(detail.total_tokens, 400);
         assert_eq!(detail.agent, "claude_code");
+    }
+
+    /// Task 7: proves the activity list + detail read paths surface the unified
+    /// cache-metrics fields written through the store write path.
+    #[test]
+    fn activity_list_row_exposes_unified_fields() {
+        use crate::write_queries::insert_usage_events_batch_returning_inserted;
+        use busytok_domain::AgentKind;
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let now = now_ms();
+        let mut e =
+            busytok_domain::NormalizedUsageEvent::minimal_for_test("u1", AgentKind::ClaudeCode);
+        e.timestamp_ms = now;
+        e.prompt_input_total_tokens = 1000;
+        e.prompt_input_non_cached_tokens = 10;
+        e.cache_read_tokens = 990;
+        e.cache_creation_tokens = 0;
+        e.provider_payload_shape =
+            busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
+
+        insert_usage_events_batch_returning_inserted(conn, &[e], "gen1").unwrap();
+
+        let rows = read_activity_list(conn, "gen1", 0, now + 1, 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prompt_input_total_tokens, 1000);
+        assert_eq!(rows[0].prompt_input_non_cached_tokens, 10);
+        assert_eq!(rows[0].cache_read_tokens, 990);
+        assert_eq!(rows[0].cache_creation_tokens, 0);
+
+        // Detail path also surfaces provider_payload_shape + unified fields.
+        let detail = read_activity_detail(conn, "u1", "gen1").unwrap();
+        assert_eq!(detail.prompt_input_total_tokens, 1000);
+        assert_eq!(detail.prompt_input_non_cached_tokens, 10);
+        assert_eq!(detail.provider_payload_shape, "anthropic_native");
+    }
+
+    /// Task 7: proves the model token breakdown read path surfaces the unified
+    /// sums alongside the raw cached_input_tokens audit value.
+    #[test]
+    fn model_token_breakdown_surfaces_unified_sums() {
+        use crate::write_queries::insert_usage_events_batch_returning_inserted;
+        use busytok_domain::AgentKind;
+
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let now = now_ms();
+        let mut e =
+            busytok_domain::NormalizedUsageEvent::minimal_for_test("m1", AgentKind::ClaudeCode);
+        e.timestamp_ms = now;
+        e.model = Some("claude-test".to_string());
+        e.prompt_input_total_tokens = 1500;
+        e.prompt_input_non_cached_tokens = 500;
+        e.cache_read_tokens = 800;
+        e.cache_creation_tokens = 200;
+        e.input_tokens = 60;
+        e.output_tokens = 40;
+        e.cached_input_tokens = 800; // raw audit
+        e.reasoning_tokens = 30;
+
+        insert_usage_events_batch_returning_inserted(conn, &[e], "gen1").unwrap();
+
+        let breakdown =
+            read_model_token_breakdown(conn, "gen1", "claude-test", 0, now + 1).unwrap();
+        assert_eq!(breakdown.prompt_input_total_tokens, 1500);
+        assert_eq!(breakdown.prompt_input_non_cached_tokens, 500);
+        assert_eq!(breakdown.cache_read_tokens, 800);
+        assert_eq!(breakdown.cache_creation_tokens, 200);
+        assert_eq!(breakdown.input_tokens, 60);
+        assert_eq!(breakdown.output_tokens, 40);
+        assert_eq!(breakdown.cached_input_tokens, 800);
+        assert_eq!(breakdown.reasoning_tokens, 30);
     }
 
     #[test]
