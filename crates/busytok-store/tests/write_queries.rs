@@ -1020,8 +1020,7 @@ fn count_cache_metric_diag(db: &Database, event_id: &str) -> i64 {
 fn violating_event(id: &str) -> NormalizedUsageEvent {
     let mut e = NormalizedUsageEvent::minimal_for_test(id, AgentKind::ClaudeCode);
     e.dedupe_key = Some(format!("claude:msg:{id}"));
-    e.provider_payload_shape =
-        busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
+    e.provider_payload_shape = busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
     e.prompt_input_total_tokens = 10;
     e.prompt_input_non_cached_tokens = 10;
     e.cache_read_tokens = 800;
@@ -1034,8 +1033,7 @@ fn violating_event(id: &str) -> NormalizedUsageEvent {
 fn valid_event(id: &str) -> NormalizedUsageEvent {
     let mut e = NormalizedUsageEvent::minimal_for_test(id, AgentKind::ClaudeCode);
     e.dedupe_key = Some(format!("claude:msg:{id}"));
-    e.provider_payload_shape =
-        busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
+    e.provider_payload_shape = busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
     e.prompt_input_total_tokens = 1000;
     e.prompt_input_non_cached_tokens = 200;
     e.cache_read_tokens = 800;

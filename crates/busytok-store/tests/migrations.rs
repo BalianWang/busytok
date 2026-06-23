@@ -53,7 +53,7 @@ fn baseline_plus_cache_metrics_migrations() {
     let migs = busytok_store::schema::migrations();
     assert_eq!(migs.len(), 2);
     assert_eq!(busytok_store::schema::SCHEMA_VERSION, 2);
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(busytok_store::schema::CREATE_SCHEMA_VERSION_TABLE)
         .unwrap();
     for (_, sql) in &migs {
