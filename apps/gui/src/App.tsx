@@ -9,6 +9,7 @@ import { UsagePage } from "./pages/UsagePage";
 import { PromptPalettePage } from "./pages/PromptPalettePage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { EventSubscriptionProvider } from "./api/EventSubscriptionProvider";
+import { UpdaterProvider } from "./api/UpdaterProvider";
 import { PageToolbarProvider } from "./components/desktop/PageToolbarContext";
 import { PromptPaletteOverlayController } from "./components/prompt-palette/PromptPaletteOverlayController";
 import {
@@ -105,11 +106,13 @@ export function App() {
 
   return (
     <EventSubscriptionProvider>
-      <PageToolbarProvider>
-        <AppShell currentPage={currentPage} onNavigate={setCurrentPage}>
-          {pageContent}
-        </AppShell>
-      </PageToolbarProvider>
+      <UpdaterProvider>
+        <PageToolbarProvider>
+          <AppShell currentPage={currentPage} onNavigate={setCurrentPage}>
+            {pageContent}
+          </AppShell>
+        </PageToolbarProvider>
+      </UpdaterProvider>
       <PromptPaletteOverlayController
         open={promptOverlayOpen}
         onClose={() => setPromptOverlayOpen(false)}
