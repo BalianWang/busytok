@@ -1674,6 +1674,30 @@ mod tests {
     }
 
     #[test]
+    fn ensure_running_pid_exited_falls_through_to_socket_unreachable_repair() {
+        // PID exits between LaunchdJobSnapshot and proc_pidpath — Ok(None).
+        // The ladder must fall through to the socket check, detect the socket
+        // is unreachable on a running job, and repair.
+        let scenario = FakeScenario {
+            live_pid: FakeLivePid::Exited,
+            ..FakeScenario::running_but_socket_unreachable()
+        };
+        let fake = FakeMacLifecycle::new(scenario);
+        let outcome = fake.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+        let actions = fake.recorded_actions();
+        assert!(
+            actions.contains(&"detect_socket_unreachable".to_string()),
+            "PID exited should fall through to socket-unreachable repair, got: {actions:?}"
+        );
+    }
+
+    #[test]
     fn ensure_running_stale_live_process_takes_priority_over_version_probe() {
         // When both conditions exist, StaleLiveProcess repairs first
         // (it's checked before version probe). The version probe may

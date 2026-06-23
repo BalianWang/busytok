@@ -1,10 +1,11 @@
 //! Pure-text parser for `launchctl print gui/<uid>/<label>` output.
 //!
-//! `SMAppService.status` does NOT expose the registered executable path, so
-//! detecting a stale registration after an app move requires parsing the
-//! launchd state. This module pulls just the program path out of the
-//! `launchctl print` dump. It deliberately has no Objective-C / FFI surface
-//! so it can be unit-tested on any platform.
+//! `SMAppService.status` does NOT expose the registered executable path, live
+//! PID, or job state, so detecting a stale registration or a stale live process
+//! after an app move requires parsing the launchd state. This module pulls the
+//! program path, pid, and state out of the `launchctl print` dump. It
+//! deliberately has no Objective-C / FFI surface so it can be unit-tested on
+//! any platform.
 
 use std::path::{Path, PathBuf};
 
