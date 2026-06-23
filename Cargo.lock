@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "busytok-gui"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.5"
 dependencies = [
  "anyhow",
  "busytok-config",
@@ -598,6 +598,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tracing",
+ "url",
  "uuid",
  "windows-sys 0.59.0",
 ]

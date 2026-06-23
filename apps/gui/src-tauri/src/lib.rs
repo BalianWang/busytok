@@ -561,6 +561,7 @@ pub fn run() {
             commands::desktop_lifecycle_settings_update,
             commands::desktop_background_service_diagnostics,
             commands::desktop_background_service_repair,
+            updater::install_version,
             logging::log_frontend_event,
             logging::flush_frontend_logs,
             prompt_palette::prompt_palette_paste_active_app,
