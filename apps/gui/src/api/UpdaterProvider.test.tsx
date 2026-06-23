@@ -12,14 +12,17 @@ const focusCallbacks: Array<(e: { payload: boolean }) => void> = [];
 // Default behavior: onFocusChanged resolves immediately with a no-op unlisten.
 // Tests that need a controlled (not-yet-resolved) promise can set
 // `pendingFocusResolve` to capture the resolve fn and defer it.
-let pendingFocusResolve: ((fn: () => void) => void) | null = null;
+let pendingFocusResolve: ((resolve: (value: () => void | PromiseLike<() => void>) => void) => void) | null = null;
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
-    onFocusChanged: (cb: (e: { payload: boolean }) => void) => {
+    onFocusChanged: (cb: (e: { payload: boolean }) => void): Promise<() => void> => {
       focusCallbacks.push(cb);
       return new Promise<() => void>((resolve) => {
-        if (pendingFocusResolve) pendingFocusResolve(resolve);
-        else resolve(() => {});
+        if (pendingFocusResolve) {
+          pendingFocusResolve(resolve);
+        } else {
+          resolve(() => {});
+        }
       });
     },
   }),
@@ -27,13 +30,14 @@ vi.mock("@tauri-apps/api/window", () => ({
 
 import { checkForUpdate, applyUpdate } from "../lib/updaterClient";
 import { UpdaterProvider, type UpdaterContextValue } from "./UpdaterProvider";
+import type { Update } from "@tauri-apps/plugin-updater";
 
 const mockedCheck = vi.mocked(checkForUpdate);
 const mockedApply = vi.mocked(applyUpdate);
 
 const wrapper = ({ children }: { children: ReactNode }) => <UpdaterProvider>{children}</UpdaterProvider>;
 
-const fakeUpdate = { version: "0.3.0", close: vi.fn().mockResolvedValue(undefined) } as unknown;
+const fakeUpdate = { version: "0.3.0", close: vi.fn().mockResolvedValue(undefined) } as unknown as Update;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -72,8 +76,8 @@ describe("UpdaterProvider state machine", () => {
   });
 
   it("closes the previously-held Update on a re-check that returns a new one", async () => {
-    const first = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) };
-    const second = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) };
+    const first = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) } as unknown as Update;
+    const second = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) } as unknown as Update;
     mockedCheck
       .mockResolvedValueOnce({ kind: "available", version: "0.3.0", notes: "", date: "", update: first })
       .mockResolvedValueOnce({ kind: "available", version: "0.4.0", notes: "", date: "", update: second });
@@ -85,7 +89,7 @@ describe("UpdaterProvider state machine", () => {
   });
 
   it("applyNow downloads with progress → updated → pending-restart", async () => {
-    const u = { ...fakeUpdate, close: vi.fn() };
+    const u = { ...fakeUpdate, close: vi.fn() } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
     mockedApply.mockResolvedValue({ kind: "updated", version: "0.3.0" });
     const { result } = renderHook(() => useHook(), { wrapper });
@@ -96,7 +100,7 @@ describe("UpdaterProvider state machine", () => {
   });
 
   it("applyNow relaunch failure → installed-needs-manual-restart", async () => {
-    const u = { ...fakeUpdate, close: vi.fn() };
+    const u = { ...fakeUpdate, close: vi.fn() } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
     mockedApply.mockResolvedValue({ kind: "needs-manual-restart", version: "0.3.0" });
     const { result } = renderHook(() => useHook(), { wrapper });
@@ -106,7 +110,7 @@ describe("UpdaterProvider state machine", () => {
   });
 
   it("applyNow download error → back to available (Update still held, retryable)", async () => {
-    const u = { ...fakeUpdate, close: vi.fn() };
+    const u = { ...fakeUpdate, close: vi.fn() } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "n", date: "d", update: u });
     mockedApply.mockResolvedValue({ kind: "error", message: "disk full" });
     const { result } = renderHook(() => useHook(), { wrapper });
@@ -116,7 +120,7 @@ describe("UpdaterProvider state machine", () => {
   });
 
   it("forwards download percent to status (50 → 100)", async () => {
-    const u = { ...fakeUpdate, close: vi.fn() };
+    const u = { ...fakeUpdate, close: vi.fn() } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
     let onProgress: ((p: { chunkLength: number; contentLength?: number }) => void) | undefined;
     let resolveApply!: (v: { kind: "updated"; version: string }) => void;
@@ -164,7 +168,7 @@ describe("UpdaterProvider state machine", () => {
   });
 
   it("closes the held Update on unmount", async () => {
-    const u = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) };
+    const u = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
     const { result, unmount } = renderHook(() => useHook(), { wrapper });
     await waitFor(() => expect(result.current.status.state).toBe("available"));
@@ -198,7 +202,7 @@ describe("UpdaterProvider state machine", () => {
 
   // progress event with no contentLength → percent null (line 112).
   it("forwards percent: null when a progress event has no contentLength", async () => {
-    const u = { ...fakeUpdate, close: vi.fn() };
+    const u = { ...fakeUpdate, close: vi.fn() } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
     let onProgress: ((p: { chunkLength: number; contentLength?: number }) => void) | undefined;
     let resolveApply!: (v: { kind: "updated"; version: string }) => void;
@@ -220,7 +224,7 @@ describe("UpdaterProvider state machine", () => {
   // download error → available using the held Update's body/date (line 126,
   // the `?? ""` left sub-branches).
   it("applyNow download error → available with the Update's notes/date when present", async () => {
-    const u = { ...fakeUpdate, body: "release notes here", date: "2026-06-23", close: vi.fn() } as unknown;
+    const u = { ...fakeUpdate, body: "release notes here", date: "2026-06-23", close: vi.fn() } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "release notes here", date: "2026-06-23", update: u });
     mockedApply.mockResolvedValue({ kind: "error", message: "disk full" });
     const { result } = renderHook(() => useHook(), { wrapper });
