@@ -77,6 +77,13 @@ describe("OverviewSummaryPanel", () => {
               helper: null,
               tone: "neutral",
             },
+            {
+              id: "errors",
+              label: "errors",
+              value: "1",
+              helper: null,
+              tone: "danger",
+            },
           ],
         },
         { is_exact: false, degraded_reason: "building aggregates" },
@@ -88,6 +95,20 @@ describe("OverviewSummaryPanel", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByText("TOKENS")).toBeDefined();
     expect(screen.getByText("12k")).toBeDefined();
+
+    // Neutralized model: success renders as neutral (opaque surface, no
+    // accent bar), neutral has no flag either, and only danger/warning
+    // carry the 2px top-flag exception cue.
+    const cards = screen.getAllByText(/TOKENS|EVENTS|ERRORS/).map((el) => el.closest(".metric-card")!);
+    // success + neutral cards have no top-accent; the danger card does.
+    const flagged = cards.filter((c) => c.querySelector(".metric-card__top-accent"));
+    expect(flagged.length).toBe(1);
+    expect(flagged[0].className).toContain("metric-card--danger");
+    // success must never be emitted as a class (renders as neutral).
+    const successCards = cards.filter((c) => c.className.includes("metric-card--success"));
+    expect(successCards.length).toBe(0);
+    const neutralCards = cards.filter((c) => c.className.includes("metric-card--neutral"));
+    expect(neutralCards.length).toBe(2);
 
     cleanup();
     mockUseOverviewSummary.mockReturnValue({
