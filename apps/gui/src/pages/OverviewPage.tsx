@@ -29,6 +29,7 @@ import { OverviewTrendPanel } from "../components/overview/OverviewTrendPanel";
 import { OverviewHeatmapPanel } from "../components/overview/OverviewHeatmapPanel";
 import { OverviewRankingsPanel } from "../components/overview/OverviewRankingsPanel";
 import { LiveCurvePanel } from "../components/overview/LiveCurvePanel";
+import { PanelSkeleton } from "../components/overview/PanelSkeleton";
 
 // ── Recent activity row type and column definitions ────────────────────
 
@@ -99,10 +100,9 @@ function OverviewRecentActivity({ range }: { range: RangePresetDto }) {
 
   if (isLoading && !envelope) {
     return (
-      <section className="overview-panel overview-panel--loading" aria-label="Recent activity">
-        <div className="overview-panel__placeholder">
-          <p>Loading recent activity...</p>
-        </div>
+      <section className="overview-console__recent" aria-label="Recent activity">
+        <h3>Recent Activity</h3>
+        <PanelSkeleton variant="table" rows={5} />
       </section>
     );
   }

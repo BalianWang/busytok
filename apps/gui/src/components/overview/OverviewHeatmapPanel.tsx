@@ -54,7 +54,7 @@ export function OverviewHeatmapPanel({ range }: OverviewHeatmapPanelProps) {
   // ── Error ────────────────────────────────────────────────────────────
   if (isError) {
     return (
-      <section className="overview-panel overview-panel--error" aria-label="Token activity heatmap">
+      <section className="overview-console__heatmap" aria-label="Token activity heatmap">
         <p className="overview-panel__error">Heatmap unavailable</p>
       </section>
     );
@@ -63,7 +63,7 @@ export function OverviewHeatmapPanel({ range }: OverviewHeatmapPanelProps) {
   // ── Loading ──────────────────────────────────────────────────────────
   if (isLoading || !envelope) {
     return (
-      <section className="overview-panel" aria-label="Token activity heatmap">
+      <section className="overview-console__heatmap" aria-label="Token activity heatmap">
         <PanelSkeleton variant="chart" />
       </section>
     );
@@ -71,7 +71,7 @@ export function OverviewHeatmapPanel({ range }: OverviewHeatmapPanelProps) {
 
   if (!heatmapModel) {
     return (
-      <section className="overview-panel overview-panel--empty" aria-label="Token activity heatmap">
+      <section className="overview-console__heatmap" aria-label="Token activity heatmap">
         <p>No heatmap data available.</p>
       </section>
     );

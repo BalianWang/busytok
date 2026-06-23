@@ -18,7 +18,7 @@ export function OverviewRankingsPanel({ range }: OverviewRankingsPanelProps) {
   // ── Error ────────────────────────────────────────────────────────────
   if (isError) {
     return (
-      <section className="overview-panel overview-panel--error" aria-label="Rankings">
+      <section className="overview-console__rankings" aria-label="Rankings">
         <p className="overview-panel__error">Rankings unavailable</p>
       </section>
     );
@@ -27,7 +27,7 @@ export function OverviewRankingsPanel({ range }: OverviewRankingsPanelProps) {
   // ── Loading ──────────────────────────────────────────────────────────
   if (isLoading || !envelope) {
     return (
-      <section className="overview-panel" aria-label="Rankings">
+      <section className="overview-console__rankings" aria-label="Rankings">
         <PanelSkeleton variant="list" rows={5} />
       </section>
     );
