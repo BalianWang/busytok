@@ -551,6 +551,35 @@ impl SmAppServiceLifecycle {
                 // identity. Treat as compatible.
             }
             Err(e) => {
+                // If the job is loaded and running but the version probe
+                // cannot reach the service (connect refused, timeout, RPC
+                // error), the socket path may exist on disk while the
+                // service is wedged or stale. A plain kickstart is a no-op
+                // on a running process, and falling through to socket_ready()
+                // would misclassify a broken service as healthy if the socket
+                // node exists. Repair directly.
+                let job_is_running = snapshot
+                    .as_ref()
+                    .and_then(|s| s.state())
+                    .map(|s| s == "running")
+                    .unwrap_or(false);
+                if job_is_running {
+                    warn!(
+                        event_code = "service_lifecycle.smappservice.version_probe_failed_repairing",
+                        session_id = %crate::logging::tauri_session_id(),
+                        error = %e,
+                        "version probe failed on a running job; repairing"
+                    );
+                    crate::logging::append_bootstrap_event(
+                        "INFO",
+                        "service_lifecycle.smappservice.version_probe_failed_repairing",
+                        "version probe failed on a running job; repairing",
+                        Some(serde_json::json!({
+                            "error": e.to_string(),
+                        })),
+                    );
+                    return self.repair_via_ladder(RepairReason::SocketUnreachable);
+                }
                 warn!(
                     event_code = "service_lifecycle.smappservice.version_probe_failed",
                     session_id = %crate::logging::tauri_session_id(),
@@ -1004,6 +1033,8 @@ mod tests {
         Matching,
         Mismatch,
         Unknown,
+        /// The probe itself fails (e.g. can't connect, RPC error, timeout).
+        ProbeFailed,
     }
 
     /// What `bootstrap` does to the readiness socket.
@@ -1183,6 +1214,21 @@ mod tests {
                 job_state: FakeJobState::Waiting,
             }
         }
+
+        /// Socket path exists on disk (socket_ready() would return true),
+        /// job is running, but the version probe RPC fails — the socket is
+        /// wedged/stale. Must repair, not return AlreadyRunning.
+        fn running_socket_exists_but_version_probe_fails() -> Self {
+            Self {
+                status: FakeStatus::Healthy,
+                bundle: FakeBundle::Valid,
+                version: FakeVersion::ProbeFailed,
+                register_effect: FakeRegisterEffect::DoesNotAutoStart,
+                socket_when_registered: FakeSocket::Open,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Running,
+            }
+        }
     }
 
     /// Test double for [`SmAppServiceLifecycle`] that records each repair
@@ -1257,6 +1303,9 @@ mod tests {
         }
 
         fn version_probe(&self) -> Result<Option<String>> {
+            if matches!(self.scenario.version, FakeVersion::ProbeFailed) {
+                anyhow::bail!("version probe failed: connection refused");
+            }
             Ok(match self.scenario.version {
                 FakeVersion::Matching => {
                     Some(ServiceBuildIdentity::current_gui().as_str().to_string())
@@ -1265,6 +1314,7 @@ mod tests {
                     Some(ServiceBuildIdentity::mismatch().as_str().to_string())
                 }
                 FakeVersion::Unknown => None,
+                FakeVersion::ProbeFailed => unreachable!(),
             })
         }
 
@@ -1324,15 +1374,32 @@ mod tests {
             }
 
             // 3. Version skew check.
-            match self.version_probe()? {
-                Some(id) if id != ServiceBuildIdentity::current_gui().as_str() => {
+            match self.version_probe() {
+                Ok(Some(id)) if id != ServiceBuildIdentity::current_gui().as_str() => {
                     self.record("detect_version_skew");
                     self.do_repair();
                     return Ok(EnsureRunningOutcome::Started {
                         install_outcome: InstallOutcome::Upgraded,
                     });
                 }
-                _ => {}
+                Ok(_) => {
+                    // identity matches or unknown — compatible
+                }
+                Err(_) => {
+                    self.record("version_probe_failed");
+                    if self.job_is_running() {
+                        // Mirror production: a failed probe on a running job
+                        // means the socket may exist but the service is wedged.
+                        // Repair directly — falling through to socket_ready()
+                        // would misclassify the broken service as healthy.
+                        self.do_repair();
+                        return Ok(EnsureRunningOutcome::Started {
+                            install_outcome: InstallOutcome::Upgraded,
+                        });
+                    }
+                    // Job not running, socket may just not be ready yet.
+                    // Fall through to the socket/kickstart path below.
+                }
             }
 
             // 4. Healthy — socket ready.
@@ -1459,6 +1526,9 @@ mod tests {
         }
         fn waiting_with_socket_closed() -> Self {
             Self::new(FakeScenario::waiting_with_socket_closed())
+        }
+        fn running_socket_exists_but_version_probe_fails() -> Self {
+            Self::new(FakeScenario::running_socket_exists_but_version_probe_fails())
         }
     }
 
@@ -1694,6 +1764,32 @@ mod tests {
         assert!(
             actions.contains(&"detect_socket_unreachable".to_string()),
             "PID exited should fall through to socket-unreachable repair, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_running_repairs_when_socket_exists_but_version_probe_fails() {
+        // Socket path is present (socket_ready() would return true), job is
+        // running, but the version probe RPC fails — the service is wedged.
+        // Must repair, not return AlreadyRunning. This closes the gap where
+        // a filesystem path check alone misclassifies a broken service as
+        // healthy (reviewer P1 finding).
+        let fake = FakeMacLifecycle::running_socket_exists_but_version_probe_fails();
+        let outcome = fake.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+        let actions = fake.recorded_actions();
+        assert!(
+            actions.contains(&"version_probe_failed".to_string()),
+            "must record version_probe_failed, got: {actions:?}"
+        );
+        assert!(
+            actions.contains(&"bootout".to_string()),
+            "must repair (bootout) when version probe fails on running job, got: {actions:?}"
         );
     }
 
