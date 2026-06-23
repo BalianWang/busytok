@@ -62,7 +62,7 @@
   /* Live primary: brighter, cleaner indigo reserved for the high-frequency */
   /* real-time throughput curve so it reads above the quieter chart palette. */
   --color-data-live-primary: #4f63f6;
-  --color-data-live-primary-soft: rgba(79, 99, 246, 0.22);
+  --color-data-live-primary-soft: rgba(79, 99, 246, 0.08);
   /* Attention: warm amber for transient/estimated data, distinct */
   /* from status.warning.                                          */
   --color-data-attention: #d69554;
@@ -183,7 +183,7 @@
   /* Live primary lifts further than generic data.primary so the real-time */
   /* curve remains readable against dark analytical surfaces.               */
   --color-data-live-primary: #a7b8ff;
-  --color-data-live-primary-soft: rgba(167, 184, 255, 0.3);
+  --color-data-live-primary-soft: rgba(167, 184, 255, 0.10);
   --color-data-attention: #e6a865;
   --color-data-neutral: rgba(230, 237, 243, 0.28);
 

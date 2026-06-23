@@ -27,11 +27,14 @@ function resolveCssColor(name: string, fallback: string): string {
 }
 
 function resolveLiveCurveThemeColors() {
+  // Chart stroke + fill both derive from the live-primary token; the fill is
+  // kept ≤8% so the line reads as a system readout, not a marketing glow.
+  const line = resolveCssColor("--color-data-live-primary", "#4f63f6");
   return {
-    lineColor: resolveCssColor("--color-data-live-primary", "#4f63f6"),
-    topColor: resolveCssColor("--color-data-live-primary-soft", "rgba(79, 99, 246, 0.22)"),
+    lineColor: line,
+    topColor: resolveCssColor("--color-data-live-primary-soft", "rgba(79, 99, 246, 0.08)"),
     textColor: resolveCssColor("--color-text-muted", "#6e7480"),
-    gridColor: resolveCssColor("--color-border-subtle", "rgba(17, 24, 39, 0.08)"),
+    gridColor: resolveCssColor("--color-border-subtle", "rgba(17, 24, 39, 0.06)"),
   };
 }
 
@@ -79,9 +82,12 @@ export function LiveCurvePanel() {
         fontSize: 11,
         attributionLogo: false,
       },
+      // Vertical grid disabled; horizontal grid reduced to ~4 subtle reference
+      // lines (lightweight-charts auto-distributes horizontals; a dotted style
+      // reads them as discrete reference marks rather than a full grid).
       grid: {
-        vertLines: { color: themeColors.gridColor },
-        horzLines: { color: themeColors.gridColor },
+        vertLines: { visible: false },
+        horzLines: { color: themeColors.gridColor, style: LightweightCharts.LineStyle.Dotted },
       },
       crosshair: {
         mode: CrosshairMode.Magnet,
@@ -129,8 +135,8 @@ export function LiveCurvePanel() {
       chartRef.current?.applyOptions({
         layout: { textColor: themeColors.textColor },
         grid: {
-          vertLines: { color: themeColors.gridColor },
-          horzLines: { color: themeColors.gridColor },
+          vertLines: { visible: false },
+          horzLines: { color: themeColors.gridColor, style: LightweightCharts.LineStyle.Dotted },
         },
         rightPriceScale: { borderColor: themeColors.gridColor },
       });

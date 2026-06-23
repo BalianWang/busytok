@@ -104,7 +104,7 @@ describe("tokens.css contract", () => {
     expect(tokensCss).toContain("--color-data-primary: #6671db;");
     expect(tokensCss).toContain("--color-data-primary-soft: rgba(102, 113, 219, 0.2);");
     expect(tokensCss).toContain("--color-data-live-primary: #4f63f6;");
-    expect(tokensCss).toContain("--color-data-live-primary-soft: rgba(79, 99, 246, 0.22);");
+    expect(tokensCss).toContain("--color-data-live-primary-soft: rgba(79, 99, 246, 0.08);");
 
     const darkBlockStart = tokensCss.indexOf(':root[data-theme="dark"]');
     expect(darkBlockStart).toBeGreaterThan(-1);
@@ -112,7 +112,7 @@ describe("tokens.css contract", () => {
     expect(darkBlock).toContain("--color-data-primary: #8d9bff;");
     expect(darkBlock).toContain("--color-data-primary-soft: rgba(141, 155, 255, 0.24);");
     expect(darkBlock).toContain("--color-data-live-primary: #a7b8ff;");
-    expect(darkBlock).toContain("--color-data-live-primary-soft: rgba(167, 184, 255, 0.3);");
+    expect(darkBlock).toContain("--color-data-live-primary-soft: rgba(167, 184, 255, 0.10);");
   });
 
   it("zeroes glass blur across all three ladder tiers in dark theme", () => {

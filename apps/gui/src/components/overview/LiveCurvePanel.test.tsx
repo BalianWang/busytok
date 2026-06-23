@@ -74,6 +74,7 @@ vi.mock("lightweight-charts", () => {
     ColorType: { Solid: "solid" },
     CrosshairMode: { Normal: 0 },
     LineType: { Curved: 2 },
+    LineStyle: { Dotted: 1 },
   };
 });
 
@@ -132,7 +133,7 @@ describe("LiveCurvePanel", () => {
               case "--color-data-live-primary":
                 return "#4f63f6";
               case "--color-data-live-primary-soft":
-                return "rgba(79, 99, 246, 0.22)";
+                return "rgba(79, 99, 246, 0.08)";
               case "--color-text-muted":
                 return "#6e7681";
               case "--color-border-subtle":
@@ -182,8 +183,8 @@ describe("LiveCurvePanel", () => {
       .mockImplementation((element) => {
         const target = element as HTMLElement;
         const theme = target.dataset.theme ?? "light";
-        const lightFill = "rgba(79, 99, 246, 0.22)";
-        const darkFill = "rgba(167, 184, 255, 0.3)";
+        const lightFill = "rgba(79, 99, 246, 0.08)";
+        const darkFill = "rgba(167, 184, 255, 0.10)";
 
         return {
           getPropertyValue: (name: string) => {
@@ -212,7 +213,7 @@ describe("LiveCurvePanel", () => {
       expect.anything(),
       expect.objectContaining({
         lineColor: "#4f63f6",
-        topColor: "rgba(79, 99, 246, 0.22)",
+        topColor: "rgba(79, 99, 246, 0.08)",
       }),
     );
 
@@ -226,7 +227,7 @@ describe("LiveCurvePanel", () => {
     expect(chartMocks.mockTokenSeries.applyOptions).toHaveBeenCalledWith(
       expect.objectContaining({
         lineColor: "#a7b8ff",
-        topColor: "rgba(167, 184, 255, 0.3)",
+        topColor: "rgba(167, 184, 255, 0.10)",
       }),
     );
 
