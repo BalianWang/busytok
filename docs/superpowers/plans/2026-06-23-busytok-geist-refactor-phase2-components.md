@@ -62,7 +62,7 @@
 - Test: `apps/gui/src/components/desktop/titlebarStatus.test.ts`
 
 **Interfaces:**
-- Consumes: `ReadinessStateDto`, `StatusChipDto`, `StatusActionDto` from `@busytok/protocol-types`; `aggregateLagStatusChip` + thresholds from `./aggregateLagStatus`.
+- Consumes: `ReadinessStateDto`, `StatusChipDto`, `StatusActionDto` from `@busytok/protocol-types`; `aggregateLagSeverity` (+ thresholds) from `./aggregateLagStatus` for lag-based escalation.
 - Produces: `deriveTitlebarStatus(input)` → `TitlebarStatus` (see types below); `escalateTone(...)` helper. Consumed by Task 2's `TitlebarStatusChip` + `AppShell`.
 
 - [ ] **Step 1: Write the failing test**
@@ -176,6 +176,7 @@ import type {
   StatusActionDto,
   StatusChipDto,
 } from "@busytok/protocol-types";
+import { aggregateLagSeverity } from "./aggregateLagStatus";
 
 export type TitlebarTone = "neutral" | "warning" | "danger";
 
@@ -270,18 +271,22 @@ export function deriveTitlebarStatus(input: TitlebarStatusInput): TitlebarStatus
   if (input.queueDepth != null && input.queueDepth > 0) reasons.push(`queue:${input.queueDepth}`);
   if (warningChip) reasons.push(`chip:${warningChip.id}`);
 
+  const lagSeverity = aggregateLagSeverity(input.aggregateLagMs);
+  if (lagSeverity != null) reasons.push(`lag:${input.aggregateLagMs}ms`);
+
   const isWarning =
     readinessLabel != null ||
     input.connection !== "connected" ||
     (input.queueDepth != null && input.queueDepth > 0) ||
-    warningChip != null;
+    warningChip != null ||
+    lagSeverity != null;
 
   const tone: TitlebarTone = isWarning ? "warning" : "neutral";
   const label = isWarning
     ? readinessLabel ?? (input.connection === "reconnecting" ? "Reconnecting…"
         : input.connection === "disconnected" ? "Disconnected"
         : (input.queueDepth != null && input.queueDepth > 0) ? "Backlog"
-        : warningChip?.label ?? "Degraded")
+        : warningChip?.label ?? (lagSeverity != null ? "Lag elevated" : "Degraded"))
     : "Live capture active";
 
   const sections: TitlebarStatusSection[] = [
