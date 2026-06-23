@@ -1023,6 +1023,26 @@ mod tests {
         Open,
     }
 
+    /// What the live PID's executable path resolves to.
+    #[derive(Debug, Clone)]
+    enum FakeLivePid {
+        /// proc_pidpath returns the current bundle's service binary.
+        CurrentBundle,
+        /// proc_pidpath returns a stale path (e.g. trashed old build).
+        StaleInTrash,
+        /// PID has exited between snapshot and inspection.
+        Exited,
+    }
+
+    /// What launchd reports as the job state.
+    #[derive(Debug, Clone)]
+    enum FakeJobState {
+        Running,
+        Waiting,
+        /// Job not loaded — the print call itself returns None.
+        NotLoaded,
+    }
+
     /// Configurable scenario for the fake lifecycle.
     #[derive(Debug, Clone)]
     struct FakeScenario {
@@ -1031,6 +1051,8 @@ mod tests {
         version: FakeVersion,
         register_effect: FakeRegisterEffect,
         socket_when_registered: FakeSocket,
+        live_pid: FakeLivePid,
+        job_state: FakeJobState,
     }
 
     impl FakeScenario {
@@ -1041,6 +1063,8 @@ mod tests {
                 version: FakeVersion::Matching,
                 register_effect: FakeRegisterEffect::DoesNotAutoStart,
                 socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::NotLoaded,
             }
         }
 
@@ -1051,6 +1075,8 @@ mod tests {
                 version: FakeVersion::Matching,
                 register_effect: FakeRegisterEffect::AutoStarts,
                 socket_when_registered: FakeSocket::Open,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::NotLoaded,
             }
         }
 
@@ -1061,6 +1087,8 @@ mod tests {
                 version: FakeVersion::Matching,
                 register_effect: FakeRegisterEffect::DoesNotAutoStart,
                 socket_when_registered: FakeSocket::Open,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Running,
             }
         }
 
@@ -1071,6 +1099,8 @@ mod tests {
                 version: FakeVersion::Matching,
                 register_effect: FakeRegisterEffect::DoesNotAutoStart,
                 socket_when_registered: FakeSocket::Open,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Running,
             }
         }
 
@@ -1081,6 +1111,8 @@ mod tests {
                 version: FakeVersion::Matching,
                 register_effect: FakeRegisterEffect::DoesNotAutoStart,
                 socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Waiting,
             }
         }
 
@@ -1091,6 +1123,8 @@ mod tests {
                 version: FakeVersion::Matching,
                 register_effect: FakeRegisterEffect::DoesNotAutoStart,
                 socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Running,
             }
         }
 
@@ -1101,6 +1135,52 @@ mod tests {
                 version: FakeVersion::Mismatch,
                 register_effect: FakeRegisterEffect::DoesNotAutoStart,
                 socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Running,
+            }
+        }
+
+        // ── New scenarios for StaleLiveProcess + SocketUnreachable ────
+
+        /// Registered path is correct (current bundle) but the live PID's
+        /// executable is in the Trash — the stale-live-process identity gap.
+        fn registered_current_but_live_process_stale_in_trash() -> Self {
+            Self {
+                status: FakeStatus::Healthy,
+                bundle: FakeBundle::Valid,
+                version: FakeVersion::Matching,
+                register_effect: FakeRegisterEffect::DoesNotAutoStart,
+                socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::StaleInTrash,
+                job_state: FakeJobState::Running,
+            }
+        }
+
+        /// Job is running but the socket is unreachable. A kickstart
+        /// cannot replace a running process — must repair.
+        fn running_but_socket_unreachable() -> Self {
+            Self {
+                status: FakeStatus::Healthy,
+                bundle: FakeBundle::Valid,
+                version: FakeVersion::Matching,
+                register_effect: FakeRegisterEffect::DoesNotAutoStart,
+                socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Running,
+            }
+        }
+
+        /// Job is waiting (not running), socket closed — kickstart is
+        /// sufficient, no repair needed.
+        fn waiting_with_socket_closed() -> Self {
+            Self {
+                status: FakeStatus::RegisteredInactive,
+                bundle: FakeBundle::Valid,
+                version: FakeVersion::Matching,
+                register_effect: FakeRegisterEffect::DoesNotAutoStart,
+                socket_when_registered: FakeSocket::Closed,
+                live_pid: FakeLivePid::CurrentBundle,
+                job_state: FakeJobState::Waiting,
             }
         }
     }
@@ -1162,6 +1242,20 @@ mod tests {
             }
         }
 
+        fn live_pid_probe(&self) -> Option<PathBuf> {
+            match self.scenario.live_pid {
+                FakeLivePid::CurrentBundle => Some(self.layout.service_binary_path()),
+                FakeLivePid::StaleInTrash => Some(PathBuf::from(
+                    "/Users/wsd/.Trash/Busytok.app/Contents/MacOS/busytok-service",
+                )),
+                FakeLivePid::Exited => None,
+            }
+        }
+
+        fn job_is_running(&self) -> bool {
+            matches!(self.scenario.job_state, FakeJobState::Running)
+        }
+
         fn version_probe(&self) -> Result<Option<String>> {
             Ok(match self.scenario.version {
                 FakeVersion::Matching => {
@@ -1208,7 +1302,7 @@ mod tests {
 
             self.record("inspect_registration");
 
-            // Stale bundle check.
+            // 1. Stale bundle check — launchd registered path ≠ desired.
             if let Some(registered) = self.program_path_probe() {
                 if registered != self.layout.service_binary_path() {
                     self.do_repair();
@@ -1218,7 +1312,18 @@ mod tests {
                 }
             }
 
-            // Version skew check.
+            // 2. Stale live process check — live PID executable path ≠ desired.
+            if let Some(live_path) = self.live_pid_probe() {
+                if live_path != self.layout.service_binary_path() {
+                    self.record("detect_stale_live_process");
+                    self.do_repair();
+                    return Ok(EnsureRunningOutcome::Started {
+                        install_outcome: InstallOutcome::Upgraded,
+                    });
+                }
+            }
+
+            // 3. Version skew check.
             match self.version_probe()? {
                 Some(id) if id != ServiceBuildIdentity::current_gui().as_str() => {
                     self.record("detect_version_skew");
@@ -1230,11 +1335,23 @@ mod tests {
                 _ => {}
             }
 
-            // Healthy.
+            // 4. Healthy — socket ready.
             if self.socket_ready() {
                 self.record("wait_ready");
                 return Ok(EnsureRunningOutcome::AlreadyRunning);
             }
+
+            // 5. Socket unreachable + job running — kickstart is a no-op
+            //    on a running process; must force repair.
+            if self.job_is_running() {
+                self.record("detect_socket_unreachable");
+                self.do_repair();
+                return Ok(EnsureRunningOutcome::Started {
+                    install_outcome: InstallOutcome::Upgraded,
+                });
+            }
+
+            // 6. Job is not running — kickstart is sufficient.
             self.do_kickstart();
             self.record("wait_ready");
             Ok(EnsureRunningOutcome::Started {
@@ -1333,6 +1450,15 @@ mod tests {
         }
         fn running_old_service_version() -> Self {
             Self::new(FakeScenario::running_old_service_version())
+        }
+        fn registered_current_but_live_process_stale_in_trash() -> Self {
+            Self::new(FakeScenario::registered_current_but_live_process_stale_in_trash())
+        }
+        fn running_but_socket_unreachable() -> Self {
+            Self::new(FakeScenario::running_but_socket_unreachable())
+        }
+        fn waiting_with_socket_closed() -> Self {
+            Self::new(FakeScenario::waiting_with_socket_closed())
         }
     }
 
@@ -1465,6 +1591,117 @@ mod tests {
         assert_eq!(
             state,
             crate::desktop_service_status::ServiceBootstrapState::Repairing
+        );
+    }
+
+    // ── StaleLiveProcess + SocketUnreachable tests ──────────────────
+
+    #[test]
+    fn ensure_running_repairs_stale_live_process_when_registered_path_is_current() {
+        // The exact bug: registered path matches the current bundle, but
+        // the live PID is running from a trashed old build whose socket
+        // is gone. The ladder must detect this and repair.
+        let fake = FakeMacLifecycle::registered_current_but_live_process_stale_in_trash();
+        let outcome = fake.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+        assert_eq!(
+            fake.recorded_actions(),
+            [
+                "cleanup_legacy",
+                "inspect_registration",
+                "detect_stale_live_process",
+                "bootout",
+                "bootstrap",
+                "kickstart",
+                "wait_ready",
+            ]
+        );
+    }
+
+    #[test]
+    fn ensure_running_repairs_when_socket_unreachable_and_job_is_running() {
+        // Job is running (launchd says so) but socket is unreachable.
+        // A plain kickstart would be a no-op — must force repair.
+        let fake = FakeMacLifecycle::running_but_socket_unreachable();
+        let outcome = fake.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+        assert_eq!(
+            fake.recorded_actions(),
+            [
+                "cleanup_legacy",
+                "inspect_registration",
+                "detect_socket_unreachable",
+                "bootout",
+                "bootstrap",
+                "kickstart",
+                "wait_ready",
+            ]
+        );
+    }
+
+    #[test]
+    fn ensure_running_kickstarts_when_socket_closed_but_job_is_waiting() {
+        // Job is NOT running (waiting state), socket closed — kickstart
+        // is sufficient here since launchd CAN start a non-running job.
+        let fake = FakeMacLifecycle::waiting_with_socket_closed();
+        let outcome = fake.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::AlreadyPresent,
+            }
+        );
+        assert_eq!(
+            fake.recorded_actions(),
+            [
+                "cleanup_legacy",
+                "inspect_registration",
+                "kickstart",
+                "wait_ready",
+            ]
+        );
+        assert!(!fake.unregister_called());
+    }
+
+    #[test]
+    fn ensure_running_stale_live_process_takes_priority_over_version_probe() {
+        // When both conditions exist, StaleLiveProcess repairs first
+        // (it's checked before version probe). The version probe may
+        // fail because the stale process's socket is gone, but the
+        // ladder should not depend on that — it should detect the
+        // stale live PID directly.
+        let scenario = FakeScenario {
+            version: FakeVersion::Mismatch,
+            ..FakeScenario::registered_current_but_live_process_stale_in_trash()
+        };
+        let fake = FakeMacLifecycle::new(scenario);
+        let outcome = fake.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+        // The StaleLiveProcess check fires before version probe, so
+        // we see detect_stale_live_process, not detect_version_skew.
+        let actions = fake.recorded_actions();
+        assert!(
+            actions.contains(&"detect_stale_live_process".to_string()),
+            "must detect stale live process, got: {actions:?}"
+        );
+        assert!(
+            !actions.contains(&"detect_version_skew".to_string()),
+            "version skew must NOT trigger before stale live process"
         );
     }
 
