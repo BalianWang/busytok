@@ -17,13 +17,15 @@ pub(crate) const LAUNCHCTL_PRINT_FIXTURE: &str =
 
 /// Parsed snapshot of `launchctl print gui/<uid>/<label>` output.
 ///
-/// `SMAppService.status` does NOT expose the registered executable path, so
-/// detecting a stale registration after an app move requires parsing the
-/// launchd state. This struct pulls just the program path out of the
-/// `launchctl print` dump.
+/// `SMAppService.status` does NOT expose the registered executable path or
+/// live PID, so detecting a stale registration or a stale live process after
+/// an app move requires parsing the launchd state. This struct pulls the
+/// program path, pid, and state out of the `launchctl print` dump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchdJobSnapshot {
     program_path: Option<PathBuf>,
+    pid: Option<u32>,
+    state: Option<String>,
 }
 
 impl LaunchdJobSnapshot {
@@ -40,10 +42,31 @@ impl LaunchdJobSnapshot {
     /// supported.
     pub fn parse(launchctl_print_output: &str) -> Result<Self> {
         let mut program_path: Option<PathBuf> = None;
+        let mut pid: Option<u32> = None;
+        let mut state: Option<String> = None;
         let mut in_program_arguments_block = false;
 
         for raw in launchctl_print_output.lines() {
             let line = raw.trim();
+
+            // `pid = <u32>`
+            if pid.is_none() {
+                if let Some(rest) = line.strip_prefix("pid =") {
+                    if let Ok(val) = rest.trim().trim_end_matches(';').trim().parse::<u32>() {
+                        pid = Some(val);
+                    }
+                }
+            }
+
+            // `state = <word>`
+            if state.is_none() {
+                if let Some(rest) = line.strip_prefix("state =") {
+                    let candidate = rest.trim().trim_end_matches(';').trim();
+                    if !candidate.is_empty() {
+                        state = Some(candidate.to_string());
+                    }
+                }
+            }
 
             // Direct `program = <path>;` form takes precedence.
             if program_path.is_none() {
@@ -83,7 +106,11 @@ impl LaunchdJobSnapshot {
             }
         }
 
-        Ok(Self { program_path })
+        Ok(Self {
+            program_path,
+            pid,
+            state,
+        })
     }
 
     /// The absolute path launchd believes the service executable lives at,
@@ -91,6 +118,16 @@ impl LaunchdJobSnapshot {
     /// the dump does not include a program path.
     pub fn program_path(&self) -> Option<&Path> {
         self.program_path.as_deref()
+    }
+
+    /// The PID of the live service process, if present in the dump.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// The launchd job state (`running`, `waiting`, etc.), if present.
+    pub fn state(&self) -> Option<&str> {
+        self.state.as_deref()
     }
 }
 
@@ -114,6 +151,8 @@ mod tests {
             snapshot.program_path(),
             Some(Path::new("/Old/Busytok.app/Contents/MacOS/busytok-service"))
         );
+        assert_eq!(snapshot.pid(), Some(4242));
+        assert_eq!(snapshot.state(), Some("running"));
     }
 
     #[test]
@@ -124,6 +163,8 @@ mod tests {
         )
         .unwrap();
         assert!(snapshot.program_path().is_none());
+        assert_eq!(snapshot.pid(), Some(123));
+        assert!(snapshot.state().is_none());
     }
 
     #[test]
@@ -134,5 +175,29 @@ mod tests {
             snapshot.program_path(),
             Some(Path::new("/Alt/Busytok.app/Contents/MacOS/busytok-service"))
         );
+    }
+
+    #[test]
+    fn launchctl_job_snapshot_extracts_pid_and_state() {
+        let input = "pid = 96869\nstate = running\nprogram = /Applications/Busytok.app/Contents/MacOS/busytok-service;\n";
+        let snapshot = LaunchdJobSnapshot::parse(input).unwrap();
+        assert_eq!(snapshot.pid(), Some(96869));
+        assert_eq!(snapshot.state(), Some("running"));
+    }
+
+    #[test]
+    fn launchctl_job_snapshot_handles_malformed_pid() {
+        let input = "pid = not_a_number\nstate = waiting\n";
+        let snapshot = LaunchdJobSnapshot::parse(input).unwrap();
+        assert!(snapshot.pid().is_none(), "malformed pid should be None");
+        assert_eq!(snapshot.state(), Some("waiting"));
+    }
+
+    #[test]
+    fn launchctl_job_snapshot_handles_no_pid() {
+        let input = "state = waiting\nlast exit code = 0\n";
+        let snapshot = LaunchdJobSnapshot::parse(input).unwrap();
+        assert!(snapshot.pid().is_none());
+        assert_eq!(snapshot.state(), Some("waiting"));
     }
 }
