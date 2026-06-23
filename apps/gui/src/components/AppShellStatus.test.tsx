@@ -268,4 +268,26 @@ describe("AppShell status rendering", () => {
       "gui.shell.aggregate_lag_recovered",
     ]);
   });
+
+  it("logs gui.titlebar.popover_opened + gui.titlebar.action_clicked on interaction", async () => {
+    const user = userEvent.setup();
+    const onNavigate = vi.fn();
+    render(
+      <PageToolbarProvider>
+        <AppShell currentPage="overview" onNavigate={onNavigate}>
+          <p>Content</p>
+        </AppShell>
+      </PageToolbarProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Live capture active" }));
+    await user.click(screen.getByRole("button", { name: "View Activity" }));
+
+    const codes = mocks.reportFrontendEvent.mock.calls.map(([entry]) => (
+      entry as { event_code: string }
+    ).event_code);
+    expect(codes).toContain("gui.titlebar.popover_opened");
+    expect(codes).toContain("gui.titlebar.action_clicked");
+    expect(onNavigate).toHaveBeenCalledWith("usage");
+  });
 });

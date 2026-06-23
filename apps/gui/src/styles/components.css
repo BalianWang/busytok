@@ -72,18 +72,37 @@
   z-index: 30;
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: nowrap;            /* no wrap — 50px single row */
   padding: 0 24px;
   background: var(--color-chrome);
   backdrop-filter: blur(var(--material-glass-blur));
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
+/* Left ~72px traffic-light gutter (window controls overlay region). */
+.desktop-titlebar__gutter {
+  width: 72px;
+  flex-shrink: 0;
+}
+
+/* Left group: status chip(s). */
 .desktop-titlebar__status {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+}
+
+/* Right group: page toolbar. Pushed to the far edge by space-between; the
+   explicit margin is belt-and-suspenders in case the status group is absent. */
+.desktop-titlebar__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
 /* ── Titlebar calm status chip (single entry) ─────────────────── */
@@ -141,11 +160,16 @@
 .titlebar-popover__detail { margin: 0; color: var(--color-text-muted); font-size: 13px; line-height: 1.45; }
 .titlebar-popover__arrow { fill: var(--color-surface); }
 
-.desktop-titlebar__toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-left: 4px;
+/* ── Long/short chip label swap ──────────────────────────────────
+   Default: show the full label; hide the short variant. Below a window
+   width of 760px (rough two-column titlebar breakpoint where the full
+   label collides with the toolbar) swap to the short label. The two
+   spans always render; only visibility flips via display. */
+.titlebar-chip__label-long { display: inline; }
+.titlebar-chip__label-short { display: none; }
+@media (max-width: 760px) {
+  .titlebar-chip__label-long { display: none; }
+  .titlebar-chip__label-short { display: inline; }
 }
 
 .desktop-workspace__content {
