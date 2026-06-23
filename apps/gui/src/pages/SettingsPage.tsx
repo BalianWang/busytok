@@ -44,7 +44,10 @@ import {
   type DesktopBackgroundServiceDiagnostics,
 } from "../lib/backgroundServiceCommands";
 import { useUpdater } from "../hooks/useUpdater";
+import { useVersionHistory } from "../api/useVersionHistory";
+import { installVersion } from "../lib/versionCommands";
 import { reportFrontendEvent } from "../logging/reporter";
+import { reportFrontendEventSafely } from "../logging/safeReporter";
 
 const COMMIT_TIMEOUT_MS = 10_000; // 10s bounded timeout for settings writes
 
@@ -295,6 +298,11 @@ export function SettingsPage() {
   // touches the server-backed settings mutation flow.
   const { preferences, updatePreference } = usePreferences();
   const { status: updateStatus, checkNow: checkForUpdates, applyNow: applyUpdateNow } = useUpdater();
+
+  // ── Version history (manual downgrade) ──────────────────────────────
+  const versionHistory = useVersionHistory();
+  const [reinstallingTag, setReinstallingTag] = useState<string | null>(null);
+  const [reinstallMessage, setReinstallMessage] = useState<string | null>(null);
 
   const handleThemePreferenceChange = useCallback(
     (next: ThemePreference) => {
@@ -976,6 +984,39 @@ export function SettingsPage() {
                 control={<span className="diag-value">Not supported</span>}
               />
             )}
+            {/* ── Version history (manual downgrade) ─────────────────── */}
+            <SettingsRow
+              label="Version history"
+              description="Reinstall an earlier version. The app will download, install, and restart."
+              control={<span className="diag-value">{versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.versions.length ?? 0} versions`}</span>}
+            />
+            {reinstallMessage && <SettingsRow label="Reinstall status" description={reinstallMessage} control={<span className="diag-value" /> } />}
+            {(versionHistory.data?.versions ?? []).map((entry) => (
+              <SettingsRow
+                key={entry.version}
+                label={entry.version}
+                description={entry.notes || `Released ${entry.date}`}
+                control={
+                  <button
+                    type="button"
+                    className="btn btn--secondary btn--sm"
+                    disabled={reinstallingTag !== null}
+                    aria-label={`Reinstall ${entry.version}`}
+                    onClick={() => {
+                      setReinstallingTag(entry.version);
+                      setReinstallMessage(`Reinstalling ${entry.version}… restarting when done.`);
+                      reportFrontendEventSafely({ level: "INFO", event_code: "gui.update.downgrade_requested", message: "User requested version reinstall", details: { version: entry.version } });
+                      void installVersion(entry.manifest_url).then((r) => {
+                        setReinstallingTag(null);
+                        setReinstallMessage(r.kind === "installed" ? `Installed ${r.version} — restarting.` : `Reinstall failed: ${r.message}`);
+                      });
+                    }}
+                  >
+                    {reinstallingTag === entry.version ? "Reinstalling…" : "Reinstall"}
+                  </button>
+                }
+              />
+            ))}
           </div>
         </section>
 

@@ -45,6 +45,18 @@ vi.mock("../logging/reporter", () => ({
   reportFrontendEvent: vi.fn(),
 }));
 
+// Version history is a real useQuery; the Coverage tests don't mount a
+// QueryClientProvider, so stub the hook to a benign empty state. The
+// version-history panel itself is exercised in SettingsPage.test.tsx.
+vi.mock("../api/useVersionHistory", () => ({
+  useVersionHistory: () => ({
+    data: { versions: [] },
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+  }),
+}));
+
 // In-memory localStorage so loadPreferences/savePreferences round-trip works
 // without bleeding across tests.
 const memoryStore: Record<string, string> = {};
