@@ -965,9 +965,7 @@ impl BusytokSupervisor {
     /// Reads the row's persisted unified fields directly — `from_raw` is
     /// ingest-only; the read path consumes stored fields and never re-derives
     /// the provider payload shape.
-    fn list_cache_hit_rate(
-        row: &busytok_store::read_models::ActivityListRow,
-    ) -> Option<f64> {
+    fn list_cache_hit_rate(row: &busytok_store::read_models::ActivityListRow) -> Option<f64> {
         let m = busytok_domain::cache_metrics::UnifiedCacheMetrics {
             prompt_input_total_tokens: row.prompt_input_total_tokens,
             prompt_input_non_cached_tokens: row.prompt_input_non_cached_tokens,
@@ -2436,9 +2434,10 @@ impl RuntimeControl for BusytokSupervisor {
                                 range.end_ms,
                             )?;
                         let agg = busytok_domain::cache_metrics::UnifiedCacheMetrics {
-                            prompt_input_total_tokens: token_breakdown_row.prompt_input_total_tokens,
-                            prompt_input_non_cached_tokens:
-                                token_breakdown_row.prompt_input_non_cached_tokens,
+                            prompt_input_total_tokens: token_breakdown_row
+                                .prompt_input_total_tokens,
+                            prompt_input_non_cached_tokens: token_breakdown_row
+                                .prompt_input_non_cached_tokens,
                             cache_read_tokens: token_breakdown_row.cache_read_tokens,
                             cache_write_tokens: token_breakdown_row.cache_creation_tokens,
                         };
@@ -2653,12 +2652,12 @@ impl RuntimeControl for BusytokSupervisor {
                                 };
                                 TokenBreakdownDto {
                                     prompt_input_total_tokens: Some(sums.0).filter(|&v| v > 0),
-                                    prompt_input_non_cached_tokens: Some(sums.1)
-                                        .filter(|&v| v > 0),
+                                    prompt_input_non_cached_tokens: Some(sums.1).filter(|&v| v > 0),
                                     cache_read_tokens: Some(sums.2).filter(|&v| v > 0),
                                     cache_write_tokens: Some(sums.3).filter(|&v| v > 0),
-                                    cache_hit_rate:
-                                        busytok_domain::cache_metrics::cache_hit_rate(agg),
+                                    cache_hit_rate: busytok_domain::cache_metrics::cache_hit_rate(
+                                        agg,
+                                    ),
                                     input_tokens: None,
                                     output_tokens: None,
                                     cached_input_tokens: Some(sums.4).filter(|&v| v > 0),

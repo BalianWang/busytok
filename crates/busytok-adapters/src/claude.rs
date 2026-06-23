@@ -123,7 +123,11 @@ impl AgentLogAdapter for ClaudeCodeAdapter {
         // rate. Family-first: known Anthropic-FORMAT providers whose input_tokens
         // is NON-cached-only are always Compatible; the cache>input check survives
         // only as an anomaly fallback for unknown compatible providers.
-        let model_lower = message_ref.model.as_deref().unwrap_or("").to_ascii_lowercase();
+        let model_lower = message_ref
+            .model
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         // Known Anthropic-FORMAT providers whose input_tokens is NON-cached-only
         // (DeepSeek, GLM, Qwen, Moonshot/Kimi, Yi, Baichuan, ...). Extensible.
         const KNOWN_COMPATIBLE: &[&str] = &[

@@ -134,7 +134,8 @@ mod tests {
     #[test]
     fn anthropic_native_total_includes_cache() {
         // input_tokens already includes cache_read + cache_creation.
-        let m = UnifiedCacheMetrics::from_raw(ProviderPayloadShape::AnthropicNative, 1500, 800, 200);
+        let m =
+            UnifiedCacheMetrics::from_raw(ProviderPayloadShape::AnthropicNative, 1500, 800, 200);
         assert!(m.invariant_holds());
         assert_eq!(m.prompt_input_total_tokens, 1500);
         assert_eq!(m.prompt_input_non_cached_tokens, 500);
@@ -161,7 +162,10 @@ mod tests {
     fn anomalous_native_where_cache_exceeds_input_is_null() {
         // A compatible payload misclassified as native: input(10) < read+write(990).
         let m = UnifiedCacheMetrics::from_raw(ProviderPayloadShape::AnthropicNative, 10, 800, 200);
-        assert!(!m.invariant_holds(), "negative non_cached must violate invariant");
+        assert!(
+            !m.invariant_holds(),
+            "negative non_cached must violate invariant"
+        );
         assert!(cache_hit_rate(m).is_none());
     }
 
