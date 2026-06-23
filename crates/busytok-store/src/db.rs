@@ -92,12 +92,14 @@ const WRITE_USAGE_IGNORE_SQL: &str = "\
         reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
         estimated_cost_usd, cost_currency, cost_source, \
         price_catalog_version, is_error, error_type, raw_event_hash, \
-        usage_limit_reset_time_ms, created_at_ms, updated_at_ms\
+        usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+        provider_payload_shape, prompt_input_total_tokens, prompt_input_non_cached_tokens\
     ) VALUES (\
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
         ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
-        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
+        ?41, ?42, ?43\
     )";
 
 /// Upsert `usage_events` keyed on `id` only, preserving `created_at_ms`.
@@ -114,12 +116,14 @@ const WRITE_USAGE_REPLACE_SQL: &str = "\
         reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
         estimated_cost_usd, cost_currency, cost_source, \
         price_catalog_version, is_error, error_type, raw_event_hash, \
-        usage_limit_reset_time_ms, created_at_ms, updated_at_ms\
+        usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+        provider_payload_shape, prompt_input_total_tokens, prompt_input_non_cached_tokens\
     ) VALUES (\
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
         ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
-        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
+        ?41, ?42, ?43\
     ) ON CONFLICT(id) DO UPDATE SET \
         speed = excluded.speed, \
         usage_limit_reset_time_ms = excluded.usage_limit_reset_time_ms, \
@@ -137,6 +141,9 @@ const WRITE_USAGE_REPLACE_SQL: &str = "\
         cost_source = excluded.cost_source, \
         price_catalog_version = excluded.price_catalog_version, \
         raw_event_hash = excluded.raw_event_hash, \
+        provider_payload_shape = excluded.provider_payload_shape, \
+        prompt_input_total_tokens = excluded.prompt_input_total_tokens, \
+        prompt_input_non_cached_tokens = excluded.prompt_input_non_cached_tokens, \
         created_at_ms = usage_events.created_at_ms, \
         updated_at_ms = CASE WHEN excluded.updated_at_ms > usage_events.updated_at_ms \
             THEN excluded.updated_at_ms ELSE usage_events.updated_at_ms END";
@@ -363,10 +370,12 @@ impl Database {
 
     // ── Usage events ──────────────────────────────────────────────────
 
-    /// Write a usage event with the given policy. Uses 41‑column SQL that
+    /// Write a usage event with the given policy. Uses 43‑column SQL that
     /// omits `generation_id`, `dedupe_key`, and `is_sidechain` so the
     /// dedupe_key unique index does not fire — this helper is exclusively
-    /// for tests where each event is a standalone row.
+    /// for tests where each event is a standalone row. Also syncs the
+    /// centralized `cache_metric` diagnostic to the event's current invariant
+    /// state (mirrors the production write path).
     pub fn write_usage_event(
         &self,
         event: &busytok_domain::NormalizedUsageEvent,
@@ -421,9 +430,13 @@ impl Database {
                     event.usage_limit_reset_time_ms,
                     event.created_at_ms,
                     event.updated_at_ms,
+                    event.provider_payload_shape.as_str(),
+                    event.prompt_input_total_tokens,
+                    event.prompt_input_non_cached_tokens,
                 ],
             )
             .context("failed to write usage event")?;
+        crate::write_queries::sync_cache_metric_diagnostic(&self.conn, event)?;
         Ok(())
     }
 

@@ -26,13 +26,14 @@ const USAGE_INSERT_IGNORE_SQL: &str = "\
         estimated_cost_usd, cost_currency, cost_source, \
         price_catalog_version, is_error, error_type, raw_event_hash, \
         usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-        generation_id, dedupe_key, is_sidechain\
+        generation_id, dedupe_key, is_sidechain, \
+        provider_payload_shape, prompt_input_total_tokens, prompt_input_non_cached_tokens\
     ) VALUES (\
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
         ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
         ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
-        ?41, ?42, ?43\
+        ?41, ?42, ?43, ?44, ?45, ?46\
     )";
 
 /// Upsert used for `WritePolicy::Replace` agents (Claude Code): on a primary
@@ -51,13 +52,14 @@ const USAGE_UPSERT_BY_ID_SQL: &str = "\
         estimated_cost_usd, cost_currency, cost_source, \
         price_catalog_version, is_error, error_type, raw_event_hash, \
         usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-        generation_id, dedupe_key, is_sidechain\
+        generation_id, dedupe_key, is_sidechain, \
+        provider_payload_shape, prompt_input_total_tokens, prompt_input_non_cached_tokens\
     ) VALUES (\
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
         ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
         ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
-        ?41, ?42, ?43\
+        ?41, ?42, ?43, ?44, ?45, ?46\
     ) ON CONFLICT(id) DO UPDATE SET \
         speed = excluded.speed, \
         usage_limit_reset_time_ms = excluded.usage_limit_reset_time_ms, \
@@ -77,11 +79,14 @@ const USAGE_UPSERT_BY_ID_SQL: &str = "\
         raw_event_hash = excluded.raw_event_hash, \
         dedupe_key = excluded.dedupe_key, \
         is_sidechain = excluded.is_sidechain, \
+        provider_payload_shape = excluded.provider_payload_shape, \
+        prompt_input_total_tokens = excluded.prompt_input_total_tokens, \
+        prompt_input_non_cached_tokens = excluded.prompt_input_non_cached_tokens, \
         created_at_ms = usage_events.created_at_ms, \
         updated_at_ms = CASE WHEN excluded.updated_at_ms > usage_events.updated_at_ms \
             THEN excluded.updated_at_ms ELSE usage_events.updated_at_ms END";
 
-/// Bind a single event's 43 columns for either usage-event statement. A macro
+/// Bind a single event's 46 columns for either usage-event statement. A macro
 /// (rather than a function) sidesteps the multi-input lifetime that a returned
 /// `Vec<&dyn ToSql>` would require.
 macro_rules! usage_event_params {
@@ -130,6 +135,9 @@ macro_rules! usage_event_params {
             $generation_id,
             $dedupe_key,
             $event.is_sidechain,
+            $event.provider_payload_shape.as_str(),
+            $event.prompt_input_total_tokens,
+            $event.prompt_input_non_cached_tokens,
         ]
     };
 }
@@ -281,6 +289,11 @@ pub fn upsert_usage_events_dedup_aware(
                 inserted_ids.push(event.id.clone());
                 inserted += 1;
             }
+            // Centralized cache-metric invariant check — single chokepoint
+            // covering both Claude and Codex events. Syncs (upsert on
+            // violation, delete on valid) the per-event `cache_metric`
+            // diagnostic to the event's CURRENT state.
+            sync_cache_metric_diagnostic(conn, event)?;
             continue;
         }
 
@@ -330,6 +343,12 @@ pub fn upsert_usage_events_dedup_aware(
             usage_event_params!(event, generation_id, &dedupe_key),
         )
         .with_context(|| format!("failed to upsert usage event {}", event.id))?;
+
+        // Centralized cache-metric invariant check — single chokepoint covering
+        // both Claude and Codex events. Syncs (upsert on violation, delete on
+        // valid) the per-event `cache_metric` diagnostic to the event's CURRENT
+        // state, so a recovered rewrite leaves no stale warning.
+        sync_cache_metric_diagnostic(conn, event)?;
 
         match existing {
             None => {
@@ -772,6 +791,81 @@ pub fn record_diagnostic_event(
     Ok(())
 }
 
+/// Upsert a diagnostic event by stable `id`. Thin alias over
+/// [`record_diagnostic_event`] (which already uses `INSERT OR REPLACE`); kept as
+/// a distinct name so callers document the upsert intent (e.g. the
+/// cache-metric diagnostic, where repeated violations of the same event id must
+/// not create duplicate rows).
+pub fn upsert_diagnostic_event(
+    conn: &Connection,
+    event: &busytok_domain::OperationalDiagnosticEvent,
+) -> Result<()> {
+    record_diagnostic_event(conn, event)
+}
+
+/// Delete a diagnostic event by its stable `id` (cheap PK delete). The recovery
+/// path of the centralized cache-metric diagnostic uses this so a previously
+/// violating event that is rewritten valid leaves no stale warning.
+pub fn delete_diagnostic_by_id(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM diagnostic_events WHERE id = ?1", params![id])
+        .context("failed to delete diagnostic event by id")?;
+    Ok(())
+}
+
+/// Keep the per-event `cache_metric` diagnostic in sync with the event's
+/// CURRENT unified-metric state. Called from the usage-event persistence path
+/// for every event, regardless of provider.
+///
+/// Lifecycle (recovery semantics): the write path upserts the same event id
+/// (Replace / dedupe-aware). On violation, UPSERT the diagnostic (stable id →
+/// no duplicates on repeated violations of the same event). On a later VALID
+/// rewrite of the same event id, DELETE the prior diagnostic so a recovered
+/// event leaves no stale warning. Contract: a `cache_metric` diagnostic exists
+/// ⇔ the event currently violates the invariant.
+pub(crate) fn sync_cache_metric_diagnostic(
+    conn: &Connection,
+    event: &busytok_domain::NormalizedUsageEvent,
+) -> Result<()> {
+    let metrics = busytok_domain::cache_metrics::UnifiedCacheMetrics {
+        prompt_input_total_tokens: event.prompt_input_total_tokens,
+        prompt_input_non_cached_tokens: event.prompt_input_non_cached_tokens,
+        cache_read_tokens: event.cache_read_tokens,
+        cache_write_tokens: event.cache_creation_tokens,
+    };
+    let diag_id = format!("cache-metric-violation:{}", event.id);
+    if metrics.invariant_holds() {
+        // Recovery: a prior violating write of this event id is now valid.
+        return delete_diagnostic_by_id(conn, &diag_id);
+    }
+    let diag = busytok_domain::OperationalDiagnosticEvent {
+        id: diag_id,
+        agent: Some(event.agent),
+        // source_id is SOURCE-level, not the usage event id — matches the
+        // existing convention (parse-error diagnostics use an empty source_id
+        // and attribute via source_file_id/source_path/source_line). The event
+        // id is preserved in the diagnostic `id` and detail_json for traceability.
+        source_id: Some(String::new()),
+        source_file_id: Some(event.source_file_id.clone()),
+        source_path: Some(event.source_path.clone()),
+        source_line: Some(event.source_line as i64),
+        category: "cache_metric".to_string(),
+        severity: "warning".to_string(),
+        message: "cache metric invariant violated; cache_hit_rate nulled".to_string(),
+        detail_json: Some(format!(
+            "{{\"event_id\":\"{}\",\"shape\":\"{}\",\"total\":{},\"non_cached\":{},\"cache_read\":{},\"cache_write\":{}}}",
+            event.id,
+            event.provider_payload_shape.as_str(),
+            event.prompt_input_total_tokens,
+            event.prompt_input_non_cached_tokens,
+            event.cache_read_tokens,
+            event.cache_creation_tokens,
+        )),
+        happened_at_ms: event.timestamp_ms,
+        created_at_ms: busytok_domain::now_ms(),
+    };
+    upsert_diagnostic_event(conn, &diag)
+}
+
 /// Upsert a log source using either a connection or a transaction.
 pub fn upsert_log_source(
     conn: &Connection,
@@ -987,8 +1081,9 @@ fn apply_single_replay(
 ) -> Result<i64> {
     // Tail replay events carry a partial JSON snapshot (not a full serialised
     // NormalizedUsageEvent), so we extract fields manually and issue a direct
-    // INSERT OR IGNORE using the canonical 43-column schema (includes
-    // is_sidechain to prevent schema mismatch).
+    // INSERT OR IGNORE using the canonical 46-column schema (includes
+    // is_sidechain and the unified cache-metric columns to prevent schema
+    // mismatch).
     let value: serde_json::Value =
         serde_json::from_str(data_json).context("failed to parse replay event JSON")?;
 
@@ -1041,6 +1136,11 @@ fn apply_single_replay(
                 target_generation_id,
                 value["id"].as_str().unwrap_or(""),
                 0i32, // is_sidechain → DEFAULT 0 (replay events have no sidechain flag)
+                value["provider_payload_shape"].as_str().unwrap_or("codex"),
+                value["prompt_input_total_tokens"].as_i64().unwrap_or(0),
+                value["prompt_input_non_cached_tokens"]
+                    .as_i64()
+                    .unwrap_or(0),
             ],
         )
         .context("failed to insert replay usage event")?;
