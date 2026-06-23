@@ -71,16 +71,75 @@ impl OldEventTokens {
     }
 }
 
-/// Result of an atomic batch ingest, reporting which events were truly new
-/// and which were replacements of existing rows.
+/// Result of an atomic batch ingest, reporting which events were newly created.
 pub struct IngestResult {
-    /// IDs of usage events that were actually inserted (not ignored by INSERT OR IGNORE).
+    /// IDs of usage events that were actually inserted (new logical events).
     pub inserted_event_ids: Vec<String>,
-    /// IDs of usage events that replaced an existing row via ON CONFLICT DO UPDATE.
-    /// The rollup builder receives the OLD token counts (via `OldEventTokens`) and
-    /// computes the correct delta (new − old) for incremental rollup adjustment.
-    pub replaced_event_ids: Vec<String>,
 }
+
+/// `INSERT OR IGNORE` into `usage_events` keyed on `id` only. Omits
+/// `generation_id`, `dedupe_key`, and `is_sidechain` (defaults). Only used by
+/// the test helper [`Database::write_usage_event`]; production paths route
+/// through the consolidated sidechain-aware function in `write_queries.rs`.
+const WRITE_USAGE_IGNORE_SQL: &str = "\
+    INSERT OR IGNORE INTO usage_events (\
+        id, agent, source_file_id, source_path, source_line, \
+        source_offset_start, source_offset_end, session_id, turn_id, \
+        source_request_id, message_id, timestamp_ms, project_path, \
+        project_hash, cwd, model, model_provider, agent_version, \
+        client_kind, speed, input_tokens, output_tokens, total_tokens, \
+        cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
+        reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
+        estimated_cost_usd, cost_currency, cost_source, \
+        price_catalog_version, is_error, error_type, raw_event_hash, \
+        usage_limit_reset_time_ms, created_at_ms, updated_at_ms\
+    ) VALUES (\
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
+        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+    )";
+
+/// Upsert `usage_events` keyed on `id` only, preserving `created_at_ms`.
+/// Same scope as [`WRITE_USAGE_IGNORE_SQL`] — only used by
+/// [`Database::write_usage_event`] for tests.
+const WRITE_USAGE_REPLACE_SQL: &str = "\
+    INSERT INTO usage_events (\
+        id, agent, source_file_id, source_path, source_line, \
+        source_offset_start, source_offset_end, session_id, turn_id, \
+        source_request_id, message_id, timestamp_ms, project_path, \
+        project_hash, cwd, model, model_provider, agent_version, \
+        client_kind, speed, input_tokens, output_tokens, total_tokens, \
+        cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
+        reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
+        estimated_cost_usd, cost_currency, cost_source, \
+        price_catalog_version, is_error, error_type, raw_event_hash, \
+        usage_limit_reset_time_ms, created_at_ms, updated_at_ms\
+    ) VALUES (\
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
+        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+    ) ON CONFLICT(id) DO UPDATE SET \
+        speed = excluded.speed, \
+        usage_limit_reset_time_ms = excluded.usage_limit_reset_time_ms, \
+        input_tokens = excluded.input_tokens, \
+        output_tokens = excluded.output_tokens, \
+        total_tokens = excluded.total_tokens, \
+        cached_input_tokens = excluded.cached_input_tokens, \
+        cache_creation_tokens = excluded.cache_creation_tokens, \
+        cache_read_tokens = excluded.cache_read_tokens, \
+        reasoning_tokens = excluded.reasoning_tokens, \
+        thoughts_tokens = excluded.thoughts_tokens, \
+        tool_tokens = excluded.tool_tokens, \
+        cost_usd = excluded.cost_usd, \
+        estimated_cost_usd = excluded.estimated_cost_usd, \
+        cost_source = excluded.cost_source, \
+        price_catalog_version = excluded.price_catalog_version, \
+        raw_event_hash = excluded.raw_event_hash, \
+        created_at_ms = usage_events.created_at_ms, \
+        updated_at_ms = CASE WHEN excluded.updated_at_ms > usage_events.updated_at_ms \
+            THEN excluded.updated_at_ms ELSE usage_events.updated_at_ms END";
 
 impl Database {
     /// Open a database file, enable WAL mode, and run any pending migrations.
@@ -304,7 +363,10 @@ impl Database {
 
     // ── Usage events ──────────────────────────────────────────────────
 
-    /// Write a usage event with the given policy.
+    /// Write a usage event with the given policy. Uses 41‑column SQL that
+    /// omits `generation_id`, `dedupe_key`, and `is_sidechain` so the
+    /// dedupe_key unique index does not fire — this helper is exclusively
+    /// for tests where each event is a standalone row.
     pub fn write_usage_event(
         &self,
         event: &busytok_domain::NormalizedUsageEvent,
@@ -312,14 +374,13 @@ impl Database {
     ) -> Result<()> {
         debug!(id = %event.id, policy = ?policy, "writing usage event");
         let sql = match policy {
-            busytok_domain::UsageWritePolicy::InsertOnce => INSERT_USAGE_IGNORE,
-            busytok_domain::UsageWritePolicy::Replace => INSERT_USAGE_REPLACE,
+            busytok_domain::UsageWritePolicy::InsertOnce => WRITE_USAGE_IGNORE_SQL,
+            busytok_domain::UsageWritePolicy::Replace => WRITE_USAGE_REPLACE_SQL,
         };
-
         self.conn
             .execute(
                 sql,
-                params![
+                rusqlite::params![
                     event.id,
                     event.agent.as_str(),
                     event.source_file_id,
@@ -363,7 +424,6 @@ impl Database {
                 ],
             )
             .context("failed to write usage event")?;
-
         Ok(())
     }
 
@@ -1655,10 +1715,7 @@ impl Database {
             diagnostic_events = diag_count,
             "batch ingested"
         );
-        Ok(IngestResult {
-            inserted_event_ids,
-            replaced_event_ids: Vec::new(),
-        })
+        Ok(IngestResult { inserted_event_ids })
     }
 
     /// Comprehensive health check for the SQLite database.
@@ -1706,69 +1763,6 @@ impl Database {
         })
     }
 }
-
-/// SQL for INSERT OR IGNORE into usage_events.
-const INSERT_USAGE_IGNORE: &str = "\
-    INSERT OR IGNORE INTO usage_events (\
-        id, agent, source_file_id, source_path, source_line, \
-        source_offset_start, source_offset_end, session_id, turn_id, \
-        source_request_id, message_id, timestamp_ms, project_path, \
-        project_hash, cwd, model, model_provider, agent_version, \
-        client_kind, speed, input_tokens, output_tokens, total_tokens, \
-        cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
-        reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
-        estimated_cost_usd, cost_currency, cost_source, \
-        price_catalog_version, is_error, error_type, raw_event_hash, \
-        usage_limit_reset_time_ms, created_at_ms, updated_at_ms\
-    ) VALUES (\
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
-        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
-    )";
-
-/// SQL for upsert into usage_events preserving created_at_ms.
-///
-/// `INSERT OR REPLACE` deletes and re-inserts, resetting `created_at_ms`.
-/// This uses `ON CONFLICT DO UPDATE` to preserve the original creation time
-/// and advance `updated_at_ms` — required for Replace policy where
-/// delayed-token completion must not lose provenance.
-const INSERT_USAGE_REPLACE: &str = "\
-    INSERT INTO usage_events (\
-        id, agent, source_file_id, source_path, source_line, \
-        source_offset_start, source_offset_end, session_id, turn_id, \
-        source_request_id, message_id, timestamp_ms, project_path, \
-        project_hash, cwd, model, model_provider, agent_version, \
-        client_kind, speed, input_tokens, output_tokens, total_tokens, \
-        cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
-        reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
-        estimated_cost_usd, cost_currency, cost_source, \
-        price_catalog_version, is_error, error_type, raw_event_hash, \
-        usage_limit_reset_time_ms, created_at_ms, updated_at_ms\
-    ) VALUES (\
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
-        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
-    ) ON CONFLICT(id) DO UPDATE SET \
-        speed = excluded.speed, \
-        usage_limit_reset_time_ms = excluded.usage_limit_reset_time_ms, \
-        input_tokens = excluded.input_tokens, \
-        output_tokens = excluded.output_tokens, \
-        total_tokens = excluded.total_tokens, \
-        cached_input_tokens = excluded.cached_input_tokens, \
-        cache_creation_tokens = excluded.cache_creation_tokens, \
-        cache_read_tokens = excluded.cache_read_tokens, \
-        reasoning_tokens = excluded.reasoning_tokens, \
-        thoughts_tokens = excluded.thoughts_tokens, \
-        tool_tokens = excluded.tool_tokens, \
-        cost_usd = excluded.cost_usd, \
-        estimated_cost_usd = excluded.estimated_cost_usd, \
-        cost_source = excluded.cost_source, \
-        price_catalog_version = excluded.price_catalog_version, \
-        raw_event_hash = excluded.raw_event_hash, \
-        created_at_ms = usage_events.created_at_ms, \
-        updated_at_ms = CASE WHEN excluded.updated_at_ms > usage_events.updated_at_ms THEN excluded.updated_at_ms ELSE usage_events.updated_at_ms END";
 
 /// Map a query row to a `NormalizedUsageEvent`.
 fn row_to_usage_event(row: &rusqlite::Row<'_>) -> busytok_domain::NormalizedUsageEvent {

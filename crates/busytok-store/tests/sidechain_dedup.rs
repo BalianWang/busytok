@@ -288,3 +288,96 @@ fn effective_events_carry_delta_for_displacement() {
     let net: i64 = 100 + outcome.effective_events[0].total_tokens;
     assert_eq!(net, 80);
 }
+
+// ── Sidechain-vs-sidechain (both sides carry isSidechain:true) ─────────────
+
+#[test]
+fn higher_total_wins_when_both_sidechain() {
+    let db = Database::open_in_memory().unwrap();
+    let low = claude_event("claude:msg-s:req-a", "msg-s", true, 50);
+    let high = claude_event("claude:msg-s:req-b", "msg-s", true, 200);
+    let outcome =
+        upsert_usage_events_dedup_aware(db.conn(), &[low, high], &replace_policies(2), "gen-1")
+            .unwrap();
+    let row = surviving_row(db.conn(), "gen-1", "claude:msg:msg-s");
+    assert_eq!(row.total_tokens, 200);
+    assert_eq!(row.is_sidechain, 1, "survivor is also a sidechain entry");
+    assert_eq!(outcome.replaced, 1);
+}
+
+#[test]
+fn tie_keeps_existing_when_both_sidechain() {
+    let db = Database::open_in_memory().unwrap();
+    let first = claude_event("claude:msg-s:req-a", "msg-s", true, 100);
+    let second = claude_event("claude:msg-s:req-b", "msg-s", true, 100);
+    upsert_usage_events_dedup_aware(db.conn(), &[first, second], &replace_policies(2), "gen-1")
+        .unwrap();
+    let row = surviving_row(db.conn(), "gen-1", "claude:msg:msg-s");
+    assert_eq!(row.id, "claude:msg-s:req-a", "ties keep the existing row");
+    assert_eq!(row.is_sidechain, 1);
+}
+
+// ── Cost delta ──────────────────────────────────────────────────────────────
+
+#[test]
+fn cost_delta_correctly_computed_on_replacement() {
+    let db = Database::open_in_memory().unwrap();
+    let mut old = claude_event("claude:msg-1:req-old", "msg-1", false, 100);
+    old.cost_usd = Some(0.10);
+    old.estimated_cost_usd = Some(0.08);
+    let mut new_ev = claude_event("claude:msg-1:req-new", "msg-1", false, 200);
+    new_ev.cost_usd = Some(0.25);
+    new_ev.estimated_cost_usd = Some(0.20);
+    // Insert old, then replace with new (higher total).
+    upsert_usage_events_dedup_aware(db.conn(), &[old], &replace_policies(1), "gen-1").unwrap();
+    let outcome =
+        upsert_usage_events_dedup_aware(db.conn(), &[new_ev], &replace_policies(1), "gen-1")
+            .unwrap();
+    let delta = &outcome.effective_events[0];
+    assert_eq!(delta.total_tokens, 100, "token delta = 200 - 100");
+    assert!(
+        (delta.cost_usd.unwrap() - 0.15).abs() < 1e-9,
+        "cost delta = 0.25 - 0.10 ≈ 0.15"
+    );
+    assert!(
+        (delta.estimated_cost_usd.unwrap() - 0.12).abs() < 1e-9,
+        "estimated delta = 0.20 - 0.08 ≈ 0.12"
+    );
+}
+
+// ── Triple dedupe-key collision ─────────────────────────────────────────────
+
+#[test]
+fn triple_dedupe_key_collision_keeps_best_across_batches() {
+    let db = Database::open_in_memory().unwrap();
+    // Batch 1: low sidechain arrives first.
+    let sc_low = claude_event("claude:msg-1:req-sc1", "msg-1", true, 50);
+    upsert_usage_events_dedup_aware(db.conn(), &[sc_low], &replace_policies(1), "gen-1").unwrap();
+
+    // Batch 2: higher sidechain replaces it.
+    let sc_high = claude_event("claude:msg-1:req-sc2", "msg-1", true, 120);
+    let outcome2 =
+        upsert_usage_events_dedup_aware(db.conn(), &[sc_high], &replace_policies(1), "gen-1")
+            .unwrap();
+    assert_eq!(
+        outcome2.replaced, 1,
+        "higher-total sidechain displaces lower"
+    );
+
+    // Batch 3: parent (non-sidechain) wins over everything.
+    let parent = claude_event("claude:msg-1:req-p", "msg-1", false, 80);
+    let outcome3 =
+        upsert_usage_events_dedup_aware(db.conn(), &[parent], &replace_policies(1), "gen-1")
+            .unwrap();
+    assert_eq!(
+        outcome3.replaced, 1,
+        "parent displaces sidechain even with lower total"
+    );
+
+    let row = surviving_row(db.conn(), "gen-1", "claude:msg:msg-1");
+    assert_eq!(row.id, "claude:msg-1:req-p");
+    assert_eq!(row.total_tokens, 80);
+    assert_eq!(row.is_sidechain, 0);
+    // Exactly one row for this dedupe_key after three batches.
+    assert_eq!(count_for_dedupe(db.conn(), "gen-1", "claude:msg:msg-1"), 1);
+}

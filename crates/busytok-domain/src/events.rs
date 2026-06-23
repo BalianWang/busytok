@@ -299,9 +299,9 @@ pub struct ParseContext {
 /// Policy for how a usage event should be persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageWritePolicy {
-    /// Ignore duplicate inserts (idempotent). Used by Claude Code.
+    /// Ignore duplicate inserts (idempotent). Used by Codex.
     InsertOnce,
-    /// Replace existing row on re-insert.
+    /// Replace existing row on re-insert. Used by Claude Code.
     Replace,
 }
 
