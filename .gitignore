@@ -41,6 +41,7 @@ GEMINI.md
 
 # Superpowers planning artifacts (generated per-session, not source of truth)
 docs/superpowers/
+docs/bugs/
 
 # Worktree / planning scratch
 .worktrees/
