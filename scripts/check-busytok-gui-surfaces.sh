@@ -83,3 +83,57 @@ if rg -n --glob '*.css' --glob '!tokens.css' -e '#[0-9a-fA-F]{3,8}' apps/gui/src
   echo "Raw hex in CSS consumer file — consume a token"
   exit 1
 fi
+
+# ── Geist refactor Phase 3: metric-card--success CSS must not exist ──
+# Spec §6.3 + Phase 2 Task 4: success renders as neutral; the old
+# --success visual variant CSS rule is deleted. This scans CSS consumer
+# files only — TS test assertions that check the class is absent (e.g.
+# OverviewPanels.test.tsx .includes("metric-card--success")) are valid
+# and intentionally out of scope.
+if rg -n 'metric-card--success' apps/gui/src/styles --glob '*.css'; then
+  echo "metric-card--success CSS rule found — success renders as neutral (spec §6.3)"
+  exit 1
+fi
+
+# ── Geist refactor Phase 3: dark accent text uses accent-400 ─────────
+# Spec §4.2 rule + §5 rule 11 + §7: dark-theme selected/active accent
+# text must use the bright tier (--color-accent-400), not 500/600 which
+# are too dim on dark chrome. Scan for CSS rules under a dark-theme
+# selector whose color property references accent-500 or accent-600.
+# The awk tracks brace-nesting depth and detects :root[data-theme="dark"]
+# on the same line as the opening brace (the project's only dark-theme
+# selector form). When darkDepth is set, any `color: var(--color-accent-500|600)`
+# inside that block or its nested children is a violation.
+# Single-line CSS rules (e.g. `selector { prop: val; }`) are skipped
+# entirely in the closing-brace handler to avoid depth drift — they
+# contribute net-zero to the brace stack.
+if ! awk '
+  BEGIN { depth = 0; darkDepth = 0; bad = 0 }
+  /\}/ {
+    # Single-line CSS rule: { and } on same line → net zero depth change.
+    if ($0 ~ /\{/) { next }
+    if (darkDepth > 0 && depth == darkDepth) darkDepth = 0
+    depth--
+    next
+  }
+  /\{/ { depth++; if ($0 ~ /:root\[data-theme="dark"\]/) darkDepth = depth; next }
+  darkDepth > 0 && depth >= darkDepth && /color:.*var\(--color-accent-500\)|color:.*var\(--color-accent-600\)/ {
+    print FILENAME ":" NR ": dark accent text uses " substr($0, index($0, "accent-")) " instead of --color-accent-400"; bad = 1
+  }
+  END { exit bad ? 1 : 0 }
+' apps/gui/src/styles/components.css apps/gui/src/styles/pages.css; then
+  echo "Dark theme accent text must use --color-accent-400 (bright tier), not 500/600"
+  exit 1
+fi
+
+# ── Geist refactor Phase 3: DESIGN-SYSTEM.md must exist ──────────────
+if ! test -f DESIGN-SYSTEM.md; then
+  echo "DESIGN-SYSTEM.md (canonical visual contract) not found at repo root"
+  exit 1
+fi
+
+# ── Geist refactor Phase 3: THEME.md must NOT exist ──────────────────
+if test -f THEME.md; then
+  echo "THEME.md still exists — was deleted in Phase 3 (abandoned Sentri system)"
+  exit 1
+fi
