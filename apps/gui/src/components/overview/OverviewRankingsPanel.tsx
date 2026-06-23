@@ -42,8 +42,12 @@ export function OverviewRankingsPanel({ range }: OverviewRankingsPanelProps) {
           <h3 className="ranking-section__title">{section.title}</h3>
           {section.items.length > 0 ? (
             <div className="ranking-section__items">
-              {section.items.map((item) => (
-                <div key={item.id} className="ranking-item">
+              {section.items.map((item, idx) => (
+                <div
+                  key={item.id}
+                  data-rank={idx + 1}
+                  className={`ranking-item${idx === 0 ? " ranking-item--leader" : ""}`}
+                >
                   <span
                     className="ranking-item__bar"
                     style={{ width: `${item.bar_value}%` }}

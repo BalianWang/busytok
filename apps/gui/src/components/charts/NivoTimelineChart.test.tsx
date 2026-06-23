@@ -159,7 +159,9 @@ describe("NivoTimelineChart", () => {
 
     // Axis tick values are populated (not empty arrays).
     expect(props.axisBottom.tickValues.length).toBeGreaterThan(0);
-    expect(props.gridXValues.length).toBeGreaterThan(0);
+    // Vertical grid is intentionally off (empty); 4 horizontal reference lines.
+    expect(props.gridXValues).toEqual([]);
+    expect(props.gridYValues).toBe(4);
   });
 
   it("placeholder bars match range granularity and use date-based labels", () => {

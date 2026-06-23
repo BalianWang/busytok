@@ -192,8 +192,8 @@ export function NivoTimelineChart({
               return formatCompactNumber(num);
             },
           }}
-          gridXValues={axis.primaryGuideKeys}
-          gridYValues={5}
+          gridXValues={[]}
+          gridYValues={4}
           colors={[chartTokens.linePrimary]}
           motionConfig="gentle"
           padding={0.42}
