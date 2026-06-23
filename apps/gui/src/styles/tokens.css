@@ -120,6 +120,8 @@
   --space-6: 24px;
   --space-7: 32px;
   --space-12: 48px;
+  /* Section rhythm for the overview page shell (Phase 2). */
+  --space-section-gap: 24px;
 
   /* ── Fonts ──────────────────────────────────────────────────── */
   --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;

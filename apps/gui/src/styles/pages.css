@@ -3,8 +3,10 @@
 .overview-console {
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: var(--space-section-gap);
   padding-top: 8px;
+  max-width: 1600px;
+  margin-inline: auto;
 }
 
 .overview-console__status {
@@ -28,8 +30,10 @@
 
 /* ── Shared chart card ──────────────────────────────────────── */
 /* Trend + live-curve are the primary visual anchors of the overview
-   surface, so they sit one material layer up: a stronger surface and a
-   heavier shadow than the supporting ranking/recent panels below. */
+   surface (Tier A). They read as the strongest containers via the
+   solid --color-border (not the subtle border used by Tier B/C),
+   border-first with no shadow — the supporting ranking/recent panels
+   sit one material layer quieter below. */
 
 .overview-console__trend,
 .live-curve-panel {
@@ -38,8 +42,8 @@
   padding: 18px 22px 16px;
   border-radius: var(--radius-md);
   background: var(--color-surface);
-  border: 1px solid var(--color-border-subtle);
-  box-shadow: var(--material-shadow-card);
+  border: 1px solid var(--color-border);
+  box-shadow: none;
   overflow: hidden;
   min-width: 0;
 }
@@ -127,7 +131,8 @@
   border-radius: var(--radius-lg);
   background: var(--color-surface);
   border: 1px solid var(--color-border-subtle);
-  box-shadow: var(--material-shadow-card);
+  /* Tier B is border-first: surface + border-subtle, no shadow. */
+  box-shadow: none;
   overflow: hidden;
 }
 
@@ -902,15 +907,16 @@
 }
 
 /* ── Overview heatmap ────────────────────────────────────── */
-/* Heatmap is a primary visual anchor of the overview surface and sits
-   on the same elevated material layer as the trend chart. */
+/* Heatmap is a primary visual anchor of the overview surface (Tier A)
+   and sits on the same material layer as the trend chart: solid
+   --color-border, border-first, no shadow. */
 
 .overview-heatmap {
   padding: 18px 20px;
   border-radius: var(--radius-lg);
   background: var(--color-surface);
-  border: 1px solid var(--color-border-subtle);
-  box-shadow: var(--material-shadow-card);
+  border: 1px solid var(--color-border);
+  box-shadow: none;
 }
 
 .overview-heatmap__header {

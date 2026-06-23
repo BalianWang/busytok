@@ -51,6 +51,9 @@ describe("tokens.css contract", () => {
     expect(css).toContain("--space-6: 24px;");
     expect(css).toContain("--font-ui:");
 
+    // Phase 2 Task 5: section-gap rhythm token for the overview shell
+    expect(css).toContain("--space-section-gap: 24px;");
+
     // Phase 1 rename: new vocabulary exists, old names are gone.
     expect(css).toContain("--color-border-subtle:");
     expect(css).toContain("--color-surface-subtle:");
