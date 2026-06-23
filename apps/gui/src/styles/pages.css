@@ -167,40 +167,22 @@
   opacity: 0.85;
 }
 
-/* Tone variants — calm tinted wash + matching top accent. The wash is a
-   very low-opacity semantic tint layered into the surface so the card
-   still reads as part of the monitoring surface, not as a semantic
-   billboard. Number stays neutral text. */
-/* Neutral intentionally uses canvas-subtle (no semantic tint) rather than a
-   colored soft token, so it reads as "no signal" rather than a faint status. */
+/* Tone variants. The metric surface itself is never recolored — the
+   default is an opaque monitoring surface + border, and only
+   warning/danger carry a 2px top flag (danger additionally strengthens
+   the border) so exception state reads as a calm cue, not a billboard.
+   The number always stays neutral high-contrast text. */
+/* Default (neutral + success): no wash, no accent bar, border-only. */
 .metric-card--neutral {
-  background: color-mix(in srgb, var(--color-surface) 92%, var(--color-surface-subtle) 8%);
+  background: var(--color-surface);            /* opaque, no tint */
 }
-.metric-card--neutral .metric-card__top-accent {
-  background: var(--color-border);
-  opacity: 0.5;
-}
+/* success is gone as a visual variant — it is rendered as neutral. */
 
-.metric-card--success {
-  background: color-mix(in srgb, var(--color-surface) 90%, var(--color-status-success-soft) 10%);
-}
-.metric-card--success .metric-card__top-accent {
-  background: var(--color-status-success);
-}
-
-.metric-card--warning {
-  background: color-mix(in srgb, var(--color-surface) 90%, var(--color-status-warning-soft) 10%);
-}
-.metric-card--warning .metric-card__top-accent {
-  background: var(--color-status-warning);
-}
-
-.metric-card--danger {
-  background: color-mix(in srgb, var(--color-surface) 90%, var(--color-status-danger-soft) 10%);
-}
-.metric-card--danger .metric-card__top-accent {
-  background: var(--color-status-danger);
-}
+/* Exception cards: 2px top flag only; number + background stay neutral. */
+.metric-card--warning .metric-card__top-accent { background: var(--color-status-warning); }
+.metric-card--danger  .metric-card__top-accent { background: var(--color-status-danger); }
+.metric-card--warning { border-color: var(--color-border-subtle); }   /* keep neutral border; flag carries the signal */
+.metric-card--danger  { border-color: color-mix(in srgb, var(--color-status-danger) 45%, var(--color-border-subtle)); } /* stronger semantic container */
 
 /* ── Rankings ────────────────────────────────────────────── */
 /* Rankings sit one material layer quieter than the primary trend and

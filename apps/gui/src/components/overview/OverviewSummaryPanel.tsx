@@ -42,14 +42,21 @@ export function OverviewSummaryPanel({ range }: OverviewSummaryPanelProps) {
     <section className="overview-panel" aria-label="Overview summary">
       {/* Metric cards */}
       <div className="overview-console__metrics" aria-label="Metric cards">
-        {data.metrics.map((metric) => (
-          <div key={metric.id} className={`metric-card metric-card--${metric.tone}`}>
-            <div className="metric-card__top-accent" aria-hidden="true" />
-            <div className="metric-card__label">{metric.label.toUpperCase()}</div>
-            <div className="metric-card__value">{metric.value}</div>
-            {metric.helper && <div className="metric-card__helper">{metric.helper}</div>}
-          </div>
-        ))}
+        {data.metrics.map((metric) => {
+          // success reads as neutral (no semantic billboard); only
+          // warning/danger carry the exception flag.
+          const cardTone: "neutral" | "warning" | "danger" =
+            metric.tone === "warning" || metric.tone === "danger" ? metric.tone : "neutral";
+          const showsFlag = cardTone === "warning" || cardTone === "danger";
+          return (
+            <div key={metric.id} className={`metric-card metric-card--${cardTone}`}>
+              {showsFlag ? <div className="metric-card__top-accent" aria-hidden="true" /> : null}
+              <div className="metric-card__label">{metric.label.toUpperCase()}</div>
+              <div className="metric-card__value">{metric.value}</div>
+              {metric.helper ? <div className="metric-card__helper">{metric.helper}</div> : null}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
