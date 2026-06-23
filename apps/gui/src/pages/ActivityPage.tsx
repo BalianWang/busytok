@@ -16,6 +16,7 @@ import { useRefreshToolbar } from "../components/desktop/useRefreshToolbar";
 import { useCursorPageStack } from "../hooks/useCursorPageStack";
 import { safeReportEvent } from "../logging/reporter";
 import { formatCost, formatCacheHitRate } from "../lib/formatters";
+import { TokenBreakdown } from "../components/TokenBreakdown";
 
 const PAGE_LIMIT = 100;
 
@@ -115,55 +116,7 @@ function ActivityDetailContent({ itemId }: { itemId: string }) {
         <dd>{detail.model_label ?? "Unknown model"}</dd>
       </dl>
 
-      {tk && (() => {
-        return (
-        <section>
-          <h3>Tokens</h3>
-          <dl>
-            <dt>Total</dt>
-            <dd>{tk.total_tokens.toLocaleString()}</dd>
-            {tk.prompt_input_total_tokens != null && (
-              <>
-                <dt>Prompt Input (Total)</dt>
-                <dd>{tk.prompt_input_total_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            {tk.prompt_input_non_cached_tokens != null && (
-              <>
-                <dt>Prompt Input (Non-cached)</dt>
-                <dd>{tk.prompt_input_non_cached_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            {tk.cache_read_tokens != null && (
-              <>
-                <dt>Cache Read</dt>
-                <dd>{tk.cache_read_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            {tk.cache_write_tokens != null && (
-              <>
-                <dt>Cache Write</dt>
-                <dd>{tk.cache_write_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            <dt>Cache Hit Rate</dt>
-            <dd>{formatCacheHitRate(tk?.cache_hit_rate ?? null)}</dd>
-            {tk.output_tokens != null && (
-              <>
-                <dt>Output</dt>
-                <dd>{tk.output_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            {tk.reasoning_tokens != null && (
-              <>
-                <dt>Reasoning</dt>
-                <dd>{tk.reasoning_tokens.toLocaleString()}</dd>
-              </>
-            )}
-          </dl>
-        </section>
-        );
-      })()}
+      {tk && <TokenBreakdown tk={tk} />}
 
       <section>
         <h3>Cost</h3>
