@@ -111,7 +111,7 @@ function OverviewRecentActivity({ range }: { range: RangePresetDto }) {
     return (
       <section className="overview-console__recent" aria-label="Recent activity">
         <h3>Recent Activity</h3>
-        <LedgerTable readOnly ariaLabel="Recent activity" columns={RECENT_COLUMNS} rows={[]} />
+        <p className="overview-panel__error">Recent activity unavailable</p>
       </section>
     );
   }
