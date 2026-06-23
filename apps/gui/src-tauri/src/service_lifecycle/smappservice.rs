@@ -60,6 +60,7 @@ use super::command_runner::{
 };
 use super::launchd_job_snapshot::LaunchdJobSnapshot;
 use super::managed_launch_agent::{ensure_managed_plist_current, managed_plist_path};
+use super::proc_pidpath::executable_path_for_pid;
 use super::smappservice_bridge::{MainThreadExecutor, SMAppServiceHandle, SMServiceStatus};
 use super::{EnsureRunningOutcome, InstallOutcome, LifecycleStatus, ServiceLifecycle};
 
@@ -440,20 +441,83 @@ impl SmAppServiceLifecycle {
         &self,
         print_status: Option<CommandStatus>,
     ) -> Result<EnsureRunningOutcome> {
-        // Inspect the launchd job snapshot to detect a stale bundle path.
-        if let Some(print_status) = print_status {
-            if let Ok(snapshot) = LaunchdJobSnapshot::parse(&print_status.stdout) {
-                let desired = self.layout.service_binary_path();
-                if let Some(registered) = snapshot.program_path() {
-                    if registered != desired {
-                        info!(
-                            event_code = "service_lifecycle.smappservice.detected_stale_bundle",
-                            session_id = %crate::logging::tauri_session_id(),
-                            registered = %registered.display(),
-                            desired = %desired.display(),
-                            "service registered to stale bundle path; repairing"
+        // Inspect the launchd job snapshot for three identity checks.
+        let snapshot: Option<LaunchdJobSnapshot> = print_status
+            .as_ref()
+            .and_then(|s| LaunchdJobSnapshot::parse(&s.stdout).ok());
+
+        if let Some(ref snapshot) = snapshot {
+            // 1. Stale bundle path — launchd's registered program path
+            //    differs from the current bundle's service binary.
+            let desired = self.layout.service_binary_path();
+            if let Some(registered) = snapshot.program_path() {
+                if registered != desired {
+                    info!(
+                        event_code = "service_lifecycle.smappservice.detected_stale_bundle",
+                        session_id = %crate::logging::tauri_session_id(),
+                        registered = %registered.display(),
+                        desired = %desired.display(),
+                        "service registered to stale bundle path; repairing"
+                    );
+                    return self.repair_via_ladder(RepairReason::StaleBundle);
+                }
+            }
+
+            // 2. Stale live process — launchd metadata says the job is
+            //    registered to the current bundle, but the actual running
+            //    PID's executable is outside the bundle (e.g. a trashed
+            //    old build still holding the control socket). This is the
+            //    identity gap identified in the stale-live-service bug.
+            if let Some(pid) = snapshot.pid() {
+                match executable_path_for_pid(pid) {
+                    Ok(Some(live_path)) => {
+                        // Canonicalize both for comparison — /Applications
+                        // vs /private/var/.../Trash resolve differently
+                        // even after symlink resolution.
+                        let desired_canon = std::fs::canonicalize(&desired)
+                            .unwrap_or_else(|_| desired.clone());
+                        let live_canon = std::fs::canonicalize(&live_path)
+                            .unwrap_or_else(|_| live_path.clone());
+                        if live_canon != desired_canon {
+                            info!(
+                                event_code = "service_lifecycle.smappservice.detected_stale_live_process",
+                                session_id = %crate::logging::tauri_session_id(),
+                                pid = pid,
+                                live_executable = %live_path.display(),
+                                desired_executable = %desired.display(),
+                                "live PID executable is outside the current bundle; repairing"
+                            );
+                            crate::logging::append_bootstrap_event(
+                                "INFO",
+                                "service_lifecycle.smappservice.detected_stale_live_process",
+                                "live PID executable is outside the current bundle; repairing",
+                                Some(serde_json::json!({
+                                    "pid": pid,
+                                    "live_executable": live_path.display().to_string(),
+                                    "desired_executable": desired.display().to_string(),
+                                })),
+                            );
+                            return self.repair_via_ladder(RepairReason::StaleLiveProcess);
+                        }
+                    }
+                    Ok(None) => {
+                        // PID exited between snapshot and inspection —
+                        // treat as missing, fall through to socket check.
+                        tracing::debug!(
+                            event_code = "service_lifecycle.smappservice.pid_exited",
+                            pid = pid,
+                            "live PID exited between snapshot and inspection"
                         );
-                        return self.repair_via_ladder(RepairReason::StaleBundle);
+                    }
+                    Err(e) => {
+                        // proc_pidpath failed unexpectedly — log and
+                        // continue; don't block bootstrap on this.
+                        warn!(
+                            event_code = "service_lifecycle.smappservice.proc_pidpath_failed",
+                            pid = pid,
+                            error = %e,
+                            "proc_pidpath failed; skipping live-PID identity check"
+                        );
                     }
                 }
             }
@@ -496,16 +560,42 @@ impl SmAppServiceLifecycle {
             }
         }
 
-        // Healthy registration. Either already running, or kickstart.
+        // 3. Socket reachability. If the socket is ready (marker + path
+        //    exist), the service is healthy.
         if self.socket_ready()? {
-            Ok(EnsureRunningOutcome::AlreadyRunning)
-        } else {
-            launchctl_kickstart_strict(&*self.runner, &self.service_label())?;
-            self.wait_for_socket_ready()?;
-            Ok(EnsureRunningOutcome::Started {
-                install_outcome: InstallOutcome::AlreadyPresent,
-            })
+            return Ok(EnsureRunningOutcome::AlreadyRunning);
         }
+
+        // 4. Socket unreachable. If launchd says the job is running, a
+        //    plain `kickstart` is a no-op — launchd will not restart an
+        //    already-running process. Force a full repair instead so the
+        //    stale process (if any) is replaced.
+        let job_is_running = snapshot
+            .as_ref()
+            .and_then(|s| s.state())
+            .map(|s| s == "running")
+            .unwrap_or(false);
+        if job_is_running {
+            info!(
+                event_code = "service_lifecycle.smappservice.detected_socket_unreachable",
+                session_id = %crate::logging::tauri_session_id(),
+                "launchd reports job running but control socket is unreachable; repairing"
+            );
+            crate::logging::append_bootstrap_event(
+                "INFO",
+                "service_lifecycle.smappservice.detected_socket_unreachable",
+                "launchd reports job running but control socket is unreachable; repairing",
+                None,
+            );
+            return self.repair_via_ladder(RepairReason::SocketUnreachable);
+        }
+
+        // 5. Job is registered but not running — kickstart is sufficient.
+        launchctl_kickstart_strict(&*self.runner, &self.service_label())?;
+        self.wait_for_socket_ready()?;
+        Ok(EnsureRunningOutcome::Started {
+            install_outcome: InstallOutcome::AlreadyPresent,
+        })
     }
 
     fn ladder_registered_present(&self) -> Result<EnsureRunningOutcome> {
@@ -544,6 +634,12 @@ impl SmAppServiceLifecycle {
             RepairReason::StaleBundle => {
                 "service_lifecycle.smappservice.repaired_after_stale_bundle"
             }
+            RepairReason::StaleLiveProcess => {
+                "service_lifecycle.smappservice.repaired_after_stale_live_process"
+            }
+            RepairReason::SocketUnreachable => {
+                "service_lifecycle.smappservice.repaired_after_socket_unreachable"
+            }
             RepairReason::VersionSkew => {
                 "service_lifecycle.smappservice.repaired_after_version_skew"
             }
@@ -564,6 +660,12 @@ impl SmAppServiceLifecycle {
 #[derive(Debug, Clone, Copy)]
 enum RepairReason {
     StaleBundle,
+    StaleLiveProcess,
+    /// launchd says the job is loaded+running but the control socket is
+    /// unreachable — a `kickstart` cannot replace a running process, so
+    /// the ladder must `bootout → bootstrap → kickstart` to force a fresh
+    /// service instance.
+    SocketUnreachable,
     VersionSkew,
 }
 
