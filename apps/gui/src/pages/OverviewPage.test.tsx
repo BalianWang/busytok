@@ -175,13 +175,30 @@ describe("OverviewPage", () => {
       document.querySelector(".metric-card__left-accent"),
     ).toBeNull();
 
-    // New direction guard: every rendered metric card must opt into the
-    // calm top-accent treatment instead.
+    // New direction guard (Phase 2 conditional top-accent model): the
+    // top-accent flag is NOT universal. Neutral cards (the calm default —
+    // including success, which renders as neutral) carry no accent bar;
+    // only exception cards (warning/danger) get the 2px top flag. This is
+    // the observable signal that tone is now carried by an exception flag
+    // rather than a left border strip. Assert the conditional contract
+    // against the rendered cards.
     const cards = document.querySelectorAll(".metric-card");
     expect(cards.length).toBeGreaterThan(0);
     cards.forEach((card) => {
-      expect(card.querySelector(".metric-card__top-accent")).not.toBeNull();
+      const isException =
+        card.classList.contains("metric-card--warning") ||
+        card.classList.contains("metric-card--danger");
+      if (isException) {
+        expect(card.querySelector(".metric-card__top-accent")).not.toBeNull();
+      } else {
+        expect(card.querySelector(".metric-card__top-accent")).toBeNull();
+      }
     });
+    // The fixture (success, neutral, warning) yields one warning card, so
+    // exactly one top-accent flag should be present overall.
+    expect(
+      document.querySelectorAll(".metric-card__top-accent").length,
+    ).toBe(1);
   });
 
   it("keeps metric values as neutral high-contrast text (helper copy may carry tone, the number must not)", () => {
