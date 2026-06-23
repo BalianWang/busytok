@@ -149,6 +149,14 @@ pub struct ActivityListRow {
     pub total_tokens: i64,
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
+    /// Unified: total prompt input including the cacheable portion.
+    pub prompt_input_total_tokens: i64,
+    /// Unified: prompt input not served from cache.
+    pub prompt_input_non_cached_tokens: i64,
+    /// Unified: prompt input served from cache (cache hit).
+    pub cache_read_tokens: i64,
+    /// Unified: prompt input written to cache (cache fill / alias for cache_write).
+    pub cache_creation_tokens: i64,
     pub cost_usd: Option<f64>,
     pub is_error: bool,
 }
@@ -300,6 +308,12 @@ pub struct ActivityDetailRow {
     pub raw_event_hash: Option<String>,
     pub usage_limit_reset_time_ms: Option<i64>,
     pub generation_id: Option<String>,
+    /// Unified: total prompt input including the cacheable portion.
+    pub prompt_input_total_tokens: i64,
+    /// Unified: prompt input not served from cache.
+    pub prompt_input_non_cached_tokens: i64,
+    /// Discriminator recording how the raw provider payload reported tokens.
+    pub provider_payload_shape: String,
 }
 
 /// A single breakdown group row.
@@ -328,10 +342,19 @@ pub struct BreakdownTotalsRow {
 }
 
 /// Token component totals for a single model detail view.
+///
+/// The unified sums (`prompt_input_*`, `cache_read_tokens`,
+/// `cache_creation_tokens`) are the cross-provider product metrics;
+/// `cached_input_tokens` is retained as the raw provider audit value.
 #[derive(Debug, Clone)]
 pub struct ModelTokenBreakdownRow {
+    pub prompt_input_total_tokens: i64,
+    pub prompt_input_non_cached_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Raw provider audit value (kept for auditing, not for product metrics).
     pub cached_input_tokens: i64,
     pub reasoning_tokens: i64,
 }
