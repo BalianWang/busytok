@@ -16,6 +16,7 @@ import { useRefreshToolbar } from "../components/desktop/useRefreshToolbar";
 import { useCursorPageStack } from "../hooks/useCursorPageStack";
 import { safeReportEvent } from "../logging/reporter";
 import { formatCost, formatCacheHitRate } from "../lib/formatters";
+import { TokenBreakdown } from "../components/TokenBreakdown";
 
 const PAGE_LIMIT = 100;
 
@@ -115,46 +116,7 @@ function ActivityDetailContent({ itemId }: { itemId: string }) {
         <dd>{detail.model_label ?? "Unknown model"}</dd>
       </dl>
 
-      {tk && (() => {
-        const cacheHitRate = tk.input_tokens != null && tk.input_tokens > 0
-          ? (tk.cached_input_tokens ?? 0) / tk.input_tokens
-          : null;
-        return (
-        <section>
-          <h3>Tokens</h3>
-          <dl>
-            <dt>Total</dt>
-            <dd>{tk.total_tokens.toLocaleString()}</dd>
-            {tk.input_tokens != null && (
-              <>
-                <dt>Input</dt>
-                <dd>{tk.input_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            {tk.output_tokens != null && (
-              <>
-                <dt>Output</dt>
-                <dd>{tk.output_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            {tk.cached_input_tokens != null && (
-              <>
-                <dt>Cached</dt>
-                <dd>{tk.cached_input_tokens.toLocaleString()}</dd>
-              </>
-            )}
-            <dt>Cache Hit</dt>
-            <dd>{formatCacheHitRate(cacheHitRate)}</dd>
-            {tk.reasoning_tokens != null && (
-              <>
-                <dt>Reasoning</dt>
-                <dd>{tk.reasoning_tokens.toLocaleString()}</dd>
-              </>
-            )}
-          </dl>
-        </section>
-        );
-      })()}
+      {tk && <TokenBreakdown tk={tk} />}
 
       <section>
         <h3>Cost</h3>

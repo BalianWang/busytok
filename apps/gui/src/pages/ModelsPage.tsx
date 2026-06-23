@@ -16,6 +16,7 @@ import { NivoTimelineChart } from "../components/charts/NivoTimelineChart";
 import { StatusPill } from "../components/desktop/StatusPill";
 import { buildTimelineBars } from "../lib/chartGrammar";
 import { formatRelativeTime, formatCost } from "../lib/formatters";
+import { TokenBreakdown } from "../components/TokenBreakdown";
 
 // ── Ledger row type and mapping ─────────────────────────────────────────────
 
@@ -92,37 +93,7 @@ function ModelDetailContent({
   return (
     <div className="detail-stack">
       {/* Token breakdown */}
-      <section>
-        <h3>Token Breakdown</h3>
-        <dl>
-          <dt>Total</dt>
-          <dd>{tk.total_tokens.toLocaleString()}</dd>
-          {tk.input_tokens != null && (
-            <>
-              <dt>Input</dt>
-              <dd>{tk.input_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.output_tokens != null && (
-            <>
-              <dt>Output</dt>
-              <dd>{tk.output_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.cached_input_tokens != null && (
-            <>
-              <dt>Cached</dt>
-              <dd>{tk.cached_input_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.reasoning_tokens != null && (
-            <>
-              <dt>Reasoning</dt>
-              <dd>{tk.reasoning_tokens.toLocaleString()}</dd>
-            </>
-          )}
-        </dl>
-      </section>
+      <TokenBreakdown tk={tk} />
 
       {/* Trend chart */}
       {timelineBars.length > 0 && (

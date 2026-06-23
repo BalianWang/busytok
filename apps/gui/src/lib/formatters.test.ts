@@ -208,6 +208,15 @@ describe("formatCompactNumber", () => {
 });
 
 describe("formatCacheHitRate", () => {
+  // Scenario 5 contract: null/NaN/Infinity → "--", rate never exceeds 100%,
+  // and 99% reads as "99.00%" (not collapsed to 100%).
+  it("formats null as -- and never exceeds 100%", () => {
+    expect(formatCacheHitRate(null)).toBe("--");
+    expect(formatCacheHitRate(1.0)).toBe("100.00%");
+    expect(formatCacheHitRate(0.99)).toBe("99.00%");
+    expect(formatCacheHitRate(0.0)).toBe("0%");
+  });
+
   it("returns -- for null", () => {
     expect(formatCacheHitRate(null)).toBe("--");
   });

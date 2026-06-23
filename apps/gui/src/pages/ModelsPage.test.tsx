@@ -91,6 +91,11 @@ function makeModelDetail(
       buckets: [],
     },
     token_breakdown: {
+      prompt_input_total_tokens: 30000,
+      prompt_input_non_cached_tokens: 25000,
+      cache_read_tokens: 5000,
+      cache_write_tokens: 0,
+      cache_hit_rate: 0.16666,
       total_tokens: 50000,
       input_tokens: 30000,
       output_tokens: 20000,
@@ -262,6 +267,11 @@ describe("ModelsPage", () => {
     const detail = makeModelDetail({
       id: "model-click",
       token_breakdown: {
+        prompt_input_total_tokens: 20000,
+        prompt_input_non_cached_tokens: 20000,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0.0,
         total_tokens: 30000,
         input_tokens: 20000,
         output_tokens: 10000,
@@ -280,7 +290,8 @@ describe("ModelsPage", () => {
     });
     expect(screen.getByText("Token Breakdown")).toBeDefined();
     expect(screen.getByText("30,000")).toBeDefined();
-    expect(screen.getByText("20,000")).toBeDefined();
+    // "20,000" appears for both Prompt Input (Total) and Input tokens.
+    expect(screen.getAllByText("20,000").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("10,000")).toBeDefined();
   });
 
@@ -395,6 +406,44 @@ describe("ModelsPage", () => {
       expect(screen.getByText("Projects (1)")).toBeDefined();
     });
     expect(screen.getByText("my-app")).toBeDefined();
+  });
+
+  it("displays recent activity in detail drawer", async () => {
+    const item = makeModelItem({ id: "model-recent", label: "recent-model" });
+    const detail = makeModelDetail({
+      id: "model-recent",
+      recent_activity: [
+        {
+          id: "a1",
+          happened_at_ms: Date.now() - 600_000,
+          client_id: "claude-code",
+          client_label: "Claude Code",
+          source_id: null,
+          source_label: null,
+          source_root_path: null,
+          project_hash: null,
+          project_label: "my-app",
+          model_id: "claude-sonnet-4",
+          model_label: "claude-sonnet-4",
+          tokens: 1234,
+          cost_usd: 0.01,
+          cost_status: "exact",
+          cache_hit_rate: 0.99,
+          status: "ok",
+          detail_available: true,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    mockSuccess(makeResponse({}, [item]), detail);
+    render(<ModelsPage />);
+
+    await user.click(screen.getByText("recent-model"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Recent Activity (1)")).toBeDefined();
+    });
+    expect(screen.getByText("claude-sonnet-4")).toBeDefined();
   });
 
   it("displays technical details in drawer", async () => {

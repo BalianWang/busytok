@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 #![allow(
     clippy::await_holding_lock,
     clippy::too_many_arguments,
@@ -991,4 +992,322 @@ fn durable_event_sequence_survives_restart() {
         latest, 8,
         "latest_event_seq should be 8 after second allocation"
     );
+}
+
+// ── Cache-metric diagnostic lifecycle (F1/F2/F3/F4/F5) ───────────────────────
+//
+// Contract: a `cache_metric` diagnostic (id `cache-metric-violation:{event_id}`)
+// exists ⇔ that event's CURRENT persisted unified fields violate the
+// cache-metric invariant. These tests pin each mutation path to the contract.
+
+use busytok_domain::UsageWritePolicy;
+
+/// Count cache_metric diagnostics for a given event id.
+fn count_cache_metric_diag(db: &Database, event_id: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostic_events \
+             WHERE id = ?1 AND code = 'cache_metric'",
+            rusqlite::params![format!("cache-metric-violation:{event_id}")],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A Claude event with VIOLATING unified fields (cache exceeds total). The
+/// invariant is `cache_read + cache_write + non_cached == total`; here
+/// 800 + 0 + 10 = 810 != 10.
+fn violating_event(id: &str) -> NormalizedUsageEvent {
+    let mut e = NormalizedUsageEvent::minimal_for_test(id, AgentKind::ClaudeCode);
+    e.dedupe_key = Some(format!("claude:msg:{id}"));
+    e.provider_payload_shape = busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
+    e.prompt_input_total_tokens = 10;
+    e.prompt_input_non_cached_tokens = 10;
+    e.cache_read_tokens = 800;
+    e.cache_creation_tokens = 0;
+    e.total_tokens = 1000;
+    e
+}
+
+/// A Claude event with VALID unified fields (1000 == 800 + 0 + 200).
+fn valid_event(id: &str) -> NormalizedUsageEvent {
+    let mut e = NormalizedUsageEvent::minimal_for_test(id, AgentKind::ClaudeCode);
+    e.dedupe_key = Some(format!("claude:msg:{id}"));
+    e.provider_payload_shape = busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative;
+    e.prompt_input_total_tokens = 1000;
+    e.prompt_input_non_cached_tokens = 200;
+    e.cache_read_tokens = 800;
+    e.cache_creation_tokens = 0;
+    e.total_tokens = 1000;
+    e
+}
+
+// F2: InsertOnce no-op must not sync the diagnostic against an unpersisted event.
+#[test]
+fn f2_insertonce_noop_does_not_sync_diagnostic() {
+    let db = Database::open_in_memory().unwrap();
+
+    // First write: VALID event persisted → no diagnostic.
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[valid_event("evt-x")],
+        &[UsageWritePolicy::InsertOnce],
+        "gen-1",
+    )
+    .unwrap();
+    assert_eq!(count_cache_metric_diag(&db, "evt-x"), 0);
+
+    // Second write with the SAME id but VIOLATING fields is an INSERT OR IGNORE
+    // no-op (changes == 0): the persisted row is still the valid first write,
+    // so NO diagnostic must appear.
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[violating_event("evt-x")],
+        &[UsageWritePolicy::InsertOnce],
+        "gen-1",
+    )
+    .unwrap();
+    assert_eq!(
+        count_cache_metric_diag(&db, "evt-x"),
+        0,
+        "InsertOnce no-op must not sync diagnostic to unpersisted event"
+    );
+
+    // Sanity: a genuinely new id with violating fields DOES produce a diagnostic
+    // (sync runs only when changes > 0).
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[violating_event("evt-y")],
+        &[UsageWritePolicy::InsertOnce],
+        "gen-1",
+    )
+    .unwrap();
+    assert_eq!(count_cache_metric_diag(&db, "evt-y"), 1);
+}
+
+// F1: dedupe eviction must delete the evicted row's diagnostic.
+#[test]
+fn f1_dedupe_eviction_deletes_evicted_diagnostic() {
+    let db = Database::open_in_memory().unwrap();
+
+    // Write A (violating) with a dedupe key. Replace policy so it persists and
+    // gets a diagnostic.
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[violating_event("id-a")],
+        &[UsageWritePolicy::Replace],
+        "gen-1",
+    )
+    .unwrap();
+    assert_eq!(count_cache_metric_diag(&db, "id-a"), 1);
+
+    // Write B: different id, SAME dedupe key, higher total_tokens so it wins,
+    // and VALID unified fields so it must have NO diagnostic. A is evicted.
+    let mut b = valid_event("id-b");
+    b.dedupe_key = Some("claude:msg:id-a".to_string()); // collide with A's key
+    b.total_tokens = 5000; // strictly higher than A's 1000 → wins
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[b],
+        &[UsageWritePolicy::Replace],
+        "gen-1",
+    )
+    .unwrap();
+
+    assert_eq!(
+        count_cache_metric_diag(&db, "id-a"),
+        0,
+        "evicted id-a's diagnostic must be deleted"
+    );
+    assert_eq!(
+        count_cache_metric_diag(&db, "id-b"),
+        0,
+        "valid replacement id-b must have no diagnostic"
+    );
+}
+
+// F3: replay must sync the diagnostic for the replayed event.
+#[test]
+fn f3_replay_syncs_diagnostic_on_violation() {
+    let db = Database::open_in_memory().unwrap();
+
+    // Build a replay JSON mirroring the real tail-replay snapshot shape.
+    let base = || -> serde_json::Value {
+        serde_json::json!({
+            "id": "evt-replay",
+            "agent": "claude_code",
+            "source_file_id": "sf-1",
+            "source_path": "/tmp/test.jsonl",
+            "source_line": 1,
+            "source_offset_start": 0,
+            "source_offset_end": 100,
+            "session_id": "sess-1",
+            "turn_id": "",
+            "source_request_id": "",
+            "message_id": "",
+            "timestamp_ms": 5000,
+            "project_path": "/project",
+            "project_hash": "abc",
+            "cwd": "/project",
+            "model": "claude-sonnet-4-5",
+            "model_provider": "anthropic",
+            "agent_version": "1.0",
+            "client_kind": "cli",
+            "input_tokens": 50,
+            "output_tokens": 50,
+            "total_tokens": 100,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "reasoning_tokens": 0,
+            "thoughts_tokens": 0,
+            "tool_tokens": 0,
+            "cost_usd": null,
+            "estimated_cost_usd": null,
+            "cost_currency": "USD",
+            "cost_source": "unknown",
+            "price_catalog_version": "",
+            "is_error": 0,
+            "error_type": null,
+            "raw_event_hash": "",
+            "usage_limit_reset_time_ms": null,
+            "created_at_ms": 5000,
+            "updated_at_ms": 5000,
+            "provider_payload_shape": "anthropic_native",
+            "prompt_input_total_tokens": 0,
+            "prompt_input_non_cached_tokens": 0,
+        })
+    };
+
+    // Violating replay: cache_read exceeds total (800 + 0 + 10 != 10).
+    let mut v = base();
+    v["id"] = serde_json::json!("evt-bad");
+    v["prompt_input_total_tokens"] = serde_json::json!(10);
+    v["prompt_input_non_cached_tokens"] = serde_json::json!(10);
+    v["cache_read_tokens"] = serde_json::json!(800);
+    write_queries::enqueue_tail_replay_rows(
+        db.conn(),
+        &[write_queries::TailReplayEnqueue {
+            source_file_id: "file-a".to_string(),
+            event_seq: 1,
+            event_data_json: v.to_string(),
+        }],
+    )
+    .unwrap();
+    write_queries::apply_replay_rows_to_target_generation(db.conn(), "gen-target", None, 10)
+        .unwrap();
+    assert_eq!(
+        count_cache_metric_diag(&db, "evt-bad"),
+        1,
+        "replayed violating event must produce a diagnostic"
+    );
+
+    // Valid replay: 1000 == 800 + 0 + 200. No diagnostic.
+    let mut g = base();
+    g["id"] = serde_json::json!("evt-good");
+    g["prompt_input_total_tokens"] = serde_json::json!(1000);
+    g["prompt_input_non_cached_tokens"] = serde_json::json!(200);
+    g["cache_read_tokens"] = serde_json::json!(800);
+    write_queries::enqueue_tail_replay_rows(
+        db.conn(),
+        &[write_queries::TailReplayEnqueue {
+            source_file_id: "file-b".to_string(),
+            event_seq: 2,
+            event_data_json: g.to_string(),
+        }],
+    )
+    .unwrap();
+    write_queries::apply_replay_rows_to_target_generation(db.conn(), "gen-target", None, 10)
+        .unwrap();
+    assert_eq!(
+        count_cache_metric_diag(&db, "evt-good"),
+        0,
+        "replayed valid event must produce no diagnostic"
+    );
+}
+
+// F4: usage prune must delete cache_metric diagnostics for pruned ids.
+#[test]
+fn f4_usage_prune_deletes_diagnostics_for_pruned_ids() {
+    let db = Database::open_in_memory().unwrap();
+
+    // A violating event with an OLD timestamp (before the 24h cutoff).
+    let mut old = violating_event("evt-old");
+    old.timestamp_ms = busytok_domain::now_ms() - 86_400_000 - 1000; // > 24h ago
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[old],
+        &[UsageWritePolicy::Replace],
+        "gen-1",
+    )
+    .unwrap();
+    assert_eq!(count_cache_metric_diag(&db, "evt-old"), 1);
+
+    write_queries::prune_usage_events(db.conn(), "gen-1").unwrap();
+
+    assert_eq!(
+        count_cache_metric_diag(&db, "evt-old"),
+        0,
+        "diagnostic for pruned usage event must be deleted"
+    );
+}
+
+// F5: diagnostic prune must NOT age/count-prune cache_metric diagnostics.
+#[test]
+fn f5_diagnostic_prune_excludes_cache_metric() {
+    let db = Database::open_in_memory().unwrap();
+
+    // An OLD cache_metric diagnostic (far in the past) for a live event.
+    let mut old_cm = violating_event("evt-live");
+    old_cm.timestamp_ms = busytok_domain::now_ms();
+    write_queries::upsert_usage_events_dedup_aware(
+        db.conn(),
+        &[old_cm],
+        &[UsageWritePolicy::Replace],
+        "gen-1",
+    )
+    .unwrap();
+    // Force its created_at into the distant past so age-pruning would normally
+    // remove it.
+    db.conn()
+        .execute(
+            "UPDATE diagnostic_events SET created_at_ms = 1 \
+             WHERE id = 'cache-metric-violation:evt-live'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(count_cache_metric_diag(&db, "evt-live"), 1);
+
+    // Also seed an OLD non-cache_metric diagnostic that SHOULD be pruned.
+    db.conn()
+        .execute(
+            "INSERT OR REPLACE INTO diagnostic_events \
+             (id, agent, source_id, source_file_id, source_path, source_line, \
+              severity, code, message, details_json, happened_at_ms, created_at_ms) \
+             VALUES ('d-old', NULL, NULL, NULL, NULL, NULL, 'info', 'parse_error', \
+                     'msg', NULL, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+    // Cutoff well past both diagnostics' created_at (1).
+    let deleted =
+        write_queries::prune_diagnostic_events(db.conn(), busytok_domain::now_ms()).unwrap();
+    assert_eq!(deleted, 1, "only the non-cache_metric diagnostic is pruned");
+
+    assert_eq!(
+        count_cache_metric_diag(&db, "evt-live"),
+        1,
+        "cache_metric diagnostic survives age pruning"
+    );
+
+    let non_cm: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostic_events WHERE id = 'd-old'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(non_cm, 0, "non-cache_metric diagnostic was pruned");
 }

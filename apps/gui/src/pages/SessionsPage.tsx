@@ -13,6 +13,7 @@ import type {
 import { useBreakdownDetail } from "../api/useBusytokData";
 import { BreakdownLedgerPage } from "./BreakdownLedgerPage";
 import { formatRelativeTime, formatDateTime, formatCost } from "../lib/formatters";
+import { TokenBreakdown } from "../components/TokenBreakdown";
 import { StatusPill } from "../components/desktop/StatusPill";
 
 // ── Ledger row type and mapping ─────────────────────────────────────────────
@@ -108,37 +109,7 @@ function SessionDetailContent({
       </dl>
 
       {/* Token breakdown */}
-      <section>
-        <h3>Token Breakdown</h3>
-        <dl>
-          <dt>Total</dt>
-          <dd>{tk.total_tokens.toLocaleString()}</dd>
-          {tk.input_tokens != null && (
-            <>
-              <dt>Input</dt>
-              <dd>{tk.input_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.output_tokens != null && (
-            <>
-              <dt>Output</dt>
-              <dd>{tk.output_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.cached_input_tokens != null && (
-            <>
-              <dt>Cached</dt>
-              <dd>{tk.cached_input_tokens.toLocaleString()}</dd>
-            </>
-          )}
-          {tk.reasoning_tokens != null && (
-            <>
-              <dt>Reasoning</dt>
-              <dd>{tk.reasoning_tokens.toLocaleString()}</dd>
-            </>
-          )}
-        </dl>
-      </section>
+      <TokenBreakdown tk={tk} />
 
       {/* Chronological timeline */}
       {d.timeline.length > 0 && (

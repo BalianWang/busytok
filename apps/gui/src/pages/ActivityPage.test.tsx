@@ -99,6 +99,11 @@ function makeDetail(
     status: "ok",
     tokens: 1500,
     token_breakdown: {
+      prompt_input_total_tokens: 800,
+      prompt_input_non_cached_tokens: 700,
+      cache_read_tokens: 100,
+      cache_write_tokens: 0,
+      cache_hit_rate: 0.125,
       input_tokens: 800,
       output_tokens: 700,
       cached_input_tokens: 100,
@@ -351,6 +356,11 @@ describe("ActivityPage", () => {
     const detail = makeDetail({
       id: "evt-detail",
       token_breakdown: {
+        prompt_input_total_tokens: 800,
+        prompt_input_non_cached_tokens: 700,
+        cache_read_tokens: 100,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0.125,
         input_tokens: 800,
         output_tokens: 700,
         cached_input_tokens: 100,
@@ -367,9 +377,9 @@ describe("ActivityPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Activity Detail")).toBeDefined();
     });
-    // Token breakdown should be visible (appears in both table head and drawer)
-    const tokenHeadings = screen.getAllByText("Tokens");
-    expect(tokenHeadings.length).toBe(2);
+    // Token breakdown renders in the drawer via the shared TokenBreakdown
+    // component; the ledger table keeps its "Tokens" column header separately.
+    expect(screen.getByText("Token Breakdown")).toBeDefined();
     // Technical details should be visible
     expect(screen.getByText("Technical Details")).toBeDefined();
     expect(screen.getByText("Anthropic")).toBeDefined();
@@ -415,11 +425,16 @@ describe("ActivityPage", () => {
     expect(screen.getByText("--")).toBeDefined();
   });
 
-  it("renders Cache Hit in detail drawer token breakdown", async () => {
+  it("renders Cache Hit Rate in detail drawer from the DTO field", async () => {
     const item = makeItem({ id: "evt-cache" });
     const detail = makeDetail({
       id: "evt-cache",
       token_breakdown: {
+        prompt_input_total_tokens: 1000,
+        prompt_input_non_cached_tokens: 700,
+        cache_read_tokens: 300,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0.3,
         input_tokens: 1000,
         output_tokens: 400,
         cached_input_tokens: 300,
@@ -436,9 +451,41 @@ describe("ActivityPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Activity Detail")).toBeDefined();
     });
-    expect(screen.getByText("Cache Hit")).toBeDefined();
-    // input=1000, cached=300 → 0.3 → "30.00%"
+    expect(screen.getByText("Cache Hit Rate")).toBeDefined();
+    // Rate is read from token_breakdown.cache_hit_rate (0.3) → "30.00%"
+    // — NOT recomputed from cached_input_tokens / input_tokens.
     expect(screen.getByText("30.00%")).toBeDefined();
+  });
+
+  it("shows the DTO cache_hit_rate in the detail drawer without recomputing", async () => {
+    const item = makeItem({ id: "evt-dto" });
+    const detail = makeDetail({
+      id: "evt-dto",
+      token_breakdown: {
+        prompt_input_total_tokens: 1000,
+        prompt_input_non_cached_tokens: 10,
+        cache_read_tokens: 990,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0.99,
+        input_tokens: 1000,
+        output_tokens: 400,
+        // Deliberately inconsistent: cached_input_tokens alone would give
+        // a different rate (0.1) if the client recomputed. The DTO rate wins.
+        cached_input_tokens: 100,
+        reasoning_tokens: null,
+        total_tokens: 1400,
+      },
+    });
+    const user = userEvent.setup();
+    mockSuccess(makeResponse({}, [item]), detail);
+    render(<ActivityPage />);
+
+    await user.click(screen.getByText("Claude Code"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Activity Detail")).toBeDefined();
+    });
+    expect(screen.getByText(/99\.00%/)).toBeDefined();
   });
 
   it("clears selection when Next is clicked", async () => {

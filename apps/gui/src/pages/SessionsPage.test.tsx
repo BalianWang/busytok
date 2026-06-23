@@ -90,6 +90,11 @@ function makeSessionDetail(
     last_active_at_ms: Date.now() - 3600_000,
     metrics: [],
     token_breakdown: {
+      prompt_input_total_tokens: 10000,
+      prompt_input_non_cached_tokens: 8000,
+      cache_read_tokens: 2000,
+      cache_write_tokens: 0,
+      cache_hit_rate: 0.2,
       total_tokens: 15000,
       input_tokens: 10000,
       output_tokens: 5000,
@@ -334,6 +339,11 @@ describe("SessionsPage", () => {
     const detail = makeSessionDetail({
       id: "sess-tokens",
       token_breakdown: {
+        prompt_input_total_tokens: 15000,
+        prompt_input_non_cached_tokens: 12000,
+        cache_read_tokens: 3000,
+        cache_write_tokens: 0,
+        cache_hit_rate: 0.2,
         total_tokens: 25000,
         input_tokens: 15000,
         output_tokens: 10000,

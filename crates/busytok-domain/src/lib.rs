@@ -12,6 +12,7 @@
 //! system uses.
 
 pub mod agent;
+pub mod cache_metrics;
 pub mod events;
 pub mod identity;
 pub mod time;
