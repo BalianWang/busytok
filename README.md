@@ -16,7 +16,7 @@ Download the latest universal DMG from [Releases](https://github.com/BalianWang/
 
 ### Stability contract
 
-Busytok is `0.x`: real and usable, but **minors may break**. Auto-update is on, so you'll get fixes without manual reinstall. Promote to `1.0` once the schema/migration story is stable and auto-update has run cleanly across at least three releases.
+Busytok is `0.x`: real and usable, but **minors may break**. Auto-update is on for macOS (you'll get fixes without manual reinstall); on Windows, auto-update is not supported — reinstall manually from [Releases](https://github.com/BalianWang/busytok/releases/latest). Promote to `1.0` once the schema/migration story is stable and auto-update has run cleanly across at least three releases.
 
 ## What it does
 

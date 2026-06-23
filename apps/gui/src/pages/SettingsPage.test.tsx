@@ -188,4 +188,20 @@ describe("SettingsPage Updates section", () => {
       screen.getByRole("button", { name: /check for updates/i }),
     ).toBeTruthy();
   });
+
+  it("hides the Windows note on macOS and shows it elsewhere", () => {
+    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, checkNow: vi.fn(), applyNow: vi.fn() } as never);
+    const platformGetter = vi.spyOn(navigator, "platform", "get");
+    try {
+      platformGetter.mockReturnValue("MacIntel");
+      const { unmount } = render(<SettingsPage />);
+      expect(screen.queryByText(/windows does not support/i)).toBeNull();
+      unmount();
+      platformGetter.mockReturnValue("Win32");
+      render(<SettingsPage />);
+      expect(screen.getByText(/windows does not support/i)).toBeTruthy();
+    } finally {
+      platformGetter.mockRestore();
+    }
+  });
 });

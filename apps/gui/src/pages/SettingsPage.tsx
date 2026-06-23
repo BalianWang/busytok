@@ -969,6 +969,13 @@ export function SettingsPage() {
                 )
               }
             />
+            {!isMacPlatform() && (
+              <SettingsRow
+                label="Windows auto-update"
+                description="Windows does not support auto-update. Reinstall manually from the Releases page."
+                control={<span className="diag-value">Not supported</span>}
+              />
+            )}
           </div>
         </section>
 
