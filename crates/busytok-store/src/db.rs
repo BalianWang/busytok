@@ -382,7 +382,8 @@ impl Database {
              reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
-             usage_limit_reset_time_ms, created_at_ms, updated_at_ms \
+             usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+             is_sidechain, dedupe_key \
              FROM usage_events WHERE id = ?1",
         )?;
 
@@ -415,7 +416,8 @@ impl Database {
              reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
-             usage_limit_reset_time_ms, created_at_ms, updated_at_ms \
+             usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+             is_sidechain, dedupe_key \
              FROM usage_events ORDER BY timestamp_ms",
         )?;
 
@@ -445,7 +447,8 @@ impl Database {
              reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
-             usage_limit_reset_time_ms, created_at_ms, updated_at_ms \
+             usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+             is_sidechain, dedupe_key \
              FROM usage_events WHERE generation_id = ?1 ORDER BY timestamp_ms",
         )?;
 
@@ -1312,7 +1315,8 @@ impl Database {
              reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
              estimated_cost_usd, cost_currency, cost_source, \
              price_catalog_version, is_error, error_type, raw_event_hash, \
-             usage_limit_reset_time_ms, created_at_ms, updated_at_ms \
+             usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+             is_sidechain, dedupe_key \
              FROM usage_events \
              WHERE (timestamp_ms < ?2) OR (timestamp_ms = ?2 AND id < ?3) \
              ORDER BY timestamp_ms DESC, id DESC LIMIT ?1";
@@ -1354,11 +1358,7 @@ impl Database {
         build_rollups: F,
     ) -> Result<IngestResult>
     where
-        F: FnOnce(
-            &[(String, &busytok_domain::NormalizedUsageEvent)],
-            &[OldEventTokens],
-            &str,
-        ) -> Result<RollupRows>,
+        F: FnOnce(&[busytok_domain::NormalizedUsageEvent], &str) -> Result<RollupRows>,
     {
         let usage_count = batch.usage_events.len();
         let diag_count = batch.diagnostic_events.len();
@@ -1377,118 +1377,22 @@ impl Database {
         // Write usage events, tracking which are truly inserted and which are replacements.
         // For Replace events, fetch the old event BEFORE replacing so the rollup builder
         // can compute the correct delta.
-        let mut inserted_events: Vec<(String, &busytok_domain::NormalizedUsageEvent)> = Vec::new();
-        let mut inserted_event_ids: Vec<String> = Vec::new();
-        let mut replaced_old_events: Vec<OldEventTokens> = Vec::new();
-        for (event, policy) in &batch.usage_events {
-            let sql = match policy {
-                busytok_domain::UsageWritePolicy::InsertOnce => INSERT_USAGE_IGNORE,
-                busytok_domain::UsageWritePolicy::Replace => INSERT_USAGE_REPLACE,
-            };
-
-            // For Replace events, detect whether this is a true replacement
-            // (row already existed) vs. a new insert.
-            // Also fetch the old event so the rollup builder can compute (new - old).
-            // For InsertOnce events, we use changes() after execution to detect
-            // whether the event was actually inserted.
-            if matches!(policy, busytok_domain::UsageWritePolicy::Replace) {
-                let existed: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM usage_events WHERE id = ?1)",
-                        params![event.id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .context("failed to check event existence")?
-                    != 0;
-                if existed {
-                    // Fetch token counts of the old row before REPLACE.
-                    let old = tx
-                        .query_row(
-                            "SELECT id, input_tokens, output_tokens, total_tokens, \
-                         cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
-                         reasoning_tokens, thoughts_tokens, tool_tokens, \
-                         cost_usd, estimated_cost_usd \
-                         FROM usage_events WHERE id = ?1",
-                            params![event.id],
-                            |row| {
-                                Ok(OldEventTokens {
-                                    event_id: row.get(0)?,
-                                    input_tokens: row.get(1)?,
-                                    output_tokens: row.get(2)?,
-                                    total_tokens: row.get(3)?,
-                                    cached_input_tokens: row.get(4)?,
-                                    cache_creation_tokens: row.get(5)?,
-                                    cache_read_tokens: row.get(6)?,
-                                    reasoning_tokens: row.get(7)?,
-                                    thoughts_tokens: row.get(8)?,
-                                    tool_tokens: row.get(9)?,
-                                    cost_usd: row.get(10)?,
-                                    estimated_cost_usd: row.get(11)?,
-                                })
-                            },
-                        )
-                        .context("failed to fetch old event tokens for replacement")?;
-                    replaced_old_events.push(old);
-                } else {
-                    inserted_events.push((event.id.clone(), event));
-                    inserted_event_ids.push(event.id.clone());
-                }
-            }
-
-            tx.execute(
-                sql,
-                params![
-                    event.id,
-                    event.agent.as_str(),
-                    event.source_file_id,
-                    event.source_path,
-                    event.source_line as i64,
-                    event.source_offset_start as i64,
-                    event.source_offset_end as i64,
-                    event.session_id,
-                    event.turn_id,
-                    event.source_request_id,
-                    event.message_id,
-                    event.timestamp_ms,
-                    event.project_path,
-                    event.project_hash,
-                    event.cwd,
-                    event.model,
-                    event.model_provider,
-                    event.agent_version,
-                    event.client_kind,
-                    event.speed.as_deref(),
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.total_tokens,
-                    event.cached_input_tokens,
-                    event.cache_creation_tokens,
-                    event.cache_read_tokens,
-                    event.reasoning_tokens,
-                    event.thoughts_tokens,
-                    event.tool_tokens,
-                    event.cost_usd,
-                    event.estimated_cost_usd,
-                    event.cost_currency,
-                    event.cost_source.as_deref().unwrap_or("unknown"),
-                    event.price_catalog_version,
-                    event.is_error as i32,
-                    event.error_type,
-                    event.raw_event_hash,
-                    event.usage_limit_reset_time_ms,
-                    event.created_at_ms,
-                    event.updated_at_ms,
-                ],
-            )
-            .with_context(|| format!("failed to write usage event {}", event.id))?;
-            // For InsertOnce, tx.changes() returns 1 if row was inserted, 0 if ignored.
-            if matches!(policy, busytok_domain::UsageWritePolicy::InsertOnce) {
-                if tx.changes() > 0 {
-                    inserted_events.push((event.id.clone(), event));
-                    inserted_event_ids.push(event.id.clone());
-                }
-            }
-        }
+        // Write usage events through the single sidechain-aware entry point.
+        // `effective_events` carries full tokens for inserts and `new − old`
+        // deltas for replacements, which the rollup builder applies additively.
+        let (usage_events, policies): (
+            Vec<busytok_domain::NormalizedUsageEvent>,
+            Vec<busytok_domain::UsageWritePolicy>,
+        ) = batch.usage_events.iter().cloned().unzip();
+        let outcome = crate::write_queries::upsert_usage_events_dedup_aware(
+            &tx,
+            &usage_events,
+            &policies,
+            generation_id,
+        )
+        .context("failed to upsert usage events batch")?;
+        let effective_events = outcome.effective_events;
+        let inserted_event_ids = outcome.inserted_ids;
 
         // Write tool events
         for tool in &batch.tool_events {
@@ -1586,14 +1490,9 @@ impl Database {
             ).with_context(|| format!("failed to write codex snapshot {}", snap.id))?;
         }
 
-        // Build rollup rows inside the transaction.
-        // The closure receives inserted IDs and OLD replaced events so it can
-        // compute the correct delta (new - old) for incremental rollups.
-        let replaced_ids: Vec<String> = replaced_old_events
-            .iter()
-            .map(|e| e.event_id.clone())
-            .collect();
-        let rollups = build_rollups(&inserted_events, &replaced_old_events, generation_id)
+        // Build rollup rows inside the transaction from the effective events
+        // (full inserts + new−old deltas), which the closure applies additively.
+        let rollups = build_rollups(&effective_events, generation_id)
             .context("failed to build rollup rows")?;
 
         // Write daily usage rows via shared function (single ON CONFLICT SQL).
@@ -1758,7 +1657,7 @@ impl Database {
         );
         Ok(IngestResult {
             inserted_event_ids,
-            replaced_event_ids: replaced_ids,
+            replaced_event_ids: Vec::new(),
         })
     }
 
@@ -1921,6 +1820,8 @@ fn row_to_usage_event(row: &rusqlite::Row<'_>) -> busytok_domain::NormalizedUsag
         raw_event_hash: row.get(36).unwrap_or_default(),
         created_at_ms: row.get(38).unwrap_or(0),
         updated_at_ms: row.get(39).unwrap_or(0),
+        is_sidechain: row.get::<_, i32>(40).unwrap_or(0) != 0,
+        dedupe_key: row.get(41).unwrap_or_default(),
     }
 }
 

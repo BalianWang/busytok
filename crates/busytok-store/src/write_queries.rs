@@ -8,108 +8,408 @@ use anyhow::{Context, Result};
 use busytok_domain::now_ms;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeSet;
+use tracing::{debug, info};
 
 // ── Usage events batch ───────────────────────────────────────────────────────
 
-/// Insert a batch of normalized usage events with `INSERT OR IGNORE`.
+/// Idempotent insert used for `WritePolicy::InsertOnce` agents (Codex): a row
+/// with the same `id` is silently kept as-is.
+const USAGE_INSERT_IGNORE_SQL: &str = "\
+    INSERT OR IGNORE INTO usage_events (\
+        id, agent, source_file_id, source_path, source_line, \
+        source_offset_start, source_offset_end, session_id, turn_id, \
+        source_request_id, message_id, timestamp_ms, project_path, \
+        project_hash, cwd, model, model_provider, agent_version, \
+        client_kind, speed, input_tokens, output_tokens, total_tokens, \
+        cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
+        reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
+        estimated_cost_usd, cost_currency, cost_source, \
+        price_catalog_version, is_error, error_type, raw_event_hash, \
+        usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+        generation_id, dedupe_key, is_sidechain\
+    ) VALUES (\
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
+        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
+        ?41, ?42, ?43\
+    )";
+
+/// Upsert used for `WritePolicy::Replace` agents (Claude Code): on a primary
+/// key (`id`) conflict, mutable columns are refreshed while `created_at_ms` is
+/// preserved. Sidechain-aware cross-row collapse is handled separately via
+/// [`remove_other_dedupe_rows`] before this runs.
+const USAGE_UPSERT_BY_ID_SQL: &str = "\
+    INSERT INTO usage_events (\
+        id, agent, source_file_id, source_path, source_line, \
+        source_offset_start, source_offset_end, session_id, turn_id, \
+        source_request_id, message_id, timestamp_ms, project_path, \
+        project_hash, cwd, model, model_provider, agent_version, \
+        client_kind, speed, input_tokens, output_tokens, total_tokens, \
+        cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
+        reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
+        estimated_cost_usd, cost_currency, cost_source, \
+        price_catalog_version, is_error, error_type, raw_event_hash, \
+        usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
+        generation_id, dedupe_key, is_sidechain\
+    ) VALUES (\
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
+        ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
+        ?41, ?42, ?43\
+    ) ON CONFLICT(id) DO UPDATE SET \
+        speed = excluded.speed, \
+        usage_limit_reset_time_ms = excluded.usage_limit_reset_time_ms, \
+        input_tokens = excluded.input_tokens, \
+        output_tokens = excluded.output_tokens, \
+        total_tokens = excluded.total_tokens, \
+        cached_input_tokens = excluded.cached_input_tokens, \
+        cache_creation_tokens = excluded.cache_creation_tokens, \
+        cache_read_tokens = excluded.cache_read_tokens, \
+        reasoning_tokens = excluded.reasoning_tokens, \
+        thoughts_tokens = excluded.thoughts_tokens, \
+        tool_tokens = excluded.tool_tokens, \
+        cost_usd = excluded.cost_usd, \
+        estimated_cost_usd = excluded.estimated_cost_usd, \
+        cost_source = excluded.cost_source, \
+        price_catalog_version = excluded.price_catalog_version, \
+        raw_event_hash = excluded.raw_event_hash, \
+        dedupe_key = excluded.dedupe_key, \
+        is_sidechain = excluded.is_sidechain, \
+        created_at_ms = usage_events.created_at_ms, \
+        updated_at_ms = CASE WHEN excluded.updated_at_ms > usage_events.updated_at_ms \
+            THEN excluded.updated_at_ms ELSE usage_events.updated_at_ms END";
+
+/// Bind a single event's 43 columns for either usage-event statement. A macro
+/// (rather than a function) sidesteps the multi-input lifetime that a returned
+/// `Vec<&dyn ToSql>` would require.
+macro_rules! usage_event_params {
+    ($event:expr, $generation_id:expr, $dedupe_key:expr) => {
+        rusqlite::params![
+            $event.id,
+            $event.agent.as_str(),
+            $event.source_file_id,
+            $event.source_path,
+            $event.source_line as i64,
+            $event.source_offset_start as i64,
+            $event.source_offset_end as i64,
+            $event.session_id,
+            $event.turn_id,
+            $event.source_request_id,
+            $event.message_id,
+            $event.timestamp_ms,
+            $event.project_path,
+            $event.project_hash,
+            $event.cwd,
+            $event.model,
+            $event.model_provider,
+            $event.agent_version,
+            $event.client_kind,
+            $event.speed,
+            $event.input_tokens,
+            $event.output_tokens,
+            $event.total_tokens,
+            $event.cached_input_tokens,
+            $event.cache_creation_tokens,
+            $event.cache_read_tokens,
+            $event.reasoning_tokens,
+            $event.thoughts_tokens,
+            $event.tool_tokens,
+            $event.cost_usd,
+            $event.estimated_cost_usd,
+            $event.cost_currency,
+            $event.cost_source.as_deref().unwrap_or("unknown"),
+            $event.price_catalog_version,
+            $event.is_error,
+            $event.error_type,
+            $event.raw_event_hash,
+            $event.usage_limit_reset_time_ms,
+            $event.created_at_ms,
+            $event.updated_at_ms,
+            $generation_id,
+            $dedupe_key,
+            $event.is_sidechain,
+        ]
+    };
+}
+
+/// Existing row sharing a dedupe key, for sidechain-aware winner selection.
+#[derive(Clone)]
+struct ExistingRow {
+    id: String,
+    is_sidechain: bool,
+    total_tokens: i64,
+    tokens: crate::OldEventTokens,
+}
+
+/// Fetch the existing row for a `(generation_id, dedupe_key)`, if any.
+fn fetch_existing_for_dedupe(
+    conn: &Connection,
+    generation_id: &str,
+    dedupe_key: &str,
+) -> Result<Option<ExistingRow>> {
+    conn.query_row(
+        "SELECT id, is_sidechain, total_tokens, \
+                input_tokens, output_tokens, cached_input_tokens, \
+                cache_creation_tokens, cache_read_tokens, reasoning_tokens, \
+                thoughts_tokens, tool_tokens, cost_usd, estimated_cost_usd \
+         FROM usage_events WHERE generation_id = ?1 AND dedupe_key = ?2",
+        params![generation_id, dedupe_key],
+        |row| {
+            Ok(ExistingRow {
+                id: row.get(0)?,
+                is_sidechain: row.get::<_, i32>(1)? != 0,
+                total_tokens: row.get(2)?,
+                tokens: crate::OldEventTokens {
+                    event_id: row.get(0)?,
+                    input_tokens: row.get(3)?,
+                    output_tokens: row.get(4)?,
+                    total_tokens: row.get(2)?,
+                    cached_input_tokens: row.get(5)?,
+                    cache_creation_tokens: row.get(6)?,
+                    cache_read_tokens: row.get(7)?,
+                    reasoning_tokens: row.get(8)?,
+                    thoughts_tokens: row.get(9)?,
+                    tool_tokens: row.get(10)?,
+                    cost_usd: row.get(11)?,
+                    estimated_cost_usd: row.get(12)?,
+                },
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| anyhow::anyhow!("failed to fetch existing dedupe row: {e}"))
+}
+
+/// Delete any row sharing a dedupe key with a *different* id, so the upcoming
+/// upsert leaves exactly one row per dedupe key. Returns the deleted count.
+fn remove_other_dedupe_rows(
+    conn: &Connection,
+    generation_id: &str,
+    dedupe_key: &str,
+    keep_id: &str,
+) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM usage_events WHERE generation_id = ?1 AND dedupe_key = ?2 AND id <> ?3",
+        params![generation_id, dedupe_key, keep_id],
+    )?;
+    Ok(deleted)
+}
+
+/// Decide whether a new event should replace an existing row.
 ///
-/// Returns the count of newly inserted events (rows where `changes() > 0`).
+/// Mirrors ccusage's `should_replace_deduped_entry`: a non-sidechain entry
+/// always beats a sidechain one (parent over `/btw` replay); within the same
+/// sidechain class, a strictly-higher `total_tokens` wins; ties keep the
+/// existing row (ccusage uses strict `>`).
+fn new_beats_existing(new: &busytok_domain::NormalizedUsageEvent, existing: &ExistingRow) -> bool {
+    if existing.is_sidechain && !new.is_sidechain {
+        return true;
+    }
+    if !existing.is_sidechain && new.is_sidechain {
+        return false;
+    }
+    new.total_tokens > existing.total_tokens
+}
+
+/// Outcome of a dedup-aware usage-event batch write.
+pub struct DedupOutcome {
+    /// Token deltas to feed additive rollup updaters: a full event for each
+    /// newly inserted row, plus a `new − old` delta event for each row that
+    /// replaced an existing one. Dropped (losing) candidates contribute
+    /// nothing — they were never counted.
+    pub effective_events: Vec<busytok_domain::NormalizedUsageEvent>,
+    /// IDs of rows newly created (new logical events; drives outbox
+    /// notifications and per-event publish during rebuild).
+    pub inserted_ids: Vec<String>,
+    /// Rows newly created (new logical events; drives outbox notifications).
+    pub inserted: i64,
+    /// Rows that replaced an existing row (same or different id).
+    pub replaced: i64,
+    /// Candidate events dropped because an existing row won the comparison.
+    pub dropped: i64,
+}
+
+/// Insert or upsert a batch of usage events with sidechain-aware dedup.
+///
+/// This is the single write entry point for both the live tailer and the
+/// historical rebuild paths. Per-event behavior is driven by [`UsageWritePolicy`]:
+///
+/// - `InsertOnce` (Codex): idempotent `INSERT OR IGNORE` keyed by `id`.
+/// - `Replace` (Claude Code): the event's `dedupe_key` (message-scoped) decides
+///   cross-row collapse. A non-sidechain entry replaces a sidechain replay of
+///   the same `message_id`; within a class the higher-total entry wins. The
+///   displaced row's tokens are captured so rollups receive a `new − old` delta.
+///
+/// Within a single call, intra-batch collisions on the same dedupe key are
+/// resolved in input order so only the final winner is persisted.
+pub fn upsert_usage_events_dedup_aware(
+    conn: &Connection,
+    events: &[busytok_domain::NormalizedUsageEvent],
+    policies: &[busytok_domain::UsageWritePolicy],
+    generation_id: &str,
+) -> Result<DedupOutcome> {
+    assert_eq!(
+        events.len(),
+        policies.len(),
+        "events and policies must be parallel slices"
+    );
+    let mut effective: Vec<busytok_domain::NormalizedUsageEvent> = Vec::new();
+    let mut inserted_ids: Vec<String> = Vec::new();
+    // dedupe_key -> current in-batch winner, so collisions within one call are
+    // resolved against the just-written row instead of a stale DB read.
+    let mut winners: std::collections::HashMap<String, ExistingRow> =
+        std::collections::HashMap::new();
+    let mut inserted = 0i64;
+    let mut replaced = 0i64;
+    let mut dropped = 0i64;
+
+    for (event, policy) in events.iter().zip(policies.iter()) {
+        let dedupe_key = event.dedupe_key.clone().unwrap_or_else(|| event.id.clone());
+
+        // InsertOnce agents are idempotent by id; no cross-event collapse.
+        if matches!(policy, busytok_domain::UsageWritePolicy::InsertOnce) {
+            let changes = conn
+                .execute(
+                    USAGE_INSERT_IGNORE_SQL,
+                    usage_event_params!(event, generation_id, &event.id),
+                )
+                .with_context(|| format!("failed to insert usage event {}", event.id))?;
+            if changes > 0 {
+                effective.push(event.clone());
+                inserted_ids.push(event.id.clone());
+                inserted += 1;
+            }
+            continue;
+        }
+
+        // Replace policy: sidechain-aware collapse on dedupe_key. The existing
+        // row is the in-batch winner if present, else whatever is persisted.
+        let existing: Option<ExistingRow> = match winners.get(&dedupe_key).cloned() {
+            Some(w) => Some(w),
+            None => fetch_existing_for_dedupe(conn, generation_id, &dedupe_key)?,
+        };
+
+        let new_wins = match &existing {
+            None => true,
+            Some(existing_row) => new_beats_existing(event, existing_row),
+        };
+
+        if !new_wins {
+            dropped += 1;
+            debug!(
+                dedupe_key = %dedupe_key,
+                message_id = ?event.message_id,
+                total_tokens = event.total_tokens,
+                "dropped usage event: existing row won sidechain/total comparison"
+            );
+            continue;
+        }
+
+        // New event wins (or is fresh). Remove any displaced different-id row
+        // sharing this dedupe key, then upsert the winner by id so the table
+        // holds exactly one row per dedupe key.
+        let needs_delete = existing.as_ref().map_or(false, |e| e.id != event.id);
+        if needs_delete {
+            remove_other_dedupe_rows(conn, generation_id, &dedupe_key, &event.id)?;
+        }
+        conn.execute(
+            USAGE_UPSERT_BY_ID_SQL,
+            usage_event_params!(event, generation_id, &dedupe_key),
+        )
+        .with_context(|| format!("failed to upsert usage event {}", event.id))?;
+
+        match existing {
+            None => {
+                effective.push(event.clone());
+                inserted_ids.push(event.id.clone());
+                inserted += 1;
+            }
+            Some(existing_row) => {
+                // Rollups previously absorbed the old row's tokens; feed the
+                // (new − old) delta so they end at the new totals.
+                effective.push(existing_row.tokens.compute_delta(event));
+                replaced += 1;
+                if !event.is_sidechain && existing_row.is_sidechain {
+                    info!(
+                        dedupe_key = %dedupe_key,
+                        message_id = ?event.message_id,
+                        old_total = existing_row.total_tokens,
+                        new_total = event.total_tokens,
+                        "parent usage replaced sidechain replay"
+                    );
+                } else {
+                    debug!(
+                        dedupe_key = %dedupe_key,
+                        event_id = %event.id,
+                        old_total = existing_row.total_tokens,
+                        new_total = event.total_tokens,
+                        "replaced usage event with higher-total entry"
+                    );
+                }
+            }
+        }
+
+        // Record the winner so a later same-key event in this batch compares
+        // against it (and any displaced row is never double-counted).
+        winners.insert(dedupe_key.clone(), existing_row_view(event));
+    }
+
+    Ok(DedupOutcome {
+        effective_events: effective,
+        inserted_ids,
+        inserted,
+        replaced,
+        dropped,
+    })
+}
+
+/// Snapshot an event as the in-batch winner for a dedupe key.
+fn existing_row_view(event: &busytok_domain::NormalizedUsageEvent) -> ExistingRow {
+    ExistingRow {
+        id: event.id.clone(),
+        is_sidechain: event.is_sidechain,
+        total_tokens: event.total_tokens,
+        tokens: crate::OldEventTokens {
+            event_id: event.id.clone(),
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            total_tokens: event.total_tokens,
+            cached_input_tokens: event.cached_input_tokens,
+            cache_creation_tokens: event.cache_creation_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            thoughts_tokens: event.thoughts_tokens,
+            tool_tokens: event.tool_tokens,
+            cost_usd: event.cost_usd,
+            estimated_cost_usd: event.estimated_cost_usd,
+        },
+    }
+}
+
+/// Insert a batch of normalized usage events with idempotent (`InsertOnce`)
+/// semantics and return the count of newly inserted rows. Thin wrapper over
+/// [`upsert_usage_events_dedup_aware`] for callers that do not need cross-event
+/// collapse (e.g. Codex, and most tests).
 pub fn insert_usage_events_batch(
     conn: &Connection,
     events: &[busytok_domain::NormalizedUsageEvent],
     generation_id: &str,
 ) -> Result<i64> {
-    Ok(insert_usage_events_batch_returning_inserted(conn, events, generation_id)?.len() as i64)
+    let policies = vec![busytok_domain::UsageWritePolicy::InsertOnce; events.len()];
+    Ok(upsert_usage_events_dedup_aware(conn, events, &policies, generation_id)?.inserted)
 }
 
-/// Insert a batch of normalized usage events and return only the rows that
-/// were newly inserted. Callers that update incremental aggregates must use
-/// this helper instead of the original input slice so duplicate events do not
-/// double-count materialized totals.
+/// Idempotent insert returning the events that were newly created. Used by
+/// tests and any path that wants the inserted set back under `InsertOnce`.
 pub fn insert_usage_events_batch_returning_inserted(
     conn: &Connection,
     events: &[busytok_domain::NormalizedUsageEvent],
     generation_id: &str,
 ) -> Result<Vec<busytok_domain::NormalizedUsageEvent>> {
-    let sql = "\
-        INSERT OR IGNORE INTO usage_events (\
-            id, agent, source_file_id, source_path, source_line, \
-            source_offset_start, source_offset_end, session_id, turn_id, \
-            source_request_id, message_id, timestamp_ms, project_path, \
-            project_hash, cwd, model, model_provider, agent_version, \
-            client_kind, speed, input_tokens, output_tokens, total_tokens, \
-            cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
-            reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
-            estimated_cost_usd, cost_currency, cost_source, \
-            price_catalog_version, is_error, error_type, raw_event_hash, \
-            usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-            generation_id, dedupe_key\
-        ) VALUES (\
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
-            ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
-            ?41, ?42\
-        )";
-
-    let mut inserted = Vec::new();
-
-    for event in events {
-        let changes = conn
-            .execute(
-                sql,
-                params![
-                    event.id,
-                    event.agent.as_str(),
-                    event.source_file_id,
-                    event.source_path,
-                    event.source_line as i64,
-                    event.source_offset_start as i64,
-                    event.source_offset_end as i64,
-                    event.session_id,
-                    event.turn_id,
-                    event.source_request_id,
-                    event.message_id,
-                    event.timestamp_ms,
-                    event.project_path,
-                    event.project_hash,
-                    event.cwd,
-                    event.model,
-                    event.model_provider,
-                    event.agent_version,
-                    event.client_kind,
-                    event.speed.as_deref(),
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.total_tokens,
-                    event.cached_input_tokens,
-                    event.cache_creation_tokens,
-                    event.cache_read_tokens,
-                    event.reasoning_tokens,
-                    event.thoughts_tokens,
-                    event.tool_tokens,
-                    event.cost_usd,
-                    event.estimated_cost_usd,
-                    event.cost_currency,
-                    event.cost_source.as_deref().unwrap_or("unknown"),
-                    event.price_catalog_version,
-                    event.is_error as i32,
-                    event.error_type,
-                    event.raw_event_hash,
-                    event.usage_limit_reset_time_ms,
-                    event.created_at_ms,
-                    event.updated_at_ms,
-                    generation_id,
-                    event.id.as_str(), // dedupe_key defaults to event id
-                ],
-            )
-            .with_context(|| format!("failed to insert usage event {}", event.id))?;
-        if changes > 0 {
-            inserted.push(event.clone());
-        }
-    }
-
-    Ok(inserted)
+    let policies = vec![busytok_domain::UsageWritePolicy::InsertOnce; events.len()];
+    Ok(upsert_usage_events_dedup_aware(conn, events, &policies, generation_id)?.effective_events)
 }
 
 // ── Source file checkpoints ──────────────────────────────────────────────────
