@@ -73,7 +73,7 @@ export type ActivityListResponseDto = { generated_at_ms: number, items: Array<Ac
 
 export type ActivityDetailRequestDto = { id: string, };
 
-export type TokenBreakdownDto = { input_tokens: number | null, output_tokens: number | null, cached_input_tokens: number | null, reasoning_tokens: number | null, total_tokens: number, };
+export type TokenBreakdownDto = { prompt_input_total_tokens: number | null, prompt_input_non_cached_tokens: number | null, cache_read_tokens: number | null, cache_write_tokens: number | null, cache_hit_rate: number | null, input_tokens: number | null, output_tokens: number | null, cached_input_tokens: number | null, reasoning_tokens: number | null, total_tokens: number, };
 
 export type ActivityTechnicalDetailsDto = { source_id: string | null, provider: string | null, raw_model: string | null, notes: Array<string>, };
 
