@@ -81,12 +81,6 @@
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-/* Left ~72px traffic-light gutter (window controls overlay region). */
-.desktop-titlebar__gutter {
-  width: 72px;
-  flex-shrink: 0;
-}
-
 /* Left group: status chip(s). */
 .desktop-titlebar__status {
   display: flex;

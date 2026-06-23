@@ -72,9 +72,9 @@ export function AppShell({ currentPage, onNavigate, children }: AppShellProps) {
       <Sidebar currentPage={currentPage} onNavigate={onNavigate} />
       <main className="desktop-workspace">
         <div className="desktop-titlebar" data-tauri-drag-region>
-          {/* Left ~72px traffic-light gutter (reserved; window controls overlay here). */}
-          <div className="desktop-titlebar__gutter" data-tauri-drag-region aria-hidden="true" />
-          {/* Left group: the single calm status chip (+ optional auxiliary). */}
+          {/* Left group: the single calm status chip (+ optional auxiliary).
+              The main window uses native decorations — macOS traffic lights sit
+              in the native bar above the webview, so no left gutter is reserved. */}
           <div className="desktop-titlebar__status">
             <TitlebarStatusChip status={status} onAction={onNavigate} />
           </div>
