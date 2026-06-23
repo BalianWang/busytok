@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use busytok_domain::{
+    cache_metrics::{ProviderPayloadShape, UnifiedCacheMetrics},
     derive_session_id, metadata_event_hash, now_ms, AgentKind, MetadataFingerprint,
     NormalizedEvent, NormalizedUsageEvent, ParseContext, ParseError, ParsedLogEvent,
     UsageWritePolicy,
@@ -115,23 +116,22 @@ impl AgentLogAdapter for ClaudeCodeAdapter {
         let cache_creation_tokens = usage_val.cache_creation_input_tokens.unwrap_or(0);
         let cached_input_tokens = cache_read_tokens;
 
-        // Match ccusage's total formula exactly: the raw reported
-        // `input_tokens` is used as-is (it already includes cached tokens for
-        // Anthropic models), and cache_creation/cache_read are summed in
-        // additively. DeepSeek's Anthropic-format API reports a non-cached-only
-        // `input_tokens` (cache_read + cache_creation > input_tokens); we do
-        // NOT normalize it, which previously double-counted cache_read. Keeping
-        // the raw value yields the same per-component breakdown ccusage uses.
+        // Classify the payload shape. Genuine Anthropic includes cached prompt
+        // tokens in input_tokens; DeepSeek/GLM (Anthropic-format, non-Anthropic
+        // semantics) report non-cached-only input where cache_read + cache_creation
+        // can exceed input_tokens.
+        let provider_shape = if cache_read_tokens + cache_creation_tokens > raw_input {
+            ProviderPayloadShape::AnthropicCompatibleNonCachedInput
+        } else {
+            ProviderPayloadShape::AnthropicNative
+        };
         let input_tokens = raw_input;
-        if cache_read_tokens + cache_creation_tokens > raw_input {
-            debug!(
-                model = ?message_ref.model,
-                raw_input,
-                cache_read_tokens,
-                cache_creation_tokens,
-                "non-anthropic cache invariant observed (deepseek-style); using ccusage total formula"
-            );
-        }
+        let unified = UnifiedCacheMetrics::from_raw(
+            provider_shape,
+            raw_input,
+            cache_read_tokens,
+            cache_creation_tokens,
+        );
 
         let is_sidechain = parsed.is_sidechain.unwrap_or(false);
 
@@ -224,6 +224,9 @@ impl AgentLogAdapter for ClaudeCodeAdapter {
             cached_input_tokens,
             cache_creation_tokens,
             cache_read_tokens,
+            provider_payload_shape: provider_shape,
+            prompt_input_total_tokens: unified.prompt_input_total_tokens,
+            prompt_input_non_cached_tokens: unified.prompt_input_non_cached_tokens,
             reasoning_tokens: 0, // MVP: not available in Claude Code logs
             thoughts_tokens: 0,  // MVP: not available in Claude Code logs
             tool_tokens: 0,      // MVP: not available in Claude Code logs
@@ -449,6 +452,24 @@ mod tests {
         let event = unwrap_first_usage(&parsed);
         assert_eq!(event.input_tokens, 10);
         assert_eq!(event.total_tokens, 10 + 5 + 20 + 100);
+    }
+
+    #[test]
+    fn claude_deepseek_style_payload_maps_to_compatible_shape() {
+        // DeepSeek-style Anthropic-format payload: small non-cached input_tokens,
+        // large cache_read. cache_read + cache_creation > input_tokens, so the
+        // adapter must classify it as AnthropicCompatibleNonCachedInput and the
+        // unified total = input + cache_read + cache_creation.
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        let line = r#"{"sessionId":"sess-1","timestamp":"2026-05-15T08:00:00Z","message":{"id":"msg-ds2","model":"deepseek-chat","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":990}}}"#;
+        let parsed = adapter.parse_line(&ctx, line).unwrap();
+        let event = unwrap_first_usage(&parsed);
+        assert_eq!(
+            event.provider_payload_shape,
+            busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicCompatibleNonCachedInput
+        );
+        assert_eq!(event.prompt_input_total_tokens, 1000);
     }
 
     #[test]
