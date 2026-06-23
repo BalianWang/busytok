@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-forbidden='ClientsPage|ActivityPage|OverviewPage|TrackToggle|LedgerTable|RecoveryPanel|useAppsQuery|useActivityQuery|useDashboardQuery|useSettingsRecovery|route-share-only|tracking\.(start|stop|status)|proxy enable|proxy status|provider binding|OAuth bridge|API key|session token'
+# Stale Autoken/proxy-era surface names that must NOT reappear in the Busytok
+# GUI. NOTE: current Busytok surfaces (OverviewPage, ActivityPage, LedgerTable,
+# useSettingsRecoveryAction) were previously listed here and are REMOVED — they
+# are live code, so forbidding them made this gate permanently red. Only
+# genuinely-absent (removed) names remain.
+forbidden='ClientsPage|TrackToggle|RecoveryPanel|useAppsQuery|useActivityQuery|useDashboardQuery|route-share-only|tracking\.(start|stop|status)|proxy enable|proxy status|provider binding|OAuth bridge|API key|session token'
 
 if rg -n "$forbidden" apps/gui/src \
   --glob '!**/*.snap' \
