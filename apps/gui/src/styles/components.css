@@ -91,6 +91,61 @@
   flex-wrap: wrap;
 }
 
+/* ── Titlebar calm status chip (single entry) ─────────────────── */
+.titlebar-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);            /* 6px rect, not a pill */
+  background: var(--color-surface-subtle);
+  color: var(--color-text-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.titlebar-chip:hover { background: var(--color-hover); }
+.titlebar-chip:focus-visible { outline: 2px solid var(--color-focus-ring); outline-offset: 2px; }
+.titlebar-chip__dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.titlebar-chip.is-warning {
+  background: var(--color-status-warning-soft);
+  border-color: color-mix(in srgb, var(--color-status-warning) 30%, transparent);
+  color: var(--color-text);
+}
+.titlebar-chip.is-danger {
+  background: var(--color-status-danger-soft);
+  border-color: color-mix(in srgb, var(--color-status-danger) 30%, transparent);
+  color: var(--color-text);
+}
+
+/* Read-only popover (floating layer → elevated shadow) */
+.titlebar-popover {
+  width: 280px;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--material-shadow-elevated);
+  z-index: 200;
+}
+.titlebar-popover__section + .titlebar-popover__section { margin-top: var(--space-2); }
+.titlebar-popover__section-label {
+  margin: 0 0 6px;
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--color-text-faint);
+}
+.titlebar-popover__rows { margin: 0; display: grid; gap: 4px; }
+.titlebar-popover__row { display: flex; justify-content: space-between; gap: 12px; margin: 0; }
+.titlebar-popover__row dt { color: var(--color-text-muted); font-size: 13px; }
+.titlebar-popover__row dd { margin: 0; color: var(--color-text); font-size: 13px; font-variant-numeric: tabular-nums; }
+.titlebar-popover__actions { display: flex; gap: var(--space-2); margin-top: var(--space-3); }
+.titlebar-popover__detail { margin: 0; color: var(--color-text-muted); font-size: 13px; line-height: 1.45; }
+.titlebar-popover__arrow { fill: var(--color-surface); }
+
 .desktop-titlebar__toolbar {
   display: flex;
   align-items: center;

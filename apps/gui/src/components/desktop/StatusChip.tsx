@@ -1,22 +1,11 @@
 import * as Popover from "@radix-ui/react-popover";
-import type { StatusChipDto, StatusActionDto } from "@busytok/protocol-types";
+import type { StatusChipDto } from "@busytok/protocol-types";
 import type { DesktopPage } from "../AppShell";
+import { statusActionToPage } from "./statusAction";
 
 interface StatusChipProps {
   model: StatusChipDto;
   onAction?: (page: DesktopPage) => void;
-}
-
-/** Maps a StatusActionDto to a DesktopPage for navigation. */
-function actionToPage(action: StatusActionDto): DesktopPage | undefined {
-  switch (action) {
-    case "open_activity":
-      return "usage";
-    case "open_settings":
-      return "settings";
-    default:
-      return undefined;
-  }
 }
 
 export function StatusChip({ model, onAction }: StatusChipProps) {
@@ -51,7 +40,7 @@ export function StatusChip({ model, onAction }: StatusChipProps) {
           ) : null}
           {model.action && onAction ? (
             (() => {
-              const targetPage = actionToPage(model.action);
+              const targetPage = statusActionToPage(model.action);
               return targetPage ? (
                 <button
                   type="button"
