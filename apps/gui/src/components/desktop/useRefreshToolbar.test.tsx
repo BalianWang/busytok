@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -49,9 +49,17 @@ function Wrapper({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Module-level stable default so `onRefresh` keeps a constant identity across
+// renders. A per-render `async () => {}` default would destabilize the
+// `handleRefresh`/`toolbar` memos in useRefreshToolbar, and
+// useRegisterPageToolbar's effect would setToolbar() on every new toolbar
+// reference → infinite render loop. (Production callers pass react-query's
+// stable `refetch`, so this only manifests in tests with non-memoized defaults.)
+const NOOP_ON_REFRESH = async (): Promise<void> => {};
+
 function RefreshingPage({
   isFetching = false,
-  onRefresh = async () => {},
+  onRefresh = NOOP_ON_REFRESH,
 }: {
   isFetching?: boolean;
   onRefresh?: () => Promise<void>;
@@ -70,6 +78,10 @@ describe("useRefreshToolbar", () => {
   });
 
   afterEach(() => {
+    // Manual cleanup — vitest.setup.ts does not register auto-cleanup
+    // (globals are off), so without this each render() accumulates in the
+    // same document and getByRole finds stale buttons from prior tests.
+    cleanup();
     vi.clearAllMocks();
   });
 
