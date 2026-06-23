@@ -298,12 +298,23 @@ pub fn upsert_usage_events_dedup_aware(
 
         if !new_wins {
             dropped += 1;
-            debug!(
-                dedupe_key = %dedupe_key,
-                message_id = ?event.message_id,
-                total_tokens = event.total_tokens,
-                "dropped usage event: existing row won sidechain/total comparison"
-            );
+            if let Some(ref existing_row) = existing {
+                debug!(
+                    dedupe_key = %dedupe_key,
+                    message_id = ?event.message_id,
+                    e_is_sc = existing_row.is_sidechain,
+                    n_is_sc = event.is_sidechain,
+                    e_total = existing_row.total_tokens,
+                    n_total = event.total_tokens,
+                    "dropped usage event: existing row won"
+                );
+            } else {
+                debug!(
+                    dedupe_key = %dedupe_key,
+                    message_id = ?event.message_id,
+                    "dropped usage event: no existing row"
+                );
+            }
             continue;
         }
 
@@ -974,76 +985,65 @@ fn apply_single_replay(
     target_generation_id: &str,
     data_json: &str,
 ) -> Result<i64> {
+    // Tail replay events carry a partial JSON snapshot (not a full serialised
+    // NormalizedUsageEvent), so we extract fields manually and issue a direct
+    // INSERT OR IGNORE using the canonical 43-column schema (includes
+    // is_sidechain to prevent schema mismatch).
     let value: serde_json::Value =
         serde_json::from_str(data_json).context("failed to parse replay event JSON")?;
 
     let event_id = value["id"].as_str().unwrap_or("replay-unknown").to_string();
 
-    let changes = tx.execute(
-        "INSERT OR IGNORE INTO usage_events (\
-            id, agent, source_file_id, source_path, source_line, \
-            source_offset_start, source_offset_end, session_id, turn_id, \
-            source_request_id, message_id, timestamp_ms, project_path, \
-            project_hash, cwd, model, model_provider, agent_version, \
-            client_kind, speed, input_tokens, output_tokens, total_tokens, \
-            cached_input_tokens, cache_creation_tokens, cache_read_tokens, \
-            reasoning_tokens, thoughts_tokens, tool_tokens, cost_usd, \
-            estimated_cost_usd, cost_currency, cost_source, \
-            price_catalog_version, is_error, error_type, raw_event_hash, \
-            usage_limit_reset_time_ms, created_at_ms, updated_at_ms, \
-            generation_id, dedupe_key\
-        ) VALUES (\
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, \
-            ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
-            ?41, ?42\
-        )",
-        params![
-            event_id,
-            value["agent"].as_str().unwrap_or("claude_code"),
-            value["source_file_id"].as_str().unwrap_or(""),
-            value["source_path"].as_str().unwrap_or(""),
-            value["source_line"].as_i64().unwrap_or(0),
-            value["source_offset_start"].as_i64().unwrap_or(0),
-            value["source_offset_end"].as_i64().unwrap_or(0),
-            value["session_id"].as_str().unwrap_or(""),
-            value["turn_id"].as_str().unwrap_or(""),
-            value["source_request_id"].as_str().unwrap_or(""),
-            value["message_id"].as_str().unwrap_or(""),
-            value["timestamp_ms"].as_i64().unwrap_or(0),
-            value["project_path"].as_str().unwrap_or(""),
-            value["project_hash"].as_str().unwrap_or(""),
-            value["cwd"].as_str().unwrap_or(""),
-            value["model"].as_str().unwrap_or(""),
-            value["model_provider"].as_str().unwrap_or(""),
-            value["agent_version"].as_str().unwrap_or(""),
-            value["client_kind"].as_str().unwrap_or(""),
-            value["speed"].as_str(),
-            value["input_tokens"].as_i64().unwrap_or(0),
-            value["output_tokens"].as_i64().unwrap_or(0),
-            value["total_tokens"].as_i64().unwrap_or(0),
-            value["cached_input_tokens"].as_i64().unwrap_or(0),
-            value["cache_creation_tokens"].as_i64().unwrap_or(0),
-            value["cache_read_tokens"].as_i64().unwrap_or(0),
-            value["reasoning_tokens"].as_i64().unwrap_or(0),
-            value["thoughts_tokens"].as_i64().unwrap_or(0),
-            value["tool_tokens"].as_i64().unwrap_or(0),
-            value["cost_usd"].as_f64(),
-            value["estimated_cost_usd"].as_f64(),
-            value["cost_currency"].as_str().unwrap_or("USD"),
-            value["cost_source"].as_str().unwrap_or("unknown"),
-            value["price_catalog_version"].as_str().unwrap_or(""),
-            value["is_error"].as_i64().unwrap_or(0),
-            value["error_type"].as_str(),
-            value["raw_event_hash"].as_str().unwrap_or(""),
-            value["usage_limit_reset_time_ms"].as_i64(),
-            value["created_at_ms"].as_i64().unwrap_or(0),
-            value["updated_at_ms"].as_i64().unwrap_or(0),
-            target_generation_id,
-            value["id"].as_str().unwrap_or(""),
-        ],
-    )?;
+    let changes = tx
+        .execute(
+            USAGE_INSERT_IGNORE_SQL,
+            rusqlite::params![
+                event_id,
+                value["agent"].as_str().unwrap_or("claude_code"),
+                value["source_file_id"].as_str().unwrap_or(""),
+                value["source_path"].as_str().unwrap_or(""),
+                value["source_line"].as_i64().unwrap_or(0),
+                value["source_offset_start"].as_i64().unwrap_or(0),
+                value["source_offset_end"].as_i64().unwrap_or(0),
+                value["session_id"].as_str().unwrap_or(""),
+                value["turn_id"].as_str().unwrap_or(""),
+                value["source_request_id"].as_str().unwrap_or(""),
+                value["message_id"].as_str().unwrap_or(""),
+                value["timestamp_ms"].as_i64().unwrap_or(0),
+                value["project_path"].as_str().unwrap_or(""),
+                value["project_hash"].as_str().unwrap_or(""),
+                value["cwd"].as_str().unwrap_or(""),
+                value["model"].as_str().unwrap_or(""),
+                value["model_provider"].as_str().unwrap_or(""),
+                value["agent_version"].as_str().unwrap_or(""),
+                value["client_kind"].as_str().unwrap_or(""),
+                value["speed"].as_str(),
+                value["input_tokens"].as_i64().unwrap_or(0),
+                value["output_tokens"].as_i64().unwrap_or(0),
+                value["total_tokens"].as_i64().unwrap_or(0),
+                value["cached_input_tokens"].as_i64().unwrap_or(0),
+                value["cache_creation_tokens"].as_i64().unwrap_or(0),
+                value["cache_read_tokens"].as_i64().unwrap_or(0),
+                value["reasoning_tokens"].as_i64().unwrap_or(0),
+                value["thoughts_tokens"].as_i64().unwrap_or(0),
+                value["tool_tokens"].as_i64().unwrap_or(0),
+                value["cost_usd"].as_f64(),
+                value["estimated_cost_usd"].as_f64(),
+                value["cost_currency"].as_str().unwrap_or("USD"),
+                value["cost_source"].as_str().unwrap_or("unknown"),
+                value["price_catalog_version"].as_str().unwrap_or(""),
+                value["is_error"].as_i64().unwrap_or(0),
+                value["error_type"].as_str(),
+                value["raw_event_hash"].as_str().unwrap_or(""),
+                value["usage_limit_reset_time_ms"].as_i64(),
+                value["created_at_ms"].as_i64().unwrap_or(0),
+                value["updated_at_ms"].as_i64().unwrap_or(0),
+                target_generation_id,
+                value["id"].as_str().unwrap_or(""),
+                0i32, // is_sidechain → DEFAULT 0 (replay events have no sidechain flag)
+            ],
+        )
+        .context("failed to insert replay usage event")?;
 
     Ok(changes as i64)
 }
