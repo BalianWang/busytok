@@ -187,7 +187,7 @@ jobs:
               VER="$CURRENT_TAG"
             else
               URL="https://github.com/$REPO/releases/download/$TAG/latest.json"
-              JSON="$(curl -fsSL "$URL" || true)"
+              JSON="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$URL" || true)"
               [ -z "$JSON" ] && continue
               BODY="$(printf '%s' "$JSON" | jq -r '.notes // ""')"
               DATE="$(printf '%s' "$JSON" | jq -r '.pub_date // ""')"
