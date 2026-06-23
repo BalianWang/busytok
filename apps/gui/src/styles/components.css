@@ -95,8 +95,37 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-left: auto;
   flex-shrink: 0;
+}
+
+/* Right-aligned cluster: global update badge + per-page toolbar (D4). */
+.desktop-titlebar__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ── Titlebar update badge ────────────────────────────────────── */
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  font-size: var(--font-size-sm, 12px);
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.update-badge:disabled { cursor: default; opacity: 0.7; }
+.update-badge--busy, .update-badge--info { cursor: default; }
+.update-badge--error { color: var(--color-danger, #c0392b); }
+.update-badge__dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--color-accent, #2e7d32);
 }
 
 /* ── Titlebar calm status chip (single entry) ─────────────────── */
