@@ -165,6 +165,46 @@ jobs:
             | sed "s|__PUB_DATE_PLACEHOLDER__|$PUB_DATE|" \
             > "$BUNDLE_DIR/latest.json"
 
+      - name: Generate versions.json (version-history index)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          BUNDLE_DIR="target/universal-apple-darwin/release/bundle/macos"
+          CURRENT_TAG="${{ github.ref_name }}"
+          # Last 6 tags (newest first); current tag is included.
+          # NOTE: use a while/read loop, NOT mapfile/readarray — GitHub's
+          # macos-latest runs /bin/bash 3.2, which predates mapfile (bash 4+).
+          ENTRIES="["
+          FIRST=1
+          while IFS= read -r TAG; do
+            if [ "$TAG" = "$CURRENT_TAG" ]; then
+              # Current release: read the locally-generated latest.json.
+              MANIFEST="$BUNDLE_DIR/latest.json"
+              BODY="$(jq -r '.notes // ""' "$MANIFEST")"
+              DATE="$(jq -r '.pub_date // ""' "$MANIFEST")"
+              VER="$CURRENT_TAG"
+            else
+              URL="https://github.com/$REPO/releases/download/$TAG/latest.json"
+              JSON="$(curl -fsSL "$URL" || true)"
+              [ -z "$JSON" ] && continue
+              BODY="$(printf '%s' "$JSON" | jq -r '.notes // ""')"
+              DATE="$(printf '%s' "$JSON" | jq -r '.pub_date // ""')"
+              VER="$TAG"
+            fi
+            ENTRY=$(jq -nc \
+              --arg tag "$VER" \
+              --arg date "$DATE" \
+              --arg body "$BODY" \
+              --arg url "https://github.com/$REPO/releases/download/$TAG/latest.json" \
+              '{tag_name:$tag, published_at:$date, body:$body, manifest_url:$url}')
+            [ "$FIRST" -eq 1 ] && FIRST=0 || ENTRIES+=","
+            ENTRIES+="$ENTRY"
+          done < <(git tag --sort=-creatordate | head -6)
+          ENTRIES+="]"
+          printf '%s' "$ENTRIES" | ./scripts/generate_versions_manifest.sh 5 > "$BUNDLE_DIR/versions.json"
+
       - name: Generate SHA256SUMS
         run: |
           cd target/universal-apple-darwin/release/bundle
@@ -181,6 +221,7 @@ jobs:
             target/universal-apple-darwin/release/bundle/macos/Busytok.app.tar.gz
             target/universal-apple-darwin/release/bundle/macos/Busytok.app.tar.gz.sig
             target/universal-apple-darwin/release/bundle/macos/latest.json
+            target/universal-apple-darwin/release/bundle/macos/versions.json
             ${{ runner.temp }}/sha256sums.txt
 
       - name: Cleanup Apple API key (always)
