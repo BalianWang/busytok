@@ -9,11 +9,18 @@ vi.mock("../lib/updaterClient", () => ({
   DOWNLOAD_TIMEOUT_MS: 120_000,
 }));
 const focusCallbacks: Array<(e: { payload: boolean }) => void> = [];
+// Default behavior: onFocusChanged resolves immediately with a no-op unlisten.
+// Tests that need a controlled (not-yet-resolved) promise can set
+// `pendingFocusResolve` to capture the resolve fn and defer it.
+let pendingFocusResolve: ((fn: () => void) => void) | null = null;
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     onFocusChanged: (cb: (e: { payload: boolean }) => void) => {
       focusCallbacks.push(cb);
-      return Promise.resolve(() => {});
+      return new Promise<() => void>((resolve) => {
+        if (pendingFocusResolve) pendingFocusResolve(resolve);
+        else resolve(() => {});
+      });
     },
   }),
 }));
@@ -30,6 +37,7 @@ const fakeUpdate = { version: "0.3.0", close: vi.fn().mockResolvedValue(undefine
 
 beforeEach(() => {
   vi.clearAllMocks();
+  pendingFocusResolve = null;
   // shouldAdvanceTime keeps RTL waitFor()'s real-interval polling live while
   // setInterval/Date.now stay faked (the interval-reset + 1h focus-threshold
   // assertions depend on both). Mirrors TagFilterCombobox.test.tsx.
@@ -162,6 +170,79 @@ describe("UpdaterProvider state machine", () => {
     await waitFor(() => expect(result.current.status.state).toBe("available"));
     unmount();
     await waitFor(() => expect(u.close).toHaveBeenCalledTimes(1));
+  });
+
+  // Default context value (no provider): the async no-op checkNow/applyNow
+  // (UpdaterProvider.tsx lines 46-47) must resolve without throwing.
+  it("default context value no-ops when consumed without a provider", async () => {
+    const { result } = renderHook(() => useHook());
+    expect(result.current.status).toEqual({ state: "idle" });
+    await act(async () => {
+      await result.current.checkNow();
+      await result.current.applyNow();
+    });
+    expect(mockedCheck).not.toHaveBeenCalled();
+    expect(mockedApply).not.toHaveBeenCalled();
+    expect(result.current.status).toEqual({ state: "idle" });
+  });
+
+  // applyNow early-return when no Update is held (UpdaterProvider.tsx line 107).
+  it("applyNow is a no-op when no Update is held (up-to-date)", async () => {
+    mockedCheck.mockResolvedValue({ kind: "up-to-date" });
+    const { result } = renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(result.current.status.state).toBe("up-to-date"));
+    await act(async () => { await result.current.applyNow(); });
+    expect(mockedApply).not.toHaveBeenCalled();
+    expect(result.current.status.state).toBe("up-to-date");
+  });
+
+  // progress event with no contentLength → percent null (line 112).
+  it("forwards percent: null when a progress event has no contentLength", async () => {
+    const u = { ...fakeUpdate, close: vi.fn() };
+    mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
+    let onProgress: ((p: { chunkLength: number; contentLength?: number }) => void) | undefined;
+    let resolveApply!: (v: { kind: "updated"; version: string }) => void;
+    mockedApply.mockImplementation(async (_update, cb) => {
+      onProgress = cb;
+      return new Promise<{ kind: "updated"; version: string }>((r) => { resolveApply = r; });
+    });
+    const { result } = renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(result.current.status.state).toBe("available"));
+    let applyPromise!: Promise<void>;
+    act(() => { applyPromise = result.current.applyNow(); });
+    await waitFor(() => expect(result.current.status.state).toBe("downloading"));
+    act(() => { onProgress?.({ chunkLength: 500 }); });
+    expect(result.current.status).toEqual({ state: "downloading", percent: null });
+    act(() => { resolveApply({ kind: "updated", version: "0.3.0" }); });
+    await act(async () => { await applyPromise; });
+  });
+
+  // download error → available using the held Update's body/date (line 126,
+  // the `?? ""` left sub-branches).
+  it("applyNow download error → available with the Update's notes/date when present", async () => {
+    const u = { ...fakeUpdate, body: "release notes here", date: "2026-06-23", close: vi.fn() } as unknown;
+    mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "release notes here", date: "2026-06-23", update: u });
+    mockedApply.mockResolvedValue({ kind: "error", message: "disk full" });
+    const { result } = renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(result.current.status.state).toBe("available"));
+    await act(async () => { await result.current.applyNow(); });
+    expect(result.current.status).toEqual({ state: "available", version: "0.3.0", notes: "release notes here", date: "2026-06-23" });
+  });
+
+  // The focus-listener .then runs with cancelled===true when the component
+  // unmounts before onFocusChanged's promise resolves (line 147).
+  it("unmounting before onFocusChanged resolves calls the unlisten fn (cancelled branch)", async () => {
+    mockedCheck.mockResolvedValue({ kind: "up-to-date" });
+    let resolveFocus!: (fn: () => void) => void;
+    pendingFocusResolve = (resolve) => { resolveFocus = resolve; };
+    const { unmount } = renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(mockedCheck).toHaveBeenCalledTimes(1));
+    // Unmount while the focus promise is still pending, then resolve it so the
+    // .then callback executes with cancelled===true and invokes fn().
+    let unlistenCalled = false;
+    unmount();
+    await act(async () => { resolveFocus(() => { unlistenCalled = true; }); });
+    expect(unlistenCalled).toBe(true);
   });
 });
 
