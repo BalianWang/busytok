@@ -176,4 +176,21 @@ describe("AppShell", () => {
     const toolbarButton = screen.getByRole("button", { name: "Refresh data" });
     expect(toolbarButton.closest(".desktop-titlebar__toolbar")).not.toBeNull();
   });
+
+  it("does not render a vestigial traffic-light gutter before the status chip", () => {
+    // The main window uses native decorations, so macOS traffic lights sit in
+    // the native bar above the webview — nothing overlays this titlebar. Any
+    // reserved gutter is dead space pushing the status chip off the content
+    // rhythm. The status group must be the titlebar's first child.
+    render(
+      <Wrapper>
+        <AppShell currentPage="overview" onNavigate={() => {}}>
+          <p>Content</p>
+        </AppShell>
+      </Wrapper>,
+    );
+    expect(document.querySelector(".desktop-titlebar__gutter")).toBeNull();
+    const titlebar = document.querySelector(".desktop-titlebar");
+    expect(titlebar?.firstElementChild?.classList.contains("desktop-titlebar__status")).toBe(true);
+  });
 });
