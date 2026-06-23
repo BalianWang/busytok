@@ -134,14 +134,16 @@ describe("OverviewSummaryPanel", () => {
 describe("OverviewHeatmapPanel", () => {
   it("renders loading, error, empty, and heatmap states", () => {
     mockUseOverviewHeatmap.mockReturnValue({ data: null, isLoading: true, isError: false });
-    render(<OverviewHeatmapPanel range="day" />);
+    const { container: loadingContainer } = render(<OverviewHeatmapPanel range="day" />);
     // Loading renders an in-frame chart skeleton (stable frame, no spinner).
     expect(document.querySelector(".panel-skeleton--chart")).not.toBeNull();
+    expect(loadingContainer.querySelector(".overview-console__heatmap")).not.toBeNull();
 
     cleanup();
     mockUseOverviewHeatmap.mockReturnValue({ data: null, isLoading: false, isError: true });
-    render(<OverviewHeatmapPanel range="day" />);
+    const { container: errorContainer } = render(<OverviewHeatmapPanel range="day" />);
     expect(screen.getByText("Heatmap unavailable")).toBeDefined();
+    expect(errorContainer.querySelector(".overview-console__heatmap")).not.toBeNull();
 
     cleanup();
     mockUseOverviewHeatmap.mockReturnValue({
@@ -149,8 +151,9 @@ describe("OverviewHeatmapPanel", () => {
       isLoading: false,
       isError: false,
     });
-    render(<OverviewHeatmapPanel range="day" />);
+    const { container: emptyContainer } = render(<OverviewHeatmapPanel range="day" />);
     expect(screen.getByText("No heatmap data available.")).toBeDefined();
+    expect(emptyContainer.querySelector(".overview-console__heatmap")).not.toBeNull();
 
     cleanup();
     mockUseOverviewHeatmap.mockReturnValue({
@@ -172,22 +175,25 @@ describe("OverviewHeatmapPanel", () => {
       isLoading: false,
       isError: false,
     });
-    render(<OverviewHeatmapPanel range="day" />);
+    const { container: readyContainer } = render(<OverviewHeatmapPanel range="day" />);
     expect(screen.getByTestId("mock-heatmap")).toBeDefined();
+    expect(readyContainer.querySelector(".overview-console__heatmap")).not.toBeNull();
   });
 });
 
 describe("OverviewRankingsPanel", () => {
   it("renders loading, error, empty, section, and per-section empty states", () => {
     mockUseOverviewRankings.mockReturnValue({ data: null, isLoading: true, isError: false });
-    render(<OverviewRankingsPanel range="day" />);
+    const { container: loadingContainer } = render(<OverviewRankingsPanel range="day" />);
     // Loading renders an in-frame list skeleton (stable frame, no spinner).
     expect(document.querySelector(".panel-skeleton--rows")).not.toBeNull();
+    expect(loadingContainer.querySelector(".overview-console__rankings")).not.toBeNull();
 
     cleanup();
     mockUseOverviewRankings.mockReturnValue({ data: null, isLoading: false, isError: true });
-    render(<OverviewRankingsPanel range="day" />);
+    const { container: errorContainer } = render(<OverviewRankingsPanel range="day" />);
     expect(screen.getByText("Rankings unavailable")).toBeDefined();
+    expect(errorContainer.querySelector(".overview-console__rankings")).not.toBeNull();
 
     cleanup();
     mockUseOverviewRankings.mockReturnValue({

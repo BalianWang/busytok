@@ -290,4 +290,78 @@ describe("OverviewPage", () => {
     // And the panel-level duplicate role="alert" banner must not appear.
     expect(screen.queryByRole("alert")).toBeNull();
   });
+
+  it("keeps the recent activity panel shell stable across loading/error/ready (state-in-frame)", () => {
+    // The outer section class must NOT change between states — the panel
+    // frame is always overview-console__recent, with loading/error/skeleton
+    // content rendered inside it.
+    function stubOthers() {
+      mockUseOverviewSummary.mockReturnValue({
+        data: envelope({
+          timezone: "Asia/Shanghai",
+          selected_range: "day",
+          cost_status: "exact",
+          generated_at_ms: 1,
+          metrics: summaryMetrics(),
+        }),
+        isLoading: false,
+        isError: false,
+        isFetching: false,
+      });
+      mockUseOverviewTrend.mockReturnValue({
+        data: envelope({
+          trend: {
+            range: "day",
+            bucket_granularity: "hour",
+            metric_options: ["tokens", "cost"],
+            cost_status: "exact",
+            buckets: [],
+          },
+        }),
+        isLoading: false,
+        isError: false,
+        isFetching: false,
+      });
+      mockUseOverviewHeatmap.mockReturnValue({
+        data: envelope({ heatmap: { today: "2026-05-27", week_starts_on: 0, days: [] } }),
+        isLoading: false,
+        isError: false,
+      });
+      mockUseOverviewRankings.mockReturnValue({
+        data: envelope({ rankings: [] }),
+        isLoading: false,
+        isError: false,
+      });
+    }
+
+    // Loading: recent activity renders a table skeleton inside the stable shell.
+    stubOthers();
+    mockUseActivityRecent.mockReturnValue({ data: null, isLoading: true, isError: false });
+    const { unmount: unload } = render(<OverviewPage />);
+    let recentShells = document.querySelectorAll("section.overview-console__recent");
+    expect(recentShells.length).toBe(1);
+    // The legacy loading spinner card markup is gone.
+    expect(document.querySelector(".overview-panel--loading")).toBeNull();
+    expect(document.querySelector(".overview-panel__placeholder")).toBeNull();
+    // The table skeleton lives inside the recent shell.
+    expect(recentShells[0].querySelector(".panel-skeleton--rows")).not.toBeNull();
+    unload();
+
+    // Error: still the same shell.
+    stubOthers();
+    mockUseActivityRecent.mockReturnValue({ data: null, isLoading: false, isError: true });
+    const { unmount: unerr } = render(<OverviewPage />);
+    expect(document.querySelectorAll("section.overview-console__recent").length).toBe(1);
+    unerr();
+
+    // Ready: still the same shell.
+    stubOthers();
+    mockUseActivityRecent.mockReturnValue({
+      data: envelope({ recent_activity: [] }),
+      isLoading: false,
+      isError: false,
+    });
+    render(<OverviewPage />);
+    expect(document.querySelectorAll("section.overview-console__recent").length).toBe(1);
+  });
 });
