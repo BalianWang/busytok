@@ -25,7 +25,7 @@ export const nivoTheme = {
   },
 
   grid: {
-    line: { stroke: chartTokens.borderSoft, strokeWidth: 1 },
+    line: { stroke: chartTokens.borderSubtle, strokeWidth: 1 },
   },
 
   tooltip: {

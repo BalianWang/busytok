@@ -23,7 +23,7 @@ describe("chartTokens", () => {
 
   it("exposes neutral surface tokens for axis/grid/tooltip text", () => {
     expect(chartTokens.textMuted).toBe("var(--color-text-muted)");
-    expect(chartTokens.borderSoft).toBe("var(--color-border-subtle)");
+    expect(chartTokens.borderSubtle).toBe("var(--color-border-subtle)");
   });
 
   it("is frozen so stray assignments cannot corrupt every chart", () => {
