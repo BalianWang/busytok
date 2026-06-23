@@ -6,6 +6,7 @@
 //! screen.
 
 import { useOverviewSummary } from "../../api/useBusytokData";
+import { PanelSkeleton } from "./PanelSkeleton";
 import type { RangePresetDto } from "@busytok/protocol-types";
 
 interface OverviewSummaryPanelProps {
@@ -27,11 +28,8 @@ export function OverviewSummaryPanel({ range }: OverviewSummaryPanelProps) {
   // ── Loading ──────────────────────────────────────────────────────────
   if (isLoading || !envelope) {
     return (
-      <section className="overview-panel overview-panel--loading" aria-label="Overview summary">
-        <div className="overview-panel__placeholder">
-          <span className="overview-panel__spinner" />
-          <p>Loading summary data...</p>
-        </div>
+      <section className="overview-panel" aria-label="Overview summary">
+        <PanelSkeleton variant="metrics" />
       </section>
     );
   }
