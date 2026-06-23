@@ -58,6 +58,10 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const downloadedBytesRef = useRef<number>(0);
   const didMountCheckRef = useRef(false);
+  // True while applyNow's download is in flight. Guards runCheck so a
+  // 12h-interval or focus re-check can't closeHeld() the in-use Update or
+  // swap updateRef.current mid-download (download errors + stale metadata).
+  const downloadingRef = useRef(false);
 
   const closeHeld = useCallback(() => {
     const u = updateRef.current;
@@ -68,6 +72,9 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const runCheck = useCallback(async () => {
+    // Don't check mid-download: closeHeld()/ref-swap would break the in-flight
+    // download and surface wrong metadata (mount, interval, focus, manual).
+    if (downloadingRef.current) return;
     setStatus({ state: "checking" });
     const outcome: CheckOutcome = await checkForUpdate();
     lastCheckAtRef.current = Date.now();
@@ -105,6 +112,7 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
   const applyNow = useCallback(async () => {
     const update = updateRef.current;
     if (!update) return;
+    downloadingRef.current = true;
     downloadedBytesRef.current = 0;
     setStatus({ state: "downloading", percent: null });
     const onProgress = (p: DownloadProgress) => {
@@ -112,19 +120,26 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
       const percent = p.contentLength ? Math.min(100, Math.round((downloadedBytesRef.current / p.contentLength) * 100)) : null;
       setStatus({ state: "downloading", percent });
     };
-    const outcome: ApplyOutcome = await applyUpdate(update, onProgress);
-    if (outcome.kind === "updated") {
-      reportFrontendEventSafely({ level: "INFO", event_code: "gui.update.applied", message: "Update applied", details: { version: outcome.version } });
-      setStatus({ state: "installed-pending-restart" });
-    } else if (outcome.kind === "needs-manual-restart") {
-      reportFrontendEventSafely({ level: "WARN", event_code: "gui.update.relaunch_failed", message: "Relaunch failed; manual restart needed", details: { version: outcome.version } });
-      setStatus({ state: "installed-needs-manual-restart", version: outcome.version });
-    } else {
-      // Download/install error: Update is still valid → return to available for retry.
-      reportFrontendEventSafely({ level: "ERROR", event_code: "gui.update.download_failed", message: "Update download/install failed", details: { message: outcome.message } });
-      setStatus(updateRef.current
-        ? { state: "available", version: update.version, notes: update.body ?? "", date: update.date ?? "" }
-        : { state: "error", message: outcome.message });
+    try {
+      const outcome: ApplyOutcome = await applyUpdate(update, onProgress);
+      if (outcome.kind === "updated") {
+        reportFrontendEventSafely({ level: "INFO", event_code: "gui.update.applied", message: "Update applied", details: { version: outcome.version } });
+        setStatus({ state: "installed-pending-restart" });
+      } else if (outcome.kind === "needs-manual-restart") {
+        reportFrontendEventSafely({ level: "WARN", event_code: "gui.update.relaunch_failed", message: "Relaunch failed; manual restart needed", details: { version: outcome.version } });
+        setStatus({ state: "installed-needs-manual-restart", version: outcome.version });
+      } else {
+        // Download/install error: Update is still valid → return to available for retry.
+        // Re-read the current Update (defense-in-depth: with the downloadingRef guard
+        // updateRef.current is unchanged here, but don't rely on the captured local).
+        const current = updateRef.current;
+        reportFrontendEventSafely({ level: "ERROR", event_code: "gui.update.download_failed", message: "Update download/install failed", details: { message: outcome.message } });
+        setStatus(current
+          ? { state: "available", version: current.version, notes: current.body ?? "", date: current.date ?? "" }
+          : { state: "error", message: outcome.message });
+      }
+    } finally {
+      downloadingRef.current = false;
     }
     // Deps []: applyNow reads only refs (updateRef, downloadedBytesRef), the
     // module-level applyUpdate/reportFrontendEventSafely imports, and setStatus —

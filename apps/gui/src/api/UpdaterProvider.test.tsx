@@ -167,6 +167,34 @@ describe("UpdaterProvider state machine", () => {
     await waitFor(() => expect(mockedCheck.mock.calls.length).toBeGreaterThan(baseline));
   });
 
+  // Fix 3: a 12h-interval / focus / manual re-check fired WHILE applyNow's
+  // download is in flight is skipped (downloadingRef guard) — no extra
+  // checkForUpdate call, so closeHeld()/ref-swap can't break the download.
+  it("skips runCheck while applyNow's download is in flight", async () => {
+    const u = { ...fakeUpdate, close: vi.fn() } as unknown as Update;
+    mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
+    let resolveApply!: (v: { kind: "updated"; version: string }) => void;
+    mockedApply.mockImplementation(async () => {
+      return new Promise<{ kind: "updated"; version: string }>((r) => { resolveApply = r; });
+    });
+    const { result } = renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(result.current.status.state).toBe("available"));
+    const baseline = mockedCheck.mock.calls.length;
+    // Hold applyNow on the unresolved promise → download in flight.
+    let applyPromise!: Promise<void>;
+    act(() => { applyPromise = result.current.applyNow(); });
+    await waitFor(() => expect(result.current.status.state).toBe("downloading"));
+    // Re-checks during the download are all skipped.
+    await act(async () => { await result.current.checkNow(); });
+    act(() => { focusCallbacks[focusCallbacks.length - 1]?.({ payload: true }); });
+    await act(async () => { vi.advanceTimersByTimeAsync(12 * 60 * 60 * 1000); });
+    expect(mockedCheck.mock.calls.length).toBe(baseline); // no extra check
+    // Resolve the held download → cleanup runs, status advances.
+    act(() => { resolveApply({ kind: "updated", version: "0.3.0" }); });
+    await act(async () => { await applyPromise; });
+    expect(result.current.status.state).toBe("installed-pending-restart");
+  });
+
   it("closes the held Update on unmount", async () => {
     const u = { ...fakeUpdate, close: vi.fn().mockResolvedValue(undefined) } as unknown as Update;
     mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "", date: "", update: u });
