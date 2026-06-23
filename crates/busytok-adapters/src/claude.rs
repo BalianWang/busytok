@@ -116,11 +116,25 @@ impl AgentLogAdapter for ClaudeCodeAdapter {
         let cache_creation_tokens = usage_val.cache_creation_input_tokens.unwrap_or(0);
         let cached_input_tokens = cache_read_tokens;
 
-        // Classify the payload shape. Genuine Anthropic includes cached prompt
-        // tokens in input_tokens; DeepSeek/GLM (Anthropic-format, non-Anthropic
-        // semantics) report non-cached-only input where cache_read + cache_creation
-        // can exceed input_tokens.
-        let provider_shape = if cache_read_tokens + cache_creation_tokens > raw_input {
+        // Classify the payload shape. Provider SEMANTICS, not the cache/input
+        // ratio, decide: a compatible provider returning a small cache (e.g.
+        // non-cached input=1000, cache_read=100) would be misclassified Native
+        // by the old `cache > input` heuristic, silently undercounting total and
+        // rate. Family-first: known Anthropic-FORMAT providers whose input_tokens
+        // is NON-cached-only are always Compatible; the cache>input check survives
+        // only as an anomaly fallback for unknown compatible providers.
+        let model_lower = message_ref.model.as_deref().unwrap_or("").to_ascii_lowercase();
+        // Known Anthropic-FORMAT providers whose input_tokens is NON-cached-only
+        // (DeepSeek, GLM, Qwen, Moonshot/Kimi, Yi, Baichuan, ...). Extensible.
+        const KNOWN_COMPATIBLE: &[&str] = &[
+            "deepseek", "glm", "qwen", "moonshot", "kimi", "yi-", "baichuan", "spark", "ernie",
+            "doubao", "hunyuan",
+        ];
+        let provider_shape = if KNOWN_COMPATIBLE.iter().any(|f| model_lower.contains(f)) {
+            ProviderPayloadShape::AnthropicCompatibleNonCachedInput
+        } else if cache_read_tokens + cache_creation_tokens > raw_input {
+            // Anomaly fallback for unknown compatible providers: cache exceeds
+            // input ⇒ must be non-cached semantics.
             ProviderPayloadShape::AnthropicCompatibleNonCachedInput
         } else {
             ProviderPayloadShape::AnthropicNative
@@ -469,6 +483,46 @@ mod tests {
             event.provider_payload_shape,
             busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicCompatibleNonCachedInput
         );
+        assert_eq!(event.prompt_input_total_tokens, 1000);
+    }
+
+    #[test]
+    fn f6_compatible_provider_small_cache_classified_by_family_not_heuristic() {
+        // The F6 regression: a known compatible provider (deepseek-chat) with a
+        // SMALL cache (cache_read + cache_creation = 100 < input = 1000). Under
+        // the old cache>input heuristic this was misclassified Native, silently
+        // undercounting total (1000) and non_cached (900). Family-first
+        // classification must still mark it Compatible so the unified total
+        // = input + cache_read + cache_creation = 1100.
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        let line = r#"{"sessionId":"sess-1","timestamp":"2026-05-15T08:00:00Z","message":{"id":"msg-ds-small","model":"deepseek-chat","usage":{"input_tokens":1000,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":100}}}"#;
+        let parsed = adapter.parse_line(&ctx, line).unwrap();
+        let event = unwrap_first_usage(&parsed);
+        assert_eq!(
+            event.provider_payload_shape,
+            busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicCompatibleNonCachedInput,
+            "known compatible provider must be classified by family regardless of cache size"
+        );
+        assert_eq!(event.prompt_input_total_tokens, 1100);
+        assert_eq!(event.prompt_input_non_cached_tokens, 1000);
+    }
+
+    #[test]
+    fn f6_genuine_anthropic_small_cache_still_native() {
+        // Counterpart: a genuine Anthropic model with cache < input must STILL
+        // classify Native (the heuristic fallback only promotes to Compatible on
+        // cache>input; claude-* is not in the known-compatible list).
+        let adapter = ClaudeCodeAdapter;
+        let ctx = ParseContext::for_test("claude-file", "/tmp/claude.jsonl", 1, 0, 100);
+        let line = r#"{"sessionId":"sess-1","timestamp":"2026-05-15T08:00:00Z","message":{"id":"msg-claude","model":"claude-sonnet-4-5","usage":{"input_tokens":1000,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":100}}}"#;
+        let parsed = adapter.parse_line(&ctx, line).unwrap();
+        let event = unwrap_first_usage(&parsed);
+        assert_eq!(
+            event.provider_payload_shape,
+            busytok_domain::cache_metrics::ProviderPayloadShape::AnthropicNative
+        );
+        // Native: total already includes cache_read, so total == input == 1000.
         assert_eq!(event.prompt_input_total_tokens, 1000);
     }
 
