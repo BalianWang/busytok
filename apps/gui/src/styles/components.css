@@ -89,15 +89,6 @@
   flex-wrap: nowrap;
 }
 
-/* Right group: page toolbar. Pushed to the far edge by space-between; the
-   explicit margin is belt-and-suspenders in case the status group is absent. */
-.desktop-titlebar__toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-shrink: 0;
-}
-
 /* Right-aligned cluster: global update badge + per-page toolbar (D4). */
 .desktop-titlebar__actions {
   margin-left: auto;
