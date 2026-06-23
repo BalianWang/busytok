@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use busytok_domain::now_ms;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeSet;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ── Usage events batch ───────────────────────────────────────────────────────
 
@@ -288,12 +288,15 @@ pub fn upsert_usage_events_dedup_aware(
                 effective.push(event.clone());
                 inserted_ids.push(event.id.clone());
                 inserted += 1;
+                // Centralized cache-metric invariant check — single chokepoint
+                // covering both Claude and Codex events. Syncs (upsert on
+                // violation, delete on valid) the per-event `cache_metric`
+                // diagnostic to the PERSISTED row's CURRENT state. A duplicate
+                // id (changes == 0) is a no-op: the persisted row is unchanged,
+                // so the diagnostic must NOT be re-synced against the
+                // (unpersisted) new event.
+                sync_cache_metric_diagnostic(conn, event)?;
             }
-            // Centralized cache-metric invariant check — single chokepoint
-            // covering both Claude and Codex events. Syncs (upsert on
-            // violation, delete on valid) the per-event `cache_metric`
-            // diagnostic to the event's CURRENT state.
-            sync_cache_metric_diagnostic(conn, event)?;
             continue;
         }
 
@@ -336,6 +339,17 @@ pub fn upsert_usage_events_dedup_aware(
         // holds exactly one row per dedupe key.
         let needs_delete = existing.as_ref().map_or(false, |e| e.id != event.id);
         if needs_delete {
+            // The dedupe invariant guarantees exactly one row per dedupe key, so
+            // the displaced `existing.id` is the only id evicted. Its
+            // `cache-metric-violation:{existing.id}` diagnostic would otherwise
+            // be orphaned (no usage row left to violate). Delete it here, before
+            // the eviction query, while we still hold the displaced id.
+            if let Some(ref existing_row) = existing {
+                delete_diagnostic_by_id(
+                    conn,
+                    &format!("cache-metric-violation:{}", existing_row.id),
+                )?;
+            }
             remove_other_dedupe_rows(conn, generation_id, &dedupe_key, &event.id)?;
         }
         conn.execute(
@@ -826,41 +840,103 @@ pub(crate) fn sync_cache_metric_diagnostic(
     conn: &Connection,
     event: &busytok_domain::NormalizedUsageEvent,
 ) -> Result<()> {
+    sync_cache_metric_diagnostic_fields(
+        conn,
+        &event.id,
+        Some(event.agent),
+        &event.source_file_id,
+        &event.source_path,
+        event.source_line,
+        event.provider_payload_shape,
+        event.prompt_input_total_tokens,
+        event.prompt_input_non_cached_tokens,
+        event.cache_read_tokens,
+        event.cache_creation_tokens,
+        event.timestamp_ms,
+    )
+}
+
+/// Primitive-taking core of the cache-metric diagnostic sync. The fields are
+/// taken as primitives so the replay path can supply them directly from a
+/// `serde_json::Value` (tail-replay events carry a partial JSON snapshot, not a
+/// full [`busytok_domain::NormalizedUsageEvent`]).
+///
+/// Lifecycle (recovery semantics): on violation, UPSERT the diagnostic (stable
+/// id `cache-metric-violation:{event_id}` → no duplicates on repeated violations
+/// of the same event); on a valid (re)write of the same event id, DELETE the
+/// prior diagnostic so a recovered event leaves no stale warning. Emits a
+/// structured tracing event in both branches (project convention:
+/// `event_code = "..."`).
+fn sync_cache_metric_diagnostic_fields(
+    conn: &Connection,
+    event_id: &str,
+    agent: Option<busytok_domain::AgentKind>,
+    source_file_id: &str,
+    source_path: &str,
+    source_line: u64,
+    provider_shape: busytok_domain::cache_metrics::ProviderPayloadShape,
+    prompt_input_total_tokens: i64,
+    prompt_input_non_cached_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+    timestamp_ms: i64,
+) -> Result<()> {
     let metrics = busytok_domain::cache_metrics::UnifiedCacheMetrics {
-        prompt_input_total_tokens: event.prompt_input_total_tokens,
-        prompt_input_non_cached_tokens: event.prompt_input_non_cached_tokens,
-        cache_read_tokens: event.cache_read_tokens,
-        cache_write_tokens: event.cache_creation_tokens,
+        prompt_input_total_tokens,
+        prompt_input_non_cached_tokens,
+        cache_read_tokens,
+        cache_write_tokens: cache_creation_tokens,
     };
-    let diag_id = format!("cache-metric-violation:{}", event.id);
+    let diag_id = format!("cache-metric-violation:{}", event_id);
     if metrics.invariant_holds() {
         // Recovery: a prior violating write of this event id is now valid.
+        info!(
+            event_code = "cache_metric.recovered",
+            event_id,
+            source_file_id,
+            prompt_input_total_tokens,
+            prompt_input_non_cached_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            "cache metric invariant recovered; stale diagnostic cleared"
+        );
         return delete_diagnostic_by_id(conn, &diag_id);
     }
+    warn!(
+        event_code = "cache_metric.invariant_violated",
+        event_id,
+        source_file_id,
+        shape = provider_shape.as_str(),
+        prompt_input_total_tokens,
+        prompt_input_non_cached_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        "cache metric invariant violated; cache_hit_rate nulled"
+    );
     let diag = busytok_domain::OperationalDiagnosticEvent {
         id: diag_id,
-        agent: Some(event.agent),
+        agent,
         // source_id is SOURCE-level, not the usage event id — matches the
         // existing convention (parse-error diagnostics use an empty source_id
         // and attribute via source_file_id/source_path/source_line). The event
         // id is preserved in the diagnostic `id` and detail_json for traceability.
         source_id: Some(String::new()),
-        source_file_id: Some(event.source_file_id.clone()),
-        source_path: Some(event.source_path.clone()),
-        source_line: Some(event.source_line as i64),
+        source_file_id: Some(source_file_id.to_string()),
+        source_path: Some(source_path.to_string()),
+        source_line: Some(source_line as i64),
         category: "cache_metric".to_string(),
         severity: "warning".to_string(),
         message: "cache metric invariant violated; cache_hit_rate nulled".to_string(),
         detail_json: Some(format!(
             "{{\"event_id\":\"{}\",\"shape\":\"{}\",\"total\":{},\"non_cached\":{},\"cache_read\":{},\"cache_write\":{}}}",
-            event.id,
-            event.provider_payload_shape.as_str(),
-            event.prompt_input_total_tokens,
-            event.prompt_input_non_cached_tokens,
-            event.cache_read_tokens,
-            event.cache_creation_tokens,
+            event_id,
+            provider_shape.as_str(),
+            prompt_input_total_tokens,
+            prompt_input_non_cached_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
         )),
-        happened_at_ms: event.timestamp_ms,
+        happened_at_ms: timestamp_ms,
         created_at_ms: busytok_domain::now_ms(),
     };
     upsert_diagnostic_event(conn, &diag)
@@ -1144,6 +1220,33 @@ fn apply_single_replay(
             ],
         )
         .context("failed to insert replay usage event")?;
+
+    // Centralized cache-metric invariant check for the replay path. Only sync
+    // when the row was actually written (changes > 0); a duplicate-id no-op
+    // leaves the persisted row (and its existing diagnostic) untouched. `tx`
+    // derefs to `&Connection`, satisfying the helper's signature.
+    if changes > 0 {
+        sync_cache_metric_diagnostic_fields(
+            tx,
+            value["id"].as_str().unwrap_or("replay-unknown"),
+            value["agent"]
+                .as_str()
+                .and_then(|s| std::str::FromStr::from_str(s).ok()),
+            value["source_file_id"].as_str().unwrap_or(""),
+            value["source_path"].as_str().unwrap_or(""),
+            value["source_line"].as_i64().unwrap_or(0) as u64,
+            busytok_domain::cache_metrics::ProviderPayloadShape::parse(
+                value["provider_payload_shape"].as_str().unwrap_or("codex"),
+            ),
+            value["prompt_input_total_tokens"].as_i64().unwrap_or(0),
+            value["prompt_input_non_cached_tokens"]
+                .as_i64()
+                .unwrap_or(0),
+            value["cache_read_tokens"].as_i64().unwrap_or(0),
+            value["cache_creation_tokens"].as_i64().unwrap_or(0),
+            value["timestamp_ms"].as_i64().unwrap_or(0),
+        )?;
+    }
 
     Ok(changes as i64)
 }
@@ -1689,19 +1792,27 @@ pub fn upsert_daily_usage_rows(
 ///
 /// Returns the number of rows deleted.
 pub fn prune_diagnostic_events(conn: &Connection, older_than_ms: i64) -> Result<i64> {
+    // cache_metric diagnostics are lifecycle-managed solely by the usage-event
+    // write path (sync on insert/upsert/replay) + prune_usage_events (delete on
+    // usage eviction). They MUST be excluded from age/count retention here, or a
+    // still-valid violation diagnostic would be silently dropped mid-session.
+    // The domain `category` is persisted in the `code` column.
     let mut deleted = conn
         .execute(
-            "DELETE FROM diagnostic_events WHERE created_at_ms < ?1",
+            "DELETE FROM diagnostic_events WHERE created_at_ms < ?1 AND code <> 'cache_metric'",
             params![older_than_ms],
         )
         .context("failed to prune diagnostic events by age")? as i64;
 
-    // Row-count cap: delete oldest rows beyond 10,000.
+    // Row-count cap: delete oldest rows beyond 10,000, counting ONLY
+    // non-cache_metric rows (cache_metric diagnostics are not subject to this cap).
     let max_rows: i64 = 10_000;
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM diagnostic_events", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostic_events WHERE code <> 'cache_metric'",
+            [],
+            |row| row.get(0),
+        )
         .context("failed to count diagnostic events")?;
 
     if count > max_rows {
@@ -1710,6 +1821,7 @@ pub fn prune_diagnostic_events(conn: &Connection, older_than_ms: i64) -> Result<
             .execute(
                 "DELETE FROM diagnostic_events WHERE id IN (\
                     SELECT id FROM diagnostic_events \
+                    WHERE code <> 'cache_metric' \
                     ORDER BY created_at_ms ASC LIMIT ?1\
                 )",
                 params![excess],
@@ -1724,6 +1836,16 @@ pub fn prune_diagnostic_events(conn: &Connection, older_than_ms: i64) -> Result<
 /// so non-active generation audit data is preserved.
 pub fn prune_usage_events(conn: &Connection, generation_id: &str) -> Result<i64> {
     let cutoff = busytok_domain::now_ms() - 86_400_000;
+    // Delete the per-event cache_metric diagnostics for the rows about to be
+    // pruned, BEFORE the usage_events DELETE (so the subquery still sees them).
+    conn.execute(
+        "DELETE FROM diagnostic_events WHERE id IN (\
+            SELECT 'cache-metric-violation:' || id FROM usage_events \
+            WHERE generation_id = ?1 AND timestamp_ms < ?2\
+         )",
+        params![generation_id, cutoff],
+    )
+    .context("failed to prune cache_metric diagnostics for aged usage events")?;
     conn.execute(
         "DELETE FROM usage_events WHERE generation_id = ?1 AND timestamp_ms < ?2",
         params![generation_id, cutoff],
