@@ -294,7 +294,7 @@ export function SettingsPage() {
   // applied live by themeRuntime via PREFERENCES_UPDATED_EVENT. It never
   // touches the server-backed settings mutation flow.
   const { preferences, updatePreference } = usePreferences();
-  const { status: updateStatus, checkNow: checkForUpdates } = useUpdater();
+  const { status: updateStatus, checkNow: checkForUpdates, applyNow: applyUpdateNow } = useUpdater();
 
   const handleThemePreferenceChange = useCallback(
     (next: ThemePreference) => {
@@ -932,29 +932,41 @@ export function SettingsPage() {
             <SettingsRow
               label="Software Update"
               description={
-                updateStatus.state === "done" && updateStatus.result.kind === "updated"
-                  ? `Updated to ${updateStatus.result.version}. Restarting...`
-                  : updateStatus.state === "done" && updateStatus.result.kind === "error"
-                    ? `Update check failed: ${updateStatus.result.message}`
-                    : "Check for and install the latest version of Busytok."
+                updateStatus.state === "downloading"
+                  ? updateStatus.percent == null
+                    ? "Downloading update…"
+                    : `Downloading update… ${updateStatus.percent}%`
+                  : updateStatus.state === "installed-pending-restart"
+                    ? "Update installed — restarting…"
+                    : updateStatus.state === "installed-needs-manual-restart"
+                      ? `Updated to v${updateStatus.version} — please restart Busytok manually.`
+                      : updateStatus.state === "error"
+                        ? `Update check failed: ${updateStatus.message}`
+                        : updateStatus.state === "available"
+                          ? `v${updateStatus.version} is available.`
+                          : "Check for and install the latest version of Busytok."
               }
               control={
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--sm"
-                  disabled={updateStatus.state === "checking"}
-                  onClick={() => void checkForUpdates()}
-                >
-                  {updateStatus.state === "checking"
-                    ? "Checking..."
-                    : updateStatus.state === "done" && updateStatus.result.kind === "up-to-date"
-                      ? "Up to date"
-                      : updateStatus.state === "done" && updateStatus.result.kind === "updated"
-                        ? `Updated to ${updateStatus.result.version}`
-                        : updateStatus.state === "done" && updateStatus.result.kind === "error"
+                updateStatus.state === "available" ? (
+                  <button type="button" className="btn btn--secondary btn--sm" onClick={() => void applyUpdateNow()}>
+                    Update now
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn--secondary btn--sm"
+                    disabled={updateStatus.state === "checking" || updateStatus.state === "downloading" || updateStatus.state === "installed-pending-restart"}
+                    onClick={() => void checkForUpdates()}
+                  >
+                    {updateStatus.state === "checking"
+                      ? "Checking…"
+                      : updateStatus.state === "up-to-date"
+                        ? "Up to date"
+                        : updateStatus.state === "error"
                           ? "Retry"
                           : "Check for updates"}
-                </button>
+                  </button>
+                )
               }
             />
           </div>
