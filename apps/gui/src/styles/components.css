@@ -653,6 +653,30 @@
   outline-offset: 2px;
 }
 
+.settings-row__control--vertical {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.settings-row__error {
+  font-size: 11px;
+  color: var(--color-status-danger);
+  white-space: nowrap;
+}
+
+.settings-row--dangerous {
+  padding: var(--space-3) var(--space-3);
+  margin: 0 calc(var(--space-3) * -1);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-status-danger) 6%, transparent);
+  border-left: 3px solid var(--color-status-danger);
+}
+
+.settings-row--dangerous h3 {
+  color: var(--color-status-danger);
+}
+
 /* ── Settings panel ──────────────────────────────────────── */
 
 .settings-panel {
