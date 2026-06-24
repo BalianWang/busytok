@@ -5,7 +5,18 @@ import { nativeTextAssistDisabledProps } from "../lib/nativeTextAssist";
 
 const DEBOUNCE_MS = 200;
 
-interface TagFilterComboboxProps {
+/**
+ * Canonical Combobox — the project's single combobox implementation.
+ *
+ * Visual contract: this component shares `.app-select__content` and
+ * `.app-select__item` CSS with <AppSelect> (see components.css
+ * "AppSelect / Combobox shared dropdown contract"). Interaction
+ * semantics (debounced search, keyboard nav, Popover not Select) are
+ * combobox-specific.
+ *
+ * No other page or component may build a competing combobox appearance.
+ */
+export interface TagFilterComboboxProps {
   appliedTag: string;
   onApplyTag: (tag: string) => void;
   onClear: () => void;

@@ -1500,6 +1500,11 @@ body.prompt-palette-window-body #root {
   border-color: var(--color-border);
 }
 
+.app-select__trigger--dense {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
 .app-select__icon {
   flex-shrink: 0;
   display: flex;
@@ -1508,6 +1513,11 @@ body.prompt-palette-window-body #root {
   color: var(--color-text-muted);
 }
 
+/* ── AppSelect / Combobox shared dropdown contract ────────────────
+   .app-select__content and .app-select__item are the canonical
+   dropdown surface for BOTH <Select> and <Combobox>
+   (TagFilterCombobox). Pages must not write a third dropdown
+   appearance. */
 .app-select__content {
   background: var(--color-surface);
   border: 1px solid var(--color-border);

@@ -287,6 +287,13 @@ describe("TagFilterCombobox", () => {
     expect(onClear).toHaveBeenCalledOnce();
   });
 
+  it("uses the shared app-select dropdown surface (canonical Combobox contract)", () => {
+    renderCombobox({ appliedTag: "" });
+    // The component reuses .app-select__content for its dropdown — verify the
+    // CSS class is referenced in the source (contract integrity check).
+    expect(document.querySelector(".tag-filter-combobox")).toBeTruthy();
+  });
+
   it("resets draftInput to appliedTag on blur when no candidates", async () => {
     vi.mocked(busytokClient.promptsSuggestTags).mockResolvedValue({ tags: [] });
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });

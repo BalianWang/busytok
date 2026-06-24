@@ -7,6 +7,7 @@ interface AppSelectProps {
   label: string;
   "aria-label"?: string;
   children: ReactNode;
+  size?: "default" | "dense";
 }
 
 export function AppSelect({
@@ -15,6 +16,7 @@ export function AppSelect({
   label,
   "aria-label": ariaLabel,
   children,
+  size = "default",
 }: AppSelectProps) {
   const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -28,7 +30,11 @@ export function AppSelect({
       </span>
       <RadixSelect.Root value={value} onValueChange={onValueChange}>
         <RadixSelect.Trigger asChild aria-label={ariaLabel ?? label}>
-          <button type="button" ref={triggerRef} className="app-select__trigger">
+          <button
+            type="button"
+            ref={triggerRef}
+            className={`app-select__trigger app-select__trigger--${size}`}
+          >
             <RadixSelect.Value />
             <RadixSelect.Icon className="app-select__icon" aria-hidden>
               <svg
