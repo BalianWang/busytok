@@ -283,13 +283,18 @@ export function SettingsPage() {
     };
   }, [fetchBgDiagnostics]);
 
+  const MIGRATION_LATCH_KEY = "busytok.controls.migration_reported";
   useEffect(() => {
+    if (typeof sessionStorage !== "undefined" && sessionStorage.getItem(MIGRATION_LATCH_KEY)) {
+      return;
+    }
     reportFrontendEventSafely({
       level: "INFO",
       event_code: "gui.controls.migration_complete",
       message: "SettingsPage rendered with canonical controls",
     });
-  }, []); // fire once on mount; StrictMode double-fire is harmless (idempotent log)
+    try { sessionStorage.setItem(MIGRATION_LATCH_KEY, "1"); } catch { /* quota/unavailable */ }
+  }, []);
 
   const handleRefresh = useCallback(async () => {
     await refetch();
@@ -565,6 +570,7 @@ export function SettingsPage() {
           <h2>Prompt Palette</h2>
           <div className="settings-panel">
             <SettingsRow
+              layout="vertical"
               label="Default action"
               description="Choose whether pressing Enter on a prompt copies it or pastes it into the active app."
               error={fieldError("prompt_palette_default_action")}
@@ -602,6 +608,7 @@ export function SettingsPage() {
           <h2>Week starts on</h2>
           <div className="settings-panel">
             <SettingsRow
+              layout="vertical"
               label="Week starts on"
               description="First day of the week for calendar views."
               error={fieldError("week_starts_on")}
@@ -627,6 +634,7 @@ export function SettingsPage() {
             {discovery && (
               <>
                 <SettingsRow
+                  layout="vertical"
                   label="Claude Code"
                   description="Scan default Claude Code config paths."
                   error={fieldError("discovery.claude_code_default_paths")}
@@ -640,6 +648,7 @@ export function SettingsPage() {
                   }
                 />
                 <SettingsRow
+                  layout="vertical"
                   label="Codex"
                   description="Scan default Codex config paths."
                   error={fieldError("discovery.codex_default_paths")}
@@ -663,6 +672,7 @@ export function SettingsPage() {
           {manualRoots.map((root, i) => (
             <div className="settings-panel" key={i}>
               <SettingsRow
+                layout="vertical"
                 label={`Root ${i + 1}`}
                 description="Select client and enter root path."
                 error={fieldError(`discovery.manual_roots[${i}].root_path`) || fieldError(`discovery.manual_roots[${i}].client_id`)}
@@ -716,6 +726,7 @@ export function SettingsPage() {
             {privacy && (
               <>
                 <SettingsRow
+                  layout="vertical"
                   label="Local only"
                   description="Keep all data local, disable network features."
                   error={fieldError("privacy.local_only")}
@@ -729,6 +740,7 @@ export function SettingsPage() {
                   }
                 />
                 <SettingsRow
+                  layout="vertical"
                   label="Redact sensitive values"
                   description="Mask sensitive information in logs and displays."
                   error={fieldError("privacy.redact_sensitive_values")}

@@ -1343,26 +1343,6 @@
   box-shadow: var(--material-shadow-card);
 }
 
-/* ── Diagnostics badges ─────────────────────────────────────── */
-
-.diag-badge {
-  display: inline-block;
-  padding: 2px 10px;
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.diag-badge--ok {
-  background: color-mix(in srgb, var(--color-status-success) 12%, transparent);
-  color: var(--color-status-success);
-}
-
-.diag-badge--error {
-  background: color-mix(in srgb, var(--color-status-danger) 12%, transparent);
-  color: var(--color-status-danger);
-}
-
 /* ── Usage page tabs ───────────────────────────────────────── */
 
 .usage-page {

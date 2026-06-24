@@ -287,11 +287,23 @@ describe("TagFilterCombobox", () => {
     expect(onClear).toHaveBeenCalledOnce();
   });
 
-  it("uses the shared app-select dropdown surface (canonical Combobox contract)", () => {
+  it("renders its dropdown with shared .app-select__content and .app-select__item classes (canonical Combobox contract)", async () => {
+    vi.mocked(busytokClient.promptsSuggestTags).mockResolvedValue({ tags: ["review", "refactor"] });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     renderCombobox({ appliedTag: "" });
-    // The component reuses .app-select__content for its dropdown — verify the
-    // CSS class is referenced in the source (contract integrity check).
-    expect(document.querySelector(".tag-filter-combobox")).toBeTruthy();
+
+    const input = screen.getByRole("combobox", { name: "Filter by tag" });
+    await user.click(input);
+    await user.type(input, "re");
+    await vi.advanceTimersByTimeAsync(250);
+
+    await waitFor(() => {
+      const content = document.querySelector(".app-select__content");
+      expect(content).not.toBeNull();
+    });
+
+    const items = document.querySelectorAll(".app-select__item");
+    expect(items.length).toBe(2);
   });
 
   it("resets draftInput to appliedTag on blur when no candidates", async () => {
