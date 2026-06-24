@@ -598,12 +598,14 @@ pub fn run() {
             // still false, the shutdown pipeline was never run (Dock Quit on
             // macOS can bypass ExitRequested).  Run the stop operations
             // directly — do NOT call app.exit(0), we are already inside Exit.
+            // Decision extracted as desktop_runtime::handle_exit so
+            // both branches are unit-tested (parallels handle_exit_requested).
             tauri::RunEvent::Exit => {
-                let allow_exit = app
-                    .state::<desktop_runtime::HostExitState>()
-                    .allow_exit
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                if !allow_exit {
+                if desktop_runtime::handle_exit(
+                    app.state::<desktop_runtime::HostExitState>()
+                        .allow_exit
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                ) {
                     tracing::warn!(
                         event_code = "desktop_host.exit_without_shutdown",
                         "process exiting without full shutdown pipeline; running stop operations"

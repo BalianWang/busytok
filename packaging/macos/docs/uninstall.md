@@ -2,11 +2,12 @@
 
 1. Quit Busytok Desktop:
    - Open the Busytok menu bar item and choose **Quit Busytok Desktop**.
-     This is the ONLY guaranteed whole-product quit path — it stops the GUI,
+     This is the guaranteed whole-product quit path — it stops the GUI,
      the `busytok-service`, and the login-start helper for the current session.
-   - Dock "Quit" and `Cmd-Q` close the GUI window but may leave the
-     `busytok-service` running.  To ensure a clean shutdown, use the menu bar
-     **Quit Busytok Desktop** option.
+   - Dock "Quit" can bypass the full shutdown pipeline and may leave the
+     `busytok-service` running.  `Cmd-Q` normally routes through the same
+     pipeline as the menu bar quit.  To ensure a clean shutdown, use the
+     menu bar **Quit Busytok Desktop** option.
 
 2. Delete the application:
    - Move `Busytok.app` to Trash.

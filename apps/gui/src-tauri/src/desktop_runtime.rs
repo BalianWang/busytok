@@ -300,6 +300,21 @@ pub(crate) fn quit_desktop_host(app: &tauri::AppHandle) {
     }
 }
 
+/// Decide whether `RunEvent::Exit` should run the safety-net stop.
+///
+/// Returns `true` when `allow_exit` is still `false` — the normal pipeline
+/// (tray-menu quit or ExitRequested → quit_desktop_host → app.exit(0)) was
+/// never reached (Dock Quit on macOS can bypass ExitRequested).  When
+/// `allow_exit` is already `true`, the normal pipeline already ran — do
+/// nothing (return `false`) to avoid a double-stop.
+///
+/// This is a pure decision function, extracted from the run-loop closure so
+/// both branches can be unit-tested — exactly the same seam as
+/// `route_exit_request` / `handle_exit_requested`.
+pub(crate) fn handle_exit(allow_exit: bool) -> bool {
+    !allow_exit
+}
+
 /// Safety-net shutdown for `RunEvent::Exit` when `allow_exit` is still
 /// `false` — the normal pipeline (tray-menu quit or ExitRequested →
 /// quit_desktop_host → app.exit(0)) was never reached (Dock Quit on macOS
@@ -322,9 +337,20 @@ pub(crate) fn run_stop_operations(app: &tauri::AppHandle) {
                     &settings_store,
                 )
                 .await;
-            // Best-effort stop: suppress errors so the process can exit.
-            let _ = coordinator.login_start().stop_for_current_session();
-            let _ = coordinator.lifecycle().stop_for_current_session();
+            // Same event codes as quit_desktop_host_with — the safety net
+            // must retain diagnostic visibility.
+            if let Err(e) = coordinator.login_start().stop_for_current_session() {
+                tracing::warn!(
+                    event_code = "desktop_host.quit.host_stop_failed",
+                    error = %e,
+                );
+            }
+            if let Err(e) = coordinator.lifecycle().stop_for_current_session() {
+                tracing::warn!(
+                    event_code = "desktop_host.quit.service_stop_failed",
+                    error = %e,
+                );
+            }
         });
     }
 }

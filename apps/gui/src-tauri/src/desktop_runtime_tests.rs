@@ -209,6 +209,24 @@ fn handle_exit_requested_skips_side_effects_for_self_triggered_exit() {
     );
 }
 
+// ── RunEvent::Exit safety-net tests ──────────────────────────
+
+#[test]
+fn exit_safety_net_triggers_stop_when_allow_exit_false() {
+    // Dock Quit on macOS can bypass ExitRequested, so allow_exit remains
+    // false when RunEvent::Exit fires.  handle_exit must return true,
+    // telling the caller to run run_stop_operations.
+    assert!(crate::desktop_runtime::handle_exit(false));
+}
+
+#[test]
+fn exit_safety_net_skips_stop_when_allow_exit_true() {
+    // Normal quit (tray menu or ExitRequested → quit_desktop_host →
+    // app.exit(0)) sets allow_exit=true before the process exits.
+    // handle_exit must return false — the shutdown already ran.
+    assert!(!crate::desktop_runtime::handle_exit(true));
+}
+
 #[test]
 fn host_presentation_uses_regular_app_model() {
     let config = host_presentation_config();
