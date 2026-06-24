@@ -17,6 +17,11 @@ import { AppSelect, AppSelectItem } from "../components/Select";
 import { PageState } from "../components/PageState";
 import { SettingsRow } from "../components/desktop/SettingsRow";
 import { SegmentedControl } from "../components/desktop/SegmentedControl";
+import { ToggleSwitch } from "../components/desktop/ToggleSwitch";
+import { SettingsValue } from "../components/desktop/SettingsValue";
+import { SettingsStatus } from "../components/desktop/SettingsStatus";
+import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
+import { DiagBadge } from "../components/desktop/DiagBadge";
 import { useRefreshToolbar } from "../components/desktop/useRefreshToolbar";
 import { usePreferences } from "../hooks/usePreferences";
 import type { ThemePreference } from "../lib/preferencesStorage";
@@ -279,6 +284,19 @@ export function SettingsPage() {
     };
   }, [fetchBgDiagnostics]);
 
+  const MIGRATION_LATCH_KEY = "busytok.controls.migration_reported";
+  useEffect(() => {
+    if (typeof sessionStorage !== "undefined" && sessionStorage.getItem(MIGRATION_LATCH_KEY)) {
+      return;
+    }
+    reportFrontendEventSafely({
+      level: "INFO",
+      event_code: "gui.controls.migration_complete",
+      message: "SettingsPage rendered with canonical controls",
+    });
+    try { sessionStorage.setItem(MIGRATION_LATCH_KEY, "1"); } catch { /* quota/unavailable */ }
+  }, []);
+
   const handleRefresh = useCallback(async () => {
     await refetch();
     setPasteStatus(await fetchPasteStatus());
@@ -523,10 +541,8 @@ export function SettingsPage() {
               }
               control={
                 hostShortcutDiagnostics?.state === "failed" ? (
-                  <div className="manual-root-controls">
-                    <span className="diag-value">
-                      Unavailable
-                    </span>
+                  <SettingsActionGroup direction="col">
+                    <SettingsStatus label="Unavailable" tone="danger" />
                     <button
                       type="button"
                       className="btn btn--secondary btn--sm"
@@ -541,11 +557,9 @@ export function SettingsPage() {
                     >
                       Retry
                     </button>
-                  </div>
+                  </SettingsActionGroup>
                 ) : (
-                  <span className="diag-value">
-                    {shortcutStatusText(shortcutStatus)}
-                  </span>
+                  <SettingsValue value={shortcutStatusText(shortcutStatus)} tone="default" />
                 )
               }
             />
@@ -557,6 +571,7 @@ export function SettingsPage() {
           <h2>Prompt Palette</h2>
           <div className="settings-panel">
             <SettingsRow
+              layout="vertical"
               label="Default action"
               description="Choose whether pressing Enter on a prompt copies it or pastes it into the active app."
               error={fieldError("prompt_palette_default_action")}
@@ -583,7 +598,7 @@ export function SettingsPage() {
               label="Reporting timezone"
               description={`Follows system: ${timezone}`}
               control={
-                <span className="diag-value">{timezone}</span>
+                <SettingsValue value={timezone} tone="default" />
               }
             />
           </div>
@@ -594,34 +609,20 @@ export function SettingsPage() {
           <h2>Week starts on</h2>
           <div className="settings-panel">
             <SettingsRow
+              layout="vertical"
               label="Week starts on"
               description="First day of the week for calendar views."
               error={fieldError("week_starts_on")}
               control={
-                <fieldset className="segmented-group" aria-label="Week start day">
-                  <label className="segmented-label">
-                    <input
-                      type="radio"
-                      name="week_start"
-                      value="0"
-                      checked={weekStart === 0}
-                      onChange={() => handleWeekStartChange(0)}
-                      aria-label="Sunday"
-                    />
-                    <span>Sunday</span>
-                  </label>
-                  <label className="segmented-label">
-                    <input
-                      type="radio"
-                      name="week_start"
-                      value="1"
-                      checked={weekStart === 1}
-                      onChange={() => handleWeekStartChange(1)}
-                      aria-label="Monday"
-                    />
-                    <span>Monday</span>
-                  </label>
-                </fieldset>
+                <SegmentedControl
+                  label="Week start day"
+                  value={String(weekStart)}
+                  options={[
+                    { value: "0", label: "Sunday" },
+                    { value: "1", label: "Monday" },
+                  ]}
+                  onChange={(v) => handleWeekStartChange(Number(v) as 0 | 1)}
+                />
               }
             />
           </div>
@@ -634,37 +635,31 @@ export function SettingsPage() {
             {discovery && (
               <>
                 <SettingsRow
+                  layout="vertical"
                   label="Claude Code"
                   description="Scan default Claude Code config paths."
                   error={fieldError("discovery.claude_code_default_paths")}
                   control={
-                    <label className="toggle-label">
-                      <input
-                        type="checkbox"
-                        className="toggle"
-                        checked={discovery.claude_code_default_paths}
-                        onChange={() => handleDiscoveryToggle("claude_code_default_paths")}
-                        aria-label="Claude Code"
-                      />
-                      <span className="toggle-track" />
-                    </label>
+                    <ToggleSwitch
+                      checked={discovery.claude_code_default_paths}
+                      onChange={() => handleDiscoveryToggle("claude_code_default_paths")}
+                      aria-label="Claude Code"
+                     
+                    />
                   }
                 />
                 <SettingsRow
+                  layout="vertical"
                   label="Codex"
                   description="Scan default Codex config paths."
                   error={fieldError("discovery.codex_default_paths")}
                   control={
-                    <label className="toggle-label">
-                      <input
-                        type="checkbox"
-                        className="toggle"
-                        checked={discovery.codex_default_paths}
-                        onChange={() => handleDiscoveryToggle("codex_default_paths")}
-                        aria-label="Codex"
-                      />
-                      <span className="toggle-track" />
-                    </label>
+                    <ToggleSwitch
+                      checked={discovery.codex_default_paths}
+                      onChange={() => handleDiscoveryToggle("codex_default_paths")}
+                      aria-label="Codex"
+                     
+                    />
                   }
                 />
               </>
@@ -678,11 +673,12 @@ export function SettingsPage() {
           {manualRoots.map((root, i) => (
             <div className="settings-panel" key={i}>
               <SettingsRow
+                layout="vertical"
                 label={`Root ${i + 1}`}
                 description="Select client and enter root path."
                 error={fieldError(`discovery.manual_roots[${i}].root_path`) || fieldError(`discovery.manual_roots[${i}].client_id`)}
                 control={
-                  <div className="manual-root-controls">
+                  <SettingsActionGroup direction="col">
                     <input
                       type="text"
                       className="input"
@@ -707,7 +703,7 @@ export function SettingsPage() {
                     >
                       Remove
                     </button>
-                  </div>
+                  </SettingsActionGroup>
                 }
               />
             </div>
@@ -731,37 +727,31 @@ export function SettingsPage() {
             {privacy && (
               <>
                 <SettingsRow
+                  layout="vertical"
                   label="Local only"
                   description="Keep all data local, disable network features."
                   error={fieldError("privacy.local_only")}
                   control={
-                    <label className="toggle-label">
-                      <input
-                        type="checkbox"
-                        className="toggle"
-                        checked={privacy.local_only}
-                        onChange={() => handlePrivacyToggle("local_only")}
-                        aria-label="Local only"
-                      />
-                      <span className="toggle-track" />
-                    </label>
+                    <ToggleSwitch
+                      checked={privacy.local_only}
+                      onChange={() => handlePrivacyToggle("local_only")}
+                      aria-label="Local only"
+                     
+                    />
                   }
                 />
                 <SettingsRow
+                  layout="vertical"
                   label="Redact sensitive values"
                   description="Mask sensitive information in logs and displays."
                   error={fieldError("privacy.redact_sensitive_values")}
                   control={
-                    <label className="toggle-label">
-                      <input
-                        type="checkbox"
-                        className="toggle"
-                        checked={privacy.redact_sensitive_values}
-                        onChange={() => handlePrivacyToggle("redact_sensitive_values")}
-                        aria-label="Redact sensitive values"
-                      />
-                      <span className="toggle-track" />
-                    </label>
+                    <ToggleSwitch
+                      checked={privacy.redact_sensitive_values}
+                      onChange={() => handlePrivacyToggle("redact_sensitive_values")}
+                      aria-label="Redact sensitive values"
+                     
+                    />
                   }
                 />
               </>
@@ -778,29 +768,23 @@ export function SettingsPage() {
                 label="Launch Busytok Desktop at login"
                 description="When enabled, Busytok starts automatically when you log in. The menu bar icon and global shortcut remain available."
                 control={
-                  <label className="toggle-label">
-                    <input
-                      type="checkbox"
-                      className="toggle"
-                      checked={lifecycleSettings.launch_busytok_desktop_at_login}
-                      onChange={() => {
-                        const next: DesktopLifecycleSettings = {
-                          launch_busytok_desktop_at_login:
-                            !lifecycleSettings.launch_busytok_desktop_at_login,
-                        };
-                        setLifecycleSettings(next);
-                        void updateDesktopLifecycleSettings(next).catch(() => {
-                          // Revert on failure.
-                          setLifecycleSettings({
-                            launch_busytok_desktop_at_login:
-                              lifecycleSettings.launch_busytok_desktop_at_login,
-                          });
+                  <ToggleSwitch
+                    checked={lifecycleSettings.launch_busytok_desktop_at_login}
+                    onChange={(checked) => {
+                      const next: DesktopLifecycleSettings = {
+                        launch_busytok_desktop_at_login: checked,
+                      };
+                      setLifecycleSettings(next);
+                      void updateDesktopLifecycleSettings(next).catch(() => {
+                        // Revert on failure.
+                        setLifecycleSettings({
+                          launch_busytok_desktop_at_login: !checked,
                         });
-                      }}
-                      aria-label="Launch Busytok Desktop at login"
-                    />
-                    <span className="toggle-track" />
-                  </label>
+                      });
+                    }}
+                    aria-label="Launch Busytok Desktop at login"
+                   
+                  />
                 }
               />
             </div>
@@ -815,7 +799,7 @@ export function SettingsPage() {
               {bgDiagLoading && !bgDiag && (
                 <SettingsRow
                   label="Background Service"
-                  control={<span className="diag-value">Checking...</span>}
+                  control={<SettingsValue value="Checking..." tone="muted" />}
                 />
               )}
               {!bgDiagLoading && bgDiag && (
@@ -832,25 +816,24 @@ export function SettingsPage() {
                             : undefined
                     }
                     control={
-                      <span
-                        className={`diag-badge diag-badge--${
-                          bgDiag.state === "running"
+                      <DiagBadge
+                        tone={
+                          bgDiag.state === "running" || bgDiag.state === "starting"
                             ? "ok"
-                            : bgDiag.state === "starting"
-                              ? "ok"
-                              : "error"
-                        }`}
-                      >
-                        {bgDiag.state === "stopped_for_this_session"
-                          ? "Stopped for session"
-                          : bgDiag.state === "needs_attention"
-                            ? "Needs attention"
-                            : bgDiag.state === "not_registered"
-                              ? "Not registered"
-                              : bgDiag.state === "starting"
-                                ? "Starting"
-                                : "Running"}
-                      </span>
+                            : "error"
+                        }
+                        label={
+                          bgDiag.state === "stopped_for_this_session"
+                            ? "Stopped for session"
+                            : bgDiag.state === "needs_attention"
+                              ? "Needs attention"
+                              : bgDiag.state === "not_registered"
+                                ? "Not registered"
+                                : bgDiag.state === "starting"
+                                  ? "Starting"
+                                  : "Running"
+                        }
+                      />
                     }
                   />
                   {bgDiag.actionable && (
@@ -881,18 +864,12 @@ export function SettingsPage() {
                     label="Show Diagnostics"
                     description="View detailed background service diagnostics information."
                     control={
-                      <label className="toggle-label">
-                        <input
-                          type="checkbox"
-                          className="toggle"
-                          checked={showBgDiagnostics}
-                          onChange={() =>
-                            setShowBgDiagnostics(!showBgDiagnostics)
-                          }
-                          aria-label="Show Diagnostics"
-                        />
-                        <span className="toggle-track" />
-                      </label>
+                      <ToggleSwitch
+                        checked={showBgDiagnostics}
+                        onChange={(checked) => setShowBgDiagnostics(checked)}
+                        aria-label="Show Diagnostics"
+                       
+                      />
                     }
                   />
                   {showBgDiagnostics && (
@@ -900,29 +877,22 @@ export function SettingsPage() {
                       <SettingsRow
                         label="GUI build"
                         control={
-                          <span className="diag-value">
-                            {bgDiag.gui_build_identity}
-                          </span>
+                          <SettingsValue value={bgDiag.gui_build_identity} tone="default" />
                         }
                       />
                       <SettingsRow
                         label="Service build"
                         control={
-                          <span className="diag-value">
-                            {bgDiag.service_build_identity ?? "Unknown"}
-                          </span>
+                          <SettingsValue value={bgDiag.service_build_identity ?? "Unknown"} tone="default" />
                         }
                       />
                       <SettingsRow
                         label="Version skew"
                         control={
-                          <span
-                            className={`diag-badge diag-badge--${
-                              bgDiag.version_skew ? "error" : "ok"
-                            }`}
-                          >
-                            {bgDiag.version_skew ? "Yes" : "No"}
-                          </span>
+                          <DiagBadge
+                            tone={bgDiag.version_skew ? "error" : "ok"}
+                            label={bgDiag.version_skew ? "Yes" : "No"}
+                          />
                         }
                       />
                     </>
@@ -981,16 +951,16 @@ export function SettingsPage() {
               <SettingsRow
                 label="Windows auto-update"
                 description="Windows does not support auto-update. Reinstall manually from the Releases page."
-                control={<span className="diag-value">Not supported</span>}
+                control={<SettingsValue value="Not supported" tone="muted" />}
               />
             )}
             {/* ── Version history (manual downgrade) ─────────────────── */}
             <SettingsRow
               label="Version history"
               description="Reinstall an earlier version. The app will download, install, and restart."
-              control={<span className="diag-value">{versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.versions.length ?? 0} versions`}</span>}
+              control={<SettingsValue value={versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.versions.length ?? 0} versions`} tone="default" />}
             />
-            {reinstallMessage && <SettingsRow label="Reinstall status" description={reinstallMessage} control={<span className="diag-value" /> } />}
+            {reinstallMessage && <SettingsRow label="Reinstall status" description={reinstallMessage} control={<SettingsValue value="" tone="muted" /> } />}
             {(versionHistory.data?.versions ?? []).map((entry) => (
               <SettingsRow
                 key={entry.version}
@@ -1027,28 +997,30 @@ export function SettingsPage() {
             <div className="settings-panel">
               <SettingsRow
                 label="DB healthy"
-                control={<span className={`diag-badge diag-badge--${diagnostics.db_healthy ? "ok" : "error"}`}>{diagnostics.db_healthy ? "Yes" : "No"}</span>}
+                control={<DiagBadge tone={diagnostics.db_healthy ? "ok" : "error"} label={diagnostics.db_healthy ? "Yes" : "No"} />}
               />
               <SettingsRow
                 label="DB size"
-                control={<span className="diag-value">{formatBytes(diagnostics.db_size_bytes)}</span>}
+                control={<SettingsValue value={formatBytes(diagnostics.db_size_bytes)} tone="default" />}
               />
               <SettingsRow
                 label="Migration version"
-                control={<span className="diag-value">{diagnostics.migration_version}</span>}
+                control={<SettingsValue value={String(diagnostics.migration_version)} tone="default" />}
               />
               <SettingsRow
                 label="Event count"
-                control={<span className="diag-value">{diagnostics.usage_event_count.toLocaleString()}</span>}
+                control={<SettingsValue value={diagnostics.usage_event_count.toLocaleString()} tone="default" />}
               />
               <SettingsRow
                 label="Last checkpoint"
                 control={
-                  <span className="diag-value">
-                    {diagnostics.last_log_checkpoint_ms != null
+                  <SettingsValue
+                    value={diagnostics.last_log_checkpoint_ms != null
                       ? new Date(diagnostics.last_log_checkpoint_ms).toLocaleString()
                       : "None"}
-                  </span>
+                    tone="muted"
+                   
+                  />
                 }
               />
               <SettingsRow
@@ -1060,8 +1032,8 @@ export function SettingsPage() {
                 }
                 control={
                   pasteStatus.failure_reason === "permission_missing" && isMacPlatform() ? (
-                    <div className="manual-root-controls">
-                      <span className="diag-value">{pasteStatusText(pasteStatus)}</span>
+                    <SettingsActionGroup direction="col">
+                      <SettingsStatus label={pasteStatusText(pasteStatus)} tone="warning" />
                       <button
                         type="button"
                         className="btn btn--secondary btn--sm"
@@ -1069,9 +1041,9 @@ export function SettingsPage() {
                       >
                         Open System Settings
                       </button>
-                    </div>
+                    </SettingsActionGroup>
                   ) : (
-                    <span className="diag-value">{pasteStatusText(pasteStatus)}</span>
+                    <SettingsValue value={pasteStatusText(pasteStatus)} tone="default" />
                   )
                 }
               />

@@ -216,7 +216,7 @@ describe("SettingsPage additional coverage", () => {
 
     render(<SettingsPage />);
 
-    await user.click(screen.getByLabelText("Monday"));
+    await user.click(screen.getByRole("button", { name: "Monday" }));
     await user.click(screen.getByLabelText("Redact sensitive values"));
     await user.click(screen.getByRole("button", { name: "Remove root 1" }));
 
@@ -419,5 +419,24 @@ describe("SettingsPage additional coverage", () => {
     expect(
       screen.getByRole("heading", { name: /^privacy/i, level: 2 }),
     ).toBeDefined();
+  });
+
+  it("uses zero page-private control classes after canonical migration", () => {
+    mockPage();
+    render(<SettingsPage />);
+    expect(document.querySelector(".segmented-group")).toBeNull();
+    expect(document.querySelector(".segmented-label")).toBeNull();
+    expect(document.querySelector(".toggle-label")).toBeNull();
+    expect(document.querySelector(".toggle")).toBeNull();
+    expect(document.querySelector(".toggle-track")).toBeNull();
+    expect(document.querySelector(".diag-value")).toBeNull();
+    expect(document.querySelector(".manual-root-controls")).toBeNull();
+  });
+
+  it("renders Theme and Week starts on via shared SegmentedControl", () => {
+    mockPage();
+    render(<SettingsPage />);
+    const groups = document.querySelectorAll(".segmented-control");
+    expect(groups.length).toBeGreaterThanOrEqual(2);
   });
 });

@@ -247,6 +247,12 @@
   outline-offset: -2px;
 }
 
+.segmented-control--dense .segmented-control__option {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 /* ── Desktop button helper ───────────────────────────────── */
 
 .desktop-button {
@@ -412,6 +418,208 @@
   outline-offset: 2px;
 }
 
+/* ── ToggleSwitch (canonical) ────────────────────────────────── */
+
+.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.toggle-switch:has(.toggle-switch__input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.toggle-switch__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.toggle-switch__track {
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--toggle-track-inactive);
+  position: relative;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.toggle-switch__track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--toggle-thumb-active);
+  transition: transform 0.2s;
+}
+
+.toggle-switch__input:checked + .toggle-switch__track {
+  background: var(--toggle-track-active);
+}
+
+.toggle-switch__input:checked + .toggle-switch__track::after {
+  transform: translateX(16px);
+}
+
+.toggle-switch:hover .toggle-switch__track {
+  background: var(--color-border-strong);
+}
+
+.toggle-switch:hover .toggle-switch__input:checked + .toggle-switch__track {
+  background: var(--color-accent-600);
+}
+
+.toggle-switch__input:focus-visible + .toggle-switch__track {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* dense */
+.toggle-switch--dense .toggle-switch__track {
+  width: 28px;
+  height: 16px;
+  border-radius: 8px;
+}
+
+.toggle-switch--dense .toggle-switch__track::after {
+  width: 12px;
+  height: 12px;
+  top: 2px;
+  left: 2px;
+}
+
+.toggle-switch--dense .toggle-switch__input:checked + .toggle-switch__track::after {
+  transform: translateX(12px);
+}
+
+/* ── SettingsValue (canonical) ───────────────────────────────── */
+
+.settings-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-value--muted {
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.settings-value--warning {
+  color: var(--color-status-warning);
+}
+
+.settings-value--danger {
+  color: var(--color-status-danger);
+}
+
+.settings-value--dense {
+  font-size: 12px;
+}
+
+/* ── SettingsStatus (canonical) ──────────────────────────────── */
+
+.settings-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.settings-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.settings-status--ok .settings-status__dot {
+  background: var(--color-status-success);
+}
+
+.settings-status--warning {
+  color: var(--color-status-warning);
+}
+
+.settings-status--warning .settings-status__dot {
+  background: var(--color-status-warning);
+}
+
+.settings-status--danger {
+  color: var(--color-status-danger);
+}
+
+.settings-status--danger .settings-status__dot {
+  background: var(--color-status-danger);
+}
+
+.settings-status--muted {
+  color: var(--color-text-muted);
+}
+
+.settings-status--dense {
+  font-size: 12px;
+}
+
+.settings-status--dense .settings-status__dot {
+  width: 6px;
+  height: 6px;
+}
+
+/* ── SettingsActionGroup (canonical) ──────────────────────────── */
+
+.settings-action-group {
+  display: flex;
+  gap: 6px;
+}
+
+.settings-action-group--col {
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.settings-action-group--row {
+  flex-direction: row;
+  align-items: center;
+}
+
+/* Migrated from pages.css .manual-root-controls .input */
+.settings-action-group .input {
+  width: 240px;
+}
+
+/* ── Diagnostics badges (canonical) ─────────────────────────── */
+
+.diag-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.diag-badge--ok {
+  background: color-mix(in srgb, var(--color-status-success) 12%, transparent);
+  color: var(--color-status-success);
+}
+
+.diag-badge--error {
+  background: color-mix(in srgb, var(--color-status-danger) 12%, transparent);
+  color: var(--color-status-danger);
+}
+
 /* ── Settings row ────────────────────────────────────────── */
 
 .settings-row {
@@ -463,6 +671,30 @@
 .settings-row__control input[type="number"]:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
+}
+
+.settings-row__control--vertical {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.settings-row__error {
+  font-size: 11px;
+  color: var(--color-status-danger);
+  white-space: nowrap;
+}
+
+.settings-row--dangerous {
+  padding: var(--space-3) var(--space-3);
+  margin: 0 calc(var(--space-3) * -1);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-status-danger) 6%, transparent);
+  border-left: 3px solid var(--color-status-danger);
+}
+
+.settings-row--dangerous h3 {
+  color: var(--color-status-danger);
 }
 
 /* ── Settings panel ──────────────────────────────────────── */
@@ -1494,6 +1726,11 @@ body.prompt-palette-window-body #root {
   border-color: var(--color-border);
 }
 
+.app-select__trigger--dense {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
 .app-select__icon {
   flex-shrink: 0;
   display: flex;
@@ -1502,6 +1739,11 @@ body.prompt-palette-window-body #root {
   color: var(--color-text-muted);
 }
 
+/* ── AppSelect / Combobox shared dropdown contract ────────────────
+   .app-select__content and .app-select__item are the canonical
+   dropdown surface for BOTH <Select> and <Combobox>
+   (TagFilterCombobox). Pages must not write a third dropdown
+   appearance. */
 .app-select__content {
   background: var(--color-surface);
   border: 1px solid var(--color-border);

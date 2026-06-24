@@ -91,6 +91,12 @@ describe("PromptPaletteOverlay", () => {
     expect(closeKeycap?.textContent).toBe("Esc");
   });
 
+  it("does not render a keyboard-hints footer", () => {
+    renderOverlay();
+
+    expect(document.querySelector(".prompt-overlay__hints")).toBeNull();
+  });
+
   it("marks the selected row with surface lift and a focus-edge accent cue", () => {
     renderOverlay();
 

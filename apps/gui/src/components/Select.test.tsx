@@ -38,4 +38,24 @@ describe("AppSelect", () => {
 
     expect(screen.getByRole("combobox", { name: "Sort" }).textContent).toContain("First");
   });
+
+  it("renders with default size when no size prop is given", () => {
+    render(
+      <AppSelect value="a" onValueChange={() => {}} label="Test">
+        <AppSelectItem value="a">A</AppSelectItem>
+      </AppSelect>,
+    );
+    const trigger = screen.getByRole("combobox");
+    expect(trigger.classList.contains("app-select__trigger--default")).toBe(true);
+  });
+
+  it("applies dense class when size='dense'", () => {
+    render(
+      <AppSelect value="a" onValueChange={() => {}} label="Test" size="dense">
+        <AppSelectItem value="a">A</AppSelectItem>
+      </AppSelect>,
+    );
+    const trigger = screen.getByRole("combobox");
+    expect(trigger.classList.contains("app-select__trigger--dense")).toBe(true);
+  });
 });

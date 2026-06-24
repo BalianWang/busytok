@@ -8,6 +8,7 @@ interface SegmentedControlProps<V extends string> {
   value: V;
   options: Array<SegmentedOption<V>>;
   onChange: (value: V) => void;
+  size?: "default" | "dense";
 }
 
 export function SegmentedControl<V extends string>({
@@ -15,9 +16,14 @@ export function SegmentedControl<V extends string>({
   value,
   options,
   onChange,
+  size = "default",
 }: SegmentedControlProps<V>) {
   return (
-    <div className="segmented-control" role="group" aria-label={label}>
+    <div
+      className={`segmented-control segmented-control--${size}`}
+      role="group"
+      aria-label={label}
+    >
       {options.map((option) => (
         <button
           key={option.value}

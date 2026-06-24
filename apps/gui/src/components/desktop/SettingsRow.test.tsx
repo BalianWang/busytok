@@ -83,4 +83,22 @@ describe("SettingsRow", () => {
     );
     expect(container.querySelector(".settings-row--dangerous")).toBeNull();
   });
+
+  it("defaults to horizontal layout modifier on control", () => {
+    const { container } = render(
+      <SettingsRow label="X" control={<span />} />,
+    );
+    expect(
+      container.querySelector(".settings-row__control--horizontal"),
+    ).not.toBeNull();
+  });
+
+  it("applies vertical layout modifier when layout='vertical'", () => {
+    const { container } = render(
+      <SettingsRow label="X" control={<span />} layout="vertical" />,
+    );
+    expect(
+      container.querySelector(".settings-row__control--vertical"),
+    ).not.toBeNull();
+  });
 });

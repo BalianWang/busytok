@@ -287,6 +287,25 @@ describe("TagFilterCombobox", () => {
     expect(onClear).toHaveBeenCalledOnce();
   });
 
+  it("renders its dropdown with shared .app-select__content and .app-select__item classes (canonical Combobox contract)", async () => {
+    vi.mocked(busytokClient.promptsSuggestTags).mockResolvedValue({ tags: ["review", "refactor"] });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    renderCombobox({ appliedTag: "" });
+
+    const input = screen.getByRole("combobox", { name: "Filter by tag" });
+    await user.click(input);
+    await user.type(input, "re");
+    await vi.advanceTimersByTimeAsync(250);
+
+    await waitFor(() => {
+      const content = document.querySelector(".app-select__content");
+      expect(content).not.toBeNull();
+    });
+
+    const items = document.querySelectorAll(".app-select__item");
+    expect(items.length).toBe(2);
+  });
+
   it("resets draftInput to appliedTag on blur when no candidates", async () => {
     vi.mocked(busytokClient.promptsSuggestTags).mockResolvedValue({ tags: [] });
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
