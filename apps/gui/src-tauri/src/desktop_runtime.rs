@@ -300,6 +300,35 @@ pub(crate) fn quit_desktop_host(app: &tauri::AppHandle) {
     }
 }
 
+/// Safety-net shutdown for `RunEvent::Exit` when `allow_exit` is still
+/// `false` — the normal pipeline (tray-menu quit or ExitRequested →
+/// quit_desktop_host → app.exit(0)) was never reached (Dock Quit on macOS
+/// can bypass ExitRequested).  Runs stop operations directly; does NOT
+/// call `app.exit(0)` (we are already inside the Exit event).
+pub(crate) fn run_stop_operations(app: &tauri::AppHandle) {
+    let coordinator = app
+        .try_state::<std::sync::Arc<crate::lifecycle_coordinator::LifecycleCoordinator>>()
+        .map(|s| s.inner().clone());
+    let settings_store = app
+        .try_state::<std::sync::Arc<crate::desktop_lifecycle_settings::DesktopLifecycleSettingsStore>>()
+        .map(|s| s.inner().clone());
+
+    if let (Some(coordinator), Some(settings_store)) = (coordinator, settings_store) {
+        tauri::async_runtime::block_on(async move {
+            coordinator.request_quit().await;
+            coordinator
+                .suppress_and_persist(
+                    crate::lifecycle_coordinator::LifecycleCause::Quit,
+                    &settings_store,
+                )
+                .await;
+            // Best-effort stop: suppress errors so the process can exit.
+            let _ = coordinator.login_start().stop_for_current_session();
+            let _ = coordinator.lifecycle().stop_for_current_session();
+        });
+    }
+}
+
 pub fn dispatch_host_action(
     app: &tauri::AppHandle,
     action: crate::desktop_host::DesktopHostAction,

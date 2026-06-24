@@ -162,11 +162,10 @@ fn exit_routing_lets_self_triggered_exit_through() {
 
 #[test]
 fn system_quit_routes_to_full_shutdown_even_when_host_mode_active() {
-    // Regression for the Dock/system-quit bypass: a real terminate request
-    // (Cmd+Q, Dock Quit, Apple-menu Quit, logout) must funnel through
-    // quit_desktop_host regardless of host mode. Host mode is intentionally
-    // not a parameter here — window-close-as-hide is handled separately by
-    // install_hide_on_close, so it must never gate a real Quit.
+    // When ExitRequested IS delivered (Cmd+Q, Apple-menu Quit) and
+    // allow_exit is false, route to full shutdown.  Note: Dock Quit on
+    // macOS can bypass ExitRequested entirely — the safety net for that
+    // case is RunEvent::Exit → run_stop_operations, not this route.
     assert_eq!(
         crate::desktop_runtime::route_exit_request(false),
         crate::desktop_runtime::ExitRouting::RouteToFullShutdown
