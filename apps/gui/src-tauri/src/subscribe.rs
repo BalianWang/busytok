@@ -109,6 +109,34 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Per-attempt reconnect backoff ceiling, in seconds. Sized to the service
+/// scan window (~8-12s) so that once the service socket becomes ready the
+/// bridge reconnects within this interval rather than up to 30s. Previously
+/// 30s, which delayed `busytok:service-status(Ready)` — and the overview-query
+/// invalidation it triggers on the frontend — by up to ~30s after the service
+/// came up. See docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md
+/// (Layer B).
+const RECONNECT_BACKOFF_CAP_SECS: u64 = 8;
+
+/// Consecutive failed connect attempts after which the bridge declares the
+/// service unreachable. At the capped backoff progression (1, 2, 4, 8, 8, 8, 8)
+/// seven failures is ~31s of sustained failure — past the scan window and
+/// matching the previous `backoff >= 30` declaration timing, so a normal
+/// startup scan never trips it.
+const RECONNECT_UNAVAILABLE_AFTER: u32 = 7;
+
+/// Pure backoff progression for the subscription-bridge reconnect loop.
+/// Doubles the current delay up to `RECONNECT_BACKOFF_CAP_SECS`.
+pub(crate) fn next_reconnect_backoff(current: u64) -> u64 {
+    current.saturating_mul(2).min(RECONNECT_BACKOFF_CAP_SECS)
+}
+
+/// Whether `consecutive_failures` sustained failed connect attempts warrant a
+/// `busytok:service-status(unavailable)` declaration.
+pub(crate) fn should_declare_unavailable(consecutive_failures: u32) -> bool {
+    consecutive_failures >= RECONNECT_UNAVAILABLE_AFTER
+}
+
 /// Start the subscription bridge. Spawned once at app startup in setup().
 /// Returns a shutdown sender.
 pub fn start_subscription_bridge(
@@ -122,6 +150,7 @@ pub fn start_subscription_bridge(
 
     tauri::async_runtime::spawn(async move {
         let mut backoff = 1u64;
+        let mut consecutive_failures = 0u32;
 
         loop {
             emit_event(
@@ -140,6 +169,7 @@ pub fn start_subscription_bridge(
             match connect_and_subscribe(&app_handle, &socket_path, &last_seen_seq).await {
                 Ok(()) => {
                     backoff = 1;
+                    consecutive_failures = 0;
                     emit_event(
                         &app_handle,
                         "busytok:subscription-status",
@@ -155,6 +185,7 @@ pub fn start_subscription_bridge(
                 }
                 Err(e) => {
                     warn!("Subscription connection error: {e}");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     emit_event(
                         &app_handle,
                         "busytok:subscription-status",
@@ -170,7 +201,7 @@ pub fn start_subscription_bridge(
                 }
             }
 
-            if backoff >= 30 {
+            if should_declare_unavailable(consecutive_failures) {
                 emit_event(
                     &app_handle,
                     "busytok:service-status",
@@ -184,7 +215,7 @@ pub fn start_subscription_bridge(
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(backoff)) => {
-                    backoff = (backoff * 2).min(30);
+                    backoff = next_reconnect_backoff(backoff);
                 }
                 _ = shutdown_rx.changed() => {
                     info!("Subscription bridge received shutdown");
@@ -508,5 +539,37 @@ mod tests {
         let gap = classify_gap(15000, 5);
         assert!(gap.detected);
         assert!(gap.service_restarted);
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_up_to_scan_window_cap() {
+        // Regression for docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md
+        // (Layer B): backoff must NOT grow to 30s, or the bridge delays
+        // `busytok:service-status(Ready)` by up to ~30s after the service comes
+        // up. It doubles only up to the scan-window-sized cap.
+        // 1 -> 2 -> 4 -> 8 (cap) -> 8 -> 8 ...
+        assert_eq!(next_reconnect_backoff(0), 0);
+        assert_eq!(next_reconnect_backoff(1), 2);
+        assert_eq!(next_reconnect_backoff(2), 4);
+        assert_eq!(next_reconnect_backoff(4), 8);
+        assert_eq!(next_reconnect_backoff(8), 8); // saturates at cap
+        assert_eq!(next_reconnect_backoff(1024), 8); // never exceeds cap
+    }
+
+    #[test]
+    fn reconnect_unavailable_declaration_is_scan_window_safe() {
+        // Normal startup completes within the scan window (~8-12s); the bridge
+        // connects after a handful of attempts, so the unavailable declaration
+        // must NOT fire during startup. At the capped progression
+        // (1,2,4,8,8,8,8) seven consecutive failures is ~31s of sustained
+        // failure — past the scan window and matching the previous timing.
+        for failures in 0..RECONNECT_UNAVAILABLE_AFTER {
+            assert!(
+                !should_declare_unavailable(failures),
+                "must not declare unavailable after {failures} consecutive failures (scan window)"
+            );
+        }
+        assert!(should_declare_unavailable(RECONNECT_UNAVAILABLE_AFTER));
+        assert!(should_declare_unavailable(RECONNECT_UNAVAILABLE_AFTER + 5));
     }
 }
