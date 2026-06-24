@@ -553,7 +553,7 @@ export function SettingsPage() {
                     </button>
                   </SettingsActionGroup>
                 ) : (
-                  <SettingsValue value={shortcutStatusText(shortcutStatus)} tone="default" size="default" />
+                  <SettingsValue value={shortcutStatusText(shortcutStatus)} tone="default" />
                 )
               }
             />
@@ -591,7 +591,7 @@ export function SettingsPage() {
               label="Reporting timezone"
               description={`Follows system: ${timezone}`}
               control={
-                <SettingsValue value={timezone} tone="default" size="default" />
+                <SettingsValue value={timezone} tone="default" />
               }
             />
           </div>
@@ -635,7 +635,7 @@ export function SettingsPage() {
                       checked={discovery.claude_code_default_paths}
                       onChange={() => handleDiscoveryToggle("claude_code_default_paths")}
                       aria-label="Claude Code"
-                      size="default"
+                     
                     />
                   }
                 />
@@ -648,7 +648,7 @@ export function SettingsPage() {
                       checked={discovery.codex_default_paths}
                       onChange={() => handleDiscoveryToggle("codex_default_paths")}
                       aria-label="Codex"
-                      size="default"
+                     
                     />
                   }
                 />
@@ -724,7 +724,7 @@ export function SettingsPage() {
                       checked={privacy.local_only}
                       onChange={() => handlePrivacyToggle("local_only")}
                       aria-label="Local only"
-                      size="default"
+                     
                     />
                   }
                 />
@@ -737,7 +737,7 @@ export function SettingsPage() {
                       checked={privacy.redact_sensitive_values}
                       onChange={() => handlePrivacyToggle("redact_sensitive_values")}
                       aria-label="Redact sensitive values"
-                      size="default"
+                     
                     />
                   }
                 />
@@ -770,7 +770,7 @@ export function SettingsPage() {
                       });
                     }}
                     aria-label="Launch Busytok Desktop at login"
-                    size="default"
+                   
                   />
                 }
               />
@@ -786,7 +786,7 @@ export function SettingsPage() {
               {bgDiagLoading && !bgDiag && (
                 <SettingsRow
                   label="Background Service"
-                  control={<SettingsValue value="Checking..." tone="muted" size="default" />}
+                  control={<SettingsValue value="Checking..." tone="muted" />}
                 />
               )}
               {!bgDiagLoading && bgDiag && (
@@ -856,7 +856,7 @@ export function SettingsPage() {
                         checked={showBgDiagnostics}
                         onChange={(checked) => setShowBgDiagnostics(checked)}
                         aria-label="Show Diagnostics"
-                        size="default"
+                       
                       />
                     }
                   />
@@ -865,13 +865,13 @@ export function SettingsPage() {
                       <SettingsRow
                         label="GUI build"
                         control={
-                          <SettingsValue value={bgDiag.gui_build_identity} tone="default" size="default" />
+                          <SettingsValue value={bgDiag.gui_build_identity} tone="default" />
                         }
                       />
                       <SettingsRow
                         label="Service build"
                         control={
-                          <SettingsValue value={bgDiag.service_build_identity ?? "Unknown"} tone="default" size="default" />
+                          <SettingsValue value={bgDiag.service_build_identity ?? "Unknown"} tone="default" />
                         }
                       />
                       <SettingsRow
@@ -942,16 +942,16 @@ export function SettingsPage() {
               <SettingsRow
                 label="Windows auto-update"
                 description="Windows does not support auto-update. Reinstall manually from the Releases page."
-                control={<SettingsValue value="Not supported" tone="muted" size="default" />}
+                control={<SettingsValue value="Not supported" tone="muted" />}
               />
             )}
             {/* ── Version history (manual downgrade) ─────────────────── */}
             <SettingsRow
               label="Version history"
               description="Reinstall an earlier version. The app will download, install, and restart."
-              control={<SettingsValue value={versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.versions.length ?? 0} versions`} tone="default" size="default" />}
+              control={<SettingsValue value={versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.versions.length ?? 0} versions`} tone="default" />}
             />
-            {reinstallMessage && <SettingsRow label="Reinstall status" description={reinstallMessage} control={<SettingsValue value="" tone="muted" size="default" /> } />}
+            {reinstallMessage && <SettingsRow label="Reinstall status" description={reinstallMessage} control={<SettingsValue value="" tone="muted" /> } />}
             {(versionHistory.data?.versions ?? []).map((entry) => (
               <SettingsRow
                 key={entry.version}
@@ -992,15 +992,15 @@ export function SettingsPage() {
               />
               <SettingsRow
                 label="DB size"
-                control={<SettingsValue value={formatBytes(diagnostics.db_size_bytes)} tone="default" size="default" />}
+                control={<SettingsValue value={formatBytes(diagnostics.db_size_bytes)} tone="default" />}
               />
               <SettingsRow
                 label="Migration version"
-                control={<SettingsValue value={String(diagnostics.migration_version)} tone="default" size="default" />}
+                control={<SettingsValue value={String(diagnostics.migration_version)} tone="default" />}
               />
               <SettingsRow
                 label="Event count"
-                control={<SettingsValue value={diagnostics.usage_event_count.toLocaleString()} tone="default" size="default" />}
+                control={<SettingsValue value={diagnostics.usage_event_count.toLocaleString()} tone="default" />}
               />
               <SettingsRow
                 label="Last checkpoint"
@@ -1010,7 +1010,7 @@ export function SettingsPage() {
                       ? new Date(diagnostics.last_log_checkpoint_ms).toLocaleString()
                       : "None"}
                     tone="muted"
-                    size="default"
+                   
                   />
                 }
               />
@@ -1034,7 +1034,7 @@ export function SettingsPage() {
                       </button>
                     </SettingsActionGroup>
                   ) : (
-                    <SettingsValue value={pasteStatusText(pasteStatus)} tone="default" size="default" />
+                    <SettingsValue value={pasteStatusText(pasteStatus)} tone="default" />
                   )
                 }
               />
