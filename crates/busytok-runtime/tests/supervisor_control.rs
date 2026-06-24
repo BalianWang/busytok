@@ -2497,7 +2497,7 @@ async fn supervisor_prompt_palette_crud_search_and_use() {
     let used = supervisor
         .prompts_use(PromptUseRequestDto {
             id: prompt_id.clone(),
-            action: PromptActionDto::Paste,
+            action: PromptActionDto::CopyAndPaste,
             surface: PromptUseSurfaceDto::Overlay,
             outcome: PromptUseOutcomeDto::PasteAttempted,
             failure_reason: None,

@@ -10,7 +10,7 @@ vi.mock("../api/useBusytokData", () => ({
         week_starts_on: 0,
         discovery: null,
         privacy: null,
-        prompt_palette_default_action: "paste",
+        prompt_palette_default_action: "Copy&Paste",
         diagnostics: null,
       },
     },

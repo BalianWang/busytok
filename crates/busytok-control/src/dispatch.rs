@@ -767,7 +767,7 @@ impl RuntimeControl for TestRuntimeControl {
                 local_only: true,
                 redact_sensitive_values: true,
             },
-            prompt_palette_default_action: PromptActionDto::Paste,
+            prompt_palette_default_action: PromptActionDto::CopyAndPaste,
             diagnostics: SettingsDiagnosticsDto {
                 db_healthy: true,
                 db_size_bytes: 0,
@@ -802,7 +802,7 @@ impl RuntimeControl for TestRuntimeControl {
             }),
             prompt_palette_default_action: req
                 .prompt_palette_default_action
-                .unwrap_or(PromptActionDto::Paste),
+                .unwrap_or(PromptActionDto::CopyAndPaste),
             diagnostics: SettingsDiagnosticsDto {
                 db_healthy: true,
                 db_size_bytes: 0,

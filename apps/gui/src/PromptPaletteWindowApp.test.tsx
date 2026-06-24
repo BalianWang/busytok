@@ -34,7 +34,7 @@ vi.mock("./api/panelBusytokClient", () => ({
 
 vi.mock("./api/useBusytokData", () => ({
   useSettingsSnapshot: () => ({
-    data: { data: { prompt_palette_default_action: "paste" } },
+    data: { data: { prompt_palette_default_action: "Copy&Paste" } },
     isLoading: false,
     isError: false,
     isFetching: false,

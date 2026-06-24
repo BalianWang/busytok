@@ -92,7 +92,7 @@ vi.mock("./api/useBusytokData", () => ({
   usePromptUse: (...args: unknown[]) => mocks.usePromptUse(...args),
   prefetchStartupQueries: (...args: unknown[]) => mocks.prefetchStartupQueries(...args),
   useSettingsSnapshot: () => ({
-    data: { data: { prompt_palette_default_action: "copy" } },
+    data: { data: { prompt_palette_default_action: "OnlyCopy" } },
     isLoading: false,
     isError: false,
     isFetching: false,
