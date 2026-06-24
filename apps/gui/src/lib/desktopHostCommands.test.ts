@@ -23,7 +23,7 @@ describe("desktopHostCommands", () => {
   });
 
   it("desktopHostShortcutDiagnostics invokes the correct Tauri command", async () => {
-    const expected = { state: "registered", shortcut: "CommandOrControl+Shift+K", failure_reason: null, retry_count: 0 };
+    const expected = { state: "registered", shortcut: "CommandOrControl+Option+K", failure_reason: null, retry_count: 0 };
     mockInvoke.mockResolvedValueOnce(expected);
     const result = await desktopHostShortcutDiagnostics();
     expect(mockInvoke).toHaveBeenCalledWith("desktop_host_shortcut_diagnostics", undefined);
