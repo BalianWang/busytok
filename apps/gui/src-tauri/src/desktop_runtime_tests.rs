@@ -112,7 +112,9 @@ fn bootstrap_failure_is_retryable_except_user_approval() {
     assert!(bootstrap_failure_is_retryable(
         "control socket did not become ready within timeout",
     ));
-    assert!(bootstrap_failure_is_retryable("launchctl bootstrap timed out"));
+    assert!(bootstrap_failure_is_retryable(
+        "launchctl bootstrap timed out"
+    ));
 }
 
 #[test]
