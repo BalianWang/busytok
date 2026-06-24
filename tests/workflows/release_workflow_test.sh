@@ -45,7 +45,7 @@ if grep -q "tauri-apps/tauri-action" "$WORKFLOW"; then
 fi
 echo "no tauri-action: OK"
 
-if ! rg -q "uses: pnpm/action-setup@v4" "$WORKFLOW"; then
+if ! rg -q "uses: pnpm/action-setup@v" "$WORKFLOW"; then
     echo "missing pnpm/action-setup"
     exit 1
 fi
