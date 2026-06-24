@@ -39,7 +39,7 @@ function renderOverlay(props: Partial<React.ComponentProps<typeof PromptPaletteO
     onExecute: vi.fn(),
     onOpenPage: vi.fn(),
     onCreateNew: vi.fn(),
-    defaultAction: "Copy&Paste",
+    defaultAction: "CopyAndPaste",
     onEdit: vi.fn(),
     onTogglePin: vi.fn(),
     onDelete: vi.fn(),
@@ -66,7 +66,7 @@ describe("PromptPaletteOverlay", () => {
 
     await user.keyboard("{Enter}");
 
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "Copy&Paste");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "CopyAndPaste");
   });
 
   it("keeps the search field as the initial focus target", async () => {
@@ -174,7 +174,7 @@ describe("PromptPaletteOverlay", () => {
           open
           entries={[makePrompt()]}
           query=""
-          defaultAction="Copy&Paste"
+          defaultAction="CopyAndPaste"
           onQueryChange={vi.fn()}
           onClose={vi.fn()}
           onExecute={vi.fn()}
@@ -208,7 +208,7 @@ describe("PromptPaletteOverlay", () => {
 
     openActions();
     await user.click(await screen.findByRole("menuitem", { name: "Paste" }));
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "Copy&Paste");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "CopyAndPaste");
 
     openActions();
     await user.click(await screen.findByRole("menuitem", { name: "Edit" }));
@@ -454,7 +454,7 @@ describe("PromptPaletteOverlay", () => {
     expect(secondRow).not.toBeNull();
     fireEvent.click(secondRow!);
 
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[1], "Copy&Paste");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[1], "CopyAndPaste");
   });
 
   it("shows sanitized action feedback when execution rejects", async () => {

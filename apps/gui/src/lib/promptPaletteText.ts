@@ -39,7 +39,7 @@ export function promptActionLabel(action: PromptActionDto): string {
   switch (action) {
     case "OnlyCopy": return "Copy";
     case "OnlyPaste": return "Paste";
-    case "Copy&Paste": return "Paste";
+    case "CopyAndPaste": return "Paste";
   }
 }
 

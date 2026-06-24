@@ -135,7 +135,7 @@ export function SettingsPage() {
   const weekStart = localWeekStart ?? snapshot?.week_starts_on ?? 0;
   const discovery = localDiscovery ?? snapshot?.discovery;
   const privacy = localPrivacy ?? snapshot?.privacy;
-  const defaultAction = localDefaultAction ?? snapshot?.prompt_palette_default_action ?? "Copy&Paste";
+  const defaultAction = localDefaultAction ?? snapshot?.prompt_palette_default_action ?? "CopyAndPaste";
 
   const handleMutate = useCallback(
     (patch: Partial<SettingsUpdateRequestDto>) => {
@@ -582,7 +582,7 @@ export function SettingsPage() {
                   value={defaultAction}
                   onValueChange={handleDefaultActionChange}
                 >
-                  <AppSelectItem value="Copy&Paste">Copy &amp; paste</AppSelectItem>
+                  <AppSelectItem value="CopyAndPaste">Copy &amp; paste</AppSelectItem>
                   <AppSelectItem value="OnlyCopy">Only copy</AppSelectItem>
                   <AppSelectItem value="OnlyPaste">Only paste</AppSelectItem>
                 </AppSelect>

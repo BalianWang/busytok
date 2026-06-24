@@ -227,7 +227,7 @@ export function PromptPaletteOverlay({
 
     if (event.key === "Enter" && isModifierPressed) {
       event.preventDefault();
-      executeSelected("Copy&Paste");
+      executeSelected("CopyAndPaste");
       return;
     }
 
@@ -351,8 +351,8 @@ export function PromptPaletteOverlay({
             <MenuItem onSelect={() => executeEntry(selectedEntry, "OnlyCopy")}>
               {promptActionLabel("OnlyCopy")}
             </MenuItem>
-            <MenuItem onSelect={() => executeEntry(selectedEntry, "Copy&Paste")}>
-              {promptActionLabel("Copy&Paste")}
+            <MenuItem onSelect={() => executeEntry(selectedEntry, "CopyAndPaste")}>
+              {promptActionLabel("CopyAndPaste")}
             </MenuItem>
             <MenuItem
               disabled={!onEdit}

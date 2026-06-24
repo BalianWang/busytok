@@ -54,7 +54,7 @@ export function App() {
   const [promptOverlayOpen, setPromptOverlayOpen] = useState(false);
   const queryClient = useQueryClient();
   const settingsSnapshot = useSettingsSnapshot();
-  const defaultAction = settingsSnapshot.data?.data.prompt_palette_default_action ?? "Copy&Paste";
+  const defaultAction = settingsSnapshot.data?.data.prompt_palette_default_action ?? "CopyAndPaste";
 
   useEffect(() => {
     if (prefetchedQueryClients.has(queryClient)) {

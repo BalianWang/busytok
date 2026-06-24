@@ -31,7 +31,7 @@ export function PromptPaletteOverlayController({
   onOpenPage,
   onCreateNew,
   presentation = "overlay",
-  defaultAction = "Copy&Paste",
+  defaultAction = "CopyAndPaste",
 }: PromptPaletteOverlayControllerProps) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<string | null>(null);

@@ -73,7 +73,7 @@ vi.mock("./PromptPaletteOverlay", () => ({
       {onExecute && (
         <button
           type="button"
-          onClick={() => onExecute({ id: "test-entry", content: "hello" }, "Copy&Paste")}
+          onClick={() => onExecute({ id: "test-entry", content: "hello" }, "CopyAndPaste")}
         >
           Execute paste
         </button>

@@ -120,11 +120,11 @@ describe("executePromptAction", () => {
     });
     const reportEvent = vi.mocked(deps.reportEvent!);
 
-    const result = await executePromptAction(makePrompt(), "Copy&Paste", "overlay", deps);
+    const result = await executePromptAction(makePrompt(), "CopyAndPaste", "overlay", deps);
 
     expect(deps.recordUse).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: "Copy&Paste",
+        action: "CopyAndPaste",
         outcome: "paste_fell_back_to_copy",
         failure_reason: "unsupported_platform",
       }),
@@ -144,7 +144,7 @@ describe("executePromptAction", () => {
       beforePaste: vi.fn().mockResolvedValue({ ok: false, failure_reason: "focus_lost" }),
     });
 
-    await executePromptAction(makePrompt(), "Copy&Paste", "overlay", deps);
+    await executePromptAction(makePrompt(), "CopyAndPaste", "overlay", deps);
 
     expect(deps.pasteActiveApp).not.toHaveBeenCalled();
     expect(deps.recordUse).toHaveBeenCalledWith(
@@ -161,7 +161,7 @@ describe("executePromptAction", () => {
       pasteActiveApp: undefined,
     });
 
-    const result = await executePromptAction(makePrompt(), "Copy&Paste", "page", deps);
+    const result = await executePromptAction(makePrompt(), "CopyAndPaste", "page", deps);
 
     expect(deps.recordUse).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -178,10 +178,10 @@ describe("executePromptAction", () => {
     const reportEvent = vi.fn();
 
     await executePromptAction(entry, "OnlyCopy", "page", makeDeps({ reportEvent }));
-    await executePromptAction(entry, "Copy&Paste", "overlay", makeDeps({ reportEvent }));
+    await executePromptAction(entry, "CopyAndPaste", "overlay", makeDeps({ reportEvent }));
     await executePromptAction(
       entry,
-      "Copy&Paste",
+      "CopyAndPaste",
       "overlay",
       makeDeps({
         reportEvent,

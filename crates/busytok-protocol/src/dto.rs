@@ -823,7 +823,7 @@ pub enum PromptActionDto {
     OnlyCopy,
     #[serde(rename = "OnlyPaste")]
     OnlyPaste,
-    #[serde(rename = "Copy&Paste", alias = "paste")]
+    #[serde(rename = "CopyAndPaste", alias = "paste")]
     CopyAndPaste,
 }
 
