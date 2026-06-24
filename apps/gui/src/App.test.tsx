@@ -276,7 +276,7 @@ beforeEach(() => {
         recent_diagnostics: [],
       },
       recovery_actions: [],
-      prompt_palette_default_action: "copy",
+      prompt_palette_default_action: "OnlyCopy",
     }),
   );
   vi.spyOn(busytokClient, "settingsDiagnostics").mockResolvedValue(

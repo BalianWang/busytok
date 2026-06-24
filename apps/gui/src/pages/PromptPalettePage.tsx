@@ -237,7 +237,7 @@ export function PromptPalettePage() {
     setActionMessage(null);
     setCopyStates((prev) => ({ ...prev, [entry.id]: "copying" }));
     try {
-      const result = await executePromptAction(entry, "copy", "page", {
+      const result = await executePromptAction(entry, "OnlyCopy", "page", {
         writeClipboard: writeSystemClipboard,
         ...createPromptPasteBridge({
           hideWindowForPaste: hideWindowForTauriPaste,

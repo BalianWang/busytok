@@ -55,7 +55,7 @@ const queryClient = new QueryClient({
 function PromptPalettePanelInner() {
   const [sessionKey, setSessionKey] = useState(0);
   const settingsSnapshot = useSettingsSnapshot();
-  const defaultAction = settingsSnapshot.data?.data.prompt_palette_default_action ?? "paste";
+  const defaultAction = settingsSnapshot.data?.data.prompt_palette_default_action ?? "CopyAndPaste";
   const themeLoggedRef = useRef(false);
 
   const closePaletteWindow = useCallback(async () => {

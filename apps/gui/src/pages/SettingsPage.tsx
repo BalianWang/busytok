@@ -135,7 +135,7 @@ export function SettingsPage() {
   const weekStart = localWeekStart ?? snapshot?.week_starts_on ?? 0;
   const discovery = localDiscovery ?? snapshot?.discovery;
   const privacy = localPrivacy ?? snapshot?.privacy;
-  const defaultAction = localDefaultAction ?? snapshot?.prompt_palette_default_action ?? "paste";
+  const defaultAction = localDefaultAction ?? snapshot?.prompt_palette_default_action ?? "CopyAndPaste";
 
   const handleMutate = useCallback(
     (patch: Partial<SettingsUpdateRequestDto>) => {
@@ -573,7 +573,7 @@ export function SettingsPage() {
             <SettingsRow
               layout="vertical"
               label="Default action"
-              description="Choose whether pressing Enter on a prompt copies it or pastes it into the active app."
+              description="Choose what pressing Enter does: copy to clipboard only, paste into the active app only (clipboard is restored), or copy and paste together."
               error={fieldError("prompt_palette_default_action")}
               control={
                 <AppSelect
@@ -582,9 +582,34 @@ export function SettingsPage() {
                   value={defaultAction}
                   onValueChange={handleDefaultActionChange}
                 >
-                  <AppSelectItem value="paste">Paste</AppSelectItem>
-                  <AppSelectItem value="copy">Copy</AppSelectItem>
+                  <AppSelectItem value="CopyAndPaste">Copy &amp; paste</AppSelectItem>
+                  <AppSelectItem value="OnlyCopy">Only copy</AppSelectItem>
+                  <AppSelectItem value="OnlyPaste">Only paste</AppSelectItem>
                 </AppSelect>
+              }
+            />
+            <SettingsRow
+              label="Prompt Palette Paste"
+              description={
+                pasteStatus.failure_reason === "permission_missing"
+                  ? "Accessibility permission is required for automatic paste."
+                  : undefined
+              }
+              control={
+                pasteStatus.failure_reason === "permission_missing" && isMacPlatform() ? (
+                  <SettingsActionGroup direction="col">
+                    <SettingsStatus label={pasteStatusText(pasteStatus)} tone="warning" />
+                    <button
+                      type="button"
+                      className="btn btn--secondary btn--sm"
+                      onClick={() => void openPromptPaletteAccessibilitySettings()}
+                    >
+                      Open System Settings
+                    </button>
+                  </SettingsActionGroup>
+                ) : (
+                  <SettingsValue value={pasteStatusText(pasteStatus)} tone="default" />
+                )
               }
             />
           </div>
@@ -1021,30 +1046,6 @@ export function SettingsPage() {
                     tone="muted"
                    
                   />
-                }
-              />
-              <SettingsRow
-                label="Prompt Palette Paste"
-                description={
-                  pasteStatus.failure_reason === "permission_missing"
-                    ? "Accessibility permission is required for automatic paste."
-                    : undefined
-                }
-                control={
-                  pasteStatus.failure_reason === "permission_missing" && isMacPlatform() ? (
-                    <SettingsActionGroup direction="col">
-                      <SettingsStatus label={pasteStatusText(pasteStatus)} tone="warning" />
-                      <button
-                        type="button"
-                        className="btn btn--secondary btn--sm"
-                        onClick={() => void openPromptPaletteAccessibilitySettings()}
-                      >
-                        Open System Settings
-                      </button>
-                    </SettingsActionGroup>
-                  ) : (
-                    <SettingsValue value={pasteStatusText(pasteStatus)} tone="default" />
-                  )
                 }
               />
             </div>

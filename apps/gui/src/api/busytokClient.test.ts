@@ -175,7 +175,7 @@ describe("createBusytokClient", () => {
     const client = createBusytokClient({ invoke });
     await client.promptsUse({
       id: "prompt-1",
-      action: "paste",
+      action: "CopyAndPaste",
       surface: "overlay",
       outcome: "paste_attempted",
       failure_reason: null,
@@ -184,7 +184,7 @@ describe("createBusytokClient", () => {
       method: "prompts.use",
       params: {
         id: "prompt-1",
-        action: "paste",
+        action: "CopyAndPaste",
         surface: "overlay",
         outcome: "paste_attempted",
         failure_reason: null,

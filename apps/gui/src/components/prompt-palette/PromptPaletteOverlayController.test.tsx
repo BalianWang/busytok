@@ -27,6 +27,7 @@ vi.mock("../../lib/promptPaletteActions", () => ({
   PROMPT_ACTION_ERROR_MESSAGE: "Could not run prompt action. Try again.",
   promptActionStatusMessage: vi.fn(),
   writeSystemClipboard: (...args: any[]) => (mocks.writeSystemClipboard as any)(...args),
+  readSystemClipboard: async () => "",
   pasteActiveApp: (...args: any[]) => (mocks.pasteActiveApp as any)(...args),
   getPromptPaletteAccessibilityStatus: (...args: any[]) => (mocks.getAccessibilityStatus as any)(...args),
 }));
@@ -72,7 +73,7 @@ vi.mock("./PromptPaletteOverlay", () => ({
       {onExecute && (
         <button
           type="button"
-          onClick={() => onExecute({ id: "test-entry", content: "hello" }, "paste")}
+          onClick={() => onExecute({ id: "test-entry", content: "hello" }, "CopyAndPaste")}
         >
           Execute paste
         </button>

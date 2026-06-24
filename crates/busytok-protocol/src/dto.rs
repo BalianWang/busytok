@@ -818,10 +818,13 @@ pub struct SettingsUpdateRequestDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "lowercase")]
 pub enum PromptActionDto {
-    Copy,
-    Paste,
+    #[serde(rename = "OnlyCopy", alias = "copy")]
+    OnlyCopy,
+    #[serde(rename = "OnlyPaste")]
+    OnlyPaste,
+    #[serde(rename = "CopyAndPaste", alias = "paste")]
+    CopyAndPaste,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

@@ -885,8 +885,10 @@ fn aggregate_trend_bucket(
 
 fn prompt_action_to_row(action: PromptActionDto) -> busytok_store::PromptActionRow {
     match action {
-        PromptActionDto::Copy => busytok_store::PromptActionRow::Copy,
-        PromptActionDto::Paste => busytok_store::PromptActionRow::Paste,
+        PromptActionDto::OnlyCopy => busytok_store::PromptActionRow::Copy,
+        PromptActionDto::OnlyPaste | PromptActionDto::CopyAndPaste => {
+            busytok_store::PromptActionRow::Paste
+        }
     }
 }
 
@@ -2893,8 +2895,11 @@ impl RuntimeControl for BusytokSupervisor {
                     redact_sensitive_values: settings.privacy.redact_sensitive_values,
                 },
                 prompt_palette_default_action: match settings.prompt_palette_default_action {
-                    busytok_config::PromptDefaultAction::Paste => PromptActionDto::Paste,
-                    busytok_config::PromptDefaultAction::Copy => PromptActionDto::Copy,
+                    busytok_config::PromptDefaultAction::OnlyCopy => PromptActionDto::OnlyCopy,
+                    busytok_config::PromptDefaultAction::OnlyPaste => PromptActionDto::OnlyPaste,
+                    busytok_config::PromptDefaultAction::CopyAndPaste => {
+                        PromptActionDto::CopyAndPaste
+                    }
                 },
                 diagnostics,
                 recovery_actions: vec![
@@ -3054,8 +3059,11 @@ impl RuntimeControl for BusytokSupervisor {
 
             if let Some(action) = req.prompt_palette_default_action {
                 pending.prompt_palette_default_action = match action {
-                    PromptActionDto::Copy => busytok_config::PromptDefaultAction::Copy,
-                    PromptActionDto::Paste => busytok_config::PromptDefaultAction::Paste,
+                    PromptActionDto::OnlyCopy => busytok_config::PromptDefaultAction::OnlyCopy,
+                    PromptActionDto::OnlyPaste => busytok_config::PromptDefaultAction::OnlyPaste,
+                    PromptActionDto::CopyAndPaste => {
+                        busytok_config::PromptDefaultAction::CopyAndPaste
+                    }
                 };
             }
 
