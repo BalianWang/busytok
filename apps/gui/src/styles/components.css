@@ -527,6 +527,57 @@
   font-size: 12px;
 }
 
+/* ── SettingsStatus (canonical) ──────────────────────────────── */
+
+.settings-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.settings-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.settings-status--ok .settings-status__dot {
+  background: var(--color-status-success);
+}
+
+.settings-status--warning {
+  color: var(--color-status-warning);
+}
+
+.settings-status--warning .settings-status__dot {
+  background: var(--color-status-warning);
+}
+
+.settings-status--danger {
+  color: var(--color-status-danger);
+}
+
+.settings-status--danger .settings-status__dot {
+  background: var(--color-status-danger);
+}
+
+.settings-status--muted {
+  color: var(--color-text-muted);
+}
+
+.settings-status--dense {
+  font-size: 12px;
+}
+
+.settings-status--dense .settings-status__dot {
+  width: 6px;
+  height: 6px;
+}
+
 /* ── Settings row ────────────────────────────────────────── */
 
 .settings-row {
