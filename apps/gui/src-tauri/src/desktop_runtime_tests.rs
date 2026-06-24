@@ -162,11 +162,10 @@ fn exit_routing_lets_self_triggered_exit_through() {
 
 #[test]
 fn system_quit_routes_to_full_shutdown_even_when_host_mode_active() {
-    // Regression for the Dock/system-quit bypass: a real terminate request
-    // (Cmd+Q, Dock Quit, Apple-menu Quit, logout) must funnel through
-    // quit_desktop_host regardless of host mode. Host mode is intentionally
-    // not a parameter here — window-close-as-hide is handled separately by
-    // install_hide_on_close, so it must never gate a real Quit.
+    // When ExitRequested IS delivered (Cmd+Q, Apple-menu Quit) and
+    // allow_exit is false, route to full shutdown.  Note: Dock Quit on
+    // macOS can bypass ExitRequested entirely — the safety net for that
+    // case is RunEvent::Exit → run_stop_operations, not this route.
     assert_eq!(
         crate::desktop_runtime::route_exit_request(false),
         crate::desktop_runtime::ExitRouting::RouteToFullShutdown
@@ -208,6 +207,24 @@ fn handle_exit_requested_skips_side_effects_for_self_triggered_exit() {
         sequence.borrow().is_empty(),
         "allow-through must call neither prevent_exit nor quit"
     );
+}
+
+// ── RunEvent::Exit safety-net tests ──────────────────────────
+
+#[test]
+fn exit_safety_net_triggers_stop_when_allow_exit_false() {
+    // Dock Quit on macOS can bypass ExitRequested, so allow_exit remains
+    // false when RunEvent::Exit fires.  handle_exit must return true,
+    // telling the caller to run run_stop_operations.
+    assert!(crate::desktop_runtime::handle_exit(false));
+}
+
+#[test]
+fn exit_safety_net_skips_stop_when_allow_exit_true() {
+    // Normal quit (tray menu or ExitRequested → quit_desktop_host →
+    // app.exit(0)) sets allow_exit=true before the process exits.
+    // handle_exit must return false — the shutdown already ran.
+    assert!(!crate::desktop_runtime::handle_exit(true));
 }
 
 #[test]

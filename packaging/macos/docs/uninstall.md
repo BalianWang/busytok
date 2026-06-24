@@ -1,9 +1,13 @@
 # Uninstalling Busytok
 
 1. Quit Busytok Desktop:
-   - Open the Busytok menu bar item and choose **Quit Busytok Desktop**, or
-     quit the app from the Dock / `Cmd-Q`.
-   - This stops the GUI and the `busytok-service` for the current session.
+   - Open the Busytok menu bar item and choose **Quit Busytok Desktop**.
+     This is the guaranteed whole-product quit path — it stops the GUI,
+     the `busytok-service`, and the login-start helper for the current session.
+   - Dock "Quit" can bypass the full shutdown pipeline and may leave the
+     `busytok-service` running.  `Cmd-Q` normally routes through the same
+     pipeline as the menu bar quit.  To ensure a clean shutdown, use the
+     menu bar **Quit Busytok Desktop** option.
 
 2. Delete the application:
    - Move `Busytok.app` to Trash.

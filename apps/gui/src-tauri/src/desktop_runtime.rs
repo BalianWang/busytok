@@ -300,6 +300,61 @@ pub(crate) fn quit_desktop_host(app: &tauri::AppHandle) {
     }
 }
 
+/// Decide whether `RunEvent::Exit` should run the safety-net stop.
+///
+/// Returns `true` when `allow_exit` is still `false` — the normal pipeline
+/// (tray-menu quit or ExitRequested → quit_desktop_host → app.exit(0)) was
+/// never reached (Dock Quit on macOS can bypass ExitRequested).  When
+/// `allow_exit` is already `true`, the normal pipeline already ran — do
+/// nothing (return `false`) to avoid a double-stop.
+///
+/// This is a pure decision function, extracted from the run-loop closure so
+/// both branches can be unit-tested — exactly the same seam as
+/// `route_exit_request` / `handle_exit_requested`.
+pub(crate) fn handle_exit(allow_exit: bool) -> bool {
+    !allow_exit
+}
+
+/// Safety-net shutdown for `RunEvent::Exit` when `allow_exit` is still
+/// `false` — the normal pipeline (tray-menu quit or ExitRequested →
+/// quit_desktop_host → app.exit(0)) was never reached (Dock Quit on macOS
+/// can bypass ExitRequested).  Runs stop operations directly; does NOT
+/// call `app.exit(0)` (we are already inside the Exit event).
+pub(crate) fn run_stop_operations(app: &tauri::AppHandle) {
+    let coordinator = app
+        .try_state::<std::sync::Arc<crate::lifecycle_coordinator::LifecycleCoordinator>>()
+        .map(|s| s.inner().clone());
+    let settings_store = app
+        .try_state::<std::sync::Arc<crate::desktop_lifecycle_settings::DesktopLifecycleSettingsStore>>()
+        .map(|s| s.inner().clone());
+
+    if let (Some(coordinator), Some(settings_store)) = (coordinator, settings_store) {
+        tauri::async_runtime::block_on(async move {
+            coordinator.request_quit().await;
+            coordinator
+                .suppress_and_persist(
+                    crate::lifecycle_coordinator::LifecycleCause::Quit,
+                    &settings_store,
+                )
+                .await;
+            // Same event codes as quit_desktop_host_with — the safety net
+            // must retain diagnostic visibility.
+            if let Err(e) = coordinator.login_start().stop_for_current_session() {
+                tracing::warn!(
+                    event_code = "desktop_host.quit.host_stop_failed",
+                    error = %e,
+                );
+            }
+            if let Err(e) = coordinator.lifecycle().stop_for_current_session() {
+                tracing::warn!(
+                    event_code = "desktop_host.quit.service_stop_failed",
+                    error = %e,
+                );
+            }
+        });
+    }
+}
+
 pub fn dispatch_host_action(
     app: &tauri::AppHandle,
     action: crate::desktop_host::DesktopHostAction,

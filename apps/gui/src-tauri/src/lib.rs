@@ -561,7 +561,6 @@ pub fn run() {
             commands::desktop_lifecycle_settings_update,
             commands::desktop_background_service_diagnostics,
             commands::desktop_background_service_repair,
-            updater::install_version,
             logging::log_frontend_event,
             logging::flush_frontend_logs,
             prompt_palette::prompt_palette_paste_active_app,
@@ -594,6 +593,25 @@ pub fn run() {
                     || api.prevent_exit(),
                     || desktop_runtime::quit_desktop_host(app),
                 );
+            }
+            // Safety net: when the event loop is exiting and allow_exit is
+            // still false, the shutdown pipeline was never run (Dock Quit on
+            // macOS can bypass ExitRequested).  Run the stop operations
+            // directly — do NOT call app.exit(0), we are already inside Exit.
+            // Decision extracted as desktop_runtime::handle_exit so
+            // both branches are unit-tested (parallels handle_exit_requested).
+            tauri::RunEvent::Exit => {
+                if desktop_runtime::handle_exit(
+                    app.state::<desktop_runtime::HostExitState>()
+                        .allow_exit
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                ) {
+                    tracing::warn!(
+                        event_code = "desktop_host.exit_without_shutdown",
+                        "process exiting without full shutdown pipeline; running stop operations"
+                    );
+                    desktop_runtime::run_stop_operations(app);
+                }
             }
             tauri::RunEvent::Reopen {
                 has_visible_windows,
