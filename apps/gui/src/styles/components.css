@@ -1228,37 +1228,13 @@ body.prompt-palette-window-body #root {
 
 .prompt-overlay__search input::placeholder {
   color: var(--color-text-faint);
+  font-size: 18px;
 }
 
 .prompt-overlay__divider {
   height: 1px;
   margin: 0 16px;
   background: var(--color-border-subtle);
-}
-
-/* Action-hint footer: a materially quiet keycap vocabulary band that
-   keeps the chrome calm and lets the result list stay the focus. */
-.prompt-overlay__hints {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 14px;
-  padding: 8px 16px 10px;
-  border-top: 1px solid var(--color-border-subtle);
-  background: var(--color-surface-subtle);
-}
-
-.prompt-overlay__hint {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--color-text-muted);
-  font-size: 11.5px;
-  font-weight: 500;
-}
-
-.prompt-overlay__hint-label {
-  letter-spacing: 0.01em;
 }
 
 .prompt-overlay__status,
@@ -1468,10 +1444,6 @@ body.prompt-palette-window-body #root {
   .prompt-overlay__status {
     margin-left: 14px;
     margin-right: 14px;
-  }
-
-  .prompt-overlay__hints {
-    padding: 8px 14px 10px;
   }
 
   .prompt-overlay__menu {

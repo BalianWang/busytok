@@ -88,11 +88,6 @@ export function PromptPaletteOverlay({
   const [actionsOpen, setActionsOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // TanStack Query keeps stale `data` on refetch failure, so entries can be
-  // non-empty while `error` is also set. The hint footer targets the visible
-  // list — hide it whenever the list is replaced by an error or loading state.
-  const hasResults = entries.length > 0 && !error && !isLoading;
-
   useEffect(() => {
     if (open) {
       const activeElement = document.activeElement;
@@ -346,39 +341,6 @@ export function PromptPaletteOverlay({
             })}
           </div>
         )}
-
-        {hasResults ? (
-          <footer
-            className="prompt-overlay__hints"
-            role="region"
-            aria-label="Keyboard shortcuts"
-          >
-            <span className="prompt-overlay__hint">
-              <kbd className="prompt-overlay__keycap">
-                <span className="prompt-overlay__keycap-label">↵</span>
-              </kbd>
-              <span className="prompt-overlay__hint-label">{promptActionLabel(defaultAction)}</span>
-            </span>
-            <span className="prompt-overlay__hint">
-              <kbd className="prompt-overlay__keycap">
-                <span className="prompt-overlay__keycap-label">⌘↵</span>
-              </kbd>
-              <span className="prompt-overlay__hint-label">Paste</span>
-            </span>
-            <span className="prompt-overlay__hint">
-              <kbd className="prompt-overlay__keycap">
-                <span className="prompt-overlay__keycap-label">⌘K</span>
-              </kbd>
-              <span className="prompt-overlay__hint-label">Actions</span>
-            </span>
-            <span className="prompt-overlay__hint">
-              <kbd className="prompt-overlay__keycap">
-                <span className="prompt-overlay__keycap-label">⌘N</span>
-              </kbd>
-              <span className="prompt-overlay__hint-label">New</span>
-            </span>
-          </footer>
-        ) : null}
 
         {actionsOpen && selectedEntry ? (
           <div

@@ -89,13 +89,6 @@ describe("PromptPaletteOverlay", () => {
     );
     expect(closeKeycap).not.toBeNull();
     expect(closeKeycap?.textContent).toBe("Esc");
-
-    // The action-hint footer must group its keyboard hints under a single
-    // keycap-vocabulary container so the chrome stays materially consistent.
-    const hintFooter = document.querySelector(".prompt-overlay__hints");
-    expect(hintFooter).not.toBeNull();
-    const hints = hintFooter?.querySelectorAll(".prompt-overlay__keycap");
-    expect(hints && hints.length >= 1).toBe(true);
   });
 
   it("marks the selected row with surface lift and a focus-edge accent cue", () => {
@@ -278,37 +271,6 @@ describe("PromptPaletteOverlay", () => {
 
     rerender(<PromptPaletteOverlay {...props} entries={[]} error="Search failed" />);
     expect(screen.getByText("Search failed")).toBeDefined();
-  });
-
-  it("hides the hint footer while TanStack Query retains stale data through an error or loading state", () => {
-    // Regression: entries.length > 0 is not enough to show the footer, because
-    // TanStack Query keeps stale `data` on refetch failure — the list is
-    // replaced by the error paragraph but the footer would otherwise keep
-    // pointing at a target the user can no longer see.
-    const staleEntries = [makePrompt()];
-
-    const { rerender, props } = renderOverlay({ entries: staleEntries });
-    expect(screen.getByRole("region", { name: /keyboard shortcuts/i })).toBeDefined();
-
-    // Stale data + error → footer must disappear even though entries is non-empty.
-    rerender(<PromptPaletteOverlay {...props} entries={staleEntries} error="Could not load saved prompts." />);
-    expect(screen.queryByRole("region", { name: /keyboard shortcuts/i })).toBeNull();
-    expect(screen.getByText("Could not load saved prompts.")).toBeDefined();
-
-    // Stale data + loading → footer must disappear during refetch too.
-    rerender(<PromptPaletteOverlay {...props} entries={staleEntries} isLoading />);
-    expect(screen.queryByRole("region", { name: /keyboard shortcuts/i })).toBeNull();
-    expect(screen.getByText("Loading prompts...")).toBeDefined();
-  });
-
-  it("exposes the hint footer as a labeled region instead of hiding it from assistive tech", () => {
-    renderOverlay();
-
-    // Regression: the footer used to be aria-hidden, which stripped Enter/
-    // Cmd+Enter/Cmd+K/Cmd+N from the accessibility tree. It must now be a
-    // labeled region so screen-reader users can discover the shortcuts.
-    const region = screen.getByRole("region", { name: /keyboard shortcuts/i });
-    expect(region.getAttribute("aria-hidden")).not.toBe("true");
   });
 
   it("renders the compact palette chrome with a single search row and lighter metadata", () => {
