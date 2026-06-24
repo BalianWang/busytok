@@ -8,6 +8,7 @@ import {
   PROMPT_ACTION_ERROR_MESSAGE,
   promptActionStatusMessage,
   pasteActiveApp,
+  readSystemClipboard,
   writeSystemClipboard,
 } from "../../lib/promptPaletteActions";
 import { createPromptPasteBridge } from "../../lib/promptPalettePasteBridge";
@@ -30,7 +31,7 @@ export function PromptPaletteOverlayController({
   onOpenPage,
   onCreateNew,
   presentation = "overlay",
-  defaultAction = "paste",
+  defaultAction = "Copy&Paste",
 }: PromptPaletteOverlayControllerProps) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -84,6 +85,7 @@ export function PromptPaletteOverlayController({
     try {
       const result = await executePromptAction(entry, action, "overlay", {
         writeClipboard: writeSystemClipboard,
+        readClipboard: readSystemClipboard,
         ...createPromptPasteBridge({
           // In window mode, hideWindowForPaste handles the actual close.
           // In overlay mode, onWindowHidden notifies the parent to close.

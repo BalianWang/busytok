@@ -62,13 +62,13 @@ describe("executePromptAction", () => {
     });
     const reportEvent = vi.mocked(deps.reportEvent!);
 
-    const result = await executePromptAction(entry, "copy", "overlay", deps);
+    const result = await executePromptAction(entry, "OnlyCopy", "overlay", deps);
 
     expect(calls).toEqual(["clipboard", "record"]);
     expect(deps.writeClipboard).toHaveBeenCalledWith(entry.content);
     expect(deps.recordUse).toHaveBeenCalledWith({
       id: entry.id,
-      action: "copy",
+      action: "OnlyCopy",
       surface: "overlay",
       outcome: "copy",
       failure_reason: null,
@@ -92,7 +92,7 @@ describe("executePromptAction", () => {
     });
     const reportEvent = vi.mocked(deps.reportEvent!);
 
-    await expect(executePromptAction(entry, "copy", "overlay", deps)).rejects.toThrow("denied");
+    await expect(executePromptAction(entry, "OnlyCopy", "overlay", deps)).rejects.toThrow("denied");
 
     expect(deps.recordUse).not.toHaveBeenCalled();
     expect(reportEvent).toHaveBeenCalledWith(
@@ -101,7 +101,7 @@ describe("executePromptAction", () => {
         event_code: "gui.prompt_palette.action_failed",
         details: expect.objectContaining({
           prompt_entry_id: entry.id,
-          action: "copy",
+          action: "OnlyCopy",
           surface: "overlay",
           outcome: "failed",
           failure_reason: "clipboard_write_failed",
@@ -120,11 +120,11 @@ describe("executePromptAction", () => {
     });
     const reportEvent = vi.mocked(deps.reportEvent!);
 
-    const result = await executePromptAction(makePrompt(), "paste", "overlay", deps);
+    const result = await executePromptAction(makePrompt(), "Copy&Paste", "overlay", deps);
 
     expect(deps.recordUse).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: "paste",
+        action: "Copy&Paste",
         outcome: "paste_fell_back_to_copy",
         failure_reason: "unsupported_platform",
       }),
@@ -144,7 +144,7 @@ describe("executePromptAction", () => {
       beforePaste: vi.fn().mockResolvedValue({ ok: false, failure_reason: "focus_lost" }),
     });
 
-    await executePromptAction(makePrompt(), "paste", "overlay", deps);
+    await executePromptAction(makePrompt(), "Copy&Paste", "overlay", deps);
 
     expect(deps.pasteActiveApp).not.toHaveBeenCalled();
     expect(deps.recordUse).toHaveBeenCalledWith(
@@ -161,7 +161,7 @@ describe("executePromptAction", () => {
       pasteActiveApp: undefined,
     });
 
-    const result = await executePromptAction(makePrompt(), "paste", "page", deps);
+    const result = await executePromptAction(makePrompt(), "Copy&Paste", "page", deps);
 
     expect(deps.recordUse).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -177,11 +177,11 @@ describe("executePromptAction", () => {
     const entry = makePrompt();
     const reportEvent = vi.fn();
 
-    await executePromptAction(entry, "copy", "page", makeDeps({ reportEvent }));
-    await executePromptAction(entry, "paste", "overlay", makeDeps({ reportEvent }));
+    await executePromptAction(entry, "OnlyCopy", "page", makeDeps({ reportEvent }));
+    await executePromptAction(entry, "Copy&Paste", "overlay", makeDeps({ reportEvent }));
     await executePromptAction(
       entry,
-      "paste",
+      "Copy&Paste",
       "overlay",
       makeDeps({
         reportEvent,
@@ -215,6 +215,66 @@ describe("executePromptAction", () => {
       expect(JSON.stringify(call[0].details)).not.toContain(entry.content);
     }
   });
+
+  // ── OnlyPaste (save → write → paste → restore) ──────────────────
+
+  it("saves old clipboard, writes new content, pastes, then restores the old clipboard", async () => {
+    const entry = makePrompt();
+    let writeCalls: string[] = [];
+    const readClipboard = vi.fn().mockResolvedValue("old clipboard");
+    const deps = makeDeps({
+      writeClipboard: vi.fn().mockImplementation(async (text: string) => {
+        writeCalls.push(text);
+      }),
+      readClipboard,
+    });
+
+    await executePromptAction(entry, "OnlyPaste", "overlay", deps);
+
+    // Old clipboard was read.
+    expect(readClipboard).toHaveBeenCalled();
+    // New content was written.
+    expect(writeCalls[0]).toBe(entry.content);
+    // Paste was attempted.
+    const request = vi.mocked(deps.recordUse).mock.calls[0][0];
+    expect(request.action).toBe("OnlyPaste");
+    expect(request.outcome).toBe("paste_attempted");
+    // Old clipboard was restored.
+    expect(writeCalls[writeCalls.length - 1]).toBe("old clipboard");
+  });
+
+  it("does not fail the paste when clipboard restore throws", async () => {
+    const entry = makePrompt();
+    const writeClipboard = vi.fn()
+      .mockResolvedValueOnce(undefined)     // write new content
+      .mockRejectedValue(new Error("restore denied")); // restore fails
+    const deps = makeDeps({
+      writeClipboard,
+      readClipboard: async () => "old",
+    });
+
+    const result = await executePromptAction(entry, "OnlyPaste", "overlay", deps);
+
+    // Paste still succeeded (restore is best-effort).
+    expect(result.outcome).toBe("paste_attempted");
+    // The restore-failure telemetry was emitted.
+    const reportEvent = vi.mocked(deps.reportEvent!);
+    expect(reportEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_code: "gui.prompt_palette.only_paste_restore_failed",
+      }),
+    );
+  });
+
+  it("OnlyPaste continues when old clipboard read throws (empty / unsupported)", async () => {
+    const entry = makePrompt();
+    const readClipboard = vi.fn().mockRejectedValue(new Error("no permission"));
+    const deps = makeDeps({ readClipboard });
+
+    const result = await executePromptAction(entry, "OnlyPaste", "overlay", deps);
+
+    expect(result.outcome).toBe("paste_attempted");
+  });
 });
 
 describe("writeSystemClipboard", () => {
@@ -246,7 +306,7 @@ describe("writeSystemClipboard", () => {
     });
 
     try {
-      await expect(writeSystemClipboard("copy")).rejects.toThrow();
+      await expect(writeSystemClipboard("hello")).rejects.toThrow();
     } finally {
       Object.defineProperty(navigator, "clipboard", {
         value: originalClipboard,

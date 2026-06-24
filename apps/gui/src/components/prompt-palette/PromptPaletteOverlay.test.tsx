@@ -39,7 +39,7 @@ function renderOverlay(props: Partial<React.ComponentProps<typeof PromptPaletteO
     onExecute: vi.fn(),
     onOpenPage: vi.fn(),
     onCreateNew: vi.fn(),
-    defaultAction: "paste",
+    defaultAction: "Copy&Paste",
     onEdit: vi.fn(),
     onTogglePin: vi.fn(),
     onDelete: vi.fn(),
@@ -66,7 +66,7 @@ describe("PromptPaletteOverlay", () => {
 
     await user.keyboard("{Enter}");
 
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "paste");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "Copy&Paste");
   });
 
   it("keeps the search field as the initial focus target", async () => {
@@ -134,7 +134,7 @@ describe("PromptPaletteOverlay", () => {
     await user.keyboard("{Meta>}c{/Meta}");
     await user.keyboard("{Escape}");
 
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[1], "copy");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[1], "OnlyCopy");
     expect(props.onClose).toHaveBeenCalled();
   });
 
@@ -174,7 +174,7 @@ describe("PromptPaletteOverlay", () => {
           open
           entries={[makePrompt()]}
           query=""
-          defaultAction="paste"
+          defaultAction="Copy&Paste"
           onQueryChange={vi.fn()}
           onClose={vi.fn()}
           onExecute={vi.fn()}
@@ -203,12 +203,12 @@ describe("PromptPaletteOverlay", () => {
     openActions();
     await user.click(await screen.findByRole("menuitem", { name: "Copy" }));
     await waitFor(() => {
-      expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "copy");
+      expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "OnlyCopy");
     });
 
     openActions();
     await user.click(await screen.findByRole("menuitem", { name: "Paste" }));
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "paste");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[0], "Copy&Paste");
 
     openActions();
     await user.click(await screen.findByRole("menuitem", { name: "Edit" }));
@@ -454,7 +454,7 @@ describe("PromptPaletteOverlay", () => {
     expect(secondRow).not.toBeNull();
     fireEvent.click(secondRow!);
 
-    expect(props.onExecute).toHaveBeenCalledWith(props.entries[1], "paste");
+    expect(props.onExecute).toHaveBeenCalledWith(props.entries[1], "Copy&Paste");
   });
 
   it("shows sanitized action feedback when execution rejects", async () => {

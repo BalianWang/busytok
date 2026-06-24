@@ -36,7 +36,11 @@ export function promptUpdatedLabel(updatedAtMs: number): string {
 }
 
 export function promptActionLabel(action: PromptActionDto): string {
-  return action === "paste" ? "Paste" : "Copy";
+  switch (action) {
+    case "OnlyCopy": return "Copy";
+    case "OnlyPaste": return "Paste";
+    case "Copy&Paste": return "Paste";
+  }
 }
 
 export function promptDisplayLabel(alias: string | null, content: string): string {

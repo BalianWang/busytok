@@ -160,7 +160,7 @@ export type SettingsSnapshotDto = { timezone: string, week_starts_on: WeekdayInd
 
 export type SettingsUpdateRequestDto = { timezone: string | null, week_starts_on: WeekdayIndexDto | null, discovery: SettingsDiscoveryDto | null, privacy: SettingsPrivacyDto | null, prompt_palette_default_action: PromptActionDto | null, };
 
-export type PromptActionDto = "copy" | "paste";
+export type PromptActionDto = "OnlyCopy" | "OnlyPaste" | "Copy&Paste";
 
 export type PromptSortDto = "smart" | "recently_used" | "most_used" | "recently_updated" | "alphabetical" | "pinned_first";
 

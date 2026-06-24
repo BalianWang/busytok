@@ -30,6 +30,8 @@ export type PromptPaletteReportEvent = (entry: {
 
 export interface PromptActionDeps {
   writeClipboard: (text: string) => Promise<void>;
+  /** Read the current system clipboard; used by OnlyPaste to save/restore. */
+  readClipboard?: () => Promise<string>;
   beforePaste?: () => Promise<PastePreparationResult>;
   pasteActiveApp?: () => Promise<PasteAttemptResult>;
   recordUse: (request: PromptUseRequestDto) => Promise<PromptUseResultDto>;
@@ -63,6 +65,13 @@ export async function writeSystemClipboard(text: string): Promise<void> {
     return;
   }
   throw new Error("Clipboard API is unavailable");
+}
+
+export async function readSystemClipboard(): Promise<string> {
+  if (globalThis.navigator?.clipboard?.readText) {
+    return await globalThis.navigator.clipboard.readText();
+  }
+  return "";
 }
 
 function unsupportedPlatformResult(): PromptPalettePasteResult {
@@ -177,43 +186,17 @@ async function recordAndReport(
   };
 }
 
-export async function executePromptAction(
+/**
+ * Shared paste flow (beforePaste → pasteActiveApp → recordUse).  Used by
+ * both Copy&Paste and OnlyPaste — the clipboard write (and optional
+ * save/restore) is handled by the caller.
+ */
+async function runPaste(
   entry: PromptEntryDto,
   action: PromptActionDto,
   surface: PromptUseSurfaceDto,
   deps: PromptActionDeps,
 ): Promise<PromptActionResult> {
-  try {
-    await deps.writeClipboard(entry.content);
-  } catch (error) {
-    const reportEvent = deps.reportEvent ?? reportFrontendEvent;
-    reportEvent({
-      level: "ERROR",
-      event_code: "gui.prompt_palette.action_failed",
-      message: "Prompt action failed before usage could be recorded",
-      details: {
-        prompt_entry_id: entry.id,
-        action,
-        surface,
-        outcome: "failed",
-        failure_reason: "clipboard_write_failed",
-        error_name: error instanceof Error ? error.name : typeof error,
-      },
-    });
-    throw error;
-  }
-
-  if (action === "copy") {
-    const request: PromptUseRequestDto = {
-      id: entry.id,
-      action,
-      surface,
-      outcome: "copy",
-      failure_reason: null,
-    };
-    return recordAndReport(entry, request, deps);
-  }
-
   const fallback = (failure_reason: PromptUseFailureReasonDto) =>
     recordAndReport(
       entry,
@@ -254,4 +237,94 @@ export async function executePromptAction(
     },
     deps,
   );
+}
+
+export async function executePromptAction(
+  entry: PromptEntryDto,
+  action: PromptActionDto,
+  surface: PromptUseSurfaceDto,
+  deps: PromptActionDeps,
+): Promise<PromptActionResult> {
+  // ── OnlyPaste: save old clipboard → write → paste → restore ──
+  if (action === "OnlyPaste") {
+    let oldClipboard = "";
+    if (deps.readClipboard) {
+      try {
+        oldClipboard = await deps.readClipboard();
+      } catch {
+        // clipboard read failure is non-fatal — the paste continues
+      }
+    }
+
+    try {
+      await deps.writeClipboard(entry.content);
+    } catch (error) {
+      const reportEvent = deps.reportEvent ?? reportFrontendEvent;
+      reportEvent({
+        level: "ERROR",
+        event_code: "gui.prompt_palette.action_failed",
+        message: "OnlyPaste clipboard write failed",
+        details: {
+          prompt_entry_id: entry.id,
+          action,
+          surface,
+          outcome: "failed",
+          failure_reason: "clipboard_write_failed",
+          error_name: error instanceof Error ? error.name : typeof error,
+        },
+      });
+      throw error;
+    }
+
+    const result = await runPaste(entry, action, surface, deps);
+
+    // Restore the old clipboard — best-effort (paste already succeeded).
+    try {
+      await deps.writeClipboard(oldClipboard);
+    } catch {
+      const reportEvent = deps.reportEvent ?? reportFrontendEvent;
+      reportEvent({
+        level: "WARN",
+        event_code: "gui.prompt_palette.only_paste_restore_failed",
+        message: "OnlyPaste failed to restore the old clipboard after paste",
+        details: { prompt_entry_id: entry.id },
+      });
+    }
+    return result;
+  }
+
+  // ── OnlyCopy / Copy&Paste: write clipboard first ──
+  try {
+    await deps.writeClipboard(entry.content);
+  } catch (error) {
+    const reportEvent = deps.reportEvent ?? reportFrontendEvent;
+    reportEvent({
+      level: "ERROR",
+      event_code: "gui.prompt_palette.action_failed",
+      message: "Prompt action failed before usage could be recorded",
+      details: {
+        prompt_entry_id: entry.id,
+        action,
+        surface,
+        outcome: "failed",
+        failure_reason: "clipboard_write_failed",
+        error_name: error instanceof Error ? error.name : typeof error,
+      },
+    });
+    throw error;
+  }
+
+  if (action === "OnlyCopy") {
+    const request: PromptUseRequestDto = {
+      id: entry.id,
+      action,
+      surface,
+      outcome: "copy",
+      failure_reason: null,
+    };
+    return recordAndReport(entry, request, deps);
+  }
+
+  // Copy&Paste: clipboard already written, now paste.
+  return runPaste(entry, action, surface, deps);
 }
