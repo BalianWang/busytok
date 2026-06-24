@@ -3,16 +3,21 @@ import { useUpdater } from "../../hooks/useUpdater";
 
 /** Titlebar badge: hidden unless an update is available/active. */
 export function UpdateBadgeButton() {
-  const { status, checkNow, applyNow } = useUpdater();
+  const { status, applyNow } = useUpdater();
 
-  if (status.state === "idle" || status.state === "up-to-date" || status.state === "checking") {
+  if (
+    status.state === "idle" ||
+    status.state === "up-to-date" ||
+    status.state === "checking" ||
+    status.state === "error"
+  ) {
     return null;
   }
 
   if (status.state === "downloading") {
     const label = status.percent == null ? "Updating…" : `Update ${status.percent}%`;
     return (
-      <button type="button" className="update-badge update-badge--busy" disabled aria-label={label}>
+      <button type="button" className="update-badge update-badge--info" disabled aria-label={label}>
         <DownloadCloud size={14} />
         <span>{label}</span>
       </button>
@@ -21,7 +26,7 @@ export function UpdateBadgeButton() {
 
   if (status.state === "installed-pending-restart") {
     return (
-      <button type="button" className="update-badge" disabled aria-label="Restarting">
+      <button type="button" className="update-badge update-badge--info" disabled aria-label="Restarting">
         <span>Restarting…</span>
       </button>
     );
@@ -35,24 +40,15 @@ export function UpdateBadgeButton() {
     );
   }
 
-  if (status.state === "error") {
-    return (
-      <button type="button" className="update-badge update-badge--error" onClick={() => void checkNow()} aria-label="Retry update check">
-        Retry check
-      </button>
-    );
-  }
-
-  // available
+  // available: success chip
   return (
     <button
       type="button"
-      className="update-badge"
+      className="update-badge update-badge--available"
       onClick={() => void applyNow()}
       title={`v${status.version} available\n\n${status.notes || "(no release notes)"}`}
       aria-label={`Update to version ${status.version}`}
     >
-      <DownloadCloud size={14} />
       <span className="update-badge__dot" aria-hidden="true" />
       <span>Update</span>
     </button>

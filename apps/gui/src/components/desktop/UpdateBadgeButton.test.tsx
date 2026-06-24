@@ -15,13 +15,20 @@ beforeEach(() => vi.clearAllMocks());
 afterEach(() => cleanup());
 
 describe("UpdateBadgeButton", () => {
-  it("renders nothing when idle/up-to-date", () => {
+  it("renders nothing when idle/up-to-date/checking/error", () => {
     setStatus({ state: "idle" });
     const { rerender } = render(<UpdateBadgeButton />);
     expect(screen.queryByRole("button")).toBeNull();
     setStatus({ state: "up-to-date" });
     rerender(<UpdateBadgeButton />);
     expect(screen.queryByRole("button")).toBeNull();
+    setStatus({ state: "checking" });
+    rerender(<UpdateBadgeButton />);
+    expect(screen.queryByRole("button")).toBeNull();
+    setStatus({ state: "error", message: "network timeout" });
+    rerender(<UpdateBadgeButton />);
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("available: shows version in tooltip + applies on click", async () => {
@@ -53,14 +60,6 @@ describe("UpdateBadgeButton", () => {
     setStatus({ state: "installed-needs-manual-restart", version: "0.3.0" });
     render(<UpdateBadgeButton />);
     expect(screen.getByRole("status").textContent).toMatch(/restart.*manually/i);
-  });
-
-  it("error: retry calls checkNow", async () => {
-    const checkNow = vi.fn();
-    mocked.mockReturnValue({ status: { state: "error", message: "x" }, checkNow, applyNow: vi.fn() });
-    render(<UpdateBadgeButton />);
-    await userEvent.click(screen.getByRole("button"));
-    expect(checkNow).toHaveBeenCalledTimes(1);
   });
 
   it("installed-pending-restart: disabled Restarting… button", () => {
