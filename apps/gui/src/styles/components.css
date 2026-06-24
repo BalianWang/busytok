@@ -501,6 +501,32 @@
   transform: translateX(12px);
 }
 
+/* ── SettingsValue (canonical) ───────────────────────────────── */
+
+.settings-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-value--muted {
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.settings-value--warning {
+  color: var(--color-status-warning);
+}
+
+.settings-value--danger {
+  color: var(--color-status-danger);
+}
+
+.settings-value--dense {
+  font-size: 12px;
+}
+
 /* ── Settings row ────────────────────────────────────────── */
 
 .settings-row {
