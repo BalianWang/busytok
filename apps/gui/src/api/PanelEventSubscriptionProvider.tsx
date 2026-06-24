@@ -68,25 +68,41 @@ export function PanelEventSubscriptionProvider({ children }: { children: ReactNo
   // successful prompts query (loaded by pull, so it succeeds regardless of the
   // missed push) proves the service is alive; latch "ready" so the action gate
   // (PromptPaletteOverlayController) does not falsely block.
+  //
+  // Tightened to a NEW success only: a high-water mark on dataUpdatedAt means
+  // only a prompts success with dataUpdatedAt newer than any already observed
+  // (and newer than this subscription) latches. This blocks stale cached
+  // success — pre-subscription OR from earlier in this provider's lifetime —
+  // from re-latching "ready" after the service genuinely became "unavailable".
+  // The panel QueryClient is a module-level singleton whose cache persists
+  // across overlay remounts, so observer reattach / invalidate / focus would
+  // otherwise re-emit an old success (status "success", fetchStatus "idle",
+  // UNCHANGED dataUpdatedAt) and falsely unblock paste actions.
   // NOTE: this is the panel-side latch, consistent with the main window — not
   // the bridge retain/replay endgame (tracked separately).
   useEffect(() => {
+    let newestSeen = Date.now(); // ignore success data older than subscription
     const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+      const state = event.query.state;
       const key = event.query.queryKey;
       if (
-        event.type !== "removed" &&
-        Array.isArray(key) &&
-        key[0] === "prompts" &&
-        event.query.state.status === "success" &&
-        lastServiceStatusRef.current !== "ready"
+        !Array.isArray(key) ||
+        key[0] !== "prompts" ||
+        state.status !== "success" ||
+        state.fetchStatus !== "idle" ||
+        state.dataUpdatedAt <= newestSeen
       ) {
+        return;
+      }
+      newestSeen = state.dataUpdatedAt;
+      if (lastServiceStatusRef.current !== "ready") {
         lastServiceStatusRef.current = "ready";
         setServiceStatus("ready");
         reportFrontendEventSafely({
           level: "INFO",
           event_code: "gui.subscription.panel_service_ready_latched_from_prompts_query",
           message:
-            "Panel serviceStatus latched to ready from a successful prompts query (startup service:status push was missed)",
+            "Panel serviceStatus latched to ready from a fresh prompts query success (startup service:status push was missed)",
         });
       }
     });
