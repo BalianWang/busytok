@@ -135,7 +135,7 @@ function snapshot(overrides: Partial<SettingsSnapshotDto> = {}): SettingsSnapsho
       local_only: false,
       redact_sensitive_values: true,
     },
-    prompt_palette_default_action: "copy",
+    prompt_palette_default_action: "OnlyCopy",
     recovery_actions: [],
     diagnostics: diagnostics(),
     ...overrides,

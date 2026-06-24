@@ -12,6 +12,7 @@
     "core:window:allow-set-focus",
     "core:window:allow-unminimize",
     "clipboard-manager:default",
+    "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text",
     "allow-invoke-busytok",
     "allow-log-frontend-event",

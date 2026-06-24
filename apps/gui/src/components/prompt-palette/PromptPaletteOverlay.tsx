@@ -227,7 +227,7 @@ export function PromptPaletteOverlay({
 
     if (event.key === "Enter" && isModifierPressed) {
       event.preventDefault();
-      executeSelected("paste");
+      executeSelected("CopyAndPaste");
       return;
     }
 
@@ -239,7 +239,7 @@ export function PromptPaletteOverlay({
 
     if (isModifierPressed && event.key.toLowerCase() === "c") {
       event.preventDefault();
-      executeSelected("copy");
+      executeSelected("OnlyCopy");
       return;
     }
 
@@ -348,11 +348,11 @@ export function PromptPaletteOverlay({
             role="menu"
             aria-label={`Actions for ${promptDisplayLabel(selectedEntry.alias, selectedEntry.content).slice(0, 120)}`}
           >
-            <MenuItem onSelect={() => executeEntry(selectedEntry, "copy")}>
-              {promptActionLabel("copy")}
+            <MenuItem onSelect={() => executeEntry(selectedEntry, "OnlyCopy")}>
+              {promptActionLabel("OnlyCopy")}
             </MenuItem>
-            <MenuItem onSelect={() => executeEntry(selectedEntry, "paste")}>
-              {promptActionLabel("paste")}
+            <MenuItem onSelect={() => executeEntry(selectedEntry, "CopyAndPaste")}>
+              {promptActionLabel("CopyAndPaste")}
             </MenuItem>
             <MenuItem
               disabled={!onEdit}

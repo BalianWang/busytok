@@ -7,7 +7,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::desktop_windows;
 
 /// Shortcut key combination for the prompt palette.
-pub const PROMPT_PALETTE_SHORTCUT: &str = "CommandOrControl+Shift+K";
+pub const PROMPT_PALETTE_SHORTCUT: &str = "CommandOrControl+Option+K";
 
 /// Diagnostic state for the global shortcut.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]

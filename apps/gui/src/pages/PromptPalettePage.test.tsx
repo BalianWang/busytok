@@ -610,7 +610,7 @@ describe("PromptPalettePage", () => {
     await waitFor(() => {
       expect(busytokClient.promptsUse).toHaveBeenCalledWith({
         id: "prompt-1",
-        action: "copy",
+        action: "OnlyCopy",
         surface: "page",
         outcome: "copy",
         failure_reason: null,

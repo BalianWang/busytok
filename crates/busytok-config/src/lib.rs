@@ -118,15 +118,18 @@ impl Default for BusytokSettings {
 
 /// Default action when using a prompt palette entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum PromptDefaultAction {
-    Paste,
-    Copy,
+    #[serde(rename = "OnlyCopy", alias = "copy")]
+    OnlyCopy,
+    #[serde(rename = "OnlyPaste")]
+    OnlyPaste,
+    #[serde(rename = "Copy&Paste", alias = "paste")]
+    CopyAndPaste,
 }
 
 impl Default for PromptDefaultAction {
     fn default() -> Self {
-        Self::Paste
+        Self::CopyAndPaste
     }
 }
 
@@ -279,7 +282,7 @@ mod tests {
         assert!(settings.discovery.manual_roots.is_empty());
         assert!(matches!(
             settings.prompt_palette_default_action,
-            PromptDefaultAction::Paste
+            PromptDefaultAction::CopyAndPaste
         ));
     }
 
@@ -310,7 +313,7 @@ mod tests {
                 codex_default_paths: true,
                 manual_roots: vec![],
             },
-            prompt_palette_default_action: PromptDefaultAction::Copy,
+            prompt_palette_default_action: PromptDefaultAction::OnlyCopy,
         };
 
         settings.save_to_file(&path).unwrap();
@@ -325,7 +328,7 @@ mod tests {
         assert!(loaded.discovery.manual_roots.is_empty());
         assert!(matches!(
             loaded.prompt_palette_default_action,
-            PromptDefaultAction::Copy
+            PromptDefaultAction::OnlyCopy
         ));
     }
 
