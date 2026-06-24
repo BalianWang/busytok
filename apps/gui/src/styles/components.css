@@ -418,6 +418,89 @@
   outline-offset: 2px;
 }
 
+/* ── ToggleSwitch (canonical) ────────────────────────────────── */
+
+.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.toggle-switch:has(.toggle-switch__input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.toggle-switch__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.toggle-switch__track {
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--toggle-track-inactive);
+  position: relative;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.toggle-switch__track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--toggle-thumb-active);
+  transition: transform 0.2s;
+}
+
+.toggle-switch__input:checked + .toggle-switch__track {
+  background: var(--toggle-track-active);
+}
+
+.toggle-switch__input:checked + .toggle-switch__track::after {
+  transform: translateX(16px);
+}
+
+.toggle-switch:hover .toggle-switch__track {
+  background: var(--color-border-strong);
+}
+
+.toggle-switch:hover .toggle-switch__input:checked + .toggle-switch__track {
+  background: var(--color-accent-600);
+}
+
+.toggle-switch__input:focus-visible + .toggle-switch__track {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* dense */
+.toggle-switch--dense .toggle-switch__track {
+  width: 28px;
+  height: 16px;
+  border-radius: 8px;
+}
+
+.toggle-switch--dense .toggle-switch__track::after {
+  width: 12px;
+  height: 12px;
+  top: 2px;
+  left: 2px;
+}
+
+.toggle-switch--dense .toggle-switch__input:checked + .toggle-switch__track::after {
+  transform: translateX(12px);
+}
+
 /* ── Settings row ────────────────────────────────────────── */
 
 .settings-row {
