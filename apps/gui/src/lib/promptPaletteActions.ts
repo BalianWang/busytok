@@ -247,12 +247,16 @@ export async function executePromptAction(
 ): Promise<PromptActionResult> {
   // ── OnlyPaste: save old clipboard → write → paste → restore ──
   if (action === "OnlyPaste") {
-    let oldClipboard = "";
+    // Snapshot the old clipboard. null = "don't restore" — only a real
+    // readClipboard success produces a non-null value, so a missing or
+    // throwing readClipboard won't overwrite the user's clipboard with an
+    // empty string (P0).
+    let oldClipboard: string | null = null;
     if (deps.readClipboard) {
       try {
         oldClipboard = await deps.readClipboard();
       } catch {
-        // clipboard read failure is non-fatal — the paste continues
+        // clipboard read failure is non-fatal — oldClipboard stays null
       }
     }
 
@@ -276,19 +280,26 @@ export async function executePromptAction(
       throw error;
     }
 
-    const result = await runPaste(entry, action, surface, deps);
-
-    // Restore the old clipboard — best-effort (paste already succeeded).
+    // P1: wrap paste + restore in try/finally so the old clipboard is
+    // always restored, even when runPaste (recordUse / beforePaste /
+    // pasteActiveApp) throws or rejects.
+    let result: PromptActionResult;
     try {
-      await deps.writeClipboard(oldClipboard);
-    } catch {
-      const reportEvent = deps.reportEvent ?? reportFrontendEvent;
-      reportEvent({
-        level: "WARN",
-        event_code: "gui.prompt_palette.only_paste_restore_failed",
-        message: "OnlyPaste failed to restore the old clipboard after paste",
-        details: { prompt_entry_id: entry.id },
-      });
+      result = await runPaste(entry, action, surface, deps);
+    } finally {
+      if (oldClipboard !== null) {
+        try {
+          await deps.writeClipboard(oldClipboard);
+        } catch {
+          const reportEvent = deps.reportEvent ?? reportFrontendEvent;
+          reportEvent({
+            level: "WARN",
+            event_code: "gui.prompt_palette.only_paste_restore_failed",
+            message: "OnlyPaste failed to restore the old clipboard after paste",
+            details: { prompt_entry_id: entry.id },
+          });
+        }
+      }
     }
     return result;
   }

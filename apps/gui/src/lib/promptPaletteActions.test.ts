@@ -266,14 +266,44 @@ describe("executePromptAction", () => {
     );
   });
 
-  it("OnlyPaste continues when old clipboard read throws (empty / unsupported)", async () => {
+  it("does NOT restore an empty string when readClipboard throws (P0: null sentinel)", async () => {
+    // Regression: oldClipboard starts as null, not "". A throwing
+    // readClipboard leaves it null → no writeClipboard("") call, so the
+    // user's clipboard is never silently cleared.
     const entry = makePrompt();
+    const writeClipboard = vi.fn().mockResolvedValue(undefined);
     const readClipboard = vi.fn().mockRejectedValue(new Error("no permission"));
-    const deps = makeDeps({ readClipboard });
+    const deps = makeDeps({ writeClipboard, readClipboard });
 
     const result = await executePromptAction(entry, "OnlyPaste", "overlay", deps);
 
     expect(result.outcome).toBe("paste_attempted");
+    // Only the new-content write — no empty-string restore.
+    const writes = writeClipboard.mock.calls.map((c) => c[0]);
+    expect(writes).toEqual([entry.content]);
+  });
+
+  it("restores the old clipboard even when runPaste throws (P1: finally guard)", async () => {
+    // If recordUse / beforePaste / pasteActiveApp throws, the old
+    // clipboard must still be restored — otherwise the user permanently
+    // loses their original clipboard content.
+    const entry = makePrompt();
+    const writeCalls: string[] = [];
+    const deps = makeDeps({
+      writeClipboard: vi.fn().mockImplementation(async (t: string) => { writeCalls.push(t); }),
+      readClipboard: async () => "old",
+      // runPaste will fail because recordUse rejects:
+      recordUse: vi.fn().mockRejectedValue(new Error("record failed")),
+    });
+
+    await expect(
+      executePromptAction(entry, "OnlyPaste", "overlay", deps),
+    ).rejects.toThrow("record failed");
+
+    // New content was written…
+    expect(writeCalls[0]).toBe(entry.content);
+    // …and the old clipboard WAS restored despite the paste failure.
+    expect(writeCalls[writeCalls.length - 1]).toBe("old");
   });
 });
 
