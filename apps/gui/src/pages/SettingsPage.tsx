@@ -21,6 +21,7 @@ import { ToggleSwitch } from "../components/desktop/ToggleSwitch";
 import { SettingsValue } from "../components/desktop/SettingsValue";
 import { SettingsStatus } from "../components/desktop/SettingsStatus";
 import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
+import { DiagBadge } from "../components/desktop/DiagBadge";
 import { useRefreshToolbar } from "../components/desktop/useRefreshToolbar";
 import { usePreferences } from "../hooks/usePreferences";
 import type { ThemePreference } from "../lib/preferencesStorage";
@@ -815,25 +816,24 @@ export function SettingsPage() {
                             : undefined
                     }
                     control={
-                      <span
-                        className={`diag-badge diag-badge--${
-                          bgDiag.state === "running"
+                      <DiagBadge
+                        tone={
+                          bgDiag.state === "running" || bgDiag.state === "starting"
                             ? "ok"
-                            : bgDiag.state === "starting"
-                              ? "ok"
-                              : "error"
-                        }`}
-                      >
-                        {bgDiag.state === "stopped_for_this_session"
-                          ? "Stopped for session"
-                          : bgDiag.state === "needs_attention"
-                            ? "Needs attention"
-                            : bgDiag.state === "not_registered"
-                              ? "Not registered"
-                              : bgDiag.state === "starting"
-                                ? "Starting"
-                                : "Running"}
-                      </span>
+                            : "error"
+                        }
+                        label={
+                          bgDiag.state === "stopped_for_this_session"
+                            ? "Stopped for session"
+                            : bgDiag.state === "needs_attention"
+                              ? "Needs attention"
+                              : bgDiag.state === "not_registered"
+                                ? "Not registered"
+                                : bgDiag.state === "starting"
+                                  ? "Starting"
+                                  : "Running"
+                        }
+                      />
                     }
                   />
                   {bgDiag.actionable && (
@@ -889,13 +889,10 @@ export function SettingsPage() {
                       <SettingsRow
                         label="Version skew"
                         control={
-                          <span
-                            className={`diag-badge diag-badge--${
-                              bgDiag.version_skew ? "error" : "ok"
-                            }`}
-                          >
-                            {bgDiag.version_skew ? "Yes" : "No"}
-                          </span>
+                          <DiagBadge
+                            tone={bgDiag.version_skew ? "error" : "ok"}
+                            label={bgDiag.version_skew ? "Yes" : "No"}
+                          />
                         }
                       />
                     </>
@@ -1000,7 +997,7 @@ export function SettingsPage() {
             <div className="settings-panel">
               <SettingsRow
                 label="DB healthy"
-                control={<span className={`diag-badge diag-badge--${diagnostics.db_healthy ? "ok" : "error"}`}>{diagnostics.db_healthy ? "Yes" : "No"}</span>}
+                control={<DiagBadge tone={diagnostics.db_healthy ? "ok" : "error"} label={diagnostics.db_healthy ? "Yes" : "No"} />}
               />
               <SettingsRow
                 label="DB size"
