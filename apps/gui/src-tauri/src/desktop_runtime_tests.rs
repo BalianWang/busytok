@@ -89,6 +89,33 @@ fn service_bootstrap_statuses_include_spec_states() {
 }
 
 #[test]
+fn bootstrap_failure_is_retryable_except_user_approval() {
+    // Regression for docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md
+    // (Layer A): the one-shot bootstrap task must retry TRANSIENT failures
+    // (stale-live-process repair race, launchctl timeout, version-probe socket
+    // not ready) because the service often recovers within ~hundreds of ms —
+    // retrying lets it emit Ready instead of stranding the GUI in Unavailable.
+    // Only an SMAppService "requires user approval" condition is non-retryable
+    // (the user must act in System Settings), mirroring the LifecycleCoordinator
+    // classification.
+    use crate::bootstrap_failure_is_retryable;
+    // Non-retryable: needs a System Settings action the user must take.
+    assert!(!bootstrap_failure_is_retryable(
+        "service requires user approval in System Settings",
+    ));
+    assert!(!bootstrap_failure_is_retryable("requires user approval"));
+    // Retryable: transient repair race on fresh-install-over-old-app.
+    assert!(bootstrap_failure_is_retryable(
+        "service repair failed during bootstrap",
+    ));
+    // Retryable: version-probe socket not ready / launchctl timeout.
+    assert!(bootstrap_failure_is_retryable(
+        "control socket did not become ready within timeout",
+    ));
+    assert!(bootstrap_failure_is_retryable("launchctl bootstrap timed out"));
+}
+
+#[test]
 fn dispatch_routes_all_action_variants() {
     // Verify all action variants have defined dispatch behavior.
     // This test ensures exhaustiveness — if a new variant is added,

@@ -108,6 +108,29 @@ fn emit_service_status(
     }
 }
 
+/// Upper bound on bootstrap `ensure_running` attempts for a retryable failure.
+/// Covers the stale-live-process repair race on fresh-install-over-old-app,
+/// where the first attempt fails and the service recovers within ~hundreds of
+/// ms. See docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md.
+const BOOTSTRAP_MAX_ATTEMPTS: u32 = 3;
+/// Delay between bootstrap retries. Sized to the observed repair-recovery
+/// window (~hundreds of ms) with margin.
+const BOOTSTRAP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a bootstrap `ensure_running` failure should be retried before the
+/// one-shot bootstrap task declares the service unavailable.
+///
+/// Mirrors the `LifecycleCoordinator`'s internal NonRetryable/RetryableFailure
+/// split (the `ensure_running` Err arm): only an SMAppService "requires user
+/// approval" condition is non-retryable, because the user must act in System
+/// Settings and no retry will help. Everything else — launchctl timeout,
+/// version-probe socket not ready, the stale-live-process repair race — may
+/// resolve within ~hundreds of ms and is worth a bounded retry so the bootstrap
+/// task emits `Ready` (not `Unavailable`) once the service is actually up.
+pub(crate) fn bootstrap_failure_is_retryable(err: &str) -> bool {
+    !err.contains("requires user approval")
+}
+
 pub fn run() {
     let paths = BusytokPaths::new();
     if let Err(e) = paths.ensure_dirs_exist() {
@@ -441,37 +464,78 @@ pub fn run() {
                             cause = lifecycle_coordinator::LifecycleCause::Startup;
                         }
                     }
-                    match coordinator.ensure_running(cause).await {
-                        Ok(_) => {
-                            tracing::info!(
-                                event_code = "desktop_host.service_bootstrap_async_finished",
-                                "async service bootstrap finished successfully"
-                            );
-                            // Follow-up recovery through the coordinator so
-                            // suppression + quit-priority are honored.
-                            if let Err(e) = coordinator
-                                .repair(lifecycle_coordinator::LifecycleCause::Repair)
-                                .await
-                            {
-                                tracing::warn!(
-                                    event_code = "desktop_host.service_recovery_followup_failed",
-                                    error = %e,
-                                    "post-bootstrap service recovery check failed"
+                    // Bounded retry for retryable failures. The first
+                    // ensure_running can fail transiently (e.g. the
+                    // stale-live-process repair race on fresh-install-over-old-
+                    // app) while the service recovers within ~hundreds of ms.
+                    // Retry retryable failures a bounded number of times so the
+                    // bootstrap task emits Ready once the service is actually
+                    // up, instead of emitting Unavailable and stranding the GUI
+                    // until the subscription bridge reconnects. A non-retryable
+                    // failure (SMAppService approval) is declared unavailable
+                    // immediately. See
+                    // docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md (Layer A).
+                    let mut attempt: u32 = 0;
+                    loop {
+                        attempt += 1;
+                        match coordinator.ensure_running(cause).await {
+                            Ok(_) => {
+                                tracing::info!(
+                                    event_code = "desktop_host.service_bootstrap_async_finished",
+                                    "async service bootstrap finished successfully"
                                 );
+                                // Follow-up recovery through the coordinator so
+                                // suppression + quit-priority are honored.
+                                if let Err(e) = coordinator
+                                    .repair(lifecycle_coordinator::LifecycleCause::Repair)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        event_code = "desktop_host.service_recovery_followup_failed",
+                                        error = %e,
+                                        "post-bootstrap service recovery check failed"
+                                    );
+                                }
+                                emit_service_status(
+                                    &bootstrap_handle,
+                                    ServiceBootstrapState::Ready,
+                                    None,
+                                );
+                                break;
                             }
-                            emit_service_status(&bootstrap_handle, ServiceBootstrapState::Ready, None);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                event_code = "desktop_host.service_bootstrap_async_failed",
-                                error = %e,
-                                "async service bootstrap failed"
-                            );
-                            emit_service_status(
-                                &bootstrap_handle,
-                                ServiceBootstrapState::Unavailable,
-                                Some(e.to_string()),
-                            );
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if bootstrap_failure_is_retryable(&err_str)
+                                    && attempt < BOOTSTRAP_MAX_ATTEMPTS
+                                {
+                                    tracing::warn!(
+                                        event_code =
+                                            "desktop_host.service_bootstrap_retryable_failure_retrying",
+                                        attempt,
+                                        max_attempts = BOOTSTRAP_MAX_ATTEMPTS,
+                                        error = %e,
+                                        "retryable bootstrap failure; retrying ensure_running"
+                                    );
+                                    // Note: this sleep is not interruptible on
+                                    // quit, but each ensure_running entry re-
+                                    // checks quit_requested, so a Quit during the
+                                    // ~500ms sleep costs at most one extra retry
+                                    // delay before the next attempt aborts.
+                                    tokio::time::sleep(BOOTSTRAP_RETRY_DELAY).await;
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    event_code = "desktop_host.service_bootstrap_async_failed",
+                                    error = %e,
+                                    "async service bootstrap failed"
+                                );
+                                emit_service_status(
+                                    &bootstrap_handle,
+                                    ServiceBootstrapState::Unavailable,
+                                    Some(err_str),
+                                );
+                                break;
+                            }
                         }
                     }
                     return;

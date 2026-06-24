@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import type { RangePresetDto } from "@busytok/protocol-types";
+import type { RangePresetDto, ReadinessStateDto } from "@busytok/protocol-types";
 
 const { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, mockClient } = vi.hoisted(() => {
   const useQuerySpy = vi.fn();
@@ -109,13 +109,44 @@ describe("useBusytokData", () => {
 
   // ── Shell ────────────────────────────────────────────────────────
 
-  it("configures shell status with stale time and no background polling", () => {
+  // Safety net for the startup race documented in
+  // docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md: the
+  // titlebar chip is driven SOLELY by shell.status readiness. The
+  // event-driven refresh can be delayed by the bootstrap one-shot gap
+  // (lib.rs emits Unavailable then returns) or the subscription-bridge
+  // backoff, and on a fresh install the runtime-event latch never fires
+  // (lightweight register, no scan). Polling while not ready lets the chip
+  // recover within the interval once the service is actually up; once ready,
+  // steady state is owned by event-driven invalidation.
+
+  it("configures shell status with a readiness-gated refetch interval", () => {
     useShellStatus();
     const options = useQuerySpy.mock.calls[0][0];
     expect(options.queryKey).toEqual(["shell", "status"]);
     expect(options.staleTime).toBe(5_000);
-    expect("refetchInterval" in options).toBe(false);
     expect(options.placeholderData).toBeUndefined();
+    expect(typeof options.refetchInterval).toBe("function");
+    expect(options.refetchIntervalInBackground).toBe(false);
+  });
+
+  it("shell status polls only for startup transients and stops on any healthy readiness", () => {
+    useShellStatus();
+    const options = useQuerySpy.mock.calls[0][0];
+    const refetch = options.refetchInterval as (q: {
+      state: { data?: { readiness?: ReadinessStateDto } | null };
+    }) => unknown;
+
+    // Startup/rebuild transients, and before the first successful fetch (data
+    // undefined), keep polling — the chip must self-heal during the startup race.
+    expect(refetch({ state: { data: undefined } })).toBe(5_000);
+    expect(refetch({ state: { data: { readiness: "starting" } } })).toBe(5_000);
+    expect(refetch({ state: { data: { readiness: "rebuilding" } } })).toBe(5_000);
+
+    // Both healthy steady states stop polling — runtime events keep shell.status
+    // fresh in steady state (zero perpetual RPC load). ready_degraded is a
+    // legitimate steady state (service up, partially degraded), not a transient.
+    expect(refetch({ state: { data: { readiness: "ready_exact" } } })).toBe(false);
+    expect(refetch({ state: { data: { readiness: "ready_degraded" } } })).toBe(false);
   });
 
   // ── Overview — modular envelopes ─────────────────────────────────

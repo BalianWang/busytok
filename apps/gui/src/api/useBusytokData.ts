@@ -48,6 +48,10 @@ import type {
 } from "@busytok/protocol-types";
 
 const SHELL_STALE_MS = 5_000;
+// Poll cadence for `useShellStatus` while the service is not yet ready.
+// Caps titlebar-chip staleness during the startup race; see
+// docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md.
+const SHELL_REFETCH_MS = 5_000;
 const ENVELOPE_STALE_TIME_MS = 30_000;
 export const DEFAULT_OVERVIEW_RANGE: RangePresetDto = "day";
 
@@ -106,6 +110,27 @@ export function useShellStatus() {
     queryKey: queryKeys.shellStatus(),
     queryFn: () => client.shellStatus(),
     staleTime: SHELL_STALE_MS,
+    // Startup-race safety net: the titlebar chip is driven solely by
+    // shell.status readiness. The event-driven refresh can be delayed by the
+    // bootstrap one-shot gap (lib.rs emits Unavailable then returns) or the
+    // subscription-bridge backoff, and on a fresh install the runtime-event
+    // latch never fires (lightweight register, no scan). Poll only while the
+    // service is NOT yet in a healthy steady state — i.e. for the
+    // starting/rebuilding transients and before the first successful fetch
+    // (data still undefined) — so the chip self-heals within SHELL_REFETCH_MS.
+    // Stop on BOTH healthy steady states (ready_exact AND ready_degraded): in
+    // steady state runtime events keep shell.status fresh, so polling would be
+    // perpetual load for no benefit. ready_degraded is a legitimate steady
+    // state (service up, partially degraded), not a transient to poll out of.
+    // refetchIntervalInBackground:false keeps polling tied to a visible window.
+    // See docs/bugs/2026-06-24-startup-status-stale-on-fresh-install.md.
+    refetchInterval: (query) => {
+      const readiness = query.state.data?.readiness;
+      return readiness === "ready_exact" || readiness === "ready_degraded"
+        ? false
+        : SHELL_REFETCH_MS;
+    },
+    refetchIntervalInBackground: false,
   });
 }
 
