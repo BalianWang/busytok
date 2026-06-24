@@ -1333,32 +1333,6 @@
   max-width: 360px;
 }
 
-.settings-row__control {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.settings-row__error {
-  font-size: 11px;
-  color: var(--color-status-danger);
-  white-space: nowrap;
-}
-
-.settings-row--dangerous {
-  padding: var(--space-3) var(--space-3);
-  margin: 0 calc(var(--space-3) * -1);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--color-status-danger) 6%, transparent);
-  border-left: 3px solid var(--color-status-danger);
-}
-
-.settings-row--dangerous h3 {
-  color: var(--color-status-danger);
-}
-
 /* ── Settings panel ────────────────────────────────────────────── */
 
 .settings-panel {
@@ -1369,128 +1343,7 @@
   box-shadow: var(--material-shadow-card);
 }
 
-/* ── Toggle switch ──────────────────────────────────────────────── */
-
-.toggle-label {
-  display: inline-flex;
-  align-items: center;
-  cursor: pointer;
-}
-
-.toggle {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-}
-
-.toggle-track {
-  display: inline-block;
-  width: 36px;
-  height: 20px;
-  border-radius: 10px;
-  background: var(--toggle-track-inactive);
-  position: relative;
-  transition: background 0.2s;
-}
-
-.toggle-track::after {
-  content: "";
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--toggle-thumb-active);
-  transition: transform 0.2s;
-}
-
-.toggle:checked + .toggle-track {
-  background: var(--toggle-track-active);
-}
-
-.toggle:checked + .toggle-track::after {
-  transform: translateX(16px);
-}
-
-.toggle-label:hover .toggle-track {
-  background: var(--color-border-strong);
-}
-
-.toggle-label:hover .toggle:checked + .toggle-track {
-  background: var(--color-accent-600);
-}
-
-.toggle:focus-visible + .toggle-track {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
-}
-
-/* ── Segmented control (radio group) ────────────────────────────── */
-
-.segmented-group {
-  display: inline-flex;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  margin: 0;
-  padding: 0;
-}
-
-.segmented-label {
-  display: inline-flex;
-  align-items: center;
-  cursor: pointer;
-}
-
-.segmented-label input {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-}
-
-.segmented-label span {
-  display: inline-block;
-  padding: 4px 14px;
-  font-size: 13px;
-  color: var(--color-text-muted);
-  background: transparent;
-  transition: background 0.15s, color 0.15s;
-}
-
-.segmented-label input:checked + span {
-  background: var(--color-accent-50);
-  color: var(--color-accent-600);
-  font-weight: 600;
-}
-
-.segmented-label input:focus-visible + span {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: -2px;
-}
-
-.segmented-label:not(:last-child) span {
-  border-right: 1px solid var(--color-border);
-}
-
-/* ── Manual root controls ───────────────────────────────────────── */
-
-.manual-root-controls {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 6px;
-}
-
-.manual-root-controls .input {
-  width: 240px;
-}
-
-/* ── Diagnostics badges & values ───────────────────────────────── */
+/* ── Diagnostics badges ─────────────────────────────────────── */
 
 .diag-badge {
   display: inline-block;
@@ -1508,13 +1361,6 @@
 .diag-badge--error {
   background: color-mix(in srgb, var(--color-status-danger) 12%, transparent);
   color: var(--color-status-danger);
-}
-
-.diag-value {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text);
-  font-variant-numeric: tabular-nums;
 }
 
 /* ── Usage page tabs ───────────────────────────────────────── */
