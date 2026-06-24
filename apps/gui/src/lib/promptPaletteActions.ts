@@ -30,8 +30,8 @@ export type PromptPaletteReportEvent = (entry: {
 
 export interface PromptActionDeps {
   writeClipboard: (text: string) => Promise<void>;
-  /** Read the current system clipboard; used by OnlyPaste to save/restore. */
-  readClipboard?: () => Promise<string>;
+  /** Read the current system clipboard; returns null when unsupported. */
+  readClipboard?: () => Promise<string | null>;
   beforePaste?: () => Promise<PastePreparationResult>;
   pasteActiveApp?: () => Promise<PasteAttemptResult>;
   recordUse: (request: PromptUseRequestDto) => Promise<PromptUseResultDto>;
@@ -67,11 +67,11 @@ export async function writeSystemClipboard(text: string): Promise<void> {
   throw new Error("Clipboard API is unavailable");
 }
 
-export async function readSystemClipboard(): Promise<string> {
+export async function readSystemClipboard(): Promise<string | null> {
   if (globalThis.navigator?.clipboard?.readText) {
     return await globalThis.navigator.clipboard.readText();
   }
-  return "";
+  return null; // unsupported read → don't restore (null sentinel)
 }
 
 function unsupportedPlatformResult(): PromptPalettePasteResult {

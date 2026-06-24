@@ -266,6 +266,23 @@ describe("executePromptAction", () => {
     );
   });
 
+  it("does NOT restore from null when the clipboard-read API is unsupported (readSystemClipboard returns null)", async () => {
+    // Regression: readSystemClipboard() returns null when navigator.clipboard
+    // .readText is unavailable. The null sentinel must prevent a destructive
+    // writeClipboard(null?) / writeClipboard("") restore.
+    const entry = makePrompt();
+    const writeClipboard = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      writeClipboard,
+      readClipboard: async () => null, // unsupported API
+    });
+
+    const result = await executePromptAction(entry, "OnlyPaste", "overlay", deps);
+    expect(result.outcome).toBe("paste_attempted");
+    // Only the new-content write — no restore attempt.
+    expect(writeClipboard.mock.calls.map((c) => c[0])).toEqual([entry.content]);
+  });
+
   it("does NOT restore an empty string when readClipboard throws (P0: null sentinel)", async () => {
     // Regression: oldClipboard starts as null, not "". A throwing
     // readClipboard leaves it null → no writeClipboard("") call, so the
