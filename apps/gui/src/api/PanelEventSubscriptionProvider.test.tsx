@@ -133,7 +133,10 @@ describe("PanelEventSubscriptionProvider", () => {
     expect(result.current.serviceStatus).toBe("starting"); // push was missed
 
     await act(async () => {
-      qc.setQueryData(["prompts", "list", { query: null }], { data: { entries: [] } });
+      // A fresh fetch success (dataUpdatedAt after subscription). Default
+      // updatedAt would be ~now and could collide with the subscription ms in
+      // a fast test, so force a clearly-newer timestamp.
+      qc.setQueryData(["prompts", "list", { query: null }], { data: { entries: [] } }, { updatedAt: Date.now() + 60000 });
     });
 
     expect(result.current.serviceStatus).toBe("ready"); // latched — action gate would pass
@@ -153,5 +156,72 @@ describe("PanelEventSubscriptionProvider", () => {
     });
 
     expect(result.current.serviceStatus).toBe("starting"); // not latched by a non-prompts query
+  });
+
+  it("does not re-latch to ready from a STALE cached prompts success after the service becomes unavailable", async () => {
+    // Regression: the panel QueryClient is a module-level singleton whose cache
+    // persists across overlay remounts. A stale cached prompts success
+    // (dataUpdatedAt before this subscription) must not re-latch "ready" once
+    // the service is genuinely unavailable — otherwise paste actions would be
+    // falsely unblocked by stale cache re-emission (observer remount /
+    // invalidate / focus).
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const customWrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={qc}>
+        <PanelEventSubscriptionProvider>{children}</PanelEventSubscriptionProvider>
+      </QueryClientProvider>
+    );
+    const { result } = renderHook(() => useEventSubscription(), { wrapper: customWrapper });
+
+    await act(async () => {
+      subscribeHandlers.get("service:status")?.({ status: "unavailable", since_ms: Date.now() });
+    });
+    expect(result.current.serviceStatus).toBe("unavailable");
+
+    // A STALE prompts success — dataUpdatedAt forced to 1 (before subscription).
+    await act(async () => {
+      qc.setQueryData(["prompts", "list", { query: null }], { data: { entries: [] } }, { updatedAt: 1 });
+    });
+
+    expect(result.current.serviceStatus).toBe("unavailable"); // NOT re-latched to ready
+  });
+
+  it("does not re-latch when an already-seen prompts success is re-observed after the service becomes unavailable", async () => {
+    // The panel QueryClient is a module-level singleton whose cache persists
+    // across overlay remounts, so an earlier successful prompts fetch can be
+    // re-observed (observer reattach / invalidate / focus) with UNCHANGED
+    // dataUpdatedAt. Such a re-observation must not re-latch "ready" after the
+    // service genuinely became "unavailable"; only a NEW success (recovery) does.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const customWrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={qc}>
+        <PanelEventSubscriptionProvider>{children}</PanelEventSubscriptionProvider>
+      </QueryClientProvider>
+    );
+    const { result } = renderHook(() => useEventSubscription(), { wrapper: customWrapper });
+
+    const freshTs = Date.now() + 60000;
+    await act(async () => {
+      qc.setQueryData(["prompts", "list", { query: null }], { data: { entries: [] } }, { updatedAt: freshTs });
+    });
+    expect(result.current.serviceStatus).toBe("ready");
+
+    await act(async () => {
+      subscribeHandlers.get("service:status")?.({ status: "unavailable", since_ms: Date.now() });
+    });
+    expect(result.current.serviceStatus).toBe("unavailable");
+
+    // Re-observe the SAME cached success (overlay remount / observer reattach)
+    // — dataUpdatedAt unchanged.
+    await act(async () => {
+      qc.setQueryData(["prompts", "list", { query: null }], { data: { entries: [] } }, { updatedAt: freshTs });
+    });
+    expect(result.current.serviceStatus).toBe("unavailable"); // NOT re-latched
+
+    // A genuinely NEW success (service recovered) re-latches.
+    await act(async () => {
+      qc.setQueryData(["prompts", "list", { query: null }], { data: { entries: [] } }, { updatedAt: freshTs + 1 });
+    });
+    expect(result.current.serviceStatus).toBe("ready");
   });
 });
