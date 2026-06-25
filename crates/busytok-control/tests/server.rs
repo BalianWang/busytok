@@ -260,6 +260,48 @@ impl RuntimeControl for MethodDispatchErrorRuntime {
         self.inner.suggest_tags(req).await
     }
 
+    async fn subagent_delegate(
+        &self,
+        req: busytok_protocol::dto::SubagentDelegateRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentDelegateResponseDto> {
+        self.inner.subagent_delegate(req).await
+    }
+
+    async fn subagent_list(
+        &self,
+        req: busytok_protocol::dto::SubagentListRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentListResponseDto> {
+        self.inner.subagent_list(req).await
+    }
+
+    async fn subagent_show(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentDetailDto> {
+        self.inner.subagent_show(req).await
+    }
+
+    async fn subagent_tasks(
+        &self,
+        req: busytok_protocol::dto::SubagentTasksRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentTasksResponseDto> {
+        self.inner.subagent_tasks(req).await
+    }
+
+    async fn subagent_hibernate(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentAckDto> {
+        self.inner.subagent_hibernate(req).await
+    }
+
+    async fn subagent_delete(
+        &self,
+        req: busytok_protocol::dto::SubagentDeleteRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentAckDto> {
+        self.inner.subagent_delete(req).await
+    }
+
     fn event_bus(&self) -> &busytok_events::AppEventBus {
         self.inner.event_bus()
     }

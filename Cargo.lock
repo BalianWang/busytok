@@ -654,6 +654,7 @@ dependencies = [
  "busytok-pricing",
  "busytok-protocol",
  "busytok-store",
+ "busytok-subagent",
  "busytok-tailer",
  "dirs",
  "futures",

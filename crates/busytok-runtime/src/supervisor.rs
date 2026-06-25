@@ -63,6 +63,8 @@ pub struct BusytokSupervisor {
     writer_handle: WriterHandle,
     /// Bounded read-only service for overview/activity read paths.
     read_service: crate::read_service::ReadService,
+    /// Logical-subagent manager (subagent.* RPC handlers).
+    subagent_manager: Arc<busytok_subagent::SubagentManager>,
     /// JoinHandle for the writer actor's background task (None when no
     /// Tokio runtime was active at construction time, e.g. sync tests).
     _writer_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -140,6 +142,11 @@ impl BusytokSupervisor {
         let event_bus = AppEventBus::new(64);
 
         let db = Arc::new(Mutex::new(db));
+        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::new(
+            Arc::clone(&db),
+            settings.subagent.clone(),
+            "pi",
+        ));
         let read_service = {
             let db_guard = db.lock().unwrap();
             if let Some(path) = db_guard.path_buf() {
@@ -186,6 +193,7 @@ impl BusytokSupervisor {
             status,
             writer_handle,
             read_service,
+            subagent_manager,
             _writer_join: Mutex::new(writer_join),
             _catalog_reload_join: Mutex::new(catalog_reload_join),
         }
@@ -645,6 +653,12 @@ impl BusytokSupervisor {
     /// bounded writer actor instead of writing directly to the DB.
     pub fn writer_handle(&self) -> &WriterHandle {
         &self.writer_handle
+    }
+
+    /// Access the logical-subagent manager (for direct use outside the
+    /// `RuntimeControl` impl).
+    pub fn subagent_manager(&self) -> &busytok_subagent::SubagentManager {
+        &self.subagent_manager
     }
 
     /// Gracefully drain and stop the writer actor.
@@ -1271,6 +1285,77 @@ impl BusytokSupervisor {
         }
 
         samples
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subagent bridge — conversion helpers between busytok-subagent models and
+// busytok-protocol DTOs. Free functions (not `From` impls) because both ends
+// are foreign types relative to this crate (avoids E0117 orphan rule).
+// ---------------------------------------------------------------------------
+
+fn map_subagent_error(e: busytok_subagent::SubagentError) -> anyhow::Error {
+    MethodDispatchError::from_read_error(e.code(), e.to_string(), serde_json::Value::Null).into()
+}
+
+fn delegate_request_from_dto(
+    d: busytok_protocol::dto::SubagentDelegateRequestDto,
+) -> busytok_subagent::models::DelegateRequest {
+    busytok_subagent::models::DelegateRequest {
+        subagent_name: d.subagent_name,
+        subagent_id: d.subagent_id,
+        cwd: d.cwd,
+        profile: d.profile,
+        intent: d.intent,
+        prompt: d.prompt,
+        timeout_seconds: d.timeout_seconds,
+        model_override: d.model_override,
+        source_harness: d.source_harness,
+        source_session_id: d.source_session_id,
+    }
+}
+
+fn resolve_params_from_dto(
+    r: busytok_protocol::dto::SubagentResolveRequestDto,
+) -> busytok_subagent::models::ResolveParams {
+    busytok_subagent::models::ResolveParams {
+        name: r.name,
+        id: r.id,
+        cwd: r.cwd,
+    }
+}
+
+fn subagent_detail(s: busytok_subagent::models::LogicalSubagent) -> SubagentDetailDto {
+    SubagentDetailDto {
+        id: s.id,
+        name: s.name,
+        project_id: s.project_id,
+        repo_path: s.repo_path,
+        repo_hash: s.repo_hash,
+        branch: s.branch,
+        intent: s.intent,
+        default_profile: s.default_profile,
+        default_model: s.default_model,
+        status: s.status.as_str().to_string(),
+        created_at_ms: s.created_at_ms,
+        updated_at_ms: s.updated_at_ms,
+        last_active_at_ms: s.last_active_at_ms,
+    }
+}
+
+fn subagent_task_summary(
+    t: busytok_subagent::models::SubagentTaskSummary,
+) -> SubagentTaskSummaryDto {
+    SubagentTaskSummaryDto {
+        id: t.id,
+        subagent_id: t.subagent_id,
+        profile: t.profile,
+        status: t.status.as_str().to_string(),
+        prompt: t.prompt,
+        result_summary: t.result_summary,
+        error: t.error,
+        created_at_ms: t.created_at_ms,
+        completed_at_ms: t.completed_at_ms,
     }
 }
 
@@ -3628,6 +3713,119 @@ impl RuntimeControl for BusytokSupervisor {
         );
 
         Ok(PromptSuggestTagsResponseDto { tags })
+    }
+
+    // ── Subagents ────────────────────────────────────────────────────
+
+    async fn subagent_delegate(
+        &self,
+        req: busytok_protocol::dto::SubagentDelegateRequestDto,
+    ) -> Result<SubagentDelegateResponseDto> {
+        let r = self
+            .subagent_manager
+            .delegate(delegate_request_from_dto(req))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentDelegateResponseDto {
+            task_id: r.task_id,
+            subagent_id: r.subagent_id,
+            subagent_name: r.subagent_name,
+            adapter: r.adapter,
+            adapter_session_id: r.adapter_session_id,
+            session_reused: r.session_reused,
+            status: r.status.as_str().to_string(),
+            profile: r.profile,
+            model: r.model,
+            summary: r.summary,
+            usage: SubagentUsageDto {
+                model: r.usage.model,
+                provider: r.usage.provider,
+                input_tokens: r.usage.input_tokens,
+                output_tokens: r.usage.output_tokens,
+                cache_read_tokens: r.usage.cache_read_tokens,
+                cache_write_tokens: r.usage.cache_write_tokens,
+                cost_usd: r.usage.cost_usd,
+            },
+        })
+    }
+
+    async fn subagent_list(&self, req: SubagentListRequestDto) -> Result<SubagentListResponseDto> {
+        let status = req.status.as_deref().and_then(|s| s.parse().ok());
+        let subs = self
+            .subagent_manager
+            .list(
+                status,
+                req.project.as_deref(),
+                req.include_deleted.unwrap_or(false),
+            )
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentListResponseDto {
+            subagents: subs.into_iter().map(subagent_detail).collect(),
+        })
+    }
+
+    async fn subagent_show(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<SubagentDetailDto> {
+        let s = self
+            .subagent_manager
+            .show(resolve_params_from_dto(req))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(subagent_detail(s))
+    }
+
+    async fn subagent_tasks(
+        &self,
+        req: SubagentTasksRequestDto,
+    ) -> Result<SubagentTasksResponseDto> {
+        let resolve = busytok_subagent::models::ResolveParams {
+            name: req.name,
+            id: req.id,
+            cwd: req.cwd,
+        };
+        let tasks = self
+            .subagent_manager
+            .tasks(resolve, req.limit.unwrap_or(20))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentTasksResponseDto {
+            tasks: tasks.into_iter().map(subagent_task_summary).collect(),
+        })
+    }
+
+    async fn subagent_hibernate(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<SubagentAckDto> {
+        let id = self
+            .subagent_manager
+            .hibernate(resolve_params_from_dto(req))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentAckDto {
+            id,
+            status: "hibernated".to_string(),
+        })
+    }
+
+    async fn subagent_delete(&self, req: SubagentDeleteRequestDto) -> Result<SubagentAckDto> {
+        let resolve = busytok_subagent::models::ResolveParams {
+            name: req.name,
+            id: req.id,
+            cwd: req.cwd,
+        };
+        let id = self
+            .subagent_manager
+            .delete(resolve, req.hard.unwrap_or(false))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentAckDto {
+            id,
+            status: "deleted".to_string(),
+        })
     }
 
     // ── Events ───────────────────────────────────────────────────────

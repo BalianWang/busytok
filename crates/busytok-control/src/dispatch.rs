@@ -162,6 +162,32 @@ pub trait RuntimeControl: Send + Sync {
         req: PromptSuggestTagsRequestDto,
     ) -> Result<PromptSuggestTagsResponseDto>;
 
+    // Subagents
+    async fn subagent_delegate(
+        &self,
+        req: busytok_protocol::dto::SubagentDelegateRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentDelegateResponseDto>;
+    async fn subagent_list(
+        &self,
+        req: busytok_protocol::dto::SubagentListRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentListResponseDto>;
+    async fn subagent_show(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentDetailDto>;
+    async fn subagent_tasks(
+        &self,
+        req: busytok_protocol::dto::SubagentTasksRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTasksResponseDto>;
+    async fn subagent_hibernate(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentAckDto>;
+    async fn subagent_delete(
+        &self,
+        req: busytok_protocol::dto::SubagentDeleteRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentAckDto>;
+
     // Events (kept from Phase 1)
     fn event_bus(&self) -> &AppEventBus;
 
@@ -411,6 +437,44 @@ impl ControlDispatcher {
                 let req: PromptSuggestTagsRequestDto = serde_json::from_value(request.params)
                     .map_err(|e| anyhow::anyhow!("invalid params for prompts.suggest_tags: {e}"))?;
                 let dto = self.runtime.suggest_tags(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Subagents
+            "subagent.delegate" => {
+                let req: SubagentDelegateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.delegate: {e}"))?;
+                let dto = self.runtime.subagent_delegate(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.list" => {
+                let req: SubagentListRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.list: {e}"))?;
+                let dto = self.runtime.subagent_list(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.show" => {
+                let req: SubagentResolveRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.show: {e}"))?;
+                let dto = self.runtime.subagent_show(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.tasks" => {
+                let req: SubagentTasksRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.tasks: {e}"))?;
+                let dto = self.runtime.subagent_tasks(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.hibernate" => {
+                let req: SubagentResolveRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.hibernate: {e}"))?;
+                let dto = self.runtime.subagent_hibernate(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.delete" => {
+                let req: SubagentDeleteRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.delete: {e}"))?;
+                let dto = self.runtime.subagent_delete(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -936,6 +1000,45 @@ impl RuntimeControl for TestRuntimeControl {
         Ok(PromptSuggestTagsResponseDto { tags: vec![] })
     }
 
+    // ── Subagents ─────────────────────────────────────────────────────
+
+    async fn subagent_delegate(
+        &self,
+        _req: busytok_protocol::dto::SubagentDelegateRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentDelegateResponseDto> {
+        Ok(Default::default())
+    }
+    async fn subagent_list(
+        &self,
+        _req: busytok_protocol::dto::SubagentListRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentListResponseDto> {
+        Ok(Default::default())
+    }
+    async fn subagent_show(
+        &self,
+        _req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentDetailDto> {
+        Ok(Default::default())
+    }
+    async fn subagent_tasks(
+        &self,
+        _req: busytok_protocol::dto::SubagentTasksRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTasksResponseDto> {
+        Ok(Default::default())
+    }
+    async fn subagent_hibernate(
+        &self,
+        _req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentAckDto> {
+        Ok(Default::default())
+    }
+    async fn subagent_delete(
+        &self,
+        _req: busytok_protocol::dto::SubagentDeleteRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentAckDto> {
+        Ok(Default::default())
+    }
+
     fn event_bus(&self) -> &AppEventBus {
         &self.event_bus
     }
@@ -1078,6 +1181,42 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: PromptSuggestTagsRequestDto,
     ) -> Result<PromptSuggestTagsResponseDto> {
         (**self).suggest_tags(req).await
+    }
+    async fn subagent_delegate(
+        &self,
+        req: busytok_protocol::dto::SubagentDelegateRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentDelegateResponseDto> {
+        (**self).subagent_delegate(req).await
+    }
+    async fn subagent_list(
+        &self,
+        req: busytok_protocol::dto::SubagentListRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentListResponseDto> {
+        (**self).subagent_list(req).await
+    }
+    async fn subagent_show(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentDetailDto> {
+        (**self).subagent_show(req).await
+    }
+    async fn subagent_tasks(
+        &self,
+        req: busytok_protocol::dto::SubagentTasksRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTasksResponseDto> {
+        (**self).subagent_tasks(req).await
+    }
+    async fn subagent_hibernate(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentAckDto> {
+        (**self).subagent_hibernate(req).await
+    }
+    async fn subagent_delete(
+        &self,
+        req: busytok_protocol::dto::SubagentDeleteRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentAckDto> {
+        (**self).subagent_delete(req).await
     }
     fn event_bus(&self) -> &AppEventBus {
         (**self).event_bus()

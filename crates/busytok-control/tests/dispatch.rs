@@ -111,6 +111,19 @@ async fn dispatcher_serves_all_surge_ui_methods() {
             "prompts.suggest_tags",
             serde_json::json!({"query": "re", "limit": null}),
         ),
+        // Subagents
+        (
+            "subagent.delegate",
+            serde_json::json!({
+                "subagent_name": "reviewer", "cwd": "/tmp/repo",
+                "profile": "pi/search-cheap", "prompt": "x"
+            }),
+        ),
+        ("subagent.list", serde_json::json!({})),
+        ("subagent.show", serde_json::json!({"id": "sa-1"})),
+        ("subagent.tasks", serde_json::json!({"id": "sa-1"})),
+        ("subagent.hibernate", serde_json::json!({"id": "sa-1"})),
+        ("subagent.delete", serde_json::json!({"id": "sa-1"})),
     ];
 
     for (method, params) in param_methods {
