@@ -634,6 +634,8 @@ pub fn run() {
             desktop_shortcut::desktop_host_shortcut_diagnostics,
             desktop_shortcut::desktop_host_retry_shortcut_registration,
             desktop_windows::desktop_host_show_gui,
+            updater::install_version,
+            updater::list_available_versions,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Busytok GUI")

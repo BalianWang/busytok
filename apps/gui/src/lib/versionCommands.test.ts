@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { installVersion, VERSIONS_MANIFEST_URL } from "./versionCommands";
+import { installVersion, listAvailableVersions } from "./versionCommands";
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -31,7 +31,21 @@ describe("installVersion", () => {
     expect(await installVersion("u")).toEqual({ kind: "failed", message: "string thrown" });
   });
 
-  it("exposes the manifest URL constant", () => {
-    expect(VERSIONS_MANIFEST_URL).toMatch(/releases\/latest\/download\/versions\.json$/);
+});
+
+describe("listAvailableVersions", () => {
+  it("invokes the list_available_versions command and returns the entries", async () => {
+    const entries = [
+      { version: "v0.0.2", date: "d2", notes: "n2", manifest_url: "u2" },
+      { version: "v0.0.1", date: "d1", notes: "n1", manifest_url: "u1" },
+    ];
+    mockedInvoke.mockResolvedValue(entries);
+    await expect(listAvailableVersions()).resolves.toEqual(entries);
+    expect(mockedInvoke).toHaveBeenCalledWith("list_available_versions");
+  });
+
+  it("rejects when invoke throws, so useVersionHistory surfaces isError", async () => {
+    mockedInvoke.mockRejectedValue(new Error("versions.json request failed"));
+    await expect(listAvailableVersions()).rejects.toThrow("versions.json request failed");
   });
 });

@@ -28,12 +28,23 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn().mockResolvedValue("0.0.2"),
+}));
+vi.mock("../logging/safeReporter", () => ({
+  reportFrontendEventSafely: vi.fn(),
+}));
+
 import { checkForUpdate, applyUpdate } from "../lib/updaterClient";
+import { getVersion } from "@tauri-apps/api/app";
+import { reportFrontendEventSafely } from "../logging/safeReporter";
 import { UpdaterProvider, type UpdaterContextValue } from "./UpdaterProvider";
 import type { Update } from "@tauri-apps/plugin-updater";
 
 const mockedCheck = vi.mocked(checkForUpdate);
 const mockedApply = vi.mocked(applyUpdate);
+const mockedReport = vi.mocked(reportFrontendEventSafely);
+const mockedGetVersion = vi.mocked(getVersion);
 
 const wrapper = ({ children }: { children: ReactNode }) => <UpdaterProvider>{children}</UpdaterProvider>;
 
@@ -216,6 +227,7 @@ describe("UpdaterProvider state machine", () => {
     expect(mockedCheck).not.toHaveBeenCalled();
     expect(mockedApply).not.toHaveBeenCalled();
     expect(result.current.status).toEqual({ state: "idle" });
+    expect(result.current.currentVersion).toBeNull();
   });
 
   // applyNow early-return when no Update is held (UpdaterProvider.tsx line 107).
@@ -275,6 +287,58 @@ describe("UpdaterProvider state machine", () => {
     unmount();
     await act(async () => { resolveFocus(() => { unlistenCalled = true; }); });
     expect(unlistenCalled).toBe(true);
+  });
+
+  // ── Current-version accessor + check-completed observability ─────────
+  it("loads the running app version into the context on mount", async () => {
+    mockedCheck.mockResolvedValue({ kind: "up-to-date" });
+    const { result } = renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(result.current.currentVersion).toBe("0.0.2"));
+  });
+
+  it("currentVersion falls back to null when getVersion rejects", async () => {
+    mockedGetVersion.mockRejectedValueOnce(new Error("unavailable"));
+    mockedCheck.mockResolvedValue({ kind: "up-to-date" });
+    const { result } = renderHook(() => useHook(), { wrapper });
+    // getVersion was invoked (the loader ran) but rejected; the catch keeps
+    // currentVersion at null instead of surfacing an unhandled rejection.
+    await waitFor(() => expect(mockedGetVersion).toHaveBeenCalledTimes(1));
+    expect(result.current.currentVersion).toBeNull();
+  });
+
+  // The up-to-date outcome used to be COMPLETELY SILENT (no telemetry), which
+  // is what made the original bug un diagnosable from logs. It now emits
+  // gui.update.checked; the old gui.update.detected (available-only) is gone.
+  it("emits gui.update.checked for an up-to-date outcome (previously silent)", async () => {
+    mockedCheck.mockResolvedValue({ kind: "up-to-date" });
+    renderHook(() => useHook(), { wrapper });
+    await waitFor(() => expect(mockedCheck).toHaveBeenCalledTimes(1));
+    expect(mockedReport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        level: "INFO",
+        event_code: "gui.update.checked",
+        message: "Up to date",
+      }),
+    );
+    // Regression guard: the folded-away gui.update.detected must not fire.
+    expect(mockedReport).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "gui.update.detected" }),
+    );
+  });
+
+  it("emits gui.update.checked for an available outcome, naming the new version", async () => {
+    mockedCheck.mockResolvedValue({ kind: "available", version: "0.3.0", notes: "n", date: "d", update: fakeUpdate });
+    renderHook(() => useHook(), { wrapper });
+    await waitFor(() =>
+      expect(mockedReport).toHaveBeenCalledWith(
+        expect.objectContaining({
+          level: "INFO",
+          event_code: "gui.update.checked",
+          message: "Update available",
+          details: expect.objectContaining({ latestVersion: "0.3.0" }),
+        }),
+      ),
+    );
   });
 });
 

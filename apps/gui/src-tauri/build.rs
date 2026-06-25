@@ -15,6 +15,7 @@ fn main() {
         "desktop_background_service_diagnostics",
         "desktop_background_service_repair",
         "install_version",
+        "list_available_versions",
     ]);
     let attrs = tauri_build::Attributes::new().app_manifest(manifest);
     // During CI (cargo clippy/test without pre-built sidecar binaries),

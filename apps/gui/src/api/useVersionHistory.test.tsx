@@ -3,41 +3,39 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode } from "react";
 
-const fetchMock = vi.fn();
-vi.stubGlobal("fetch", fetchMock);
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
+import { invoke } from "@tauri-apps/api/core";
 import { useVersionHistory } from "./useVersionHistory";
+
+const mockedInvoke = vi.mocked(invoke);
 
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-beforeEach(() => { vi.clearAllMocks(); fetchMock.mockReset(); });
+beforeEach(() => { vi.clearAllMocks(); });
 
 describe("useVersionHistory", () => {
-  it("parses the versions array", async () => {
-    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ versions: [{ version: "0.1.0-rc.4", date: "d", notes: "n", manifest_url: "u" }] }) });
+  it("returns the versions array surfaced by the Rust command", async () => {
+    const entries = [{ version: "v0.1.0", date: "d", notes: "n", manifest_url: "u" }];
+    mockedInvoke.mockResolvedValue(entries);
     const { result } = renderHook(() => useVersionHistory(), { wrapper });
-    await waitFor(() => expect(result.current.data?.versions).toHaveLength(1));
-    expect(result.current.data?.versions[0].version).toBe("0.1.0-rc.4");
+    await waitFor(() => expect(result.current.data).toHaveLength(1));
+    expect(result.current.data?.[0].version).toBe("v0.1.0");
   });
 
-  it("tolerates a missing versions field", async () => {
-    fetchMock.mockResolvedValue({ ok: true, json: async () => ({}) });
-    const { result } = renderHook(() => useVersionHistory(), { wrapper });
-    await waitFor(() => expect(result.current.data?.versions).toEqual([]));
-  });
-
-  it("surfaces fetch errors as isError", async () => {
-    fetchMock.mockRejectedValue(new Error("net"));
+  it("surfaces invoke errors as isError", async () => {
+    mockedInvoke.mockRejectedValue(new Error("versions.json request failed"));
     const { result } = renderHook(() => useVersionHistory(), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true), { timeout: 3000 });
   });
 
-  it("surfaces a non-ok HTTP response as isError", async () => {
-    fetchMock.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
+  it("does not flag isError when the Rust command resolves", async () => {
+    mockedInvoke.mockResolvedValue([]);
     const { result } = renderHook(() => useVersionHistory(), { wrapper });
-    await waitFor(() => expect(result.current.isError).toBe(true), { timeout: 3000 });
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.isError).toBe(false);
   });
 });

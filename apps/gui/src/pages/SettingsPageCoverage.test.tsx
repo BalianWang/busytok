@@ -50,7 +50,7 @@ vi.mock("../logging/reporter", () => ({
 // version-history panel itself is exercised in SettingsPage.test.tsx.
 vi.mock("../api/useVersionHistory", () => ({
   useVersionHistory: () => ({
-    data: { versions: [] },
+    data: [],
     isLoading: false,
     isError: false,
     isFetching: false,

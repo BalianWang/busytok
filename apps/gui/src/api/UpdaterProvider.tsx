@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   applyUpdate,
   checkForUpdate,
@@ -34,6 +35,8 @@ export type UpdaterStatus =
 
 export interface UpdaterContextValue {
   status: UpdaterStatus;
+  /** Running app version (semver), or null while loading/unknown. */
+  currentVersion: string | null;
   checkNow: () => Promise<void>;
   applyNow: () => Promise<void>;
 }
@@ -43,6 +46,7 @@ export interface UpdaterContextValue {
 // EventSubscriptionProvider.
 const DEFAULT_UPDATER_VALUE: UpdaterContextValue = {
   status: { state: "idle" },
+  currentVersion: null,
   checkNow: async () => {},
   applyNow: async () => {},
 };
@@ -50,6 +54,11 @@ export const UpdaterContext = createContext<UpdaterContextValue>(DEFAULT_UPDATER
 
 export function UpdaterProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<UpdaterStatus>({ state: "idle" });
+  const [currentVersion, setCurrentVersion] = useState<string | null>(null);
+  // Synchronous mirror of currentVersion for reads inside async runCheck
+  // (avoids a stale-closure / race where the check telemetry would capture a
+  // not-yet-loaded version). Written by the loader effect below.
+  const appVersionRef = useRef<string | null>(null);
 
   // The live Tauri Update is a server-side resource (D8): hold it in a ref,
   // never React state; close before swap + on unmount.
@@ -78,17 +87,24 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
     setStatus({ state: "checking" });
     const outcome: CheckOutcome = await checkForUpdate();
     lastCheckAtRef.current = Date.now();
+    const appVersion = appVersionRef.current;
     if (outcome.kind === "up-to-date") {
       closeHeld();
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "gui.update.checked",
+        message: "Up to date",
+        details: { currentVersion: appVersion },
+      });
       setStatus({ state: "up-to-date" });
     } else if (outcome.kind === "available") {
       closeHeld();
       updateRef.current = outcome.update;
       reportFrontendEventSafely({
         level: "INFO",
-        event_code: "gui.update.detected",
+        event_code: "gui.update.checked",
         message: "Update available",
-        details: { version: outcome.version },
+        details: { currentVersion: appVersion, latestVersion: outcome.version },
       });
       setStatus({ state: "available", version: outcome.version, notes: outcome.notes, date: outcome.date });
     } else {
@@ -146,6 +162,25 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
     // all stable, so [] is correct and avoids a stale closure.
   }, []);
 
+  // Load the running app version once. Declared before the mount-check effect.
+  // runCheck() awaits checkForUpdate() (Tauri IPC + network), so getVersion()
+  // resolves first in practice, making currentVersion available for telemetry.
+  useEffect(() => {
+    let cancelled = false;
+    void getVersion()
+      .then((v) => {
+        if (cancelled) return;
+        appVersionRef.current = v;
+        setCurrentVersion(v);
+      })
+      .catch(() => {
+        // getVersion is a local Tauri call that essentially never fails; on
+        // failure leave currentVersion null (UI shows the loading placeholder).
+        if (!cancelled) setCurrentVersion(null);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
   // Mount: one check (StrictMode-safe), the 12h interval, and a focus listener.
   useEffect(() => {
     if (!didMountCheckRef.current) {
@@ -169,7 +204,7 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
   }, [runCheck, closeHeld]);
 
   return (
-    <UpdaterContext.Provider value={{ status, checkNow, applyNow }}>
+    <UpdaterContext.Provider value={{ status, currentVersion, checkNow, applyNow }}>
       {children}
     </UpdaterContext.Provider>
   );
