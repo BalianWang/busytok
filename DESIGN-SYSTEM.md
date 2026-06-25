@@ -176,7 +176,7 @@ Standard scale: `4 / 8 / 12 / 16 / 20 / 24 / 32 / 48`.
 - **No branding** at top. Padding top: `18→12px`. Pure directory from first group.
 - **Groups**: `MONITORING` (Overview, Usage) / `TOOLS` (Prompt Palette) / `SYSTEM` (Settings). Labels: uppercase 11px `--color-text-faint`. Orphan items get no label.
 - **Item**: height `32px` (was 36), padding `0 12px`, r6, icon 16px/stroke 1.75.
-  - **Rest**: text + icon `--color-text-muted`, transparent background.
+  - **Rest**: text + icon `--color-nav-text` (between text and muted — readable primary-nav rest state, distinct from settings secondary copy). Transparent background.
   - **Hover**: background `--color-hover`, no border/shadow.
   - **Active**: accent text + icon (light `accent-600` / dark `accent-400`) weight 500 + **2px left inset accent vertical bar** + very subtle neutral support (`--color-hover-strong`). **No accent-tinted block**.
   - **Focus-visible**: 2px `--color-focus-ring` inset outline.
