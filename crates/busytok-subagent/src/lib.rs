@@ -4,6 +4,10 @@
 //! (Step 1) task execution is a mock; the Pi sidecar executor lands in Plan 2.
 
 pub mod error;
+pub mod manager;
+pub mod mock_executor;
 pub mod models;
+pub mod resolver;
 
 pub use error::{Result, SubagentError};
+pub use manager::SubagentManager;

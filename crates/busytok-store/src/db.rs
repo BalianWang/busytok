@@ -1970,6 +1970,17 @@ impl Database {
     pub fn subagent_insert_resource_event(&self, row: &SubagentResourceEventRow) -> Result<()> {
         subagent_queries::insert_resource_event(self.conn(), row)
     }
+    pub fn subagent_list_filtered(
+        &self,
+        status: Option<&str>,
+        project: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+        subagent_queries::list_filtered(self.conn(), status, project, include_deleted)
+    }
+    pub fn subagent_hard_delete(&self, id: &str) -> Result<()> {
+        subagent_queries::hard_delete_logical_subagent(self.conn(), id)
+    }
 }
 
 /// Map a query row to a `NormalizedUsageEvent`.

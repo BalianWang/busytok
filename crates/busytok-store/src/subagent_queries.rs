@@ -143,6 +143,106 @@ pub fn find_by_name_in_repo(
     Ok(rows)
 }
 
+/// List subagents, optionally filtered by status and/or project.
+/// `include_deleted = false` excludes soft-deleted rows.
+pub fn list_filtered(
+    conn: &Connection,
+    status: Option<&str>,
+    project: Option<&str>,
+    include_deleted: bool,
+) -> Result<Vec<SubagentLogicalSubagentRow>> {
+    let mut sql = String::from(
+        "SELECT id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
+                default_model, status, created_at_ms, updated_at_ms, last_active_at_ms \
+         FROM subagent_logical_subagents WHERE 1=1",
+    );
+    if !include_deleted {
+        sql.push_str(" AND status != 'deleted'");
+    }
+    if status.is_some() {
+        sql.push_str(" AND status = :status");
+    }
+    if project.is_some() {
+        sql.push_str(" AND project_id = :project");
+    }
+    sql.push_str(" ORDER BY last_active_at_ms DESC NULLS LAST");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params_vec: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+    let status_val: String;
+    if let Some(s) = status {
+        status_val = s.to_string();
+        params_vec.push((":status", &status_val));
+    }
+    let project_val: String;
+    if let Some(p) = project {
+        project_val = p.to_string();
+        params_vec.push((":project", &project_val));
+    }
+    let rows = stmt
+        .query_map(params_vec.as_slice(), |row| {
+            Ok(SubagentLogicalSubagentRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                project_id: row.get(2)?,
+                repo_path: row.get(3)?,
+                repo_hash: row.get(4)?,
+                branch: row.get(5)?,
+                intent: row.get(6)?,
+                default_profile: row.get(7)?,
+                default_model: row.get(8)?,
+                status: row.get(9)?,
+                created_at_ms: row.get(10)?,
+                updated_at_ms: row.get(11)?,
+                last_active_at_ms: row.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Hard-delete a logical subagent and all its dependents, in FK-safe order.
+///
+/// Per spec §3.5 there is **no `ON DELETE CASCADE`** on the subagent tables —
+/// audit data must never be silently removed. Hard delete is explicit, at the
+/// application (store) layer: delete children in dependency order, then the row.
+pub fn hard_delete_logical_subagent(conn: &Connection, id: &str) -> Result<()> {
+    // usage_records reference both tasks and the logical row → delete first.
+    conn.execute(
+        "DELETE FROM subagent_usage_records WHERE subagent_id = ?1",
+        params![id],
+    )
+    .with_context(|| format!("delete usage records for subagent {id}"))?;
+    conn.execute(
+        "DELETE FROM subagent_tasks WHERE subagent_id = ?1",
+        params![id],
+    )
+    .with_context(|| format!("delete tasks for subagent {id}"))?;
+    conn.execute(
+        "DELETE FROM subagent_harness_bindings WHERE subagent_id = ?1",
+        params![id],
+    )
+    .with_context(|| format!("delete bindings for subagent {id}"))?;
+    conn.execute(
+        "DELETE FROM subagent_memory WHERE subagent_id = ?1",
+        params![id],
+    )
+    .with_context(|| format!("delete memory for subagent {id}"))?;
+    // resource_events.target_id is a free-text column (no FK); subagent-scoped
+    // events carry the subagent id there. Per spec §3.5 hard delete removes events.
+    conn.execute(
+        "DELETE FROM subagent_resource_events WHERE target_id = ?1",
+        params![id],
+    )
+    .with_context(|| format!("delete resource events for subagent {id}"))?;
+    conn.execute(
+        "DELETE FROM subagent_logical_subagents WHERE id = ?1",
+        params![id],
+    )
+    .map(|_| ())
+    .with_context(|| format!("hard-delete logical subagent {id}"))
+}
+
 // --- memory ----------------------------------------------------------------
 
 pub fn upsert_memory(conn: &Connection, row: &SubagentMemoryRow) -> Result<()> {
