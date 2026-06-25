@@ -37,6 +37,23 @@ pub enum InstallVersionOutcome {
     Failed { message: String },
 }
 
+/// URL of the published versions manifest (versions.json), served from the
+/// latest GitHub release. Fetched from Rust (not the webview) because the
+/// release-asset CDN serves no `Access-Control-Allow-Origin` header — a
+/// browser fetch is CORS-blocked, which surfaced in the UI as "Unavailable".
+const VERSIONS_MANIFEST_URL: &str =
+    "https://github.com/BalianWang/busytok/releases/latest/download/versions.json";
+
+/// One entry in the published versions manifest. Serialized to the frontend
+/// verbatim (snake_case keys match versions.json).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VersionHistoryEntryDto {
+    pub version: String,
+    pub date: String,
+    pub notes: String,
+    pub manifest_url: String,
+}
+
 /// Pure helper: parse the chosen version's manifest URL into the endpoint vec
 /// the updater consumes. Unit-tested in isolation (the only pure logic here;
 /// the rest of the command is Tauri-coupled and covered by the manual verify gate).
@@ -45,6 +62,43 @@ pub(crate) fn parse_manifest_endpoint(manifest_url: &str) -> Result<Vec<Url>, St
         .parse()
         .map_err(|e: url::ParseError| e.to_string())?;
     Ok(vec![url])
+}
+
+/// Pure helper: parse the versions.json body into entries. Unit-tested in
+/// isolation — the only pure logic in `list_available_versions` (the network
+/// fetch is covered by the manual verify gate, same split as
+/// `parse_manifest_endpoint`).
+pub(crate) fn parse_versions_manifest(body: &str) -> Result<Vec<VersionHistoryEntryDto>, String> {
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        versions: Vec<VersionHistoryEntryDto>,
+    }
+    let wrapped: Wrapper =
+        serde_json::from_str(body).map_err(|e| format!("invalid versions.json: {e}"))?;
+    Ok(wrapped.versions)
+}
+
+/// Fetch the published versions manifest (versions.json) from the release CDN.
+/// Done in Rust rather than the webview so it is not subject to browser CORS —
+/// the release-asset CDN serves no `Access-Control-Allow-Origin` header, which
+/// is what made the equivalent webview `fetch()` fail with "Unavailable".
+#[tauri::command]
+pub async fn list_available_versions() -> Result<Vec<VersionHistoryEntryDto>, String> {
+    tracing::info!(
+        event_code = "tauri.list_available_versions",
+        url = %VERSIONS_MANIFEST_URL,
+        "fetching published versions manifest"
+    );
+    let body = reqwest::get(VERSIONS_MANIFEST_URL)
+        .await
+        .map_err(|e| format!("versions.json request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("versions.json HTTP error: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("versions.json body read failed: {e}"))?;
+    parse_versions_manifest(&body)
 }
 
 /// Install a user-selected version (downgrade/reinstall) by pointing the

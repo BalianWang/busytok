@@ -237,6 +237,12 @@
           "markdownDescription": "Enables the invoke_busytok command without any pre-configured scope."
         },
         {
+          "description": "Enables the list_available_versions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-available-versions",
+          "markdownDescription": "Enables the list_available_versions command without any pre-configured scope."
+        },
+        {
           "description": "Enables the log_frontend_event command without any pre-configured scope.",
           "type": "string",
           "const": "allow-log-frontend-event",
@@ -325,6 +331,12 @@
           "type": "string",
           "const": "deny-invoke-busytok",
           "markdownDescription": "Denies the invoke_busytok command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_available_versions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-available-versions",
+          "markdownDescription": "Denies the list_available_versions command without any pre-configured scope."
         },
         {
           "description": "Denies the log_frontend_event command without any pre-configured scope.",

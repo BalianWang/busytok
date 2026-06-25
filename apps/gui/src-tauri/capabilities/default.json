@@ -23,6 +23,7 @@
     "allow-desktop-host-shortcut-diagnostics",
     "allow-desktop-host-retry-shortcut-registration",
     "allow-desktop-host-show-gui",
-    "allow-install-version"
+    "allow-install-version",
+    "allow-list-available-versions"
   ]
 }

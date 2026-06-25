@@ -79,7 +79,7 @@ vi.mock("../api/useVersionHistory", () => ({
 
 vi.mock("../lib/versionCommands", () => ({
   installVersion: vi.fn(),
-  VERSIONS_MANIFEST_URL: "u",
+  listAvailableVersions: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
@@ -107,7 +107,7 @@ describe("SettingsPage Updates section", () => {
     // Default: no version history loaded. Tests that exercise the panel
     // override this via seedVersions() / vi.mocked(useVersionHistory).
     vi.mocked(useVersionHistory).mockReturnValue({
-      data: { versions: [] },
+      data: [],
       isLoading: false,
       isError: false,
       isFetching: false,
@@ -264,10 +264,10 @@ describe("SettingsPage Updates section", () => {
   function seedVersions() {
     vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() } as never);
     vi.mocked(useVersionHistory).mockReturnValue({
-      data: { versions: [
+      data: [
         { version: "0.1.0-rc.5", date: "2026-06-23", notes: "current", manifest_url: "u5" },
         { version: "0.1.0-rc.4", date: "2026-06-20", notes: "prev", manifest_url: "u4" },
-      ] },
+      ],
       isLoading: false, isError: false, isFetching: false,
     } as never);
   }

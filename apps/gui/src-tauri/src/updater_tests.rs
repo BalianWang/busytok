@@ -16,11 +16,53 @@
     unused_imports,
     dead_code
 )]
-use crate::updater::{init_updater_logging, parse_manifest_endpoint};
+use crate::updater::{init_updater_logging, parse_manifest_endpoint, parse_versions_manifest};
 
 #[test]
 fn init_updater_logging_does_not_panic() {
     init_updater_logging();
+}
+
+#[test]
+fn parse_versions_manifest_parses_entries_in_order() {
+    let body = r#"{"versions":[
+        {"version":"v0.0.2","date":"2026-06-25T04:41:40Z","notes":"Busytok 0.0.2","manifest_url":"https://github.com/x/y/releases/download/v0.0.2/latest.json"},
+        {"version":"v0.0.1","date":"2026-06-24T14:22:10Z","notes":"Busytok 0.0.1","manifest_url":"https://github.com/x/y/releases/download/v0.0.1/latest.json"}
+    ]}"#;
+    let entries = parse_versions_manifest(body).expect("valid manifest");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].version, "v0.0.2");
+    assert_eq!(
+        entries[0].manifest_url,
+        "https://github.com/x/y/releases/download/v0.0.2/latest.json"
+    );
+    assert_eq!(entries[1].version, "v0.0.1");
+    assert_eq!(entries[1].notes, "Busytok 0.0.1");
+}
+
+#[test]
+fn parse_versions_manifest_empty_list() {
+    let entries = parse_versions_manifest(r#"{"versions":[]}"#).expect("empty list");
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn parse_versions_manifest_missing_versions_key_defaults_to_empty() {
+    // Defensive: a manifest object without a "versions" key yields an empty
+    // list rather than erroring (so a malformed manifest degrades to "0
+    // versions" instead of "Unavailable").
+    let entries = parse_versions_manifest(r#"{}"#).expect("defaults to empty");
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn parse_versions_manifest_rejects_malformed_json() {
+    assert!(parse_versions_manifest("not json").is_err());
+}
+
+#[test]
+fn parse_versions_manifest_rejects_non_object_top_level() {
+    assert!(parse_versions_manifest(r#"[1,2,3]"#).is_err());
 }
 
 #[test]

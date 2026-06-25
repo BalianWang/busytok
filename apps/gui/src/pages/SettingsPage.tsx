@@ -965,10 +965,10 @@ export function SettingsPage() {
             <SettingsRow
               label="Version history"
               description="Reinstall an earlier version. The app will download, install, and restart."
-              control={<SettingsValue value={versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.versions.length ?? 0} versions`} tone="default" />}
+              control={<SettingsValue value={versionHistory.isLoading ? "Loading…" : versionHistory.isError ? "Unavailable" : `${versionHistory.data?.length ?? 0} versions`} tone="default" />}
             />
             {reinstallMessage && <SettingsRow label="Reinstall status" description={reinstallMessage} control={<SettingsValue value="" tone="muted" /> } />}
-            {(versionHistory.data?.versions ?? []).map((entry) => (
+            {(versionHistory.data ?? []).map((entry) => (
               <SettingsRow
                 key={entry.version}
                 label={entry.version}
