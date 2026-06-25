@@ -16,15 +16,11 @@ if [ -z "$APP_VERSION" ]; then
 fi
 
 DMG_STAGING_DIR=""
-DMG_ICON_DIR=""
 # BUNDLE_DMG_DIR and BUNDLE_MACOS_DIR are sourced from _release_vars.sh
 
 cleanup() {
     if [ -n "$DMG_STAGING_DIR" ] && [ -d "$DMG_STAGING_DIR" ]; then
         rm -rf "$DMG_STAGING_DIR"
-    fi
-    if [ -n "$DMG_ICON_DIR" ] && [ -d "$DMG_ICON_DIR" ]; then
-        rm -rf "$DMG_ICON_DIR"
     fi
 }
 
@@ -163,23 +159,6 @@ cp -R "$APP_PATH" "$DMG_STAGING_DIR/Busytok.app"
 DMG_WINDOW_WIDTH=768
 DMG_WINDOW_HEIGHT=512
 DMG_BACKGROUND_SOURCE="$PROJECT_ROOT/packaging/macos/assets/dmg-background.png"
-DMG_ICON_DIR="$(mktemp -d "${TMPDIR:-/tmp}/busytok-dmg-icon.XXXXXX")"
-APPLICATIONS_ICON_PNG="$DMG_ICON_DIR/ApplicationsIcon.png"
-APPLICATIONS_ICON_RSRC="$DMG_ICON_DIR/ApplicationsIcon.rsrc"
-APPLICATIONS_FOLDER_ICON="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns"
-
-# macOS 26 has a Finder bug where the special Applications symlink created by
-# create-dmg's --app-drop-link sometimes renders without its folder icon.
-# A Finder alias plus an explicit custom icon keeps drag-to-install semantics
-# while avoiding the missing-icon placeholder.
-osascript -e 'set destFolder to POSIX file "'"$DMG_STAGING_DIR"'" as alias' \
-    -e 'tell application "Finder" to make new alias file to POSIX file "/Applications" at destFolder with properties {name:"Applications"}' \
-    >/dev/null
-sips -s format png "$APPLICATIONS_FOLDER_ICON" --out "$APPLICATIONS_ICON_PNG" >/dev/null
-sips -i "$APPLICATIONS_ICON_PNG" >/dev/null
-DeRez -only icns "$APPLICATIONS_ICON_PNG" > "$APPLICATIONS_ICON_RSRC"
-Rez -append "$APPLICATIONS_ICON_RSRC" -o "$DMG_STAGING_DIR/Applications"
-SetFile -a C "$DMG_STAGING_DIR/Applications"
 
 create-dmg \
     --volname "Busytok" \
@@ -189,7 +168,7 @@ create-dmg \
     --icon-size 112 \
     --icon "Busytok.app" 194 188 \
     --hide-extension "Busytok.app" \
-    --icon "Applications" 566 188 \
+    --app-drop-link 566 188 \
     --format UDZO \
     --hdiutil-quiet \
     "$DMG_PATH" \
