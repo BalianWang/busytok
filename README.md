@@ -4,7 +4,9 @@
 [![Release](https://img.shields.io/github/v/release/BalianWang/busytok?include_prereleases)](https://github.com/BalianWang/busytok/releases)
 [![License: Apache--2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-**Busytok is a local-first agent token usage audit dashboard.** It reads local AI coding agent logs (Claude Code, Codex, Gemini CLI), normalizes low-sensitive token metadata, stores it in local SQLite, and serves GUI/CLI views through a local service.
+![Busytok Dashboard](docs/screenshot.png)
+
+**Busytok is a local-first agent token usage audit dashboard.** It reads local AI coding agent logs (Claude Code, Codex), normalizes low-sensitive token metadata, stores it in local SQLite, and serves GUI/CLI views through a local service.
 
 Busytok does **not** proxy traffic, route models, inspect protocol payloads, install certificates, hook TLS, or handle OAuth/API keys/session tokens.
 
@@ -20,17 +22,19 @@ Busytok is `0.x`: real and usable, but **minors may break**. Auto-update is on f
 
 ## What it does
 
-- Reads local agent logs (Claude Code, Codex, Gemini CLI)
+- Reads local agent logs (Claude Code, Codex)
 - Persists metadata-only token usage to local SQLite (no prompt/response bodies)
 - Serves a desktop GUI (Dashboard, Agents, Settings pages) and a CLI (`busytok`)
 - Bundles a background service (`busytok-service`) running as a launchd LaunchAgent
 
-## What it does NOT do
+## Prompt Palette
 
-- ❌ Proxy network traffic
-- ❌ Store provider credentials or OAuth/session tokens
-- ❌ Modify client agent configurations
-- ❌ Inspect protocol payloads (only log-parsed token metadata)
+Press **`Cmd+Option+K`** anywhere to open the prompt palette — a floating search window for saved prompts.
+
+- **Save & reuse prompts** — write prompt templates with tags (alias, content, pin, tags) in the palette or Settings page. Use counts and last-used tracking help you find your most-used prompts.
+- **One-key execution** — select a prompt and press `Enter` to execute your default action (configurable in Settings).
+- **Three action modes** — **OnlyCopy** (clipboard only), **OnlyPaste** (paste without modifying your clipboard), **Copy & Paste** (write clipboard + paste). Choose your default in Settings → Prompt Palette.
+- **Quick actions** — `⌘K` opens per-prompt actions (Copy, Paste, Edit, Delete, Toggle pin) from the palette.
 
 ## Workspace
 
