@@ -705,6 +705,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "busytok-subagent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "busytok-config",
+ "busytok-domain",
+ "busytok-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "busytok-tailer"
 version = "0.1.0"
 dependencies = [

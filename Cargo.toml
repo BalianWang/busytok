@@ -11,6 +11,7 @@ members = [
   "crates/busytok-adapters",
   "crates/busytok-tailer",
   "crates/busytok-store",
+  "crates/busytok-subagent",
   "crates/busytok-aggregator",
   "crates/busytok-events",
   "crates/busytok-runtime",
