@@ -5,7 +5,7 @@
 
 pub mod error;
 pub mod manager;
-pub(crate) mod mock_executor;
+pub mod mock_executor;
 pub mod models;
 pub mod resolver;
 

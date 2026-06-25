@@ -9,7 +9,7 @@ use busytok_store::{
 use tracing::{info, warn};
 
 use crate::error::{Result, SubagentError};
-use crate::mock_executor::run_mock;
+use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
     DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
     SubagentTaskSummary, TaskStatus,
@@ -22,14 +22,21 @@ pub struct SubagentManager {
     db: SharedDb,
     settings: SubagentSettings,
     adapter: String,
+    executor: Arc<dyn TaskExecutor>,
 }
 
 impl SubagentManager {
-    pub fn new(db: SharedDb, settings: SubagentSettings, adapter: &str) -> Self {
+    pub fn new(
+        db: SharedDb,
+        settings: SubagentSettings,
+        adapter: &str,
+        executor: Arc<dyn TaskExecutor>,
+    ) -> Self {
         Self {
             db,
             settings,
             adapter: adapter.to_string(),
+            executor,
         }
     }
 
@@ -121,7 +128,19 @@ impl SubagentManager {
         // 3. mock-execute (Plan 2: sidecar turn). No lock held during execution.
         let model = req.model_override.clone().or(profile_model);
         let started = busytok_domain::now_ms();
-        let out = run_mock(&req.prompt, model.as_deref());
+        let input = ExecutorInput {
+            subagent_id: subagent.id.clone(),
+            subagent_name: subagent.name.clone(),
+            cwd: req.cwd.clone(),
+            profile: req.profile.clone(),
+            model: model.clone(),
+            prompt: req.prompt.clone(),
+            timeout_seconds: req.timeout_seconds,
+        };
+        let out = self.executor.execute(&input).await.map_err(|e| {
+            warn!(event_code = "subagent.delegate.executor_failed", error = %e);
+            SubagentError::Store(e)
+        })?;
         let duration_ms = busytok_domain::now_ms().saturating_sub(started);
 
         // 4. persist results: task status, usage, memory (hot_summary), status.

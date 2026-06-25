@@ -3,13 +3,19 @@
 use busytok_config::SubagentSettings;
 use busytok_store::{Database, SubagentHarnessBindingRow};
 use busytok_subagent::manager::SubagentManager;
+use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::{DelegateRequest, ResolveParams, SubagentStatus};
 use busytok_subagent::SubagentError;
 
 async fn manager() -> SubagentManager {
     // std::sync::Mutex — matches the supervisor's db field type.
     let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
-    SubagentManager::new(db, SubagentSettings::default(), "pi")
+    SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    )
 }
 
 fn req_with_cwd(name: &str, prompt: &str, cwd: &str) -> DelegateRequest {
@@ -276,7 +282,7 @@ async fn delegate_rejected_when_feature_disabled() {
         enabled: false,
         ..Default::default()
     };
-    let m = SubagentManager::new(db, settings, "pi");
+    let m = SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor));
     let err = m.delegate(req("reviewer", "do")).await.unwrap_err();
     assert!(matches!(err, SubagentError::Disabled));
 }
@@ -617,6 +623,7 @@ async fn hibernate_closes_existing_hot_binding() {
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
+        std::sync::Arc::new(MockTaskExecutor),
     );
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
 

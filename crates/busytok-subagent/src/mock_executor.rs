@@ -1,29 +1,55 @@
-//! In-process mock task executor (Step 1 only).
-//!
-//! Produces a deterministic canned result so the management layer, store,
-//! control protocol, and CLI can be validated without the Pi sidecar.
-//! Plan 2 swaps in the real sidecar-backed `TaskExecutor`.
+//! Task executor abstraction. Plan 1 had a mock; Plan 2 adds a sidecar-backed
+//! executor. The trait lets `SubagentManager` stay executor-agnostic.
 
 use crate::models::{TaskStatus, TaskUsage};
 
-pub struct MockTaskOutput {
+/// Input to a task executor — everything needed to run one turn.
+pub struct ExecutorInput {
+    pub subagent_id: String,
+    pub subagent_name: String,
+    pub cwd: String,
+    pub profile: String,
+    pub model: Option<String>,
+    pub prompt: String,
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Output from a task executor — mapped into `DelegateResult` by the manager.
+pub struct ExecutorOutput {
+    pub adapter_session_id: Option<String>,
+    pub session_reused: bool,
     pub status: TaskStatus,
     pub summary: String,
     pub usage: TaskUsage,
 }
 
-/// Run a mock task. The summary echoes the prompt so tests can assert on it.
-pub(crate) fn run_mock(prompt: &str, model: Option<&str>) -> MockTaskOutput {
-    let summary = format!("[mock] no sidecar wired yet; prompt was: {prompt}");
-    MockTaskOutput {
-        status: TaskStatus::Completed,
-        summary: summary.clone(),
-        usage: TaskUsage {
-            model: model.map(|s| s.to_string()),
-            provider: Some("mock".to_string()),
-            input_tokens: Some(prompt.len() as i64),
-            output_tokens: Some(summary.len() as i64),
-            ..Default::default()
-        },
+/// Executor trait — `SubagentManager` calls this to run a task.
+/// Plan 1: `MockTaskExecutor`. Plan 2: `SidecarTaskExecutor`.
+#[async_trait::async_trait]
+pub trait TaskExecutor: Send + Sync {
+    async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput>;
+}
+
+/// Deterministic in-process mock executor. Used by Plan 1 tests and by Plan 2
+/// when `pi_sidecar.enabled = false`.
+pub struct MockTaskExecutor;
+
+#[async_trait::async_trait]
+impl TaskExecutor for MockTaskExecutor {
+    async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        let summary = format!("[mock] no sidecar wired yet; prompt was: {}", input.prompt);
+        Ok(ExecutorOutput {
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: summary.clone(),
+            usage: TaskUsage {
+                model: input.model.clone(),
+                provider: Some("mock".to_string()),
+                input_tokens: Some(input.prompt.len() as i64),
+                output_tokens: Some(summary.len() as i64),
+                ..Default::default()
+            },
+        })
     }
 }

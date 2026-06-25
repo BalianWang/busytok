@@ -142,10 +142,14 @@ impl BusytokSupervisor {
         let event_bus = AppEventBus::new(64);
 
         let db = Arc::new(Mutex::new(db));
+        let executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
+            Arc::new(busytok_subagent::mock_executor::MockTaskExecutor);
+        // (Plan 2 Task 5 swaps this for SidecarTaskExecutor when pi_sidecar.enabled)
         let subagent_manager = Arc::new(busytok_subagent::SubagentManager::new(
             Arc::clone(&db),
             settings.subagent.clone(),
             "pi",
+            executor,
         ));
         let read_service = {
             let db_guard = db.lock().unwrap();
