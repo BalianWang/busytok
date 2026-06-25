@@ -19,6 +19,7 @@ pub mod read_queries;
 pub mod repository;
 pub mod schema;
 pub mod source_queries;
+pub mod subagent_queries;
 pub mod write_queries;
 
 pub use db::{Database, IngestResult, OldEventTokens};

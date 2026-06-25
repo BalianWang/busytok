@@ -8,9 +8,11 @@ use tracing::{debug, info};
 use crate::repository::{
     CodexTokenSnapshotRow, DailyUsageRow, DiagnosticEventRow, LogFileRow, LogSourceRow,
     ModelSummaryRow, ModelUsageRow, ProjectRow, RollupRows, SessionRow, StoreHealthInfo,
-    StoreWriteBatch,
+    StoreWriteBatch, SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
+    SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
 use crate::schema;
+use crate::subagent_queries;
 
 /// SQLite database handle for the Busytok store.
 ///
@@ -1900,6 +1902,73 @@ impl Database {
             usage_event_count: usage_count,
             last_log_checkpoint_ms,
         })
+    }
+
+    // --- subagent runtime ------------------------------------------------------
+
+    pub fn subagent_upsert_logical(&self, row: &SubagentLogicalSubagentRow) -> Result<()> {
+        subagent_queries::upsert_logical_subagent(self.conn(), row)
+    }
+    pub fn subagent_get_logical(&self, id: &str) -> Result<Option<SubagentLogicalSubagentRow>> {
+        subagent_queries::get_logical_subagent(self.conn(), id)
+    }
+    pub fn subagent_list_active_by_repo(
+        &self,
+        repo_hash: &str,
+    ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+        subagent_queries::list_active_by_repo(self.conn(), repo_hash)
+    }
+    pub fn subagent_find_by_name_in_repo(
+        &self,
+        project_id: &str,
+        repo_hash: &str,
+        name: &str,
+    ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+        subagent_queries::find_by_name_in_repo(self.conn(), project_id, repo_hash, name)
+    }
+    pub fn subagent_upsert_memory(&self, row: &SubagentMemoryRow) -> Result<()> {
+        subagent_queries::upsert_memory(self.conn(), row)
+    }
+    pub fn subagent_get_memory(&self, subagent_id: &str) -> Result<Option<SubagentMemoryRow>> {
+        subagent_queries::get_memory(self.conn(), subagent_id)
+    }
+    pub fn subagent_insert_task(&self, row: &SubagentTaskRow) -> Result<()> {
+        subagent_queries::insert_task(self.conn(), row)
+    }
+    pub fn subagent_get_task(&self, id: &str) -> Result<Option<SubagentTaskRow>> {
+        subagent_queries::get_task(self.conn(), id)
+    }
+    pub fn subagent_list_tasks(
+        &self,
+        subagent_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SubagentTaskRow>> {
+        subagent_queries::list_tasks(self.conn(), subagent_id, limit)
+    }
+    pub fn subagent_set_task_status(
+        &self,
+        id: &str,
+        status: &str,
+        result_summary: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        subagent_queries::set_task_status(self.conn(), id, status, result_summary, error)
+    }
+    pub fn subagent_upsert_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
+        subagent_queries::upsert_binding(self.conn(), row)
+    }
+    pub fn subagent_hot_binding(
+        &self,
+        subagent_id: &str,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        subagent_queries::hot_binding(self.conn(), subagent_id, harness)
+    }
+    pub fn subagent_insert_usage_record(&self, row: &SubagentUsageRecordRow) -> Result<()> {
+        subagent_queries::insert_usage_record(self.conn(), row)
+    }
+    pub fn subagent_insert_resource_event(&self, row: &SubagentResourceEventRow) -> Result<()> {
+        subagent_queries::insert_resource_event(self.conn(), row)
     }
 }
 
