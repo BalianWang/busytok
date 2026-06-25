@@ -68,20 +68,6 @@ vi.mock("../lib/promptPaletteActions", () => ({
   openPromptPaletteAccessibilitySettings: vi.fn(),
 }));
 
-vi.mock("../api/useVersionHistory", () => ({
-  useVersionHistory: vi.fn(() => ({
-    data: { versions: [] },
-    isLoading: false,
-    isError: false,
-    isFetching: false,
-  })),
-}));
-
-vi.mock("../lib/versionCommands", () => ({
-  installVersion: vi.fn(),
-  listAvailableVersions: vi.fn().mockResolvedValue([]),
-}));
-
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     onFocusChanged: vi.fn().mockResolvedValue(() => {}),
@@ -91,8 +77,6 @@ vi.mock("@tauri-apps/api/window", () => ({
 // Pull the mocked hook in AFTER the mock is registered.
 import { useUpdater } from "../hooks/useUpdater";
 import type { UpdaterContextValue } from "../hooks/useUpdater";
-import { useVersionHistory } from "../api/useVersionHistory";
-import { installVersion } from "../lib/versionCommands";
 import { SettingsPage } from "./SettingsPage";
 
 function mockUpdater(value: Omit<UpdaterContextValue, "currentVersion"> & { currentVersion?: string | null }): void {
@@ -104,14 +88,6 @@ function mockUpdater(value: Omit<UpdaterContextValue, "currentVersion"> & { curr
 describe("SettingsPage Updates section", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Default: no version history loaded. Tests that exercise the panel
-    // override this via seedVersions() / vi.mocked(useVersionHistory).
-    vi.mocked(useVersionHistory).mockReturnValue({
-      data: [],
-      isLoading: false,
-      isError: false,
-      isFetching: false,
-    } as never);
   });
 
   afterEach(() => {
@@ -259,54 +235,13 @@ describe("SettingsPage Updates section", () => {
     }
   });
 
-  // ── Version-history panel (manual downgrade) ────────────────────────
-
-  function seedVersions() {
-    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() } as never);
-    vi.mocked(useVersionHistory).mockReturnValue({
-      data: [
-        { version: "0.1.0-rc.5", date: "2026-06-23", notes: "current", manifest_url: "u5" },
-        { version: "0.1.0-rc.4", date: "2026-06-20", notes: "prev", manifest_url: "u4" },
-      ],
-      isLoading: false, isError: false, isFetching: false,
-    } as never);
-  }
-
-  it("lists version-history entries", () => {
-    seedVersions();
+  it("does not render the Version history (downgrade) panel", () => {
+    // Product stance: installing older versions is discouraged, so the
+    // version-history / reinstall UI must not appear in Settings.
+    mockUpdater({ status: { state: "up-to-date" }, checkNow: vi.fn(), applyNow: vi.fn() });
     render(<SettingsPage />);
-    expect(screen.getByText("0.1.0-rc.5")).toBeTruthy();
-    expect(screen.getByText("0.1.0-rc.4")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /reinstall.*0\.1\.0-rc\.4/i })).toBeTruthy();
+    expect(screen.queryByText("Version history")).toBeNull();
+    expect(screen.queryByRole("button", { name: /reinstall/i })).toBeNull();
   });
 
-  it("reinstall shows Reinstalling…, then Installed on success", async () => {
-    seedVersions();
-    let resolveInstall!: (v: { kind: "installed"; version: string }) => void;
-    vi.mocked(installVersion).mockReturnValue(new Promise((r) => { resolveInstall = r as never; }) as never);
-    render(<SettingsPage />);
-    fireEvent.click(screen.getByRole("button", { name: /reinstall.*0\.1\.0-rc\.4/i }));
-    expect(screen.getByText("Reinstalling…")).toBeTruthy();
-    resolveInstall({ kind: "installed", version: "0.1.0-rc.4" });
-    await waitFor(() => expect(screen.getByText(/Installed 0\.1\.0-rc\.4 — restarting/i)).toBeTruthy());
-  });
-
-  it("reinstall failure surfaces the failure message", async () => {
-    seedVersions();
-    vi.mocked(installVersion).mockResolvedValue({ kind: "failed", message: "signature invalid" } as never);
-    render(<SettingsPage />);
-    fireEvent.click(screen.getByRole("button", { name: /reinstall.*0\.1\.0-rc\.4/i }));
-    await waitFor(() => expect(screen.getByText(/Reinstall failed: signature invalid/i)).toBeTruthy());
-  });
-
-  it("renders Loading… / Unavailable for version-history fetch states", () => {
-    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() } as never);
-    vi.mocked(useVersionHistory).mockReturnValue({ data: undefined, isLoading: true, isError: false, isFetching: false } as never);
-    const { unmount } = render(<SettingsPage />);
-    expect(screen.getByText("Loading…")).toBeTruthy();
-    unmount();
-    vi.mocked(useVersionHistory).mockReturnValue({ data: undefined, isLoading: false, isError: true, isFetching: false } as never);
-    render(<SettingsPage />);
-    expect(screen.getByText("Unavailable")).toBeTruthy();
-  });
 });
