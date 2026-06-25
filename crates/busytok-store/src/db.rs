@@ -1969,6 +1969,20 @@ impl Database {
         let conn = self.conn();
         subagent_queries::commit_hot_binding_and_status(conn, binding, subagent_id)
     }
+    pub fn subagent_commit_hibernate_binding_and_status(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+        new_status: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::commit_hibernate_binding_and_status(
+            conn,
+            binding,
+            subagent_id,
+            new_status,
+        )
+    }
     pub fn subagent_hot_binding(
         &self,
         subagent_id: &str,

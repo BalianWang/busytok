@@ -58,7 +58,11 @@ async fn supervisor_crash_recovery_restarts_sidecar() {
     cfg.env
         .insert("BUSYTOK_MOCK_CRASH_AFTER".into(), "2".into());
     cfg.health_interval = Duration::from_secs(3600); // avoid health-ping interference
-    let sup = PiSidecarSupervisor::new(cfg, None);
+                                                     // Attach a DB so the supervisor writes resource events (sidecar_start,
+                                                     // sidecar_crash, sidecar_restart, sidecar_stop). This verifies the
+                                                     // `sidecar_restart` event is emitted on crash-recovery respawn.
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let sup = PiSidecarSupervisor::new(cfg, Some(db.clone()));
     let handle = sup.ensure_started().await.unwrap();
     // First turn_auto succeeds (message 2 — initialize was message 1).
     // Mock crashes AFTER responding to message 2 (CRASH_AFTER=2).
@@ -85,6 +89,29 @@ async fn supervisor_crash_recovery_restarts_sidecar() {
         .await
         .unwrap();
     sup.shutdown().await.unwrap();
+
+    // Assert the full resource event sequence for crash recovery:
+    // sidecar_start (initial spawn) → sidecar_crash (detected) →
+    // sidecar_restart (respawn) → sidecar_stop (graceful shutdown).
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"sidecar_start"),
+        "missing sidecar_start event: {types:?}"
+    );
+    assert!(
+        types.contains(&"sidecar_crash"),
+        "missing sidecar_crash event: {types:?}"
+    );
+    assert!(
+        types.contains(&"sidecar_restart"),
+        "missing sidecar_restart event after crash recovery: {types:?}"
+    );
+    assert!(
+        types.contains(&"sidecar_stop"),
+        "missing sidecar_stop event: {types:?}"
+    );
 }
 
 #[tokio::test]

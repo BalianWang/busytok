@@ -221,3 +221,96 @@ fn release_hot_bindings_for_shutdown_releases_and_rolls_back() {
         "graceful shutdown must not mark tasks as SIDECAR_CRASHED"
     );
 }
+
+/// Verify `commit_hibernate_binding_and_status` atomically flips the binding
+/// (is_hot=0, status='closed', closed_at_ms set) AND the logical status
+/// (warm/cold) in a single transaction, and that `status='deleted'` tombstones
+/// are excluded from the logical status update (Plan 1 deletion semantics).
+#[test]
+fn commit_hibernate_binding_and_status_is_atomic_and_excludes_tombstones() {
+    let db = db();
+
+    // Subagent A: live, hot, with a hot binding. Hibernate → warm.
+    let mut a = SubagentLogicalSubagentRow::for_test("sa-a", "live");
+    a.status = "hot".to_string();
+    db.subagent_upsert_logical(&a).unwrap();
+    seed_hot_binding(&db, "sa-a");
+    // Seed memory so hibernate rolls back to 'warm' (not 'cold').
+    let mut mem_a = busytok_store::repository::SubagentMemoryRow::new_empty("sa-a");
+    mem_a.hot_summary = Some("did stuff".to_string());
+    db.subagent_upsert_memory(&mem_a).unwrap();
+
+    // Subagent B: soft-deleted tombstone, but with a hot binding still in
+    // place (simulates a hibernate happening between delegate and a clean
+    // delete — the binding must still be released, but the tombstone must NOT
+    // be revived).
+    let mut b = SubagentLogicalSubagentRow::for_test("sa-b", "tomb");
+    b.status = "deleted".to_string();
+    db.subagent_upsert_logical(&b).unwrap();
+    seed_hot_binding(&db, "sa-b");
+
+    // Sanity: both bindings are hot before hibernate; A is hot, B is deleted.
+    assert_eq!(binding_state(&db, "sa-a"), Some((1, "hot".to_string())));
+    assert_eq!(binding_state(&db, "sa-b"), Some((1, "hot".to_string())));
+
+    // --- Hibernate A: binding flip + status→warm in one transaction. ---
+    let mut binding_a = db.subagent_hot_binding("sa-a", "pi").unwrap().unwrap();
+    let now = busytok_domain::now_ms();
+    binding_a.is_hot = 0;
+    binding_a.status = "closed".to_string();
+    binding_a.closed_at_ms = Some(now);
+    db.subagent_commit_hibernate_binding_and_status(&binding_a, "sa-a", "warm")
+        .unwrap();
+
+    // 1. A's binding is released (is_hot=0, status='closed', closed_at_ms set).
+    let a_binding_after = binding_state(&db, "sa-a").expect("binding row must remain");
+    assert_eq!(a_binding_after.0, 0, "is_hot must be 0 after hibernate");
+    assert_eq!(
+        a_binding_after.1, "closed",
+        "binding status must be 'closed' after hibernate"
+    );
+    // No hot binding remains for A.
+    assert!(
+        db.subagent_hot_binding("sa-a", "pi").unwrap().is_none(),
+        "no hot binding should remain after hibernate"
+    );
+
+    // 2. A's logical status flipped to 'warm' atomically (memory exists).
+    let a_after = db.subagent_get_logical("sa-a").unwrap().unwrap();
+    assert_eq!(
+        a_after.status, "warm",
+        "logical status must flip to warm (memory exists) — atomically with the binding flip"
+    );
+
+    // --- Hibernate B (tombstone): binding flip happens, status stays 'deleted'. ---
+    let mut binding_b = db.subagent_hot_binding("sa-b", "pi").unwrap().unwrap();
+    binding_b.is_hot = 0;
+    binding_b.status = "closed".to_string();
+    binding_b.closed_at_ms = Some(now);
+    db.subagent_commit_hibernate_binding_and_status(&binding_b, "sa-b", "warm")
+        .unwrap();
+
+    // 3. B's binding WAS released (bindings are not tombstone-protected).
+    let b_binding_after = binding_state(&db, "sa-b").expect("binding row must remain");
+    assert_eq!(b_binding_after.0, 0, "tombstone binding is_hot must be 0");
+    assert_eq!(
+        b_binding_after.1, "closed",
+        "tombstone binding status must be 'closed'"
+    );
+
+    // 4. B's logical status is STILL 'deleted' (tombstone exclusion — Plan 1
+    //    deletion semantics). Hibernate must not revive a soft-deleted subagent.
+    let b_after = db.subagent_get_logical("sa-b").unwrap().unwrap();
+    assert_eq!(
+        b_after.status, "deleted",
+        "soft-deleted subagent must NOT be revived by hibernate (tombstone exclusion)"
+    );
+
+    // 5. Atomicity guard: there is no observable point where the binding is
+    //    closed but the status is still 'hot'. Since the commit is a single
+    //    transaction, after `commit_hibernate_binding_and_status` returns Ok
+    //    both writes are durable — verified above by (1) and (2) holding
+    //    simultaneously. (A true concurrency test would need a snapshot at the
+    //    intermediate point, which SQLite's tx isolation prevents — so this
+    //    test asserts the post-commit invariant instead.)
+}

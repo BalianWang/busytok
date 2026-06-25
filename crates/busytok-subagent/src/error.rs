@@ -42,6 +42,9 @@ pub enum SubagentError {
     #[error("sidecar rpc error: {0}")]
     SidecarRpc(String),
 
+    #[error("sidecar io error: {0}")]
+    SidecarIo(String),
+
     #[error("sidecar timeout: {0}")]
     SidecarTimeout(String),
 
@@ -63,6 +66,7 @@ impl SubagentError {
             SubagentError::TaskTimeout => "subagent.task_timeout",
             SubagentError::SidecarSpawn(_) => "subagent.sidecar_spawn_failed",
             SubagentError::SidecarRpc(_) => "subagent.sidecar_rpc_error",
+            SubagentError::SidecarIo(_) => "subagent.sidecar_io_error",
             SubagentError::SidecarTimeout(_) => "subagent.sidecar_timeout",
             SubagentError::SidecarCrashed(_) => "subagent.sidecar_crashed",
         }
@@ -81,7 +85,7 @@ impl From<SidecarError> for SubagentError {
             SidecarError::Rpc(msg) => SubagentError::SidecarRpc(msg),
             SidecarError::Timeout(msg) => SubagentError::SidecarTimeout(msg),
             SidecarError::Crashed(msg) => SubagentError::SidecarCrashed(msg),
-            SidecarError::Io(msg) => SubagentError::SidecarRpc(msg),
+            SidecarError::Io(msg) => SubagentError::SidecarIo(msg),
             SidecarError::Application(code, msg) => {
                 use crate::sidecar::protocol::*;
                 match code {

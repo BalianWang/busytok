@@ -34,7 +34,17 @@ pub fn resolve_by_name(
     let matches = db
         .subagent_find_by_name_in_repo(&repo_hash, &repo_hash, name)
         .map_err(SubagentError::Store)?;
-    match matches.len() {
+    // Filter out soft-deleted tombstones at the Rust level so delegate never
+    // revives a tombstoned subagent. The partial unique index
+    // `idx_subagent_unique_active_name` guarantees at most one non-deleted row
+    // per (project_id, repo_hash, name), so after filtering `matches` has at
+    // most one row — `AmbiguousName` is unreachable in practice but kept as a
+    // defensive guard. (Mirrors the filter in `lookup_by_name_impl`.)
+    let active: Vec<_> = matches
+        .into_iter()
+        .filter(|r| r.status != "deleted")
+        .collect();
+    match active.len() {
         0 => Ok(Resolved {
             subagent: create_subagent(
                 db,
@@ -47,7 +57,7 @@ pub fn resolve_by_name(
             created: true,
         }),
         1 => Ok(Resolved {
-            subagent: row_to_model(&matches[0]),
+            subagent: row_to_model(&active[0]),
             created: false,
         }),
         _ => Err(SubagentError::AmbiguousName(name.to_string())),

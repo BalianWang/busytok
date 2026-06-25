@@ -115,11 +115,17 @@ pub fn find_by_name_in_repo(
     repo_hash: &str,
     name: &str,
 ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+    // NOTE: deliberately NOT filtering `status != 'deleted'` at the SQL level.
+    // Callers that need to exclude tombstones (e.g. `resolve_by_name`,
+    // `lookup_by_name`) apply a Rust-level filter on the returned rows so the
+    // `include_deleted` flag in `lookup_by_name_impl` actually takes effect.
+    // Filtering here would make `lookup_by_name_include_deleted` unable to
+    // reach soft-deleted rows, breaking hard-delete-by-name.
     let mut stmt = conn.prepare(
         "SELECT id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
                 default_model, status, created_at_ms, updated_at_ms, last_active_at_ms \
          FROM subagent_logical_subagents \
-         WHERE project_id = ?1 AND repo_hash = ?2 AND name = ?3 AND status != 'deleted'",
+         WHERE project_id = ?1 AND repo_hash = ?2 AND name = ?3",
     )?;
     let rows = stmt
         .query_map(params![project_id, repo_hash, name], |row| {
@@ -511,6 +517,43 @@ pub fn commit_hot_binding_and_status(
     .with_context(|| format!("set logical status hot for {subagent_id}"))?;
     tx.commit()
         .context("commit hot binding + status transaction")?;
+    Ok(())
+}
+
+/// Atomically: (1) upsert the (now-closed) binding, (2) roll the logical
+/// subagent status to `new_status` (`warm` or `cold`). Both writes commit in a
+/// single transaction so the spec §3.3 invariant ("status='hot' iff is_hot=1
+/// binding exists") holds at every observable point — without this, hibernate
+/// would briefly leave `status='hot'` with no `is_hot=1` binding between the
+/// binding flip and the status flip.
+///
+/// Mirrors `commit_hot_binding_and_status` but for the hibernate (cool-down)
+/// direction. The caller must pre-populate `binding` with `is_hot=0`,
+/// `status='closed'`, and `closed_at_ms=Some(now)` before calling.
+///
+/// `status='deleted'` tombstones are excluded from the logical status update
+/// (Plan 1 deletion semantics) — a hibernate on an already-soft-deleted
+/// subagent must not revive it. The binding is still upserted (bindings are
+/// not tombstone-protected, only logical status is — same rule as
+/// `release_hot_bindings_for_shutdown`).
+pub fn commit_hibernate_binding_and_status(
+    conn: &Connection,
+    binding: &SubagentHarnessBindingRow,
+    subagent_id: &str,
+    new_status: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    upsert_binding(&tx, binding)?;
+    let now = busytok_domain::now_ms();
+    tx.execute(
+        "UPDATE subagent_logical_subagents SET status = ?1, updated_at_ms = ?2, \
+            last_active_at_ms = COALESCE(last_active_at_ms, ?2) \
+         WHERE id = ?3 AND status != 'deleted'",
+        params![new_status, now, subagent_id],
+    )
+    .with_context(|| format!("set logical status {new_status} for {subagent_id}"))?;
+    tx.commit()
+        .context("commit hibernate binding + status transaction")?;
     Ok(())
 }
 

@@ -289,6 +289,16 @@ impl SubagentManager {
     pub async fn hibernate(&self, resolve: ResolveParams) -> Result<String> {
         let db = self.db.lock().expect("subagent db lock poisoned");
         let sub = self.resolve(&db, &resolve)?;
+        // Compute new_status (warm/cold based on memory) BEFORE the transaction.
+        // The status follows the invariant: memory exists → warm, else cold.
+        let new_status = match db
+            .subagent_get_memory(&sub.id)
+            .map_err(SubagentError::Store)?
+            .and_then(|m| m.hot_summary)
+        {
+            Some(_) => SubagentStatus::Warm,
+            None => SubagentStatus::Cold,
+        };
         let binding = db
             .subagent_hot_binding(&sub.id, &self.adapter)
             .map_err(SubagentError::Store)?;
@@ -297,8 +307,23 @@ impl SubagentManager {
             b.is_hot = 0;
             b.status = "closed".to_string();
             b.closed_at_ms = Some(now);
-            db.subagent_upsert_binding(&b)
-                .map_err(SubagentError::Store)?;
+            // Spec §3.3 invariant: status='hot' iff is_hot=1 binding exists.
+            // Commit the binding flip (is_hot=0, status='closed') AND the
+            // logical status flip (warm/cold) in a single transaction so
+            // readers never observe `status='hot'` with no `is_hot=1` binding.
+            // Mirrors the delegate path's `commit_hot_binding_and_status`.
+            db.subagent_commit_hibernate_binding_and_status(&b, &sub.id, new_status.as_str())
+                .map_err(|e| {
+                    error!(
+                        event_code = "subagent.session.hibernate_commit_failed",
+                        error = %e,
+                        "hibernate binding+status commit failed; invariant may be violated"
+                    );
+                    SubagentError::Store(e)
+                })?;
+            // Resource event is observational (audit), not invariant-critical,
+            // so it stays OUTSIDE the transaction. If this insert fails the
+            // §3.3 invariant still holds — we only lose an audit row.
             db.subagent_insert_resource_event(&SubagentResourceEventRow {
                 id: format!("re_{}", uuid::Uuid::new_v4()),
                 event_type: "session_hibernate".to_string(),
@@ -310,17 +335,12 @@ impl SubagentManager {
             })
             .map_err(SubagentError::Store)?;
             info!(event_code = "subagent.session.hibernate", subagent_id = %sub.id, "hibernated hot session");
+        } else {
+            // No hot binding to release — just flip the logical status. The
+            // §3.3 invariant already holds (no is_hot=1 binding exists), so a
+            // non-atomic status flip is safe here.
+            self.set_logical_status(&db, &sub.id, new_status)?;
         }
-        // status follows the invariant: memory exists → warm, else cold
-        let new_status = match db
-            .subagent_get_memory(&sub.id)
-            .map_err(SubagentError::Store)?
-            .and_then(|m| m.hot_summary)
-        {
-            Some(_) => SubagentStatus::Warm,
-            None => SubagentStatus::Cold,
-        };
-        self.set_logical_status(&db, &sub.id, new_status)?;
         Ok(sub.id)
     }
 

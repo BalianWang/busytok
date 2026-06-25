@@ -60,6 +60,12 @@ fn sidecar_application_error_maps_to_subagent_error() {
 
     let e: SubagentError = SidecarError::Spawn("no node".into()).into();
     assert_eq!(e.code(), "subagent.sidecar_spawn_failed");
+
+    // IO errors (stdin/stdout pipe closed) must map to SidecarIo, NOT
+    // SidecarRpc — the two were previously indistinguishable.
+    let e: SubagentError = SidecarError::Io("pipe closed".into()).into();
+    assert!(matches!(e, SubagentError::SidecarIo(_)));
+    assert_eq!(e.code(), "subagent.sidecar_io_error");
 }
 
 // `SidecarRpcError` is part of the protocol surface; verify it round-trips
