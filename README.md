@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/BalianWang/busytok?include_prereleases)](https://github.com/BalianWang/busytok/releases)
 [![License: Apache--2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-![Busytok Dashboard](docs/screenshot.png)
+![Busytok Dashboard](docs/assets/dashboard.png)
 
 **Busytok is a local-first agent token usage audit dashboard.** It reads local AI coding agent logs (Claude Code, Codex), normalizes low-sensitive token metadata, stores it in local SQLite, and serves GUI/CLI views through a local service.
 
@@ -35,6 +35,8 @@ Press **`Cmd+Option+K`** anywhere to open the prompt palette — a floating sear
 - **One-key execution** — select a prompt and press `Enter` to execute your default action (configurable in Settings).
 - **Three action modes** — **OnlyCopy** (clipboard only), **OnlyPaste** (paste without modifying your clipboard), **Copy & Paste** (write clipboard + paste). Choose your default in Settings → Prompt Palette.
 - **Quick actions** — `⌘K` opens per-prompt actions (Copy, Paste, Edit, Delete, Toggle pin) from the palette.
+
+![Prompt Palette](docs/assets/prompt-palette.png)
 
 ## Workspace
 
