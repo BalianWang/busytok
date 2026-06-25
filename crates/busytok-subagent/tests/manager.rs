@@ -337,6 +337,85 @@ async fn resolve_with_both_id_and_name_returns_invalid_argument() {
 }
 
 #[tokio::test]
+async fn name_only_resolve_without_cwd_returns_invalid_argument() {
+    let m = manager().await;
+    // delegate first so the subagent exists
+    let _ = m.delegate(req("reviewer", "do")).await.unwrap();
+    // show by name without cwd → rejected by server-side contract
+    let err = m
+        .show(ResolveParams {
+            name: Some("reviewer".to_string()),
+            id: None,
+            cwd: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert_eq!(err.code(), "subagent.invalid_argument");
+    // hibernate by name without cwd → same
+    let err = m
+        .hibernate(ResolveParams {
+            name: Some("reviewer".to_string()),
+            id: None,
+            cwd: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    // tasks by name without cwd → same
+    let err = m
+        .tasks(
+            ResolveParams {
+                name: Some("reviewer".to_string()),
+                id: None,
+                cwd: None,
+            },
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+}
+
+#[tokio::test]
+async fn soft_then_hard_delete_by_name_succeeds() {
+    let m = manager().await;
+    let _ = m.delegate(req("reviewer", "do")).await.unwrap();
+    // soft delete by name + cwd
+    m.delete(
+        ResolveParams {
+            name: Some("reviewer".to_string()),
+            id: None,
+            cwd: Some("/tmp/repo".to_string()),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    // hard delete by same name + cwd — must reach the tombstone
+    m.delete(
+        ResolveParams {
+            name: Some("reviewer".to_string()),
+            id: None,
+            cwd: Some("/tmp/repo".to_string()),
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    // now truly gone — resolve by name returns NotFound (not tombstone)
+    let err = m
+        .show(ResolveParams {
+            name: Some("reviewer".to_string()),
+            id: None,
+            cwd: Some("/tmp/repo".to_string()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::NotFound(_)));
+}
+
+#[tokio::test]
 async fn soft_deleted_subagent_cannot_be_resolved_by_id() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();

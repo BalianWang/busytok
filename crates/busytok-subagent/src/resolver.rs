@@ -86,6 +86,25 @@ pub fn lookup_by_name(
     name: &str,
     cwd: &str,
 ) -> Result<LogicalSubagent> {
+    lookup_by_name_impl(db, name, cwd, false)
+}
+
+/// Look up by name including tombstoned rows. Used by `delete(hard=true)` so a
+/// soft-deleted subagent can still be hard-deleted by name + cwd.
+pub fn lookup_by_name_include_deleted(
+    db: &busytok_store::Database,
+    name: &str,
+    cwd: &str,
+) -> Result<LogicalSubagent> {
+    lookup_by_name_impl(db, name, cwd, true)
+}
+
+fn lookup_by_name_impl(
+    db: &busytok_store::Database,
+    name: &str,
+    cwd: &str,
+    include_deleted: bool,
+) -> Result<LogicalSubagent> {
     if !LogicalSubagent::is_valid_name(name) {
         return Err(SubagentError::InvalidName(name.to_string()));
     }
@@ -96,10 +115,14 @@ pub fn lookup_by_name(
     let matches = db
         .subagent_find_by_name_in_repo(&repo_hash, &repo_hash, name)
         .map_err(SubagentError::Store)?;
-    let active: Vec<_> = matches.iter().filter(|r| r.status != "deleted").collect();
-    match active.len() {
+    let candidates: Vec<_> = if include_deleted {
+        matches.iter().collect()
+    } else {
+        matches.iter().filter(|r| r.status != "deleted").collect()
+    };
+    match candidates.len() {
         0 => Err(SubagentError::NotFound(name.to_string())),
-        1 => Ok(row_to_model(active[0])),
+        1 => Ok(row_to_model(candidates[0])),
         _ => Err(SubagentError::AmbiguousName(name.to_string())),
     }
 }

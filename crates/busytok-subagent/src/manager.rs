@@ -268,9 +268,15 @@ impl SubagentManager {
             if let Some(id) = &resolve.id {
                 crate::resolver::resolve_by_id_include_deleted(&db, id)?
             } else {
-                // name path: tombstones are filtered by lookup_by_name, so a
-                // soft-deleted-by-name subagent is NotFound here — acceptable.
-                self.resolve(&db, &resolve)?
+                // name path: hard delete must reach tombstoned rows too
+                // (soft-delete-then-hard-delete-by-name is a valid flow).
+                let name = resolve.name.as_ref().expect("checked by resolve() below");
+                let cwd = resolve.cwd.as_deref().ok_or_else(|| {
+                    SubagentError::InvalidArgument(
+                        "cwd is required when name is provided".to_string(),
+                    )
+                })?;
+                crate::resolver::lookup_by_name_include_deleted(&db, name, cwd)?
             }
         } else {
             self.resolve(&db, &resolve)?
@@ -292,7 +298,9 @@ impl SubagentManager {
 
     /// Resolve a single subagent by UUID (`id`) or by name + cwd.
     /// Lookup-only — does NOT create (read/delete ops must not mutate identity).
-    /// Exactly one of `id` or `name` must be provided (the control contract).
+    /// Exactly one of `id` or `name` must be provided (the control contract),
+    /// and when `name` is provided `cwd` is required — the service does NOT
+    /// fall back to `"."` for direct RPC clients.
     fn resolve(&self, db: &busytok_store::Database, p: &ResolveParams) -> Result<LogicalSubagent> {
         match (&p.id, &p.name) {
             (Some(_), Some(_)) => {
@@ -311,7 +319,9 @@ impl SubagentManager {
             return resolve_by_id(db, id);
         }
         let name = p.name.as_ref().expect("checked above");
-        let cwd = p.cwd.as_deref().unwrap_or(".");
+        let cwd = p.cwd.as_deref().ok_or_else(|| {
+            SubagentError::InvalidArgument("cwd is required when name is provided".to_string())
+        })?;
         crate::resolver::lookup_by_name(db, name, cwd)
     }
 
