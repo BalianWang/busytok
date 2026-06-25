@@ -10,6 +10,7 @@ node_modules/
 /dist/
 **/coverage/
 apps/gui/dist/
+apps/pi-sidecar/dist/
 **/ephemeral/
 apps/desktop/.dart_tool/
 apps/desktop/build/
