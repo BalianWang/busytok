@@ -66,6 +66,13 @@ fn parse_versions_manifest_rejects_non_object_top_level() {
 }
 
 #[test]
+fn parse_versions_manifest_rejects_wrong_field_type() {
+    // A field with the wrong JSON type (number where a string is expected)
+    // must be rejected by serde rather than silently coerced.
+    assert!(parse_versions_manifest(r#"{"versions": [{"version": 123}]}"#).is_err());
+}
+
+#[test]
 fn parse_manifest_endpoint_accepts_https_url() {
     let eps =
         parse_manifest_endpoint("https://github.com/x/y/releases/download/v0.1.0/latest.json")

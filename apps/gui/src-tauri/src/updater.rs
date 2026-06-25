@@ -8,7 +8,7 @@
 //! `UpdaterProvider` in `apps/gui/src/api/UpdaterProvider.tsx` polls via
 //! `checkForUpdate()` in `apps/gui/src/lib/updaterClient.ts`.
 //!
-//! This module has two responsibilities:
+//! This module has three responsibilities:
 //!
 //! 1. Emit a startup tracing event so logs confirm the plugin loaded.
 //!    The plugin's own check/download activity emits its own tracing
@@ -17,6 +17,11 @@
 //!    It points the updater at a chosen tag's per-tag `latest.json` and
 //!    forces acceptance via a `true` version comparator, reusing the
 //!    proven macOS install pipeline.
+//! 3. The `list_available_versions` command — fetches the published versions
+//!    manifest (versions.json) from the release CDN via native-tls (no CORS)
+//!    so the version-history panel can list earlier releases for downgrade.
+//!    The network call runs inside the Rust runtime; its pure parser
+//!    (`parse_versions_manifest`) is unit-tested.
 
 /// Called once from `lib.rs` Tauri setup hook. Emits a tracing::info!
 /// so logs confirm the updater plugin loaded at startup.
@@ -90,15 +95,51 @@ pub async fn list_available_versions() -> Result<Vec<VersionHistoryEntryDto>, St
         url = %VERSIONS_MANIFEST_URL,
         "fetching published versions manifest"
     );
-    let body = reqwest::get(VERSIONS_MANIFEST_URL)
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let body = client
+        .get(VERSIONS_MANIFEST_URL)
+        .send()
         .await
-        .map_err(|e| format!("versions.json request failed: {e}"))?
+        .map_err(|e| {
+            tracing::warn!(
+                event_code = "tauri.list_available_versions.request_failed",
+                error = %e,
+                "versions.json request failed"
+            );
+            format!("versions.json request failed: {e}")
+        })?
         .error_for_status()
-        .map_err(|e| format!("versions.json HTTP error: {e}"))?
+        .map_err(|e| {
+            tracing::warn!(
+                event_code = "tauri.list_available_versions.http_error",
+                status = %e,
+                "versions.json returned a non-2xx response"
+            );
+            format!("versions.json HTTP error: {e}")
+        })?
         .text()
         .await
-        .map_err(|e| format!("versions.json body read failed: {e}"))?;
-    parse_versions_manifest(&body)
+        .map_err(|e| {
+            tracing::warn!(
+                event_code = "tauri.list_available_versions.body_read_failed",
+                error = %e,
+                "versions.json body read failed"
+            );
+            format!("versions.json body read failed: {e}")
+        })?;
+
+    let entries = parse_versions_manifest(&body)?;
+    tracing::info!(
+        event_code = "tauri.list_available_versions",
+        entry_count = entries.len(),
+        "fetched published versions manifest"
+    );
+    Ok(entries)
 }
 
 /// Install a user-selected version (downgrade/reinstall) by pointing the

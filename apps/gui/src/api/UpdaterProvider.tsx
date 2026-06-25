@@ -162,9 +162,9 @@ export function UpdaterProvider({ children }: { children: ReactNode }) {
     // all stable, so [] is correct and avoids a stale closure.
   }, []);
 
-  // Load the running app version once. Declared before the check effect so its
-  // promise resolves first (microtask order within a single effect flush),
-  // making currentVersion available to the mount check's telemetry.
+  // Load the running app version once. Declared before the mount-check effect.
+  // runCheck() awaits checkForUpdate() (Tauri IPC + network), so getVersion()
+  // resolves first in practice, making currentVersion available for telemetry.
   useEffect(() => {
     let cancelled = false;
     void getVersion()
