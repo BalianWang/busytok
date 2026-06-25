@@ -171,7 +171,11 @@ pub(crate) fn collect_codex_model_resolutions(
             if let Some(ref model) = event.model {
                 let key = (event.source_file_id.clone(), event.session_id.clone());
                 if seen.insert(key) {
-                    result.push((event.source_file_id.clone(), event.session_id.clone(), model.clone()));
+                    result.push((
+                        event.source_file_id.clone(),
+                        event.session_id.clone(),
+                        model.clone(),
+                    ));
                 }
             }
         }
@@ -431,8 +435,8 @@ pub(crate) fn parse_events_with_codex_model_context(
         HashMap::new();
     // turn_context lines don't carry session_id, so we key by source_path
     // (which IS the session-id basis for Codex) to avoid cross-session pollution.
-    let mut turn_context_models_by_path:
-        HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut turn_context_models_by_path: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
     let mut session_pending: HashMap<String, Vec<usize>> = HashMap::new();
 
     for tailed_line in lines {
@@ -1002,7 +1006,8 @@ pub fn scan_once(
             }
             // Also handle batches where only turn_context arrived (no usage events).
             if *agent == AgentKind::Codex {
-                backfill_changed |= cross_batch_backfill_from_turn_context(db, &batch.lines, &file_id);
+                backfill_changed |=
+                    cross_batch_backfill_from_turn_context(db, &batch.lines, &file_id);
             }
             // If backfill changed any events, rebuild model-dependent aggregates
             // (model_summary, daily_usage, sessions) to stay consistent.
@@ -2108,7 +2113,11 @@ mod tests {
         make_codex_tailed_line_with_path(text, line_num, "/fake/codex-backfill-test.jsonl")
     }
 
-    fn make_codex_tailed_line_with_path(text: &str, line_num: u64, source_path: &str) -> TailedLine {
+    fn make_codex_tailed_line_with_path(
+        text: &str,
+        line_num: u64,
+        source_path: &str,
+    ) -> TailedLine {
         TailedLine {
             text: text.to_string(),
             context: busytok_domain::ParseContext {
@@ -2135,9 +2144,7 @@ mod tests {
     }
 
     fn codex_turn_context_line(ts: &str, model: &str) -> String {
-        format!(
-            r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"{model}"}}}}"#
-        )
+        format!(r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"{model}"}}}}"#)
     }
 
     fn extract_snapshots(events: &[ParsedLogEvent]) -> Vec<&CodexTokenSnapshot> {
@@ -2293,8 +2300,14 @@ mod tests {
 
         let snapshots = extract_snapshots(&events);
         assert_eq!(snapshots.len(), 2);
-        assert!(snapshots[0].model.is_none(), "stays None — no model to backfill");
-        assert!(snapshots[1].model.is_none(), "stays None — no model to backfill");
+        assert!(
+            snapshots[0].model.is_none(),
+            "stays None — no model to backfill"
+        );
+        assert!(
+            snapshots[1].model.is_none(),
+            "stays None — no model to backfill"
+        );
     }
 
     /// Scenario 5: backfill only within same session boundary.
@@ -2430,12 +2443,8 @@ mod tests {
         event.agent = AgentKind::Codex;
         event.total_tokens = 42;
         event.model = None;
-        busytok_store::write_queries::insert_usage_events_batch(
-            db.conn(),
-            &[event],
-            "gen-test",
-        )
-        .expect("seed event insert");
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-test")
+            .expect("seed event insert");
 
         // Batch with TWO different turn_context models — ambiguous.
         let tc_a = codex_turn_context_line("2026-05-20T07:16:22.000Z", "gpt-5.4");
@@ -2493,7 +2502,9 @@ mod tests {
         db.upsert_codex_snapshot(&snapshot).expect("seed snapshot");
 
         // Verify the session is discoverable via codex_sessions_with_null_model.
-        let sessions = db.codex_sessions_with_null_model("f-snap-only").expect("query");
+        let sessions = db
+            .codex_sessions_with_null_model("f-snap-only")
+            .expect("query");
         assert!(
             sessions.contains(&"sess-snap".to_string()),
             "snapshot-only session must be found by codex_sessions_with_null_model"
@@ -2551,7 +2562,9 @@ mod tests {
         .expect("seed events");
 
         // Sanity: two unresolved sessions exist.
-        let sessions = db.codex_sessions_with_null_model("f-multi-sess").expect("query");
+        let sessions = db
+            .codex_sessions_with_null_model("f-multi-sess")
+            .expect("query");
         assert_eq!(sessions.len(), 2, "should have two unresolved sessions");
 
         // Batch with a single turn_context model — unambiguous at the batch
@@ -2594,7 +2607,8 @@ mod tests {
 
         // Seed event 2: current batch event with resolved model (already
         // written to DB by ingest_store_batch before backfill is called).
-        let mut event_current = NormalizedUsageEvent::minimal_for_test("evt-current", AgentKind::Codex);
+        let mut event_current =
+            NormalizedUsageEvent::minimal_for_test("evt-current", AgentKind::Codex);
         event_current.source_file_id = "f-xbatch".to_string();
         event_current.source_path = "/fake/xbatch.jsonl".to_string();
         event_current.session_id = "sess-xbatch".to_string();
@@ -2617,17 +2631,26 @@ mod tests {
         )];
 
         let changed = backfill_cross_batch_codex_models(&db, &resolutions);
-        assert!(changed, "backfill should succeed when DB has single matching model");
+        assert!(
+            changed,
+            "backfill should succeed when DB has single matching model"
+        );
 
         let events = db.all_usage_events().expect("query events");
         assert_eq!(events.len(), 2);
-        let prior = events.iter().find(|e| e.id == "evt-prior").expect("evt-prior");
+        let prior = events
+            .iter()
+            .find(|e| e.id == "evt-prior")
+            .expect("evt-prior");
         assert_eq!(
             prior.model.as_deref(),
             Some("gpt-5.4"),
             "prior NULL-model event should be backfilled with the resolved model"
         );
-        let current = events.iter().find(|e| e.id == "evt-current").expect("evt-current");
+        let current = events
+            .iter()
+            .find(|e| e.id == "evt-current")
+            .expect("evt-current");
         assert_eq!(
             current.model.as_deref(),
             Some("gpt-5.4"),
@@ -2655,7 +2678,8 @@ mod tests {
         event_null.model = None;
 
         // Seed event 2: already has a DIFFERENT model from the batch.
-        let mut event_existing = NormalizedUsageEvent::minimal_for_test("evt-existing", AgentKind::Codex);
+        let mut event_existing =
+            NormalizedUsageEvent::minimal_for_test("evt-existing", AgentKind::Codex);
         event_existing.source_file_id = "f-mismatch".to_string();
         event_existing.source_path = "/fake/mismatch.jsonl".to_string();
         event_existing.session_id = "sess-mismatch".to_string();
@@ -2680,17 +2704,26 @@ mod tests {
         )];
 
         let changed = backfill_cross_batch_codex_models(&db, &resolutions);
-        assert!(!changed, "backfill must skip when DB model differs from batch model");
+        assert!(
+            !changed,
+            "backfill must skip when DB model differs from batch model"
+        );
 
         let events = db.all_usage_events().expect("query events");
         assert_eq!(events.len(), 2);
         // The NULL event must NOT be overwritten with the wrong model.
-        let null_event = events.iter().find(|e| e.id == "evt-null").expect("evt-null");
+        let null_event = events
+            .iter()
+            .find(|e| e.id == "evt-null")
+            .expect("evt-null");
         assert!(
             null_event.model.is_none(),
             "NULL event must NOT be backfilled with mismatched model"
         );
-        let existing_event = events.iter().find(|e| e.id == "evt-existing").expect("evt-existing");
+        let existing_event = events
+            .iter()
+            .find(|e| e.id == "evt-existing")
+            .expect("evt-existing");
         assert_eq!(
             existing_event.model.as_deref(),
             Some("o4-mini"),

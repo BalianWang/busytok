@@ -585,11 +585,13 @@ fn process_file_change(
     // update earlier events from previous batches that had NULL model.
     let mut backfill_changed = false;
     if !codex_model_resolutions.is_empty() {
-        backfill_changed |= crate::scan::backfill_cross_batch_codex_models(db, &codex_model_resolutions);
+        backfill_changed |=
+            crate::scan::backfill_cross_batch_codex_models(db, &codex_model_resolutions);
     }
     // Also handle batches where only turn_context arrived (no usage events).
     if agent == AgentKind::Codex {
-        backfill_changed |= crate::scan::cross_batch_backfill_from_turn_context(db, &batch.lines, &file_id);
+        backfill_changed |=
+            crate::scan::cross_batch_backfill_from_turn_context(db, &batch.lines, &file_id);
     }
     // If backfill changed any events, rebuild model-dependent aggregates.
     if backfill_changed {
@@ -951,7 +953,10 @@ mod tests {
         let initial = supervisor
             .run_scan_with_sources(vec![source.clone()])
             .expect("initial scan");
-        assert_eq!(initial.events_found, 1, "batch 1 should produce 1 delta event");
+        assert_eq!(
+            initial.events_found, 1,
+            "batch 1 should produce 1 delta event"
+        );
 
         // Verify batch 1's event has NULL model.
         let db_handle: Arc<std::sync::Mutex<Database>> = supervisor.db_handle().clone();
@@ -1042,7 +1047,10 @@ mod tests {
         let initial = supervisor
             .run_scan_with_sources(vec![source.clone()])
             .expect("initial scan");
-        assert_eq!(initial.events_found, 1, "batch 1 should produce 1 delta event");
+        assert_eq!(
+            initial.events_found, 1,
+            "batch 1 should produce 1 delta event"
+        );
 
         let db_handle: Arc<std::sync::Mutex<Database>> = supervisor.db_handle().clone();
 
