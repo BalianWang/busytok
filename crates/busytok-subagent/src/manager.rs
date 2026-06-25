@@ -222,7 +222,7 @@ impl SubagentManager {
                 created_at_ms: now,
             })
             .map_err(SubagentError::Store)?;
-            info!(event_code = "subagent.hibernate", subagent_id = %sub.id, "hibernated hot session");
+            info!(event_code = "subagent.session.hibernate", subagent_id = %sub.id, "hibernated hot session");
         }
         // status follows the invariant: memory exists → warm, else cold
         let new_status = match db
@@ -275,13 +275,9 @@ impl SubagentManager {
             "pi/search-cheap" => Some(self.settings.models.default_cheap_model.clone()),
             "pi/review-cheap" => Some(self.settings.models.default_review_model.clone()),
             "pi/plan-cheap" => Some(self.settings.models.default_reasoning_model.clone()),
-            other => self
-                .settings
-                .profiles
-                .get(other)
-                .map(|p| p.model.clone())
-                .filter(|m| !m.is_empty()),
+            other => self.settings.profiles.get(other).map(|p| p.model.clone()),
         }
+        .filter(|m| !m.is_empty())
     }
 
     /// Persist the most recent task summary as the recoverable `hot_summary`.
@@ -326,7 +322,14 @@ fn task_row_to_summary(r: SubagentTaskRow) -> SubagentTaskSummary {
         id: r.id,
         subagent_id: r.subagent_id,
         profile: r.profile,
-        status: r.status.parse().unwrap_or(TaskStatus::Queued),
+        status: r.status.parse().unwrap_or_else(|s| {
+            warn!(
+                event_code = "subagent.task.parse_status_failed",
+                raw_status = %s,
+                "failed to parse task status, falling back to Queued"
+            );
+            TaskStatus::Queued
+        }),
         prompt: r.prompt,
         result_summary: r.result_summary,
         error: r.error,

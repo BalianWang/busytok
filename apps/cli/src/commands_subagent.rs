@@ -256,11 +256,9 @@ fn print_detail(value: &serde_json::Value, output: &str) -> Result<()> {
                 .or_else(|| value.get("subagent_name").and_then(|v| v.as_str()))
                 .unwrap_or("?");
             let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            let tier = value.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
             println!("id:     {id}");
             println!("name:   {name}");
             println!("status: {status}");
-            println!("tier:   {tier}");
         }
     }
     Ok(())

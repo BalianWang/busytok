@@ -133,10 +133,14 @@ pub fn row_to_model(r: &SubagentLogicalSubagentRow) -> LogicalSubagent {
         intent: r.intent.clone(),
         default_profile: r.default_profile.clone(),
         default_model: r.default_model.clone(),
-        status: r
-            .status
-            .parse()
-            .unwrap_or(crate::models::SubagentStatus::Cold),
+        status: r.status.parse().unwrap_or_else(|s| {
+            tracing::warn!(
+                event_code = "subagent.session.parse_status_failed",
+                raw_status = %s,
+                "failed to parse subagent status, falling back to Cold"
+            );
+            crate::models::SubagentStatus::Cold
+        }),
         created_at_ms: r.created_at_ms,
         updated_at_ms: r.updated_at_ms,
         last_active_at_ms: r.last_active_at_ms,
