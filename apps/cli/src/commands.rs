@@ -18,7 +18,7 @@ use busytok_runtime::BusytokSupervisor;
 use busytok_store::Database;
 
 /// Connect to the control server and return a client.
-async fn connect_client() -> Result<ControlClient> {
+pub(crate) async fn connect_client() -> Result<ControlClient> {
     let endpoint = if let Ok(s) = std::env::var("BUSYTOK_SOCKET") {
         s
     } else {
