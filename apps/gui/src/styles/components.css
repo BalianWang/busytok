@@ -33,7 +33,7 @@
   display: flex; align-items: center; gap: 10px;
   border: 0; border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--color-text-muted);             /* recedes at rest */
+  color: var(--color-nav-text);                /* readable primary-nav rest state */
   font-size: 13.5px; padding: 0 12px;
   cursor: pointer; text-align: left;
   position: relative;

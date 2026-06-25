@@ -279,12 +279,11 @@ export function buildOverviewHeatmapModel(dto: OverviewHeatmapDto): OverviewHeat
 
   if (nonZeroDays.length === 0) {
     legendLevels = [0];
-  } else if (nonZeroDays.length < 4) {
-    legendLevels = [0, 1];
-    for (const day of nonZeroDays) {
-      day.intensity = 1;
-    }
   } else {
+    // All non-zero cases use the same quartile-binned 5-tier ramp.
+    // The former "sparse" path (<4 active days) forced every active day
+    // to intensity=1, collapsing different token counts into the same
+    // colour — a heatmap with no heat.
     legendLevels = [0, 1, 2, 3, 4];
     const values = nonZeroDays.map((d) => d.tokens!);
     values.sort((a, b) => Number(a - b));
@@ -413,7 +412,7 @@ function computeSummary(
 
 /** Summarized heatmap distribution emitted to the logging system when the
  *  model is built, so "user can't see activity" reports can be triaged:
- *  was the year sparse (few legend tiers), all-zero, or fully binned?
+ *  was the year sparse (few active days), all-zero, or fully binned?
  *
  *  Pure derivation over the model — no side effects — so it is unit-testable
  *  independently of the React/logging layers. */
@@ -442,9 +441,10 @@ export function summarizeHeatmapForDiagnostics(model: OverviewHeatmapModel): Hea
     legend_levels: model.legendLevels,
     total_cells: totalCells,
     active_days: activeDays,
-    // <=2 distinct tiers means the no-activity ([0]) or sparse-active ([0,1])
-    // path — the scenario where empty-vs-level-1 contrast matters most.
-    sparse: model.legendLevels.length <= 2,
+    // Sparse is decoupled from legend-binning: it records data-scarcity for
+    // observability, while the heatmap always uses a full 5-tier ramp.
+    // Threshold: fewer than 4 active days in the 12-month window.
+    sparse: activeDays < 4,
   };
 }
 

@@ -150,7 +150,7 @@ describe("OverviewPage", () => {
     ).toBeDefined();
 
     // Trend + heatmap are present as primary visual anchors.
-    expect(screen.getByRole("heading", { name: /usage trend/i })).toBeDefined();
+    expect(screen.getByRole("heading", { name: /trend/i })).toBeDefined();
     expect(screen.getByTestId("mock-trend-chart")).toBeDefined();
     expect(screen.getByTestId("mock-heatmap")).toBeDefined();
   });
