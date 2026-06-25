@@ -31,7 +31,8 @@ pub use read_models::DailyUsageTrendRow;
 pub use repository::{
     CodexTokenSnapshotRow, DailyUsageRow, DiagnosticEventRow, LogFileRow, LogSourceRow,
     ModelSummaryRow, ModelUsageRow, ProjectRow, RealtimeSummaryRow, RollupRows, SessionRow,
-    StoreHealthInfo, StoreWriteBatch,
+    StoreHealthInfo, StoreWriteBatch, SubagentHarnessBindingRow, SubagentLogicalSubagentRow,
+    SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
