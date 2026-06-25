@@ -96,7 +96,11 @@ pub(crate) fn backfill_cross_batch_codex_models(
     let mut any_updated = false;
     for (source_file_id, session_id, model) in codex_model_resolutions {
         match db.distinct_codex_models_for_session(source_file_id, session_id) {
-            Ok(models) if models.len() == 1 => {
+            // Explicit model comparison (not just len() == 1): defends against
+            // call-order changes where the current batch's model might differ
+            // from what's already in the DB. Mirrors the check in
+            // cross_batch_backfill_from_turn_context.
+            Ok(models) if models.len() == 1 && models[0] == *model => {
                 match db.backfill_codex_model_for_session(source_file_id, session_id, model) {
                     Ok(updated) if updated > 0 => {
                         any_updated = true;
@@ -128,6 +132,16 @@ pub(crate) fn backfill_cross_batch_codex_models(
                     source_file_id = %source_file_id,
                     seen_models = ?models,
                     "Cross-batch backfill skipped: multiple distinct models in session"
+                );
+            }
+            Ok(models) if models.len() == 1 && models[0] != *model => {
+                warn!(
+                    event_code = "codex_model_backfill_skipped_model_mismatch",
+                    session_id = %session_id,
+                    source_file_id = %source_file_id,
+                    batch_model = %model,
+                    db_model = %models[0],
+                    "Cross-batch backfill skipped: DB model differs from batch model"
                 );
             }
             Ok(_) => {}
@@ -297,6 +311,10 @@ pub(crate) fn cross_batch_backfill_from_turn_context(
 ///
 /// This function rebuilds those tables from the full event corpus, mirroring
 /// what `handle_rebuild_rollups` does in the writer actor.
+///
+/// Error policy: fail-fast. If any table rebuild fails, return immediately
+/// without touching the remaining tables. A half-rebuilt aggregate state is
+/// worse than no rebuild at all — the next scan cycle will retry.
 pub(crate) fn rebuild_model_aggregates(db: &Database, timezone: &str) {
     let all_events = match db.all_usage_events() {
         Ok(events) => events,
@@ -316,8 +334,9 @@ pub(crate) fn rebuild_model_aggregates(db: &Database, timezone: &str) {
         warn!(
             event_code = "codex_model_aggregate_rebuild_failed",
             error = %e,
-            "Failed to replace model summaries after backfill"
+            "Failed to replace model summaries after backfill; aborting rebuild"
         );
+        return;
     }
 
     // Rebuild sessions (carries model column).
@@ -326,20 +345,12 @@ pub(crate) fn rebuild_model_aggregates(db: &Database, timezone: &str) {
         warn!(
             event_code = "codex_model_aggregate_rebuild_failed",
             error = %e,
-            "Failed to replace sessions after backfill"
-        );
-    }
-
-    // Rebuild daily_usage (has model in grouping key).
-    // Must DELETE first, then re-insert, because the model field changed.
-    if let Err(e) = db.delete_daily_usage() {
-        warn!(
-            event_code = "codex_model_aggregate_rebuild_failed",
-            error = %e,
-            "Failed to delete daily_usage for rebuild"
+            "Failed to replace sessions after backfill; aborting rebuild"
         );
         return;
     }
+
+    // Rebuild daily_usage atomically (DELETE + upsert in one transaction).
     let rtz = match busytok_domain::ReportingTimezone::parse(timezone) {
         Ok(tz) => tz,
         Err(e) => {
@@ -347,23 +358,18 @@ pub(crate) fn rebuild_model_aggregates(db: &Database, timezone: &str) {
                 event_code = "codex_model_aggregate_rebuild_failed",
                 error = %e,
                 timezone = %timezone,
-                "Failed to parse timezone for daily_usage rebuild"
+                "Failed to parse timezone for daily_usage rebuild; aborting rebuild"
             );
             return;
         }
     };
-    let conn = db.conn();
-    if let Err(e) = busytok_store::write_queries::upsert_daily_usage_for_events(
-        conn,
-        &all_events,
-        &rtz,
-        "rebuild-after-backfill",
-    ) {
+    if let Err(e) = db.replace_daily_usage(&all_events, &rtz, "rebuild-after-backfill") {
         warn!(
             event_code = "codex_model_aggregate_rebuild_failed",
             error = %e,
-            "Failed to upsert daily_usage after backfill"
+            "Failed to replace daily_usage after backfill; aborting rebuild"
         );
+        return;
     }
 
     info!(
@@ -2565,6 +2571,130 @@ mod tests {
         assert!(
             events.iter().all(|e| e.model.is_none()),
             "all events must remain NULL after multi-session skip"
+        );
+    }
+
+    /// Regression: `backfill_cross_batch_codex_models` path — when the current
+    /// batch contains a Codex usage event WITH a model, earlier NULL-model
+    /// events from prior batches should be backfilled. This exercises the
+    /// `collect_codex_model_resolutions` → `backfill_cross_batch_codex_models`
+    /// path (not the turn_context-only path).
+    #[test]
+    fn backfill_cross_batch_codex_models_backfills_from_usage_event() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed event 1: prior batch event with NULL model (backfill candidate).
+        let mut event_prior = NormalizedUsageEvent::minimal_for_test("evt-prior", AgentKind::Codex);
+        event_prior.source_file_id = "f-xbatch".to_string();
+        event_prior.source_path = "/fake/xbatch.jsonl".to_string();
+        event_prior.session_id = "sess-xbatch".to_string();
+        event_prior.agent = AgentKind::Codex;
+        event_prior.total_tokens = 42;
+        event_prior.model = None;
+
+        // Seed event 2: current batch event with resolved model (already
+        // written to DB by ingest_store_batch before backfill is called).
+        let mut event_current = NormalizedUsageEvent::minimal_for_test("evt-current", AgentKind::Codex);
+        event_current.source_file_id = "f-xbatch".to_string();
+        event_current.source_path = "/fake/xbatch.jsonl".to_string();
+        event_current.session_id = "sess-xbatch".to_string();
+        event_current.agent = AgentKind::Codex;
+        event_current.total_tokens = 58;
+        event_current.model = Some("gpt-5.4".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(
+            db.conn(),
+            &[event_prior, event_current],
+            "gen-test",
+        )
+        .expect("seed events");
+
+        // Simulate collect_codex_model_resolutions output for the current batch.
+        let resolutions = vec![(
+            "f-xbatch".to_string(),
+            "sess-xbatch".to_string(),
+            "gpt-5.4".to_string(),
+        )];
+
+        let changed = backfill_cross_batch_codex_models(&db, &resolutions);
+        assert!(changed, "backfill should succeed when DB has single matching model");
+
+        let events = db.all_usage_events().expect("query events");
+        assert_eq!(events.len(), 2);
+        let prior = events.iter().find(|e| e.id == "evt-prior").expect("evt-prior");
+        assert_eq!(
+            prior.model.as_deref(),
+            Some("gpt-5.4"),
+            "prior NULL-model event should be backfilled with the resolved model"
+        );
+        let current = events.iter().find(|e| e.id == "evt-current").expect("evt-current");
+        assert_eq!(
+            current.model.as_deref(),
+            Some("gpt-5.4"),
+            "current event model should be unchanged"
+        );
+    }
+
+    /// Regression: `backfill_cross_batch_codex_models` must skip when the DB
+    /// already has a different model for the session (explicit model mismatch,
+    /// not just len() > 1). Seeds BOTH a NULL-model event AND a different-model
+    /// event so the test actually exercises the mismatch guard — without it,
+    /// `len() == 1` alone would pass and the NULL event would be wrongly
+    /// overwritten with the batch's model.
+    #[test]
+    fn backfill_cross_batch_codex_models_skips_on_model_mismatch() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed event 1: NULL model (candidate for backfill).
+        let mut event_null = NormalizedUsageEvent::minimal_for_test("evt-null", AgentKind::Codex);
+        event_null.source_file_id = "f-mismatch".to_string();
+        event_null.source_path = "/fake/mismatch.jsonl".to_string();
+        event_null.session_id = "sess-mismatch".to_string();
+        event_null.agent = AgentKind::Codex;
+        event_null.total_tokens = 10;
+        event_null.model = None;
+
+        // Seed event 2: already has a DIFFERENT model from the batch.
+        let mut event_existing = NormalizedUsageEvent::minimal_for_test("evt-existing", AgentKind::Codex);
+        event_existing.source_file_id = "f-mismatch".to_string();
+        event_existing.source_path = "/fake/mismatch.jsonl".to_string();
+        event_existing.session_id = "sess-mismatch".to_string();
+        event_existing.agent = AgentKind::Codex;
+        event_existing.total_tokens = 42;
+        event_existing.model = Some("o4-mini".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(
+            db.conn(),
+            &[event_null, event_existing],
+            "gen-test",
+        )
+        .expect("seed events");
+
+        // Current batch claims model is "gpt-5.4", but DB has "o4-mini".
+        // distinct_codex_models_for_session returns ["o4-mini"] (len == 1),
+        // but models[0] != "gpt-5.4" → must skip.
+        let resolutions = vec![(
+            "f-mismatch".to_string(),
+            "sess-mismatch".to_string(),
+            "gpt-5.4".to_string(),
+        )];
+
+        let changed = backfill_cross_batch_codex_models(&db, &resolutions);
+        assert!(!changed, "backfill must skip when DB model differs from batch model");
+
+        let events = db.all_usage_events().expect("query events");
+        assert_eq!(events.len(), 2);
+        // The NULL event must NOT be overwritten with the wrong model.
+        let null_event = events.iter().find(|e| e.id == "evt-null").expect("evt-null");
+        assert!(
+            null_event.model.is_none(),
+            "NULL event must NOT be backfilled with mismatched model"
+        );
+        let existing_event = events.iter().find(|e| e.id == "evt-existing").expect("evt-existing");
+        assert_eq!(
+            existing_event.model.as_deref(),
+            Some("o4-mini"),
+            "existing event model must NOT be overwritten"
         );
     }
 }

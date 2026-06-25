@@ -923,6 +923,31 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically replace all `daily_usage` rows. Wraps DELETE + upsert in a
+    /// single transaction so readers never observe an empty or half-rebuilt
+    /// table. Mirrors the `replace_model_summaries` / `replace_sessions`
+    /// pattern used elsewhere in the rebuild path.
+    pub fn replace_daily_usage(
+        &self,
+        events: &[busytok_domain::NormalizedUsageEvent],
+        rtz: &busytok_domain::ReportingTimezone,
+        generation_id: &str,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin transaction for daily_usage rebuild")?;
+        tx.execute("DELETE FROM daily_usage", [])
+            .context("failed to clear daily_usage")?;
+        // Re-use the shared upsert helper, but against the transaction's
+        // connection so the DELETE + INSERTs commit atomically.
+        crate::write_queries::upsert_daily_usage_for_events(&tx, events, rtz, generation_id)
+            .context("failed to upsert daily_usage rows during rebuild")?;
+        tx.commit()
+            .context("failed to commit daily_usage rebuild transaction")?;
+        Ok(())
+    }
+
     // ── Log files ─────────────────────────────────────────────────────
 
     /// Update the checkpoint offset for a log file (upsert).
