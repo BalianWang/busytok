@@ -1225,6 +1225,133 @@ pub struct EventSubscriptionBatchDto {
 }
 
 // ---------------------------------------------------------------------------
+// Subagent control DTOs (subagent.* methods)
+// ---------------------------------------------------------------------------
+
+// --- requests -------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentDelegateRequestDto {
+    pub subagent_name: String,
+    pub subagent_id: Option<String>,
+    pub cwd: String,
+    pub profile: String,
+    pub intent: Option<String>,
+    pub prompt: String,
+    pub timeout_seconds: Option<u64>,
+    pub model_override: Option<String>,
+    pub source_harness: Option<String>,
+    pub source_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentListRequestDto {
+    /// "hot" | "warm" | "cold"
+    pub status: Option<String>,
+    pub project: Option<String>,
+    pub include_deleted: Option<bool>,
+}
+
+/// Resolution params for single-subagent operations (show/tasks/hibernate/delete).
+/// Exactly one of `id` (UUID) or `name` (+ `cwd`) should be set.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentResolveRequestDto {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentTasksRequestDto {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentDeleteRequestDto {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+    pub hard: Option<bool>,
+}
+
+// --- responses ------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentUsageDto {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentDelegateResponseDto {
+    pub task_id: String,
+    pub subagent_id: String,
+    pub subagent_name: String,
+    pub adapter: String,
+    pub adapter_session_id: Option<String>,
+    pub session_reused: bool,
+    pub status: String,
+    pub profile: String,
+    pub model: Option<String>,
+    pub summary: Option<String>,
+    pub usage: SubagentUsageDto,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentDetailDto {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub repo_path: String,
+    pub repo_hash: String,
+    pub branch: Option<String>,
+    pub intent: Option<String>,
+    pub default_profile: String,
+    pub default_model: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_active_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentListResponseDto {
+    pub subagents: Vec<SubagentDetailDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentTaskSummaryDto {
+    pub id: String,
+    pub subagent_id: String,
+    pub profile: String,
+    pub status: String,
+    pub prompt: Option<String>,
+    pub result_summary: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentTasksResponseDto {
+    pub tasks: Vec<SubagentTaskSummaryDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentAckDto {
+    pub id: String,
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

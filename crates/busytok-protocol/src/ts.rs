@@ -159,6 +159,19 @@ mod tests {
             // Event streaming types
             dto::RuntimeEventDto::decl(),
             dto::EventSubscriptionBatchDto::decl(),
+            // Subagent control DTOs (subagent.* methods)
+            dto::SubagentUsageDto::decl(),
+            dto::SubagentDelegateResponseDto::decl(),
+            dto::SubagentResolveRequestDto::decl(),
+            dto::SubagentDelegateRequestDto::decl(),
+            dto::SubagentListRequestDto::decl(),
+            dto::SubagentDetailDto::decl(),
+            dto::SubagentListResponseDto::decl(),
+            dto::SubagentTaskSummaryDto::decl(),
+            dto::SubagentTasksRequestDto::decl(),
+            dto::SubagentTasksResponseDto::decl(),
+            dto::SubagentDeleteRequestDto::decl(),
+            dto::SubagentAckDto::decl(),
         ]
         .into_iter()
         .collect();

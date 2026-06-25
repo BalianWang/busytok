@@ -38,6 +38,13 @@ pub fn method_manifest() -> Vec<String> {
         "events.subscribe".to_string(),
         // Live
         "live.window".to_string(),
+        // Subagents
+        "subagent.delegate".to_string(),
+        "subagent.list".to_string(),
+        "subagent.show".to_string(),
+        "subagent.tasks".to_string(),
+        "subagent.hibernate".to_string(),
+        "subagent.delete".to_string(),
     ]
 }
 

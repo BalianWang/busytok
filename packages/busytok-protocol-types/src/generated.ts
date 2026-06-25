@@ -268,3 +268,31 @@ watermark_ms: number | null,
 is_exact: boolean, };
 
 export type EventSubscriptionBatchDto = { events: Array<RuntimeEventDto>, };
+
+export type SubagentUsageDto = { model: string | null, provider: string | null, input_tokens: number | null, output_tokens: number | null, cache_read_tokens: number | null, cache_write_tokens: number | null, cost_usd: number | null, };
+
+export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string, subagent_name: string, adapter: string, adapter_session_id: string | null, session_reused: boolean, status: string, profile: string, model: string | null, summary: string | null, usage: SubagentUsageDto, };
+
+export type SubagentResolveRequestDto = { name: string | null, id: string | null, cwd: string | null, };
+
+export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: string | null, cwd: string, profile: string, intent: string | null, prompt: string, timeout_seconds: number | null, model_override: string | null, source_harness: string | null, source_session_id: string | null, };
+
+export type SubagentListRequestDto = { 
+/**
+ * "hot" | "warm" | "cold"
+ */
+status: string | null, project: string | null, include_deleted: boolean | null, };
+
+export type SubagentDetailDto = { id: string, name: string, project_id: string, repo_path: string, repo_hash: string, branch: string | null, intent: string | null, default_profile: string, default_model: string | null, status: string, created_at_ms: number, updated_at_ms: number, last_active_at_ms: number | null, };
+
+export type SubagentListResponseDto = { subagents: Array<SubagentDetailDto>, };
+
+export type SubagentTaskSummaryDto = { id: string, subagent_id: string, profile: string, status: string, prompt: string | null, result_summary: string | null, error: string | null, created_at_ms: number, completed_at_ms: number | null, };
+
+export type SubagentTasksRequestDto = { name: string | null, id: string | null, cwd: string | null, limit: number | null, };
+
+export type SubagentTasksResponseDto = { tasks: Array<SubagentTaskSummaryDto>, };
+
+export type SubagentDeleteRequestDto = { name: string | null, id: string | null, cwd: string | null, hard: boolean | null, };
+
+export type SubagentAckDto = { id: string, status: string, };
