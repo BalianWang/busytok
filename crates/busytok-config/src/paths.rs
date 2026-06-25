@@ -7,6 +7,7 @@ const DB_NAME: &str = "busytok.db";
 const SOCKET_NAME: &str = "busytok.sock";
 const PRICE_CATALOG_NAME: &str = "price-catalog.json";
 const LOGS_DIR_NAME: &str = "logs";
+pub const ARTIFACTS_DIR_NAME: &str = "artifacts";
 
 /// Resolves local filesystem paths for the Busytok service.
 ///
@@ -125,14 +126,21 @@ impl BusytokPaths {
         self.data_dir.join(PRICE_CATALOG_NAME)
     }
 
+    /// Root for large subagent artifacts (logs, patches, traces).
+    /// Full layout: `<artifacts_dir>/<subagent_id>/<task_id>/...`.
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.data_dir.join(ARTIFACTS_DIR_NAME)
+    }
+
     /// Ensures all directories exist by creating them if needed.
     ///
-    /// Creates `data_dir`, `config_dir`, `runtime_dir`, and `log_dir`.
+    /// Creates `data_dir`, `config_dir`, `runtime_dir`, `log_dir`, and `artifacts_dir`.
     pub fn ensure_dirs_exist(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.config_dir)?;
         std::fs::create_dir_all(&self.runtime_dir)?;
         std::fs::create_dir_all(self.log_dir())?;
+        std::fs::create_dir_all(self.artifacts_dir())?;
         Ok(())
     }
 }
