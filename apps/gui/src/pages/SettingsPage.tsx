@@ -936,16 +936,34 @@ export function SettingsPage() {
             <SettingsRow
               label="Software Update"
               description={updateView.description}
-              control={
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--sm"
-                  disabled={updateView.buttonDisabled}
-                  onClick={() => void (updateView.appliesUpdate ? applyUpdateNow() : checkForUpdates())}
-                >
-                  {updateView.buttonLabel}
-                </button>
-              }
+              control={(function renderControl() {
+                const c = updateView.control;
+                switch (c.kind) {
+                  case "status":
+                    return <SettingsStatus label={c.label} tone={c.tone} />;
+                  case "value":
+                    return <SettingsValue value={c.label} tone={c.tone} />;
+                  case "action":
+                    return (
+                      <SettingsActionGroup direction="row">
+                        {c.status != null &&
+                          (c.status.kind === "status" ? (
+                            <SettingsStatus label={c.status.label} tone={c.status.tone} size="dense" />
+                          ) : (
+                            <SettingsValue value={c.status.label} tone={c.status.tone} size="dense" />
+                          ))}
+                        <button
+                          type="button"
+                          className="btn btn--secondary btn--sm"
+                          disabled={c.buttonDisabled}
+                          onClick={() => void (c.appliesUpdate ? applyUpdateNow() : checkForUpdates())}
+                        >
+                          {c.buttonLabel}
+                        </button>
+                      </SettingsActionGroup>
+                    );
+                }
+              })()}
             />
             {!isMacPlatform() && (
               <SettingsRow

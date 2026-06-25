@@ -75,7 +75,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 // Pull the mocked hook in AFTER the mock is registered.
-import { useUpdater } from "../hooks/useUpdater";
+import { useUpdater, type UpdaterStatus } from "../hooks/useUpdater";
 import type { UpdaterContextValue } from "../hooks/useUpdater";
 import { SettingsPage } from "./SettingsPage";
 
@@ -242,6 +242,44 @@ describe("SettingsPage Updates section", () => {
     render(<SettingsPage />);
     expect(screen.queryByText("Version history")).toBeNull();
     expect(screen.queryByRole("button", { name: /reinstall/i })).toBeNull();
+  });
+
+  // DOM contract: the control slot renders canonical Settings components
+  // (SettingsStatus / SettingsValue / SettingsActionGroup), not faux
+  // buttons pretending to be read-outs.
+  it("control slot uses canonical controls, not faux buttons, per state", () => {
+    // ── status-only states: canonical control, no faux button ────────
+    const statusOnlyCases: Array<[UpdaterStatus["state"], string, { version?: string }?]> = [
+      ["up-to-date", "Up to date"],
+      ["checking", "Checking…"],
+      ["downloading", "Downloading…"],
+      ["installed-pending-restart", "Restarting…"],
+      ["installed-needs-manual-restart", "Restart required", { version: "0.3.0" }],
+    ] as any;
+    for (const [state, label, extra] of statusOnlyCases) {
+      mockUpdater({ status: { state, ...(extra ?? {}) } as any, checkNow: vi.fn(), applyNow: vi.fn() });
+      render(<SettingsPage />);
+      expect(screen.getByText(label)).toBeTruthy();                // control rendered
+      expect(screen.queryByRole("button", { name: label })).toBeNull(); // not a button
+    }
+
+    // ── action states: button + optional status/value present ──────────
+    // available
+    mockUpdater({ status: { state: "available", version: "0.3.0", notes: "n", date: "d" }, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByText("Update available")).toBeTruthy();     // status dot
+    expect(screen.getByRole("button", { name: /update now/i })).toBeTruthy();
+
+    // error
+    mockUpdater({ status: { state: "error", message: "boom" }, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByText("Check failed")).toBeTruthy();         // status dot
+    expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
+
+    // idle — no status label, just the button
+    mockUpdater({ status: { state: "idle" }, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByRole("button", { name: /check for updates/i })).toBeTruthy();
   });
 
 });

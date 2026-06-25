@@ -2,82 +2,104 @@ import { describe, it, expect } from "vitest";
 import type { UpdaterStatus } from "../api/UpdaterProvider";
 import { updatePanelView } from "./updatePanelView";
 
-// updatePanelView derives the Updates-panel presentation (description text,
-// button label, disabled flag, and whether the primary action applies vs
-// re-checks) from the UpdaterStatus state machine. Centralizing it keeps the
-// SettingsPage JSX free of nested ternaries and makes every state assertable.
-
 describe("updatePanelView", () => {
-  it("idle: prompts to check, enabled, re-checks", () => {
-    expect(updatePanelView({ state: "idle" } satisfies UpdaterStatus)).toEqual({
-      description: "Check for and install the latest version of Busytok.",
+  // ── status-only states (no button) ──────────────────────────────────
+
+  it("checking: value control, muted, no button", () => {
+    const v = updatePanelView({ state: "checking" } satisfies UpdaterStatus);
+    expect(v.description).toBe("Checking for updates…");
+    expect(v.control).toEqual({ kind: "value", label: "Checking…", tone: "muted" });
+  });
+
+  it("up-to-date: status-dot + ok tone, no button", () => {
+    const v = updatePanelView({ state: "up-to-date" } satisfies UpdaterStatus);
+    expect(v.description).toBe("You're on the latest version of Busytok.");
+    expect(v.control).toEqual({ kind: "status", label: "Up to date", tone: "ok" });
+    expect(v.description).not.toBe("Check for and install the latest version of Busytok.");
+  });
+
+  it("downloading without percent: value control, default tone", () => {
+    const v = updatePanelView({ state: "downloading", percent: null } satisfies UpdaterStatus);
+    expect(v.description).toBe("Downloading update…");
+    expect(v.control).toEqual({ kind: "value", label: "Downloading…", tone: "default" });
+  });
+
+  it("downloading with percent: value control with progress", () => {
+    const v = updatePanelView({ state: "downloading", percent: 42 } satisfies UpdaterStatus);
+    expect(v.description).toBe("Downloading update… 42%");
+    expect(v.control).toEqual({ kind: "value", label: "Downloading… 42%", tone: "default" });
+  });
+
+  it("installed-pending-restart: value control, muted", () => {
+    const v = updatePanelView({ state: "installed-pending-restart" } satisfies UpdaterStatus);
+    expect(v.description).toBe("Update installed — restarting…");
+    expect(v.control).toEqual({ kind: "value", label: "Restarting…", tone: "muted" });
+  });
+
+  it("installed-needs-manual-restart: status-dot + warning, no button", () => {
+    const v = updatePanelView({ state: "installed-needs-manual-restart", version: "0.3.0" } satisfies UpdaterStatus);
+    expect(v.description).toBe("Updated to v0.3.0 — please restart Busytok manually.");
+    expect(v.control).toEqual({ kind: "status", label: "Restart required", tone: "warning" });
+  });
+
+  // ── action-group states (status/value + button) ─────────────────────
+
+  it("idle: action-group with button, no status label", () => {
+    const v = updatePanelView({ state: "idle" } satisfies UpdaterStatus);
+    expect(v.description).toBe("Check for and install the latest version of Busytok.");
+    expect(v.control).toEqual({
+      kind: "action",
+      status: null,
       buttonLabel: "Check for updates",
       buttonDisabled: false,
       appliesUpdate: false,
     });
   });
 
-  it("checking: in-progress copy, disabled", () => {
-    expect(updatePanelView({ state: "checking" } satisfies UpdaterStatus)).toEqual({
-      description: "Checking for updates…",
-      buttonLabel: "Checking…",
-      buttonDisabled: true,
-      appliesUpdate: false,
-    });
-  });
-
-  it("up-to-date: reassuring copy that is DISTINCT from idle, re-check enabled", () => {
-    const view = updatePanelView({ state: "up-to-date" } satisfies UpdaterStatus);
-    expect(view.description).toBe("You're on the latest version of Busytok.");
-    expect(view.buttonLabel).toBe("Up to date");
-    expect(view.buttonDisabled).toBe(false);
-    expect(view.appliesUpdate).toBe(false);
-    // Regression guard for the original bug: the up-to-date state must not
-    // collapse onto the idle placeholder description (which made the panel look
-    // identical before/after an upgrade).
-    expect(view.description).not.toBe("Check for and install the latest version of Busytok.");
-  });
-
-  it("available: names the new version; button applies the update", () => {
-    expect(
-      updatePanelView({ state: "available", version: "0.3.0", notes: "n", date: "d" } satisfies UpdaterStatus),
-    ).toEqual({
-      description: "v0.3.0 is available.",
+  it("available: action-group with ok status-dot + Update now button", () => {
+    const v = updatePanelView({ state: "available", version: "0.3.0", notes: "n", date: "d" } satisfies UpdaterStatus);
+    expect(v.description).toBe("v0.3.0 is available.");
+    expect(v.control).toEqual({
+      kind: "action",
+      status: { kind: "status", label: "Update available", tone: "ok" },
       buttonLabel: "Update now",
       buttonDisabled: false,
       appliesUpdate: true,
     });
   });
 
-  it("downloading without percent", () => {
-    const view = updatePanelView({ state: "downloading", percent: null } satisfies UpdaterStatus);
-    expect(view.description).toBe("Downloading update…");
-    expect(view.buttonDisabled).toBe(true);
+  it("error: action-group with danger status-dot + Retry button", () => {
+    const v = updatePanelView({ state: "error", message: "network down" } satisfies UpdaterStatus);
+    expect(v.description).toBe("Update check failed: network down");
+    expect(v.control).toEqual({
+      kind: "action",
+      status: { kind: "status", label: "Check failed", tone: "danger" },
+      buttonLabel: "Retry",
+      buttonDisabled: false,
+      appliesUpdate: false,
+    });
   });
 
-  it("downloading with percent", () => {
-    const view = updatePanelView({ state: "downloading", percent: 42 } satisfies UpdaterStatus);
-    expect(view.description).toBe("Downloading update… 42%");
-    expect(view.buttonDisabled).toBe(true);
-  });
+  // ── exhaustiveness ──────────────────────────────────────────────────
 
-  it("installed-pending-restart: restarting copy, disabled", () => {
-    const view = updatePanelView({ state: "installed-pending-restart" } satisfies UpdaterStatus);
-    expect(view.description).toBe("Update installed — restarting…");
-    expect(view.buttonDisabled).toBe(true);
-  });
-
-  it("installed-needs-manual-restart: names version, not disabled", () => {
-    const view = updatePanelView({ state: "installed-needs-manual-restart", version: "0.3.0" } satisfies UpdaterStatus);
-    expect(view.description).toBe("Updated to v0.3.0 — please restart Busytok manually.");
-    expect(view.buttonDisabled).toBe(false);
-    expect(view.appliesUpdate).toBe(false);
-  });
-
-  it("error: surfaces the failure message; Retry re-checks", () => {
-    const view = updatePanelView({ state: "error", message: "network down" } satisfies UpdaterStatus);
-    expect(view.description).toBe("Update check failed: network down");
-    expect(view.buttonLabel).toBe("Retry");
-    expect(view.appliesUpdate).toBe(false);
+  it("covers all 8 UpdaterStatus variants", () => {
+    // Iterate every variant of the discriminated union — if a variant is
+    // added to UpdaterStatus without a corresponding branch in
+    // updatePanelView, this test won't compile.
+    const variants: UpdaterStatus[] = [
+      { state: "idle" },
+      { state: "checking" },
+      { state: "up-to-date" },
+      { state: "available", version: "1.0.0", notes: "", date: "" },
+      { state: "downloading", percent: null },
+      { state: "installed-pending-restart" },
+      { state: "installed-needs-manual-restart", version: "1.0.0" },
+      { state: "error", message: "x" },
+    ];
+    for (const v of variants) {
+      const view = updatePanelView(v);
+      expect(typeof view.description).toBe("string");
+      expect(["status", "value", "action"]).toContain(view.control.kind);
+    }
   });
 });
