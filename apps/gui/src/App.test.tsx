@@ -423,7 +423,7 @@ describe("App", () => {
     renderApp(<App />);
     // Wait for overview data to load
     await waitFor(() => {
-      expect(screen.getByText("Usage Trend")).toBeDefined();
+      expect(screen.getByRole("heading", { name: "Trend" })).toBeDefined();
     });
     await user.click(screen.getByRole("button", { name: "Settings" }));
     await waitFor(() => {
@@ -432,7 +432,7 @@ describe("App", () => {
     });
     await user.click(screen.getByRole("button", { name: "Overview" }));
     await waitFor(() => {
-      expect(screen.getByText("Usage Trend")).toBeDefined();
+      expect(screen.getByRole("heading", { name: "Trend" })).toBeDefined();
     });
   });
 

@@ -59,9 +59,9 @@ export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelP
   // ── Error ────────────────────────────────────────────────────────────
   if (isError) {
     return (
-      <section className="overview-console__trend" aria-label="Usage trend">
+      <section className="overview-console__trend" aria-label="Trend">
         <div className="overview-console__trend-header">
-          <h2>Usage Trend</h2>
+          <h2>Trend</h2>
         </div>
         <div className="overview-console__chart">
           <div className="overview-console__chart-empty">Trend data unavailable</div>
@@ -73,9 +73,9 @@ export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelP
   // ── Loading ──────────────────────────────────────────────────────────
   if (isLoading || !envelope) {
     return (
-      <section className="overview-console__trend" aria-label="Usage trend">
+      <section className="overview-console__trend" aria-label="Trend">
         <div className="overview-console__trend-header">
-          <h2>Usage Trend</h2>
+          <h2>Trend</h2>
         </div>
         <div className="overview-console__chart">
           <PanelSkeleton variant="chart" />
@@ -88,7 +88,7 @@ export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelP
   const showStale = isFetching && envelope.is_stale;
 
   return (
-    <section className="overview-console__trend" aria-label="Usage trend">
+    <section className="overview-console__trend" aria-label="Trend">
       {showStale && (
         <div className="overview-panel__stale-banner" role="status">
           Refreshing trend data...
@@ -96,7 +96,7 @@ export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelP
       )}
 
       <div className="overview-console__trend-header">
-        <h2>Usage Trend</h2>
+        <h2>Trend</h2>
         <div className="overview-console__trend-controls">
           <SegmentedControl
             label="Range"
