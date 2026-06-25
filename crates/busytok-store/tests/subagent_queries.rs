@@ -76,7 +76,7 @@ fn memory_upsert_is_idempotent_on_subagent_id() {
     let db = db();
     let sa = SubagentLogicalSubagentRow::for_test("sa-1", "r");
     db.subagent_upsert_logical(&sa).unwrap();
-    let mut mem = busytok_store::repository::SubagentMemoryRow::for_test("sa-1");
+    let mut mem = busytok_store::repository::SubagentMemoryRow::new_empty("sa-1");
     mem.hot_summary = Some("first".to_string());
     db.subagent_upsert_memory(&mem).unwrap();
     mem.hot_summary = Some("second".to_string());

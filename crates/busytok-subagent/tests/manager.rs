@@ -217,17 +217,31 @@ async fn delegate_with_model_override_wins_over_profile_model() {
 }
 
 #[tokio::test]
-async fn delegate_with_unknown_profile_falls_back_to_no_model() {
+async fn delegate_with_unknown_profile_returns_profile_not_found() {
     let m = manager().await;
-    let r = m
+    let err = m
         .delegate(DelegateRequest {
             profile: "custom/unknown".to_string(),
             ..req("reviewer", "do")
         })
         .await
+        .err()
         .unwrap();
-    // unknown profile → profile_model returns None → model is None
-    assert!(r.model.is_none());
+    assert_eq!(err.code(), "subagent.profile_not_found");
+}
+
+#[tokio::test]
+async fn delegate_with_unknown_profile_and_model_override_succeeds() {
+    let m = manager().await;
+    let r = m
+        .delegate(DelegateRequest {
+            profile: "custom/unknown".to_string(),
+            model_override: Some("gpt-4o".to_string()),
+            ..req("reviewer", "do")
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.model.as_deref(), Some("gpt-4o"));
     assert_eq!(r.profile, "custom/unknown");
 }
 

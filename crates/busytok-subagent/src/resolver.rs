@@ -117,7 +117,7 @@ fn create_subagent(
     db.subagent_upsert_logical(&row)
         .map_err(SubagentError::Store)?;
     // seed an empty memory row so hibernate/restore always finds one
-    db.subagent_upsert_memory(&SubagentMemoryRow::for_test(&id))
+    db.subagent_upsert_memory(&SubagentMemoryRow::new_empty(&id))
         .map_err(SubagentError::Store)?;
     Ok(row_to_model(&row))
 }

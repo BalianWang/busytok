@@ -42,6 +42,16 @@ impl SubagentManager {
             );
             return Err(SubagentError::Disabled);
         }
+        // Unknown profile with no model override → fail fast so callers surface
+        // configuration typos instead of silently running model-less.
+        if req.model_override.is_none() && !self.profile_known(&req.profile) {
+            warn!(
+                event_code = "subagent.delegate.rejected",
+                reason = "profile_not_found",
+                profile = %req.profile,
+            );
+            return Err(SubagentError::ProfileNotFound(req.profile));
+        }
         let profile_model = self.profile_model(&req.profile);
 
         // 1. resolve subagent (create if needed). `resolve_by_name` canonicalizes
@@ -280,6 +290,14 @@ impl SubagentManager {
         .filter(|m| !m.is_empty())
     }
 
+    /// Whether `profile` is a recognized profile name (built-in or configured).
+    fn profile_known(&self, profile: &str) -> bool {
+        matches!(
+            profile,
+            "pi/search-cheap" | "pi/review-cheap" | "pi/plan-cheap"
+        ) || self.settings.profiles.contains_key(profile)
+    }
+
     /// Persist the most recent task summary as the recoverable `hot_summary`.
     fn write_hot_summary(
         &self,
@@ -290,7 +308,7 @@ impl SubagentManager {
         let mut mem = db
             .subagent_get_memory(subagent_id)
             .map_err(SubagentError::Store)?
-            .unwrap_or_else(|| SubagentMemoryRow::for_test(subagent_id));
+            .unwrap_or_else(|| SubagentMemoryRow::new_empty(subagent_id));
         mem.hot_summary = Some(summary.to_string());
         mem.updated_at_ms = busytok_domain::now_ms();
         db.subagent_upsert_memory(&mem)

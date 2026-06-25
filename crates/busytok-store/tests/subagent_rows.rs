@@ -7,7 +7,7 @@ fn subagent_row_for_test_constructors_build_minimal_rows() {
     assert_eq!(sa.name, "reviewer");
     assert_eq!(sa.status, "cold");
 
-    let mem = SubagentMemoryRow::for_test("sa-1");
+    let mem = SubagentMemoryRow::new_empty("sa-1");
     assert_eq!(mem.subagent_id, "sa-1");
 
     let task = SubagentTaskRow::for_test("task-1", "sa-1", "pi/search-cheap", "find the bug");

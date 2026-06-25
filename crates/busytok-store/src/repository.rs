@@ -495,7 +495,9 @@ pub struct SubagentMemoryRow {
 }
 
 impl SubagentMemoryRow {
-    pub fn for_test(subagent_id: &str) -> Self {
+    /// Create an empty memory row for a subagent (used on creation and as a
+    /// fallback when no memory exists yet).
+    pub fn new_empty(subagent_id: &str) -> Self {
         Self {
             id: format!("mem-{subagent_id}"),
             subagent_id: subagent_id.to_string(),
