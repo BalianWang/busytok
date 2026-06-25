@@ -456,6 +456,64 @@ pub fn upsert_binding(conn: &Connection, row: &SubagentHarnessBindingRow) -> Res
     .with_context(|| format!("upsert binding {}", row.id))
 }
 
+/// Upsert a hot binding, keyed on the partial unique index
+/// `idx_subagent_binding_one_hot (subagent_id, harness) WHERE is_hot = 1`.
+/// A re-delegate to the same subagent+harness updates the existing row
+/// instead of creating a duplicate.
+pub fn upsert_hot_binding(conn: &Connection, row: &SubagentHarnessBindingRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO subagent_harness_bindings \
+             (id, subagent_id, harness, adapter_session_id, adapter_process_id, is_hot, status, \
+              created_at_ms, last_used_at_ms, closed_at_ms, detail_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+         ON CONFLICT(subagent_id, harness) WHERE is_hot = 1 DO UPDATE SET \
+             adapter_session_id = excluded.adapter_session_id, \
+             adapter_process_id = excluded.adapter_process_id, \
+             status = excluded.status, \
+             last_used_at_ms = excluded.last_used_at_ms, \
+             detail_json = excluded.detail_json",
+        params![
+            row.id,
+            row.subagent_id,
+            row.harness,
+            row.adapter_session_id,
+            row.adapter_process_id,
+            row.is_hot,
+            row.status,
+            row.created_at_ms,
+            row.last_used_at_ms,
+            row.closed_at_ms,
+            row.detail_json,
+        ],
+    )
+    .map(|_| ())
+    .with_context(|| format!("upsert hot binding {} {}", row.subagent_id, row.harness))
+}
+
+/// Atomically: (1) upsert the hot binding, (2) set the logical subagent
+/// status to `hot`. Both writes commit in a single transaction so the spec
+/// §3.3 invariant ("status='hot' iff is_hot=1 binding exists") holds at every
+/// observable point. Call this ONLY when a real adapter_session_id exists.
+pub fn commit_hot_binding_and_status(
+    conn: &Connection,
+    binding: &SubagentHarnessBindingRow,
+    subagent_id: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    upsert_hot_binding(&tx, binding)?;
+    let now = busytok_domain::now_ms();
+    tx.execute(
+        "UPDATE subagent_logical_subagents SET status = 'hot', updated_at_ms = ?1, \
+            last_active_at_ms = COALESCE(last_active_at_ms, ?1) \
+         WHERE id = ?2",
+        params![now, subagent_id],
+    )
+    .with_context(|| format!("set logical status hot for {subagent_id}"))?;
+    tx.commit()
+        .context("commit hot binding + status transaction")?;
+    Ok(())
+}
+
 pub fn hot_binding(
     conn: &Connection,
     subagent_id: &str,

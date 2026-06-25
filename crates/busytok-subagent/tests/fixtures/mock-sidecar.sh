@@ -6,10 +6,15 @@
 #                                (the Nth response IS sent, then the process
 #                                exits 1). -1 (default) = never crash.
 #   BUSYTOK_MOCK_DELAY_MS=N      Delay each response by N ms.
+#   BUSYTOK_MOCK_EMPTY_SESSION=1 Emit an empty adapter_session_id in
+#                                session.turn_auto responses (regression
+#                                fixture for the warm-path fallback).
+#                                0/unset = emit a real session id.
 
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
+EMPTY_SESSION="${BUSYTOK_MOCK_EMPTY_SESSION:-0}"
 COUNT=0
 while IFS= read -r line; do
   COUNT=$((COUNT + 1))
@@ -31,7 +36,11 @@ while IFS= read -r line; do
       exit 0
       ;;
     session.turn_auto)
-      printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"pi_sess_mock_%s","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$COUNT" "$ID"
+      if [[ "$EMPTY_SESSION" == "1" ]]; then
+        printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$ID"
+      else
+        printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"pi_sess_mock_%s","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$COUNT" "$ID"
+      fi
       ;;
     session.prepare_hibernate)
       printf '{"jsonrpc":"2.0","result":{"memory_delta":null,"stats":{}},"id":%s}\n' "$ID"

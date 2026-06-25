@@ -1957,6 +1957,18 @@ impl Database {
     pub fn subagent_upsert_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
         subagent_queries::upsert_binding(self.conn(), row)
     }
+    pub fn subagent_upsert_hot_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::upsert_hot_binding(conn, row)
+    }
+    pub fn subagent_commit_hot_binding_and_status(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::commit_hot_binding_and_status(conn, binding, subagent_id)
+    }
     pub fn subagent_hot_binding(
         &self,
         subagent_id: &str,

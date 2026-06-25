@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::Connection;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use busytok_config::{BusytokPaths, BusytokSettings};
 use busytok_control::dispatch::{MethodDispatchError, RuntimeControl};
@@ -65,6 +65,16 @@ pub struct BusytokSupervisor {
     read_service: crate::read_service::ReadService,
     /// Logical-subagent manager (subagent.* RPC handlers).
     subagent_manager: Arc<busytok_subagent::SubagentManager>,
+    /// Pi sidecar supervisor (present when `subagent.pi_sidecar.enabled`).
+    /// Task 6 uses this for graceful shutdown.
+    sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+    /// Error message captured when the sidecar config could not be resolved
+    /// despite `pi_sidecar.enabled = true`. `None` when the sidecar was
+    /// initialized successfully OR when `pi_sidecar.enabled = false` (the
+    /// default). Surfaced via `sidecar_init_error()` so Task 6 / status
+    /// reporting can flag degraded mode without a `Result<Self>` refactor
+    /// of `build_with_settings` (which would touch ~30 call sites).
+    sidecar_init_error: Option<String>,
     /// JoinHandle for the writer actor's background task (None when no
     /// Tokio runtime was active at construction time, e.g. sync tests).
     _writer_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -142,9 +152,67 @@ impl BusytokSupervisor {
         let event_bus = AppEventBus::new(64);
 
         let db = Arc::new(Mutex::new(db));
-        let executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
-            Arc::new(busytok_subagent::mock_executor::MockTaskExecutor);
-        // (Plan 2 Task 5 swaps this for SidecarTaskExecutor when pi_sidecar.enabled)
+        // Plan 2 Task 5: gate on `subagent.pi_sidecar.enabled`. When enabled,
+        // construct `SidecarTaskExecutor`; otherwise fall back to `MockTaskExecutor`
+        // (Plan 1 behavior). If `resolve_sidecar_config` fails (e.g. bundled node
+        // binary missing in dev/test), log at `error!` with event_code
+        // `subagent.sidecar.config_resolve_failed`, capture the message in
+        // `sidecar_init_error` (surfaced via `sidecar_init_error()`), and fall
+        // back to the mock executor so the supervisor still starts —
+        // `build_with_settings` returns `Self`, not `Result<Self>`, so the
+        // error cannot propagate. Production deployments with
+        // `pi_sidecar.enabled = true` must ensure the bundle is installed; a
+        // missing bundle surfaces as an `error!` log + queryable init error
+        // and degraded (mock) execution rather than a panic.
+        let (executor, sidecar_supervisor, sidecar_init_error): (
+            Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+            Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+            Option<String>,
+        ) = if settings.subagent.pi_sidecar.enabled {
+            match busytok_subagent::sidecar::config::resolve_sidecar_config(
+                &settings.subagent.pi_sidecar,
+                &paths,
+            ) {
+                Ok(sidecar_config) => {
+                    let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
+                        sidecar_config,
+                        Some(Arc::clone(&db)),
+                    );
+                    let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> = Arc::new(
+                        busytok_subagent::sidecar::SidecarTaskExecutor::new(Arc::clone(&sup)),
+                    );
+                    (exec, Some(sup), None)
+                }
+                Err(e) => {
+                    // `build_with_settings` returns `Self`, not `Result<Self>`,
+                    // so the error cannot propagate. We MUST still boot (the
+                    // service runs in degraded mode with MockTaskExecutor),
+                    // but the failure is escalated to `error!` with a stable
+                    // event_code AND captured in `sidecar_init_error` so Task 6
+                    // / status reporting can surface it without re-scanning
+                    // logs. This closes the "warn-log-only" observability gap.
+                    let msg = e.to_string();
+                    error!(
+                        event_code = "subagent.sidecar.config_resolve_failed",
+                        error = %e,
+                        "sidecar config resolve failed; falling back to MockTaskExecutor (degraded mode)"
+                    );
+                    (
+                        Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+                            as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                        None,
+                        Some(msg),
+                    )
+                }
+            }
+        } else {
+            (
+                Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+                    as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                None,
+                None,
+            )
+        };
         let subagent_manager = Arc::new(busytok_subagent::SubagentManager::new(
             Arc::clone(&db),
             settings.subagent.clone(),
@@ -198,6 +266,8 @@ impl BusytokSupervisor {
             writer_handle,
             read_service,
             subagent_manager,
+            sidecar_supervisor,
+            sidecar_init_error,
             _writer_join: Mutex::new(writer_join),
             _catalog_reload_join: Mutex::new(catalog_reload_join),
         }
@@ -206,6 +276,19 @@ impl BusytokSupervisor {
     /// Discover log sources using current settings and user roots from DB.
     fn discover_sources(&self) -> Result<Vec<busytok_discovery::DiscoveredLogSource>> {
         self.source_registry.discover_all()
+    }
+
+    /// Returns the error message captured when `pi_sidecar.enabled = true`
+    /// but `resolve_sidecar_config` failed at construction time, OR `None`
+    /// when the sidecar initialized successfully or was not enabled.
+    ///
+    /// This lets Task 6 / status reporting surface sidecar config degradation
+    /// without refactoring `build_with_settings` to return `Result<Self>`.
+    /// The service is still running in degraded mode (MockTaskExecutor) when
+    /// this returns `Some`; callers should treat a non-`None` value as a
+    /// loud signal that the configured sidecar is NOT backing delegate calls.
+    pub fn sidecar_init_error(&self) -> Option<&str> {
+        self.sidecar_init_error.as_deref()
     }
 
     // ── Scan methods ────────────────────────────────────────────────────

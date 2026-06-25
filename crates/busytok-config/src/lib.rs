@@ -215,7 +215,7 @@ fn default_memory_hard_limit_mb() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentPiSidecarConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub enabled: bool,
     /// "bundled" | "system"
     #[serde(default = "default_bundled_runtime")]
@@ -253,7 +253,7 @@ pub struct SubagentPiSidecarConfig {
 impl Default for SubagentPiSidecarConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             node_runtime: default_bundled_runtime(),
             system_node_path: String::new(),
             max_hot_sessions: default_max_hot_sessions(),

@@ -6,7 +6,7 @@ use busytok_config::SubagentSettings;
 use busytok_store::{
     SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::{Result, SubagentError};
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
@@ -138,15 +138,24 @@ impl SubagentManager {
             timeout_seconds: req.timeout_seconds,
         };
         let out = self.executor.execute(&input).await.map_err(|e| {
-            warn!(event_code = "subagent.delegate.executor_failed", error = %e);
-            SubagentError::Store(e)
+            // If the executor wrapped a SubagentError (SidecarTaskExecutor does this
+            // via sidecar_to_anyhow), downcast to recover the semantic variant.
+            match e.downcast::<SubagentError>() {
+                Ok(se) => se,
+                Err(other) => {
+                    warn!(event_code = "subagent.delegate.executor_failed", error = %other);
+                    SubagentError::Store(other)
+                }
+            }
         })?;
         let duration_ms = busytok_domain::now_ms().saturating_sub(started);
 
         // 4. persist results: task status, usage, memory (hot_summary), status.
         //    Writing hot_summary satisfies the `warm` invariant (recoverable
-        //    memory exists). Plan 1 records NO hot binding (no real session),
-        //    so status is Warm, not Hot — consistent with spec §3.3.
+        //    memory exists). For the hot path (real adapter_session_id), the
+        //    binding + status flip commit in a single transaction so the spec
+        //    §3.3 invariant ("status='hot' iff is_hot=1 binding exists") holds
+        //    at every observable point.
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
             db.subagent_set_task_status(
@@ -176,7 +185,47 @@ impl SubagentManager {
 
             // memory: write hot_summary so hibernate/restore recovers context.
             self.write_hot_summary(&db, &subagent.id, &out.summary)?;
-            self.set_logical_status(&db, &subagent.id, SubagentStatus::Warm)?;
+
+            // Spec §3.3 invariant: status='hot' iff is_hot=1 binding exists.
+            // Hot path: commit binding + status atomically; failure fails the
+            // delegate to preserve the status invariant (no `hot` without a
+            // backing binding). Warm path (mock executor, no adapter_session_id):
+            // just flip status — no real session to bind.
+            //
+            // An empty `adapter_session_id` is treated as warm — there is no
+            // real backing session, so committing a hot binding would violate
+            // spec §3.3 semantically. The delegate is the authority that
+            // decides hot vs warm (the executor only extracts the raw value).
+            let hot_sid = out.adapter_session_id.as_deref().filter(|s| !s.is_empty());
+            if let Some(sid) = hot_sid {
+                let now_ms = busytok_domain::now_ms();
+                let binding = busytok_store::repository::SubagentHarnessBindingRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    subagent_id: subagent.id.clone(),
+                    harness: self.adapter.clone(),
+                    adapter_session_id: Some(sid.to_string()),
+                    adapter_process_id: None, // Plan 3 tracks PID
+                    is_hot: 1,
+                    status: "hot".to_string(),
+                    created_at_ms: now_ms,
+                    last_used_at_ms: Some(now_ms),
+                    closed_at_ms: None,
+                    detail_json: None,
+                };
+                db.subagent_commit_hot_binding_and_status(&binding, &subagent.id)
+                    .map_err(|e| {
+                        error!(
+                            event_code = "subagent.delegate.binding_commit_failed",
+                            error = %e,
+                            "hot binding commit failed; delegate fails to preserve status invariant"
+                        );
+                        SubagentError::Store(e)
+                    })?;
+            } else {
+                // Mock executor path OR empty adapter_session_id — no real
+                // session to bind, status stays Warm.
+                self.set_logical_status(&db, &subagent.id, SubagentStatus::Warm)?;
+            }
         }
 
         Ok(DelegateResult {
@@ -184,8 +233,8 @@ impl SubagentManager {
             subagent_id: subagent.id.clone(),
             subagent_name: subagent.name.clone(),
             adapter: self.adapter.clone(),
-            adapter_session_id: None,
-            session_reused: !created,
+            adapter_session_id: out.adapter_session_id.clone(),
+            session_reused: out.session_reused,
             status: out.status,
             profile: req.profile,
             model,
