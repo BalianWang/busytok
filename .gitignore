@@ -11,6 +11,7 @@ node_modules/
 **/coverage/
 apps/gui/dist/
 apps/pi-sidecar/dist/
+apps/pi-sidecar/spike/dist/
 **/ephemeral/
 apps/desktop/.dart_tool/
 apps/desktop/build/
