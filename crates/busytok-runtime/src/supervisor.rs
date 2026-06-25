@@ -766,6 +766,21 @@ impl BusytokSupervisor {
         Ok(())
     }
 
+    /// Gracefully shut down the Pi sidecar subprocess (hibernate sessions,
+    /// kill child). Called from `ServiceApp::run()` after the control server
+    /// has stopped accepting new delegate requests and before the
+    /// tailer/sampler drain. No-op when `pi_sidecar.enabled = false` (the
+    /// default) — `sidecar_supervisor` is `None` in that case. Failures are
+    /// logged but do not propagate; service shutdown must continue so the
+    /// writer actor flush and WAL checkpoint still run.
+    pub async fn shutdown_sidecar(&self) {
+        if let Some(sup) = &self.sidecar_supervisor {
+            if let Err(e) = sup.shutdown().await {
+                warn!(event_code = "subagent.sidecar.shutdown_failed", error = %e);
+            }
+        }
+    }
+
     /// Return a clone of the event bus arc (for starting the sampler).
     pub fn event_bus_arc(&self) -> Arc<AppEventBus> {
         Arc::clone(&self.event_bus)
