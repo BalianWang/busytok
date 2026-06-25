@@ -32,8 +32,33 @@ default_cheap_model = "deepseek-chat"
         settings.subagent.models.default_cheap_model,
         "deepseek-chat"
     );
+    // Built-in profiles must survive partial config (no [subagent.profiles] in TOML).
+    assert_eq!(
+        settings.subagent.profiles.len(),
+        3,
+        "built-in profiles must be present even when TOML omits [subagent.profiles]"
+    );
+    assert!(settings.subagent.profiles.contains_key("pi/search-cheap"));
+    assert!(settings.subagent.profiles.contains_key("pi/review-cheap"));
+    assert!(settings.subagent.profiles.contains_key("pi/plan-cheap"));
 
     let _reloaded: SubagentSettings = settings.subagent.clone();
+}
+
+#[test]
+fn partial_config_with_only_pi_sidecar_preserves_built_in_profiles() {
+    let toml = r#"
+timezone = "UTC"
+[subagent.pi_sidecar]
+max_hot_sessions = 1
+"#;
+    let settings = BusytokSettings::load_from_str(toml).unwrap();
+    assert_eq!(settings.subagent.pi_sidecar.max_hot_sessions, 1);
+    assert_eq!(
+        settings.subagent.profiles.len(),
+        3,
+        "built-in profiles must survive when only [subagent.pi_sidecar] is present"
+    );
 }
 
 #[test]

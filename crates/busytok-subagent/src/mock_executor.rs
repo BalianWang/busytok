@@ -13,7 +13,7 @@ pub struct MockTaskOutput {
 }
 
 /// Run a mock task. The summary echoes the prompt so tests can assert on it.
-pub fn run_mock(prompt: &str, model: Option<&str>) -> MockTaskOutput {
+pub(crate) fn run_mock(prompt: &str, model: Option<&str>) -> MockTaskOutput {
     let summary = format!("[mock] no sidecar wired yet; prompt was: {prompt}");
     MockTaskOutput {
         status: TaskStatus::Completed,

@@ -175,7 +175,7 @@ pub struct SubagentSettings {
     pub resource_policy: SubagentResourcePolicyConfig,
     #[serde(default)]
     pub models: SubagentModelsConfig,
-    #[serde(default)]
+    #[serde(default = "default_profiles")]
     pub profiles: std::collections::HashMap<String, SubagentProfileConfig>,
 }
 impl Default for SubagentSettings {

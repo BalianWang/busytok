@@ -144,7 +144,7 @@ pub async fn handle_delete(
 ) -> Result<()> {
     if hard && !yes {
         println!(
-            "About to HARD-delete subagent {}. This cannot be undone. Type 'y' to continue:",
+            "About to HARD-delete subagent {}. This cannot be undone. Type 'y' or 'yes' to continue:",
             name.as_deref().or(id.as_deref()).unwrap_or("?")
         );
         let stdin = std::io::stdin();
