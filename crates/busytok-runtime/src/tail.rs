@@ -536,6 +536,10 @@ fn process_file_change(
         .map(|e| (e.id.clone(), e.agent.as_str().to_string()))
         .collect();
 
+    // Capture Codex model resolutions for cross-batch backfill
+    // before events are moved into store_batch.
+    let codex_model_resolutions = crate::scan::collect_codex_model_resolutions(&usage_events);
+
     let store_batch = StoreWriteBatch {
         source_id: source_id.to_string(),
         source_file_id: Some(file_id.clone()),
@@ -576,6 +580,23 @@ fn process_file_change(
             })
         })
         .with_context(|| format!("failed to ingest tail batch for {}", path.display()))?;
+
+    // Cross-batch backfill: if this batch resolved a Codex model,
+    // update earlier events from previous batches that had NULL model.
+    let mut backfill_changed = false;
+    if !codex_model_resolutions.is_empty() {
+        backfill_changed |=
+            crate::scan::backfill_cross_batch_codex_models(db, &codex_model_resolutions);
+    }
+    // Also handle batches where only turn_context arrived (no usage events).
+    if agent == AgentKind::Codex {
+        backfill_changed |=
+            crate::scan::cross_batch_backfill_from_turn_context(db, &batch.lines, &file_id);
+    }
+    // If backfill changed any events, rebuild model-dependent aggregates.
+    if backfill_changed {
+        crate::scan::rebuild_model_aggregates(db, timezone);
+    }
 
     // Publish UsageEventInserted only for truly inserted events.
     let inserted_ids: std::collections::HashSet<&str> = ingest_result
@@ -898,6 +919,215 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].model.as_deref(), Some("gpt-5.3-codex-spark"));
         assert_eq!(events[0].total_tokens, 43);
+    }
+
+    /// Cross-batch backfill: batch 1 has token_count without model,
+    /// batch 2 has turn_context with model. After batch 2 is processed,
+    /// batch 1's event should be backfilled in the DB.
+    #[test]
+    fn process_file_change_codex_cross_batch_model_backfill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("rollout-cross-batch.jsonl");
+        let source = busytok_discovery::DiscoveredLogSource {
+            agent: AgentKind::Codex,
+            source_id: "test-cross-batch".to_string(),
+            root_path: dir.path().to_path_buf(),
+            files: vec![file_path.clone()],
+            source_type: LogSourceType::Jsonl,
+            configured_by_user: false,
+        };
+
+        // Batch 1: two token_count lines WITHOUT info.model.
+        // The second snapshot produces a delta event (43 tokens) with NULL model.
+        let heartbeat1 = r#"{"timestamp":"2026-05-20T07:16:22.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":165},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":165}}}}"#;
+        let heartbeat2 = r#"{"timestamp":"2026-05-20T07:16:23.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":15,"output_tokens":70,"reasoning_output_tokens":8,"total_tokens":208},"last_token_usage":{"input_tokens":30,"cached_input_tokens":5,"output_tokens":20,"reasoning_output_tokens":3,"total_tokens":58}}}}"#;
+
+        {
+            let mut f = std::fs::File::create(&file_path).expect("create file");
+            writeln!(f, "{heartbeat1}").expect("write heartbeat1");
+            writeln!(f, "{heartbeat2}").expect("write heartbeat2");
+        }
+
+        let db = busytok_store::Database::open_in_memory().expect("db open");
+        let supervisor = BusytokSupervisor::new(db, BusytokPaths::new());
+        let initial = supervisor
+            .run_scan_with_sources(vec![source.clone()])
+            .expect("initial scan");
+        assert_eq!(
+            initial.events_found, 1,
+            "batch 1 should produce 1 delta event"
+        );
+
+        // Verify batch 1's event has NULL model.
+        let db_handle: Arc<std::sync::Mutex<Database>> = supervisor.db_handle().clone();
+        {
+            let db = db_handle.lock().unwrap();
+            let events = db.all_usage_events().expect("get all events");
+            assert_eq!(events.len(), 1);
+            assert!(
+                events[0].model.is_none(),
+                "batch 1 event should have NULL model before backfill"
+            );
+        }
+
+        // Batch 2: turn_context with model arrives in a later tail read.
+        let turn_context = r#"{"timestamp":"2026-05-20T07:16:24.000Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#;
+
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .expect("open append");
+            writeln!(f, "{turn_context}").expect("write turn_context");
+        }
+
+        let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter)];
+        let event_bus = AppEventBus::new(32);
+
+        {
+            let db = db_handle.lock().unwrap();
+            process_file_change(
+                &db,
+                &adapters,
+                &file_path,
+                "test-cross-batch",
+                AgentKind::Codex,
+                &event_bus,
+                "UTC",
+                "gen-test",
+            )
+            .expect("tail processing should succeed");
+        }
+
+        // After batch 2, the cross-batch backfill should have updated
+        // batch 1's event with the resolved model.
+        let db = db_handle.lock().unwrap();
+        let events = db.all_usage_events().expect("get all events");
+        assert_eq!(
+            events.len(),
+            1,
+            "turn_context alone should not produce a new usage event"
+        );
+        assert_eq!(
+            events[0].model.as_deref(),
+            Some("gpt-5.4"),
+            "batch 1 event should be backfilled with model from batch 2's turn_context"
+        );
+    }
+
+    /// Regression: after cross-batch backfill updates the `model` field on
+    /// existing usage_events, the aggregate tables (`model_summary`,
+    /// `daily_usage`, `sessions`) must be rebuilt so rankings/models views
+    /// don't keep showing the stale NULL/empty model grouping.
+    #[test]
+    fn process_file_change_codex_cross_batch_backfill_rebuilds_aggregates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("rollout-agg-rebuild.jsonl");
+        let source = busytok_discovery::DiscoveredLogSource {
+            agent: AgentKind::Codex,
+            source_id: "test-agg-rebuild".to_string(),
+            root_path: dir.path().to_path_buf(),
+            files: vec![file_path.clone()],
+            source_type: LogSourceType::Jsonl,
+            configured_by_user: false,
+        };
+
+        // Batch 1: two heartbeats WITHOUT model → 1 delta event with NULL model.
+        let heartbeat1 = r#"{"timestamp":"2026-05-20T07:16:22.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":5,"total_tokens":165},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":165}}}}"#;
+        let heartbeat2 = r#"{"timestamp":"2026-05-20T07:16:23.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":15,"output_tokens":70,"reasoning_output_tokens":8,"total_tokens":208},"last_token_usage":{"input_tokens":30,"cached_input_tokens":5,"output_tokens":20,"reasoning_output_tokens":3,"total_tokens":58}}}}"#;
+
+        {
+            let mut f = std::fs::File::create(&file_path).expect("create file");
+            writeln!(f, "{heartbeat1}").expect("write heartbeat1");
+            writeln!(f, "{heartbeat2}").expect("write heartbeat2");
+        }
+
+        let db = busytok_store::Database::open_in_memory().expect("db open");
+        let supervisor = BusytokSupervisor::new(db, BusytokPaths::new());
+        let initial = supervisor
+            .run_scan_with_sources(vec![source.clone()])
+            .expect("initial scan");
+        assert_eq!(
+            initial.events_found, 1,
+            "batch 1 should produce 1 delta event"
+        );
+
+        let db_handle: Arc<std::sync::Mutex<Database>> = supervisor.db_handle().clone();
+
+        // After batch 1: aggregates should NOT have the resolved model yet.
+        // `model_summary` skips empty-model events entirely, so there should
+        // be no gpt-5.4 row. `daily_usage` stores empty string for NULL model.
+        {
+            let db = db_handle.lock().unwrap();
+            let model_summaries = db.model_summary_rows().expect("model_summary rows");
+            assert!(
+                !model_summaries.iter().any(|m| m.model == "gpt-5.4"),
+                "before backfill, model_summary should NOT have a gpt-5.4 row"
+            );
+            let daily = db.daily_usage_rows().expect("daily_usage rows");
+            assert!(
+                daily.iter().any(|d| d.model.is_empty()),
+                "before backfill, daily_usage should have an empty-model row"
+            );
+        }
+
+        // Batch 2: turn_context with model → triggers cross-batch backfill
+        // + aggregate rebuild.
+        let turn_context = r#"{"timestamp":"2026-05-20T07:16:24.000Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .expect("open append");
+            writeln!(f, "{turn_context}").expect("write turn_context");
+        }
+
+        let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter)];
+        let event_bus = AppEventBus::new(32);
+        {
+            let db = db_handle.lock().unwrap();
+            process_file_change(
+                &db,
+                &adapters,
+                &file_path,
+                "test-agg-rebuild",
+                AgentKind::Codex,
+                &event_bus,
+                "UTC",
+                "gen-test",
+            )
+            .expect("tail processing should succeed");
+        }
+
+        // After batch 2: aggregates should be rebuilt with the resolved model.
+        let db = db_handle.lock().unwrap();
+        let events = db.all_usage_events().expect("get all events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].model.as_deref(),
+            Some("gpt-5.4"),
+            "event model should be backfilled"
+        );
+
+        let model_summaries = db.model_summary_rows().expect("model_summary rows");
+        assert!(
+            model_summaries.iter().any(|m| m.model == "gpt-5.4"),
+            "after backfill, model_summary should have a gpt-5.4 row"
+        );
+        assert!(
+            !model_summaries.iter().any(|m| m.model.is_empty()),
+            "after backfill, model_summary should NOT have an empty-model row"
+        );
+
+        let daily = db.daily_usage_rows().expect("daily_usage rows");
+        assert!(
+            daily.iter().any(|d| d.model == "gpt-5.4"),
+            "after backfill, daily_usage should have a gpt-5.4 row"
+        );
+        assert!(
+            !daily.iter().any(|d| d.model.is_empty()),
+            "after backfill, daily_usage should NOT have an empty-model row"
+        );
     }
 
     #[test]

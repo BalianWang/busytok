@@ -49,7 +49,7 @@ fn quit_desktop_host_action_stops_service() {
 #[test]
 fn shortcut_failure_has_menu_diagnostic_label() {
     let status = ShortcutRegistrationState::Failed {
-        shortcut: "CommandOrControl+Shift+K".into(),
+        shortcut: "CommandOrControl+Option+K".into(),
         reason: "already registered".into(),
     };
     assert_eq!(shortcut_menu_label(&status), Some("Shortcut Unavailable"));

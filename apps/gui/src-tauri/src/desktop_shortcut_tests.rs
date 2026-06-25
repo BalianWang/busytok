@@ -29,11 +29,11 @@ fn shortcut_retry_uses_bounded_backoff() {
 fn shortcut_failure_is_visible_in_diagnostics() {
     let diagnostics = record_shortcut_failure(
         ShortcutDiagnostics::default(),
-        "CommandOrControl+Shift+K",
+        "CommandOrControl+Option+K",
         "already registered",
     );
     assert_eq!(diagnostics.state, "failed");
-    assert_eq!(diagnostics.shortcut, "CommandOrControl+Shift+K");
+    assert_eq!(diagnostics.shortcut, "CommandOrControl+Option+K");
     assert_eq!(
         diagnostics.failure_reason.as_deref(),
         Some("already registered")

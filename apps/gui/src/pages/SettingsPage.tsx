@@ -534,9 +534,9 @@ export function SettingsPage() {
               label="Prompt Palette Shortcut"
               description={
                 hostShortcutDiagnostics?.state === "failed"
-                  ? `Global shortcut could not be registered: ${hostShortcutDiagnostics.failure_reason ?? "unknown"}. Cmd/Ctrl+Shift+K still works while Busytok is focused.`
+                  ? `Global shortcut could not be registered: ${hostShortcutDiagnostics.failure_reason ?? "unknown"}. Cmd/Ctrl+Option+K still works while Busytok is focused.`
                   : shortcutStatus.state === "failed"
-                    ? "Global shortcut could not be registered. Cmd/Ctrl+Shift+K still works while Busytok is focused."
+                    ? "Global shortcut could not be registered. Cmd/Ctrl+Option+K still works while Busytok is focused."
                     : undefined
               }
               control={

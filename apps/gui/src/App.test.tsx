@@ -400,7 +400,7 @@ describe("App", () => {
     });
   });
 
-  it("opens the prompt palette overlay with Cmd/Ctrl+Shift+K", async () => {
+  it("opens the prompt palette overlay with Cmd/Ctrl+Option+K", async () => {
     // NOTE: The hotkey is now handled natively (NSPanel) rather than via
     // usePromptPaletteHotkey. The in-app overlay is still rendered but is
     // no longer triggerable from JS keyboard events. This test is retained
