@@ -1,4 +1,5 @@
 import type { JsonRpcRequest, JsonRpcResponse, JsonRpcError } from './types.js';
+import { SidecarError } from './errors.js';
 import * as readline from 'node:readline';
 
 export interface HandlerContext {
@@ -84,7 +85,9 @@ export class JsonRpcServer {
       const result = await handler(req.params, ctx);
       this.writeResponse(req.id, result);
     } catch (err: unknown) {
-      const code = (err as { code?: number }).code ?? -32603;
+      // SidecarError carries a specific JSON-RPC code; anything else is
+      // surfaced as the default -32603 (internal error).
+      const code = err instanceof SidecarError ? err.code : -32603;
       const message = err instanceof Error ? err.message : String(err);
       this.writeError(req.id, code, message);
     }

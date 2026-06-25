@@ -49,7 +49,7 @@ fn make_sidecar_settings() -> BusytokSettings {
 /// but with `bundle_path` set to the mock fixture (no env var needed).
 fn make_sidecar_config() -> SidecarConfig {
     SidecarConfig {
-        node_binary: PathBuf::from("/bin/bash"),
+        node_binary: PathBuf::from("bash"),
         bundle_path: mock_sidecar_path(),
         env: HashMap::new(),
         idle_exit_seconds: 300,

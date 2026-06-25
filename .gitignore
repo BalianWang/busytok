@@ -12,6 +12,8 @@ node_modules/
 apps/gui/dist/
 apps/pi-sidecar/dist/
 apps/pi-sidecar/spike/dist/
+# spike lockfile is regenerated locally; not tracked to avoid working-tree noise
+apps/pi-sidecar/spike/pnpm-lock.yaml
 **/ephemeral/
 apps/desktop/.dart_tool/
 apps/desktop/build/

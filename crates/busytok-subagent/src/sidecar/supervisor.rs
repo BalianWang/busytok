@@ -99,6 +99,23 @@ impl PiSidecarSupervisor {
         // Exponential backoff if this is a restart after a crash.
         let backoff = {
             let state = self.state.lock().await;
+            // Double-checked locking: `ensure_started` checks `needs_spawn`
+            // without holding the lock, so two concurrent callers can both see
+            // `needs_spawn=true` and both call `spawn_internal`. Re-check here
+            // (under the lock) so only the first caller actually spawns — the
+            // second sees the child/client the first installed and returns
+            // early. `child.id().is_some()` guards against the case where a
+            // child was set but has since exited (id() returns None after
+            // wait()/kill()).
+            if state.client.is_some()
+                && state
+                    .child
+                    .as_ref()
+                    .map(|c| c.id().is_some())
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
             if state.restart_attempts > self.config.max_restart_attempts {
                 return Err(SidecarError::Crashed(format!(
                     "max restart attempts ({}) exceeded",
@@ -358,6 +375,7 @@ impl PiSidecarSupervisor {
         if let Some(client) = &client {
             // Best-effort: ask the sidecar to prepare all hot sessions for
             // hibernate (Plan 3 tracks per-session state; Plan 2 uses `all`).
+            // Plan 3: consume memory_delta from the response.
             let _ = client
                 .lock()
                 .await
