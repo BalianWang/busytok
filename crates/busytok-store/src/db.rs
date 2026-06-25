@@ -830,6 +830,99 @@ impl Database {
             .context("failed to query latest usage event model for source file")
     }
 
+    /// Get all distinct non-empty models for a Codex session, across all batches.
+    /// Used to decide whether cross-batch backfill is safe (exactly one model).
+    pub fn distinct_codex_models_for_session(
+        &self,
+        source_file_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT model FROM usage_events \
+             WHERE source_file_id = ?1 AND session_id = ?2 AND agent = 'codex' \
+             AND model IS NOT NULL AND model != '' \
+             UNION \
+             SELECT DISTINCT model FROM codex_token_snapshots \
+             WHERE source_file_id = ?1 AND session_id = ?2 \
+             AND model IS NOT NULL AND model != ''",
+        )?;
+        let rows = stmt
+            .query_map(params![source_file_id, session_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Backfill NULL/empty model on earlier Codex events for a session.
+    /// Called after a batch resolves a model, to fix events from prior batches
+    /// that were persisted with NULL model before the model was known.
+    /// Returns the total number of rows updated across both `usage_events`
+    /// and `codex_token_snapshots`. Both updates are wrapped in a single
+    /// transaction so readers never observe a half-updated state.
+    pub fn backfill_codex_model_for_session(
+        &self,
+        source_file_id: &str,
+        session_id: &str,
+        model: &str,
+    ) -> Result<usize> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to begin transaction for codex model backfill")?;
+        let updated_events = tx
+            .execute(
+                "UPDATE usage_events SET model = ?1, updated_at_ms = ?2 \
+                 WHERE source_file_id = ?3 AND session_id = ?4 AND agent = 'codex' \
+                 AND (model IS NULL OR model = '')",
+                params![model, now, source_file_id, session_id],
+            )
+            .context("failed to backfill usage_events model")?;
+        let updated_snapshots = tx
+            .execute(
+                "UPDATE codex_token_snapshots SET model = ?1, updated_at_ms = ?2 \
+                 WHERE source_file_id = ?3 AND session_id = ?4 \
+                 AND (model IS NULL OR model = '')",
+                params![model, now, source_file_id, session_id],
+            )
+            .context("failed to backfill codex_token_snapshots model")?;
+        tx.commit()
+            .context("failed to commit codex model backfill transaction")?;
+        Ok(updated_events + updated_snapshots)
+    }
+
+    /// Find all Codex session_ids for a source_file_id that have NULL/empty
+    /// model events or snapshots. Used to identify sessions that need
+    /// cross-batch backfill. Checks both `usage_events` and
+    /// `codex_token_snapshots` because some sessions may have snapshots
+    /// but not yet have produced usage events (e.g. first heartbeat).
+    pub fn codex_sessions_with_null_model(&self, source_file_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session_id FROM usage_events \
+             WHERE source_file_id = ?1 AND agent = 'codex' \
+             AND (model IS NULL OR model = '') \
+             UNION \
+             SELECT DISTINCT session_id FROM codex_token_snapshots \
+             WHERE source_file_id = ?1 \
+             AND (model IS NULL OR model = '')",
+        )?;
+        let rows = stmt
+            .query_map(params![source_file_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete all rows from `daily_usage`. Used before full rebuild after
+    /// cross-batch model backfill, since the model field is part of the
+    /// grouping key and incremental upserts can't fix stale groupings.
+    pub fn delete_daily_usage(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM daily_usage", [])?;
+        Ok(())
+    }
+
     // ── Log files ─────────────────────────────────────────────────────
 
     /// Update the checkpoint offset for a log file (upsert).
