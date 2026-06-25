@@ -1970,6 +1970,19 @@ impl Database {
     pub fn subagent_insert_resource_event(&self, row: &SubagentResourceEventRow) -> Result<()> {
         subagent_queries::insert_resource_event(self.conn(), row)
     }
+    pub fn subagent_list_resource_events(
+        &self,
+        target_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SubagentResourceEventRow>> {
+        subagent_queries::list_resource_events(self.conn(), target_id, limit)
+    }
+    pub fn subagent_reconcile_sidecar_crash(
+        &self,
+        harness: &str,
+    ) -> Result<subagent_queries::CrashReconciliationCounts> {
+        subagent_queries::reconcile_sidecar_crash(self.conn(), harness)
+    }
     pub fn subagent_list_filtered(
         &self,
         status: Option<&str>,

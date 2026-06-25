@@ -236,6 +236,19 @@ pub struct SubagentPiSidecarConfig {
     pub memory_hard_limit_mb: u32,
     #[serde(default = "default_task_queue_max")]
     pub task_queue_max: u32,
+    /// Optional override for the sidecar runtime directory (bundle + node binary).
+    /// When set, `BusytokPaths::sidecar_runtime_dir()` returns this path verbatim.
+    /// When None (default), `sidecar_runtime_dir()` resolves to the dev path
+    /// (`apps/pi-sidecar/dist/`) — packaged builds MUST set this via settings.toml
+    /// or a Tauri-injected env var.
+    ///
+    /// Examples:
+    ///   - Packaged GUI (macOS): `/Applications/Busytok.app/Contents/Resources/sidecars/pi`
+    ///   - Service-only: `/usr/local/lib/busytok/sidecars/pi` (or wherever the
+    ///     package manager installs it)
+    ///   - Dev: unset (resolves to apps/pi-sidecar/dist/)
+    #[serde(default)]
+    pub runtime_dir: Option<String>,
 }
 impl Default for SubagentPiSidecarConfig {
     fn default() -> Self {
@@ -250,6 +263,7 @@ impl Default for SubagentPiSidecarConfig {
             memory_soft_limit_mb: default_memory_soft_limit_mb(),
             memory_hard_limit_mb: default_memory_hard_limit_mb(),
             task_queue_max: default_task_queue_max(),
+            runtime_dir: None,
         }
     }
 }

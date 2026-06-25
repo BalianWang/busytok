@@ -714,6 +714,7 @@ dependencies = [
  "busytok-config",
  "busytok-domain",
  "busytok-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

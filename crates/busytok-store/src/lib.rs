@@ -35,5 +35,6 @@ pub use repository::{
     StoreHealthInfo, StoreWriteBatch, SubagentHarnessBindingRow, SubagentLogicalSubagentRow,
     SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
+pub use subagent_queries::CrashReconciliationCounts;
 
 pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");

@@ -534,3 +534,169 @@ pub fn insert_resource_event(conn: &Connection, row: &SubagentResourceEventRow) 
     .map(|_| ())
     .with_context(|| format!("insert resource event {}", row.event_type))
 }
+
+/// List resource events, optionally filtered by `target_id`, newest first.
+pub fn list_resource_events(
+    conn: &Connection,
+    target_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<SubagentResourceEventRow>> {
+    let mut sql = String::from(
+        "SELECT id, event_type, target_id, rss_mb, cpu_percent, detail_json, created_at_ms \
+         FROM subagent_resource_events WHERE 1=1",
+    );
+    if target_id.is_some() {
+        sql.push_str(" AND target_id = :target_id");
+    }
+    sql.push_str(" ORDER BY created_at_ms DESC LIMIT :limit");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let target_val: String;
+    let mut params_vec: Vec<(&str, &dyn rusqlite::ToSql)> = vec![(":limit", &limit)];
+    if let Some(t) = target_id {
+        target_val = t.to_string();
+        params_vec.push((":target_id", &target_val));
+    }
+    let rows = stmt
+        .query_map(params_vec.as_slice(), |row| {
+            Ok(SubagentResourceEventRow {
+                id: row.get(0)?,
+                event_type: row.get(1)?,
+                target_id: row.get(2)?,
+                rss_mb: row.get(3)?,
+                cpu_percent: row.get(4)?,
+                detail_json: row.get(5)?,
+                created_at_ms: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Converge DB state after a sidecar crash, per spec §3.3 + §5.4.
+/// Runs in a single transaction so readers never observe a half-converged
+/// state. Returns counts for observability logging.
+///
+/// **Binding-anchored (spec §3.3: binding is authoritative for "is a worker
+/// process running")**: the affected `subagent_id` set is collected FIRST from
+/// the hot bindings of the crashed harness, then all subsequent updates are
+/// scoped to that set. This avoids two bugs present in a profile-prefix
+/// approach:
+///   (a) `default_profile LIKE 'pi%'` is imprecise (profiles are free-form
+///       strings; future profiles like `pi-search-v2` would match `pi` even
+///       if they belonged to a different harness adapter).
+///   (b) Updating logical status for "all subagents with no hot binding"
+///       would also rewrite `deleted` tombstones and unrelated cold/warm
+///       subagents, destroying Plan 1's deletion semantics.
+///
+/// **Task filter: `subagent_id IN affected` ONLY.** Do NOT filter by
+/// `subagent_tasks.source_harness` — that column means the task's *origin*
+/// (`claude-code | codex | cli`, spec line 193), not the sidecar adapter that
+/// executed it. Filtering `source_harness='pi'` would miss every real Pi
+/// sidecar task (their origin is the harness that invoked delegate, e.g.
+/// `claude-code`), leaving running tasks orphaned after a crash. The affected
+/// `subagent_id` set (from hot bindings) already encodes "had a session on
+/// the crashed sidecar", which is the correct scope.
+///
+/// Steps:
+/// 1. Collect affected `subagent_id` set from `subagent_harness_bindings
+///    WHERE is_hot=1 AND harness=?`.
+/// 2. Mark in-flight tasks (`status='running'` AND `subagent_id IN affected`)
+///    → `failed`/`SIDECAR_CRASHED`.
+/// 3. Release hot bindings for this harness → `is_hot=0, status='crashed'`.
+/// 4. Roll back logical status for the affected set ONLY, excluding
+///    `status='deleted'` tombstones: `warm` if memory exists, else `cold`.
+pub fn reconcile_sidecar_crash(
+    conn: &Connection,
+    harness: &str,
+) -> Result<CrashReconciliationCounts> {
+    let now = busytok_domain::now_ms();
+    let tx = conn.unchecked_transaction()?;
+
+    // 1. Collect affected subagent_id set from hot bindings.
+    //    This is the authoritative "who was affected" — not profile prefix,
+    //    not source_harness (which is origin, not executor).
+    let affected_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT subagent_id FROM subagent_harness_bindings \
+             WHERE is_hot = 1 AND harness = ?1",
+        )?;
+        let rows = stmt.query_map(params![harness], |row| row.get::<_, String>(0))?;
+        let mut v = Vec::new();
+        for r in rows {
+            v.push(r?);
+        }
+        v
+    };
+    if affected_ids.is_empty() {
+        // No hot bindings for this harness — nothing to reconcile.
+        // Commit the empty tx for consistency.
+        tx.commit().context("commit empty crash reconciliation")?;
+        return Ok(CrashReconciliationCounts::default());
+    }
+
+    // 2. Mark in-flight tasks as failed. Scope by subagent_id IN affected ONLY.
+    //    NOT source_harness — that column is task origin (claude-code|codex|cli,
+    //    spec line 193), not the executing sidecar adapter. The affected set
+    //    from hot bindings already encodes "had a session on this sidecar".
+    let placeholders = affected_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql_tasks = format!(
+        "UPDATE subagent_tasks SET status = 'failed', error = 'SIDECAR_CRASHED', \
+            completed_at_ms = ?1 \
+         WHERE status = 'running' AND subagent_id IN ({placeholders})",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+    for id in &affected_ids {
+        params_vec.push(Box::new(id.clone()));
+    }
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let tasks_failed = tx
+        .execute(&sql_tasks, params_refs.as_slice())
+        .with_context(|| format!("reconcile tasks for harness {harness}"))?;
+
+    // 3. Release hot bindings: is_hot=0, status='crashed'.
+    let bindings_released = tx
+        .execute(
+            "UPDATE subagent_harness_bindings SET is_hot = 0, status = 'crashed', \
+                closed_at_ms = ?1 \
+             WHERE is_hot = 1 AND harness = ?2",
+            params![now, harness],
+        )
+        .with_context(|| format!("reconcile bindings for harness {harness}"))?;
+
+    // 4. Roll back logical status for the affected set ONLY.
+    //    Exclude deleted tombstones (Plan 1 deletion semantics).
+    //    Roll back to warm if memory.hot_summary exists, else cold.
+    let sql_status = format!(
+        "UPDATE subagent_logical_subagents SET status = CASE \
+            WHEN EXISTS (SELECT 1 FROM subagent_memory \
+                         WHERE subagent_memory.subagent_id = subagent_logical_subagents.id \
+                         AND subagent_memory.hot_summary IS NOT NULL) THEN 'warm' \
+            ELSE 'cold' END, \
+            updated_at_ms = ?1 \
+         WHERE status != 'deleted' AND id IN ({placeholders})",
+    );
+    let status_rolled_back = tx
+        .execute(&sql_status, params_refs.as_slice())
+        .context("reconcile logical status after crash")?;
+
+    tx.commit()
+        .context("commit crash reconciliation transaction")?;
+    Ok(CrashReconciliationCounts {
+        tasks_failed,
+        bindings_released,
+        status_rolled_back,
+    })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CrashReconciliationCounts {
+    pub tasks_failed: usize,
+    pub bindings_released: usize,
+    pub status_rolled_back: usize,
+}

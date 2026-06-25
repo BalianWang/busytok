@@ -1,8 +1,12 @@
 pub mod client;
+pub mod config;
 pub mod protocol;
+pub mod supervisor;
 
 pub use client::SidecarRpcClient;
+pub use config::{resolve_sidecar_config, SidecarConfig};
 pub use protocol::*;
+pub use supervisor::{PiSidecarSupervisor, SharedDb, SidecarHandle};
 
 /// Errors from sidecar operations.
 #[derive(Debug, thiserror::Error)]
