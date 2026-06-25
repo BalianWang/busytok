@@ -19,6 +19,9 @@ pub enum SubagentError {
     #[error("invalid subagent name: {0}")]
     InvalidName(String),
 
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("profile not found: {0}")]
     ProfileNotFound(String),
 
@@ -36,6 +39,7 @@ impl SubagentError {
             SubagentError::NotFound(_) => "subagent.not_found",
             SubagentError::AmbiguousName(_) => "subagent.ambiguous_name",
             SubagentError::InvalidName(_) => "subagent.invalid_name",
+            SubagentError::InvalidArgument(_) => "subagent.invalid_argument",
             SubagentError::ProfileNotFound(_) => "subagent.profile_not_found",
             SubagentError::Disabled => "subagent.disabled",
             SubagentError::Store(_) => "subagent.store_error",

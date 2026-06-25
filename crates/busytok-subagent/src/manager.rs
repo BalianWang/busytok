@@ -199,6 +199,15 @@ impl SubagentManager {
         resolve: ResolveParams,
         limit: i64,
     ) -> Result<Vec<SubagentTaskSummary>> {
+        // Clamp and validate limit — SQLite treats negative LIMIT as "no limit",
+        // which would bypass the "recent N tasks" boundary.
+        const MAX_TASKS_LIMIT: i64 = 500;
+        if limit < 0 {
+            return Err(SubagentError::InvalidArgument(format!(
+                "limit must be >= 0, got {limit}"
+            )));
+        }
+        let limit = limit.min(MAX_TASKS_LIMIT);
         let db = self.db.lock().expect("subagent db lock poisoned");
         let sub = self.resolve(&db, &resolve)?;
         let rows = db
@@ -249,9 +258,23 @@ impl SubagentManager {
 
     /// Soft delete (default) or hard delete with `hard=true`.
     /// Returns the resolved subagent id so callers can echo it back.
+    /// Hard delete may operate on already-tombstoned rows; soft delete on a
+    /// tombstone is a no-op success.
     pub async fn delete(&self, resolve: ResolveParams, hard: bool) -> Result<String> {
         let db = self.db.lock().expect("subagent db lock poisoned");
-        let sub = self.resolve(&db, &resolve)?;
+        // Hard delete needs to reach tombstoned rows (user may soft-delete then
+        // hard-delete). Soft delete uses the ordinary resolve (rejects tombstones).
+        let sub = if hard {
+            if let Some(id) = &resolve.id {
+                crate::resolver::resolve_by_id_include_deleted(&db, id)?
+            } else {
+                // name path: tombstones are filtered by lookup_by_name, so a
+                // soft-deleted-by-name subagent is NotFound here — acceptable.
+                self.resolve(&db, &resolve)?
+            }
+        } else {
+            self.resolve(&db, &resolve)?
+        };
         if hard {
             // Application-layer cascade (spec §3.5: no DB-level CASCADE).
             // subagent_hard_delete removes usage, tasks, bindings, memory, events, then the row.
@@ -269,13 +292,25 @@ impl SubagentManager {
 
     /// Resolve a single subagent by UUID (`id`) or by name + cwd.
     /// Lookup-only — does NOT create (read/delete ops must not mutate identity).
+    /// Exactly one of `id` or `name` must be provided (the control contract).
     fn resolve(&self, db: &busytok_store::Database, p: &ResolveParams) -> Result<LogicalSubagent> {
+        match (&p.id, &p.name) {
+            (Some(_), Some(_)) => {
+                return Err(SubagentError::InvalidArgument(
+                    "id and name are mutually exclusive".to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(SubagentError::InvalidArgument(
+                    "either id or name must be provided".to_string(),
+                ));
+            }
+            _ => {}
+        }
         if let Some(id) = &p.id {
             return resolve_by_id(db, id);
         }
-        let name = p.name.as_ref().ok_or_else(|| {
-            SubagentError::InvalidName("neither id nor name provided".to_string())
-        })?;
+        let name = p.name.as_ref().expect("checked above");
         let cwd = p.cwd.as_deref().unwrap_or(".");
         crate::resolver::lookup_by_name(db, name, cwd)
     }

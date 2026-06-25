@@ -54,8 +54,24 @@ pub fn resolve_by_name(
     }
 }
 
-/// Look up by UUID directly.
+/// Look up by UUID directly. Tombstoned (`status='deleted'`) subagents are
+/// rejected as `NotFound` so ordinary read/write paths cannot revive them.
+/// Callers that must see tombstones (e.g. hard delete) use
+/// [`resolve_by_id_include_deleted`].
 pub fn resolve_by_id(db: &busytok_store::Database, id: &str) -> Result<LogicalSubagent> {
+    let sub = resolve_by_id_include_deleted(db, id)?;
+    if sub.status == crate::models::SubagentStatus::Deleted {
+        return Err(SubagentError::NotFound(id.to_string()));
+    }
+    Ok(sub)
+}
+
+/// Look up by UUID, including tombstoned rows. Used by `delete` (which needs
+/// to operate on already-deleted rows for hard delete) and internal tooling.
+pub fn resolve_by_id_include_deleted(
+    db: &busytok_store::Database,
+    id: &str,
+) -> Result<LogicalSubagent> {
     db.subagent_get_logical(id)
         .map_err(SubagentError::Store)?
         .map(|r| row_to_model(&r))
@@ -64,7 +80,7 @@ pub fn resolve_by_id(db: &busytok_store::Database, id: &str) -> Result<LogicalSu
 
 /// Look up (WITHOUT creating) a subagent by name within the repo scope of `cwd`.
 /// Used by read-only operations (show/tasks/hibernate/delete); delegate uses the
-/// create-or-lookup `resolve_by_name`.
+/// create-or-lookup `resolve_by_name`. Tombstoned rows are rejected.
 pub fn lookup_by_name(
     db: &busytok_store::Database,
     name: &str,
@@ -80,9 +96,10 @@ pub fn lookup_by_name(
     let matches = db
         .subagent_find_by_name_in_repo(&repo_hash, &repo_hash, name)
         .map_err(SubagentError::Store)?;
-    match matches.len() {
+    let active: Vec<_> = matches.iter().filter(|r| r.status != "deleted").collect();
+    match active.len() {
         0 => Err(SubagentError::NotFound(name.to_string())),
-        1 => Ok(row_to_model(&matches[0])),
+        1 => Ok(row_to_model(active[0])),
         _ => Err(SubagentError::AmbiguousName(name.to_string())),
     }
 }

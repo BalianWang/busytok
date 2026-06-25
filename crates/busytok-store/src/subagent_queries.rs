@@ -201,46 +201,49 @@ pub fn list_filtered(
     Ok(rows)
 }
 
-/// Hard-delete a logical subagent and all its dependents, in FK-safe order.
+/// Hard-delete a logical subagent and all its dependents, in FK-safe order,
+/// wrapped in a single transaction so a mid-cascade failure leaves no orphans.
 ///
 /// Per spec §3.5 there is **no `ON DELETE CASCADE`** on the subagent tables —
 /// audit data must never be silently removed. Hard delete is explicit, at the
 /// application (store) layer: delete children in dependency order, then the row.
 pub fn hard_delete_logical_subagent(conn: &Connection, id: &str) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     // usage_records reference both tasks and the logical row → delete first.
-    conn.execute(
+    tx.execute(
         "DELETE FROM subagent_usage_records WHERE subagent_id = ?1",
         params![id],
     )
     .with_context(|| format!("delete usage records for subagent {id}"))?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM subagent_tasks WHERE subagent_id = ?1",
         params![id],
     )
     .with_context(|| format!("delete tasks for subagent {id}"))?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM subagent_harness_bindings WHERE subagent_id = ?1",
         params![id],
     )
     .with_context(|| format!("delete bindings for subagent {id}"))?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM subagent_memory WHERE subagent_id = ?1",
         params![id],
     )
     .with_context(|| format!("delete memory for subagent {id}"))?;
     // resource_events.target_id is a free-text column (no FK); subagent-scoped
     // events carry the subagent id there. Per spec §3.5 hard delete removes events.
-    conn.execute(
+    tx.execute(
         "DELETE FROM subagent_resource_events WHERE target_id = ?1",
         params![id],
     )
     .with_context(|| format!("delete resource events for subagent {id}"))?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM subagent_logical_subagents WHERE id = ?1",
         params![id],
     )
-    .map(|_| ())
-    .with_context(|| format!("hard-delete logical subagent {id}"))
+    .with_context(|| format!("hard-delete logical subagent {id}"))?;
+    tx.commit()
+        .with_context(|| format!("commit hard-delete for subagent {id}"))
 }
 
 // --- memory ----------------------------------------------------------------

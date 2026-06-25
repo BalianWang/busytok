@@ -314,10 +314,142 @@ async fn show_unknown_id_returns_not_found() {
 }
 
 #[tokio::test]
-async fn resolve_without_id_or_name_returns_invalid_name() {
+async fn resolve_without_id_or_name_returns_invalid_argument() {
     let m = manager().await;
     let err = m.show(ResolveParams::default()).await.unwrap_err();
-    assert!(matches!(err, SubagentError::InvalidName(_)));
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert_eq!(err.code(), "subagent.invalid_argument");
+}
+
+#[tokio::test]
+async fn resolve_with_both_id_and_name_returns_invalid_argument() {
+    let m = manager().await;
+    let err = m
+        .show(ResolveParams {
+            id: Some("some-uuid".to_string()),
+            name: Some("reviewer".to_string()),
+            cwd: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert_eq!(err.code(), "subagent.invalid_argument");
+}
+
+#[tokio::test]
+async fn soft_deleted_subagent_cannot_be_resolved_by_id() {
+    let m = manager().await;
+    let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let id = r.subagent_id.clone();
+    // soft delete
+    m.delete(
+        ResolveParams {
+            id: Some(id.clone()),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    // resolve by id now fails (tombstone filtered)
+    let err = m
+        .show(ResolveParams {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::NotFound(_)));
+    // hibernate on tombstone also fails
+    let err = m
+        .hibernate(ResolveParams {
+            id: Some(id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::NotFound(_)));
+    // delegate with subagent_id on tombstone fails
+    let err = m
+        .delegate(DelegateRequest {
+            subagent_id: Some(id.clone()),
+            ..req("reviewer", "do")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn hard_delete_can_operate_on_soft_deleted_subagent() {
+    let m = manager().await;
+    let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let id = r.subagent_id.clone();
+    // soft delete first
+    m.delete(
+        ResolveParams {
+            id: Some(id.clone()),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    // hard delete on tombstone succeeds (resolve_by_id_include_deleted)
+    m.delete(
+        ResolveParams {
+            id: Some(id.clone()),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    // now truly gone
+    let err = m
+        .show(ResolveParams {
+            id: Some(id),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn tasks_with_negative_limit_returns_invalid_argument() {
+    let m = manager().await;
+    let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let err = m
+        .tasks(
+            ResolveParams {
+                id: Some(r.subagent_id.clone()),
+                ..Default::default()
+            },
+            -1,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert_eq!(err.code(), "subagent.invalid_argument");
+}
+
+#[tokio::test]
+async fn tasks_with_large_limit_is_clamped() {
+    let m = manager().await;
+    let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    // limit 10000 should be clamped to 500 and succeed (returns 1 task)
+    let tasks = m
+        .tasks(
+            ResolveParams {
+                id: Some(r.subagent_id.clone()),
+                ..Default::default()
+            },
+            10000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
 }
 
 #[tokio::test]
