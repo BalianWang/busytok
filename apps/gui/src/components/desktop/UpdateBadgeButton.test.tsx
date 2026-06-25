@@ -8,7 +8,7 @@ vi.mock("../../hooks/useUpdater", () => ({ useUpdater: vi.fn() }));
 const mocked = vi.mocked(useUpdater);
 
 function setStatus(status: ReturnType<typeof useUpdater>["status"]) {
-  mocked.mockReturnValue({ status, checkNow: vi.fn(), applyNow: vi.fn() });
+  mocked.mockReturnValue({ status, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() });
 }
 
 beforeEach(() => vi.clearAllMocks());
@@ -33,7 +33,7 @@ describe("UpdateBadgeButton", () => {
 
   it("available: shows version in tooltip + applies on click", async () => {
     const applyNow = vi.fn();
-    mocked.mockReturnValue({ status: { state: "available", version: "0.3.0", notes: "fixes", date: "d" }, checkNow: vi.fn(), applyNow });
+    mocked.mockReturnValue({ status: { state: "available", version: "0.3.0", notes: "fixes", date: "d" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow });
     render(<UpdateBadgeButton />);
     const btn = screen.getByRole("button");
     expect(btn.title).toContain("0.3.0");
@@ -73,6 +73,7 @@ describe("UpdateBadgeButton", () => {
   it("available with empty notes: tooltip shows fallback text", () => {
     mocked.mockReturnValue({
       status: { state: "available", version: "0.3.0", notes: "", date: "d" },
+      currentVersion: "0.0.2",
       checkNow: vi.fn(),
       applyNow: vi.fn(),
     });

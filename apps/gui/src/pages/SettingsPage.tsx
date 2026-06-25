@@ -51,6 +51,7 @@ import {
 import { useUpdater } from "../hooks/useUpdater";
 import { useVersionHistory } from "../api/useVersionHistory";
 import { installVersion } from "../lib/versionCommands";
+import { updatePanelView } from "../lib/updatePanelView";
 import { reportFrontendEvent } from "../logging/reporter";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 
@@ -315,7 +316,8 @@ export function SettingsPage() {
   // applied live by themeRuntime via PREFERENCES_UPDATED_EVENT. It never
   // touches the server-backed settings mutation flow.
   const { preferences, updatePreference } = usePreferences();
-  const { status: updateStatus, checkNow: checkForUpdates, applyNow: applyUpdateNow } = useUpdater();
+  const { status: updateStatus, currentVersion, checkNow: checkForUpdates, applyNow: applyUpdateNow } = useUpdater();
+  const updateView = updatePanelView(updateStatus);
 
   // ── Version history (manual downgrade) ──────────────────────────────
   const versionHistory = useVersionHistory();
@@ -933,43 +935,23 @@ export function SettingsPage() {
           <h2>Updates</h2>
           <div className="settings-panel">
             <SettingsRow
-              label="Software Update"
-              description={
-                updateStatus.state === "downloading"
-                  ? updateStatus.percent == null
-                    ? "Downloading update…"
-                    : `Downloading update… ${updateStatus.percent}%`
-                  : updateStatus.state === "installed-pending-restart"
-                    ? "Update installed — restarting…"
-                    : updateStatus.state === "installed-needs-manual-restart"
-                      ? `Updated to v${updateStatus.version} — please restart Busytok manually.`
-                      : updateStatus.state === "error"
-                        ? `Update check failed: ${updateStatus.message}`
-                        : updateStatus.state === "available"
-                          ? `v${updateStatus.version} is available.`
-                          : "Check for and install the latest version of Busytok."
-              }
+              label="Version"
               control={
-                updateStatus.state === "available" ? (
-                  <button type="button" className="btn btn--secondary btn--sm" onClick={() => void applyUpdateNow()}>
-                    Update now
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn--secondary btn--sm"
-                    disabled={updateStatus.state === "checking" || updateStatus.state === "downloading" || updateStatus.state === "installed-pending-restart"}
-                    onClick={() => void checkForUpdates()}
-                  >
-                    {updateStatus.state === "checking"
-                      ? "Checking…"
-                      : updateStatus.state === "up-to-date"
-                        ? "Up to date"
-                        : updateStatus.state === "error"
-                          ? "Retry"
-                          : "Check for updates"}
-                  </button>
-                )
+                <SettingsValue value={currentVersion ?? "Loading…"} tone={currentVersion ? "default" : "muted"} />
+              }
+            />
+            <SettingsRow
+              label="Software Update"
+              description={updateView.description}
+              control={
+                <button
+                  type="button"
+                  className="btn btn--secondary btn--sm"
+                  disabled={updateView.buttonDisabled}
+                  onClick={() => void (updateView.appliesUpdate ? applyUpdateNow() : checkForUpdates())}
+                >
+                  {updateView.buttonLabel}
+                </button>
               }
             />
             {!isMacPlatform() && (

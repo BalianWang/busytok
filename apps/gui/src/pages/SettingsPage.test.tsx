@@ -95,8 +95,10 @@ import { useVersionHistory } from "../api/useVersionHistory";
 import { installVersion } from "../lib/versionCommands";
 import { SettingsPage } from "./SettingsPage";
 
-function mockUpdater(value: UpdaterContextValue) {
-  vi.mocked(useUpdater).mockReturnValue(value);
+function mockUpdater(value: Omit<UpdaterContextValue, "currentVersion"> & { currentVersion?: string | null }): void {
+  // Default currentVersion so the always-visible Version row has a value; a
+  // test overrides it by passing currentVersion explicitly.
+  vi.mocked(useUpdater).mockReturnValue({ currentVersion: "0.0.2", ...value });
 }
 
 describe("SettingsPage Updates section", () => {
@@ -213,8 +215,36 @@ describe("SettingsPage Updates section", () => {
     ).toBeTruthy();
   });
 
+  it("shows the running version in a persistent Version row", () => {
+    mockUpdater({ status: { state: "idle" }, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByText("0.0.2")).toBeTruthy();
+  });
+
+  it("shows Loading… for the Version row while currentVersion is unknown", () => {
+    mockUpdater({ status: { state: "idle" }, currentVersion: null, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByText("Loading…")).toBeTruthy();
+  });
+
+  it("up-to-date shows a confirmation distinct from idle", () => {
+    mockUpdater({ status: { state: "up-to-date" }, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByText(/you're on the latest version of busytok/i)).toBeTruthy();
+    // The idle placeholder must NOT also be present in the up-to-date state.
+    expect(screen.queryByText(/check for and install the latest version of busytok/i)).toBeNull();
+    // The persistent Version row is still shown.
+    expect(screen.getByText("0.0.2")).toBeTruthy();
+  });
+
+  it("checking shows the in-progress message", () => {
+    mockUpdater({ status: { state: "checking" }, checkNow: vi.fn(), applyNow: vi.fn() });
+    render(<SettingsPage />);
+    expect(screen.getByText(/checking for updates/i)).toBeTruthy();
+  });
+
   it("hides the Windows note on macOS and shows it elsewhere", () => {
-    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, checkNow: vi.fn(), applyNow: vi.fn() } as never);
+    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() } as never);
     const platformGetter = vi.spyOn(navigator, "platform", "get");
     try {
       platformGetter.mockReturnValue("MacIntel");
@@ -232,7 +262,7 @@ describe("SettingsPage Updates section", () => {
   // ── Version-history panel (manual downgrade) ────────────────────────
 
   function seedVersions() {
-    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, checkNow: vi.fn(), applyNow: vi.fn() } as never);
+    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() } as never);
     vi.mocked(useVersionHistory).mockReturnValue({
       data: { versions: [
         { version: "0.1.0-rc.5", date: "2026-06-23", notes: "current", manifest_url: "u5" },
@@ -270,7 +300,7 @@ describe("SettingsPage Updates section", () => {
   });
 
   it("renders Loading… / Unavailable for version-history fetch states", () => {
-    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, checkNow: vi.fn(), applyNow: vi.fn() } as never);
+    vi.mocked(useUpdater).mockReturnValue({ status: { state: "up-to-date" }, currentVersion: "0.0.2", checkNow: vi.fn(), applyNow: vi.fn() } as never);
     vi.mocked(useVersionHistory).mockReturnValue({ data: undefined, isLoading: true, isError: false, isFetching: false } as never);
     const { unmount } = render(<SettingsPage />);
     expect(screen.getByText("Loading…")).toBeTruthy();
