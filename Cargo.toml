@@ -44,7 +44,7 @@ tauri-build = { version = "2", features = [] }
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "io-util", "process"] }
 toml = "0.8"
 toml_edit = "0.22"
 tracing = "0.1"

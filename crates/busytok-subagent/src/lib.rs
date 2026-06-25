@@ -8,6 +8,7 @@ pub mod manager;
 pub mod mock_executor;
 pub mod models;
 pub mod resolver;
+pub mod sidecar;
 
 pub use error::{Result, SubagentError};
 pub use manager::SubagentManager;
