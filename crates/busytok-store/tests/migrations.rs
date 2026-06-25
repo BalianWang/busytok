@@ -51,8 +51,8 @@ fn table_info_map(
 #[test]
 fn baseline_plus_cache_metrics_migrations() {
     let migs = busytok_store::schema::migrations();
-    assert_eq!(migs.len(), 2);
-    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 2);
+    assert_eq!(migs.len(), 3);
+    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 3);
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(busytok_store::schema::CREATE_SCHEMA_VERSION_TABLE)
         .unwrap();
@@ -505,4 +505,42 @@ fn service_state_contains_read_model_metadata() {
             .unwrap();
         assert_eq!(count, 1, "service_state missing {column}");
     }
+}
+
+// ── Logical subagent schema (v3) ────────────────────────────────────────────
+
+#[test]
+fn subagent_migration_creates_tables() {
+    let db = Database::open_in_memory().unwrap();
+    let tables = db.table_names().unwrap();
+    for name in [
+        "subagent_logical_subagents",
+        "subagent_memory",
+        "subagent_tasks",
+        "subagent_harness_bindings",
+        "subagent_usage_records",
+        "subagent_resource_events",
+    ] {
+        assert!(tables.contains(&name.to_string()), "missing table {name}");
+    }
+}
+
+#[test]
+fn migrations_registered_in_order() {
+    assert_eq!(
+        schema::migrations().len(),
+        3,
+        "expected baseline + cache-metrics + subagent migrations"
+    );
+    assert_eq!(schema::migrations()[0].0, 1);
+    assert_eq!(schema::migrations()[1].0, 2);
+    assert_eq!(schema::migrations()[2].0, 3);
+    assert_eq!(schema::SCHEMA_VERSION, 3);
+}
+
+#[test]
+fn schema_version_is_three() {
+    assert_eq!(schema::SCHEMA_VERSION, 3);
+    let max_version = schema::migrations().iter().map(|(v, _)| *v).max().unwrap();
+    assert_eq!(max_version, schema::SCHEMA_VERSION);
 }
