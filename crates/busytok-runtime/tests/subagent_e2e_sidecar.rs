@@ -239,3 +239,107 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
 
     supervisor.shutdown_writer().await.unwrap();
 }
+
+#[tokio::test]
+async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
+    // Delegate creates a hot binding (is_hot=1, status='hot').
+    // Graceful shutdown must release it (is_hot=0, status='closed')
+    // and roll back logical status to warm/cold — WITHOUT hibernate
+    // or delete first. This is the only test that genuinely exercises
+    // the shutdown reconciliation path: the sibling lifecycle test
+    // hibernates + deletes before shutdown, which drains hot bindings
+    // first and makes `release_hot_bindings_for_shutdown` hit its
+    // early-return (vacuous assertion).
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
+
+    // 1. delegate — must go through the sidecar subprocess.
+    let delegate_resp = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "shutdown-test".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+
+    let sub_id = delegate_resp.subagent_id.clone();
+    assert_eq!(delegate_resp.status, "completed");
+    assert!(
+        delegate_resp.adapter_session_id.is_some(),
+        "adapter_session_id must be set — proves the sidecar subprocess was used"
+    );
+    assert!(
+        delegate_resp
+            .adapter_session_id
+            .as_ref()
+            .unwrap()
+            .starts_with("pi_sess_mock_"),
+        "adapter_session_id should come from mock-sidecar.sh, got: {:?}",
+        delegate_resp.adapter_session_id
+    );
+
+    // 2. verify the subagent is hot (proves a hot binding exists pre-shutdown).
+    let shown = supervisor
+        .subagent_show(SubagentResolveRequestDto {
+            name: None,
+            id: Some(sub_id.clone()),
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        shown.status, "hot",
+        "subagent must be hot after delegate (precondition for the shutdown assertion)"
+    );
+
+    // 3. graceful shutdown — WITHOUT hibernate or delete first. This is the
+    //    only path that leaves a hot binding in place for
+    //    `release_hot_bindings_for_shutdown` to reconcile.
+    supervisor.shutdown_sidecar().await;
+
+    // 4. post-shutdown DB assertions (spec §3.3 end-to-end). Scoped block
+    //    ensures the MutexGuard is dropped before the cleanup `.await`
+    //    (clippy::await_holding_lock).
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        // (a) No hot bindings may remain for the pi harness.
+        let hot_count: i64 = db_guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_harness_bindings \
+                 WHERE is_hot = 1 AND harness = ?1",
+                rusqlite::params!["pi"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hot_count, 0,
+            "no hot bindings should exist for the pi harness after shutdown"
+        );
+        // (b) The previously-hot subagent's status must roll back to warm/cold.
+        //     STRICT assertion (not `!= "hot"`) — a dead sidecar process must
+        //     never leave a `status='hot'` row, and the rollback target is
+        //     specifically warm (memory exists) or cold (no memory).
+        let sub = db_guard
+            .subagent_get_logical(&sub_id)
+            .unwrap()
+            .expect("logical subagent row must still exist after shutdown");
+        assert!(
+            sub.status == "warm" || sub.status == "cold",
+            "previously-hot subagent must roll back to 'warm' or 'cold' after shutdown, got: {:?}",
+            sub.status
+        );
+    }
+
+    supervisor.shutdown_writer().await.unwrap();
+}
