@@ -133,6 +133,32 @@ impl BusytokSupervisor {
         Self::build_with_settings(db, paths, adapters, settings)
     }
 
+    /// Construct a supervisor with a pre-resolved `SidecarConfig`.
+    ///
+    /// Used by integration tests that need to substitute a mock sidecar bundle
+    /// path without setting an env var in production code. The rest of the
+    /// build proceeds as normal: settings are loaded from
+    /// `paths.config_dir()/settings.toml` (or defaults if the file is
+    /// missing), and the sidecar supervisor is constructed from the provided
+    /// `sidecar_config` instead of calling `resolve_sidecar_config`.
+    /// `settings.subagent.pi_sidecar.enabled` must be `true` for the sidecar
+    /// to be wired in (same gate as the production path).
+    pub fn new_with_sidecar_config(
+        db: Database,
+        paths: BusytokPaths,
+        sidecar_config: busytok_subagent::sidecar::SidecarConfig,
+    ) -> Self {
+        let adapters: Vec<BoxedAdapter> = vec![
+            Box::new(busytok_adapters::ClaudeCodeAdapter),
+            Box::new(busytok_adapters::CodexAdapter),
+        ];
+        let settings = BusytokSettings::load(&paths).unwrap_or_else(|e| {
+            warn!("Failed to load settings, using defaults: {e}");
+            BusytokSettings::default()
+        });
+        Self::build_with_sidecar_config(db, paths, adapters, settings, sidecar_config)
+    }
+
     /// Shared constructor for `new` and `with_adapters`.
     fn build(db: Database, paths: BusytokPaths, adapters: Vec<BoxedAdapter>) -> Self {
         let settings = BusytokSettings::load(&paths).unwrap_or_else(|e| {
@@ -164,55 +190,128 @@ impl BusytokSupervisor {
         // `pi_sidecar.enabled = true` must ensure the bundle is installed; a
         // missing bundle surfaces as an `error!` log + queryable init error
         // and degraded (mock) execution rather than a panic.
-        let (executor, sidecar_supervisor, sidecar_init_error): (
-            Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
-            Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
-            Option<String>,
-        ) = if settings.subagent.pi_sidecar.enabled {
-            match busytok_subagent::sidecar::config::resolve_sidecar_config(
-                &settings.subagent.pi_sidecar,
-                &paths,
-            ) {
-                Ok(sidecar_config) => {
-                    let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
-                        sidecar_config,
-                        Some(Arc::clone(&db)),
-                    );
-                    let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> = Arc::new(
-                        busytok_subagent::sidecar::SidecarTaskExecutor::new(Arc::clone(&sup)),
-                    );
-                    (exec, Some(sup), None)
-                }
-                Err(e) => {
-                    // `build_with_settings` returns `Self`, not `Result<Self>`,
-                    // so the error cannot propagate. We MUST still boot (the
-                    // service runs in degraded mode with MockTaskExecutor),
-                    // but the failure is escalated to `error!` with a stable
-                    // event_code AND captured in `sidecar_init_error` so Task 6
-                    // / status reporting can surface it without re-scanning
-                    // logs. This closes the "warn-log-only" observability gap.
-                    let msg = e.to_string();
-                    error!(
-                        event_code = "subagent.sidecar.config_resolve_failed",
-                        error = %e,
-                        "sidecar config resolve failed; falling back to MockTaskExecutor (degraded mode)"
-                    );
-                    (
-                        Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
-                            as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
-                        None,
-                        Some(msg),
-                    )
-                }
-            }
-        } else {
-            (
+        let (executor, sidecar_supervisor, sidecar_init_error) =
+            Self::construct_sidecar(&settings, &paths, &db, None);
+        Self::assemble_with_sidecar(
+            db,
+            paths,
+            adapters,
+            settings,
+            event_bus,
+            executor,
+            sidecar_supervisor,
+            sidecar_init_error,
+        )
+    }
+
+    /// Shared constructor accepting pre-loaded settings AND a pre-resolved
+    /// `SidecarConfig`. Used by `new_with_sidecar_config` so integration tests
+    /// can inject a mock sidecar bundle path without setting an env var in
+    /// production code. Skips `resolve_sidecar_config` and uses the provided
+    /// config directly when constructing the `PiSidecarSupervisor`.
+    fn build_with_sidecar_config(
+        db: Database,
+        paths: BusytokPaths,
+        adapters: Vec<BoxedAdapter>,
+        settings: BusytokSettings,
+        sidecar_config: busytok_subagent::sidecar::SidecarConfig,
+    ) -> Self {
+        let event_bus = AppEventBus::new(64);
+        let db = Arc::new(Mutex::new(db));
+        let (executor, sidecar_supervisor, sidecar_init_error) =
+            Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
+        Self::assemble_with_sidecar(
+            db,
+            paths,
+            adapters,
+            settings,
+            event_bus,
+            executor,
+            sidecar_supervisor,
+            sidecar_init_error,
+        )
+    }
+
+    /// Construct the sidecar executor + supervisor + init-error triple.
+    /// When `sidecar_config_override` is `Some`, skip `resolve_sidecar_config`
+    /// and use the provided config directly (test injection path). When
+    /// `None`, resolve from settings + paths (production path).
+    fn construct_sidecar(
+        settings: &BusytokSettings,
+        paths: &BusytokPaths,
+        db: &Arc<Mutex<Database>>,
+        sidecar_config_override: Option<busytok_subagent::sidecar::SidecarConfig>,
+    ) -> (
+        Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+        Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+        Option<String>,
+    ) {
+        if !settings.subagent.pi_sidecar.enabled {
+            return (
                 Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
                     as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
                 None,
                 None,
-            )
+            );
+        }
+        // Either use the injected config (test path) or resolve from settings.
+        let config_result = match sidecar_config_override {
+            Some(cfg) => Ok(cfg),
+            None => busytok_subagent::sidecar::config::resolve_sidecar_config(
+                &settings.subagent.pi_sidecar,
+                paths,
+            ),
         };
+        match config_result {
+            Ok(sidecar_config) => {
+                let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
+                    sidecar_config,
+                    Some(Arc::clone(db)),
+                );
+                let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> = Arc::new(
+                    busytok_subagent::sidecar::SidecarTaskExecutor::new(Arc::clone(&sup)),
+                );
+                (exec, Some(sup), None)
+            }
+            Err(e) => {
+                // `build_with_settings` returns `Self`, not `Result<Self>`,
+                // so the error cannot propagate. We MUST still boot (the
+                // service runs in degraded mode with MockTaskExecutor),
+                // but the failure is escalated to `error!` with a stable
+                // event_code AND captured in `sidecar_init_error` so Task 6
+                // / status reporting can surface it without re-scanning
+                // logs. This closes the "warn-log-only" observability gap.
+                let msg = e.to_string();
+                error!(
+                    event_code = "subagent.sidecar.config_resolve_failed",
+                    error = %e,
+                    "sidecar config resolve failed; falling back to MockTaskExecutor (degraded mode)"
+                );
+                (
+                    Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+                        as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                    None,
+                    Some(msg),
+                )
+            }
+        }
+    }
+
+    /// Assemble the final `BusytokSupervisor` from the shared constructor
+    /// inputs plus the already-constructed sidecar triple. Both
+    /// `build_with_settings` and `build_with_sidecar_config` funnel through
+    /// this to avoid duplicating the ~60 lines of manager/read-service/
+    /// writer/event-bus wiring.
+    fn assemble_with_sidecar(
+        db: Arc<Mutex<Database>>,
+        paths: BusytokPaths,
+        adapters: Vec<BoxedAdapter>,
+        settings: BusytokSettings,
+        event_bus: AppEventBus,
+        executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+        sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+        sidecar_init_error: Option<String>,
+    ) -> Self {
         let subagent_manager = Arc::new(busytok_subagent::SubagentManager::new(
             Arc::clone(&db),
             settings.subagent.clone(),

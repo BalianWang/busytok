@@ -758,3 +758,108 @@ pub struct CrashReconciliationCounts {
     pub bindings_released: usize,
     pub status_rolled_back: usize,
 }
+
+/// Converge DB state after a **graceful** sidecar shutdown, per spec §3.3.
+///
+/// Mirrors `reconcile_sidecar_crash` but with two key differences reflecting
+/// that this is a controlled shutdown (the sidecar was asked to
+/// `prepare_hibernate` + `adapter.shutdown` first), not a crash:
+///
+/// 1. Hot bindings are released to `status='closed'` (NOT `'crashed'`).
+/// 2. In-flight tasks are NOT touched. The sidecar was given a chance to
+///    finish or roll back its own work; a graceful shutdown must not
+///    unilaterally rewrite task status. (Crash reconciliation marks running
+///    tasks `failed`/`SIDECAR_CRASHED` because a crash gives no such chance.)
+///
+/// Otherwise the same binding-anchored pattern as `reconcile_sidecar_crash`:
+///
+/// 1. Collect affected `subagent_id` set from `subagent_harness_bindings
+///    WHERE is_hot=1 AND harness=?` FIRST.
+/// 2. Release hot bindings for this harness → `is_hot=0, status='closed'`.
+/// 3. Roll back logical status for the affected set ONLY, excluding
+///    `status='deleted'` tombstones (Plan 1 deletion semantics):
+///    `warm` if memory exists, else `cold`.
+///
+/// Spec §3.3 invariant: after this returns, `status='hot'` iff a hot binding
+/// exists — so a dead sidecar process never leaves a `status='hot'` row.
+pub fn release_hot_bindings_for_shutdown(
+    conn: &Connection,
+    harness: &str,
+) -> Result<ShutdownReconciliationCounts> {
+    let now = busytok_domain::now_ms();
+    let tx = conn.unchecked_transaction()?;
+
+    // 1. Collect affected subagent_id set from hot bindings (binding-anchored,
+    //    same as reconcile_sidecar_crash). This is the authoritative
+    //    "who was affected" scope for all subsequent updates.
+    let affected_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT subagent_id FROM subagent_harness_bindings \
+             WHERE is_hot = 1 AND harness = ?1",
+        )?;
+        let rows = stmt.query_map(params![harness], |row| row.get::<_, String>(0))?;
+        let mut v = Vec::new();
+        for r in rows {
+            v.push(r?);
+        }
+        v
+    };
+    if affected_ids.is_empty() {
+        // No hot bindings for this harness — nothing to reconcile.
+        // Commit the empty tx for consistency.
+        tx.commit()
+            .context("commit empty shutdown reconciliation")?;
+        return Ok(ShutdownReconciliationCounts::default());
+    }
+
+    // 2. Release hot bindings: is_hot=0, status='closed'.
+    //    NOT 'crashed' — this is graceful shutdown.
+    let bindings_released = tx
+        .execute(
+            "UPDATE subagent_harness_bindings SET is_hot = 0, status = 'closed', \
+                closed_at_ms = ?1 \
+             WHERE is_hot = 1 AND harness = ?2",
+            params![now, harness],
+        )
+        .with_context(|| format!("release hot bindings for shutdown harness {harness}"))?;
+
+    // 3. Roll back logical status for the affected set ONLY.
+    //    Exclude deleted tombstones (Plan 1 deletion semantics).
+    //    Roll back to warm if memory.hot_summary exists, else cold.
+    let placeholders = affected_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql_status = format!(
+        "UPDATE subagent_logical_subagents SET status = CASE \
+            WHEN EXISTS (SELECT 1 FROM subagent_memory \
+                         WHERE subagent_memory.subagent_id = subagent_logical_subagents.id \
+                         AND subagent_memory.hot_summary IS NOT NULL) THEN 'warm' \
+            ELSE 'cold' END, \
+            updated_at_ms = ?1 \
+         WHERE status != 'deleted' AND id IN ({placeholders})",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+    for id in &affected_ids {
+        params_vec.push(Box::new(id.clone()));
+    }
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let status_rolled_back = tx
+        .execute(&sql_status, params_refs.as_slice())
+        .context("reconcile logical status after shutdown")?;
+
+    tx.commit()
+        .context("commit shutdown reconciliation transaction")?;
+    Ok(ShutdownReconciliationCounts {
+        bindings_released,
+        status_rolled_back,
+    })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ShutdownReconciliationCounts {
+    pub bindings_released: usize,
+    pub status_rolled_back: usize,
+}

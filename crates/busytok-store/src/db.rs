@@ -1995,6 +1995,12 @@ impl Database {
     ) -> Result<subagent_queries::CrashReconciliationCounts> {
         subagent_queries::reconcile_sidecar_crash(self.conn(), harness)
     }
+    pub fn subagent_release_hot_bindings_for_shutdown(
+        &self,
+        harness: &str,
+    ) -> Result<subagent_queries::ShutdownReconciliationCounts> {
+        subagent_queries::release_hot_bindings_for_shutdown(self.conn(), harness)
+    }
     pub fn subagent_list_filtered(
         &self,
         status: Option<&str>,

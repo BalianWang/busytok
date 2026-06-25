@@ -293,6 +293,36 @@ impl PiSidecarSupervisor {
         }
     }
 
+    /// Converge DB state after a graceful sidecar shutdown (spec §3.3).
+    /// Releases hot bindings (`status='closed'`, NOT `'crashed'`) and rolls
+    /// back logical subagent status to `warm`/`cold` for the affected set.
+    /// Synchronous (no `.await` held across the DB lock) — the DB lock is a
+    /// `std::sync::Mutex`, distinct from `self.state` (`tokio::sync::Mutex`);
+    /// acquire it, run the sync store function, release it, with no `.await`
+    /// in between.
+    fn reconcile_shutdown(&self) {
+        if let Some(db) = &self.db {
+            let db = db.lock().expect("subagent db lock poisoned");
+            match db.subagent_release_hot_bindings_for_shutdown(&self.config.harness_name) {
+                Ok(counts) => {
+                    info!(
+                        event_code = "subagent.sidecar.shutdown_reconciled",
+                        bindings_released = counts.bindings_released,
+                        status_rolled_back = counts.status_rolled_back,
+                        "sidecar shutdown reconciled"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        event_code = "subagent.sidecar.shutdown_reconcile_failed",
+                        error = %e,
+                        "shutdown reconciliation failed; store may be half-converged"
+                    );
+                }
+            }
+        }
+    }
+
     /// Perform one RPC call. Locks state only to clone the client Arc and bump
     /// `last_activity`; the RPC itself runs with the state lock released.
     #[instrument(skip(self, params), fields(method = %method))]
@@ -364,6 +394,12 @@ impl PiSidecarSupervisor {
                 }
             }
         }
+        // Spec §3.3 end-to-end: after the worker process is dead, release hot
+        // bindings (status='closed') and roll back logical status to warm/cold
+        // so the store never says "hot" with no worker running. This mirrors
+        // `reconcile_crash` but uses 'closed' (graceful) instead of 'crashed'.
+        // Synchronous — no `.await` held across the DB lock.
+        self.reconcile_shutdown();
         info!(event_code = "subagent.sidecar.stop", "sidecar shut down");
         self.write_resource_event("sidecar_stop");
         Ok(())

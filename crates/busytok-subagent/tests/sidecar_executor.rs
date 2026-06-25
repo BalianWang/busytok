@@ -95,20 +95,20 @@ async fn delegate_via_sidecar_writes_binding_and_sets_hot() {
     assert!(r.usage.input_tokens.is_some());
 
     // Hot binding was upserted.
-    let db = h.db.lock().unwrap();
-    let binding = db.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
-    assert!(binding.is_some(), "hot binding not found");
-    let binding = binding.unwrap();
-    assert_eq!(binding.is_hot, 1);
-    assert_eq!(binding.status, "hot");
-    assert_eq!(binding.adapter_session_id, r.adapter_session_id);
+    {
+        let db = h.db.lock().unwrap();
+        let binding = db.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
+        assert!(binding.is_some(), "hot binding not found");
+        let binding = binding.unwrap();
+        assert_eq!(binding.is_hot, 1);
+        assert_eq!(binding.status, "hot");
+        assert_eq!(binding.adapter_session_id, r.adapter_session_id);
 
-    // Subagent status is Hot (not Warm).
-    let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
-    assert!(sub.is_some());
-    assert_eq!(sub.unwrap().status, "hot");
-
-    drop(db);
+        // Subagent status is Hot (not Warm).
+        let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
+        assert!(sub.is_some());
+        assert_eq!(sub.unwrap().status, "hot");
+    }
     h.supervisor.shutdown().await.unwrap();
 }
 
@@ -130,11 +130,11 @@ async fn delegate_via_sidecar_reuses_hot_binding_on_redelegate() {
     assert_eq!(r1.subagent_id, r2.subagent_id);
 
     // Only one hot binding row (upsert, not duplicate insert).
-    let db = h.db.lock().unwrap();
-    let binding = db.subagent_hot_binding(&r1.subagent_id, "pi").unwrap();
-    assert!(binding.is_some());
-
-    drop(db);
+    {
+        let db = h.db.lock().unwrap();
+        let binding = db.subagent_hot_binding(&r1.subagent_id, "pi").unwrap();
+        assert!(binding.is_some());
+    }
     h.supervisor.shutdown().await.unwrap();
 }
 
@@ -162,20 +162,20 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_warm() {
     );
     assert_eq!(r.status, TaskStatus::Completed);
 
-    let db = h.db.lock().unwrap();
+    {
+        let db = h.db.lock().unwrap();
 
-    // No hot binding row — spec §3.3 (no hot binding without a real session).
-    let binding = db.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
-    assert!(
-        binding.is_none(),
-        "empty adapter_session_id must not create a hot binding"
-    );
+        // No hot binding row — spec §3.3 (no hot binding without a real session).
+        let binding = db.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
+        assert!(
+            binding.is_none(),
+            "empty adapter_session_id must not create a hot binding"
+        );
 
-    // Logical subagent status is Warm (not Hot).
-    let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
-    assert!(sub.is_some());
-    assert_eq!(sub.unwrap().status, "warm");
-
-    drop(db);
+        // Logical subagent status is Warm (not Hot).
+        let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
+        assert!(sub.is_some());
+        assert_eq!(sub.unwrap().status, "warm");
+    }
     h.supervisor.shutdown().await.unwrap();
 }

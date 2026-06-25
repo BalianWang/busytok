@@ -2,8 +2,9 @@
 //! End-to-end subagent lifecycle through the real Pi sidecar subprocess.
 //!
 //! Constructs a `BusytokSupervisor` with `pi_sidecar.enabled = true` and
-//! substitutes mock-sidecar.sh for the real Node bundle via the
-//! `BUSYTOK_TEST_SIDECAR_BUNDLE` env var. Exercises the full
+//! injects mock-sidecar.sh as the sidecar bundle via a pre-resolved
+//! `SidecarConfig` passed to `BusytokSupervisor::new_with_sidecar_config`
+//! (no env-var escape hatch in production code). Exercises the full
 //! delegate → list → show → hibernate → delete lifecycle through the
 //! `RuntimeControl` dispatch path — the same path the control server uses.
 //!
@@ -11,51 +12,24 @@
 //! supervisor constructs the sidecar incorrectly, settings don't propagate,
 //! the shutdown sequence doesn't cleanly stop the sidecar, etc.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
 use busytok_config::{BusytokPaths, BusytokSettings};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
-
-/// RAII guard that sets an env var on creation and restores the previous
-/// value (or unsets it) on drop. Ensures test env vars don't leak to
-/// other tests in the same binary.
-struct EnvVarGuard {
-    key: String,
-    previous: Option<Option<String>>,
-    set: bool,
-}
-
-impl EnvVarGuard {
-    fn set(key: &str, value: &str) -> Self {
-        let previous = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self {
-            key: key.to_string(),
-            previous: Some(previous),
-            set: true,
-        }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if !self.set {
-            return;
-        }
-        match &self.previous {
-            Some(Some(val)) => std::env::set_var(&self.key, val),
-            Some(None) => std::env::remove_var(&self.key),
-            None => {}
-        }
-    }
-}
+use busytok_subagent::sidecar::SidecarConfig;
 
 /// Path to the mock-sidecar.sh fixture, resolved relative to
 /// CARGO_MANIFEST_DIR (crates/busytok-runtime). The fixture lives in
 /// busytok-subagent/tests/fixtures/.
-fn mock_sidecar_path() -> String {
+fn mock_sidecar_path() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest}/../busytok-subagent/tests/fixtures/mock-sidecar.sh")
+    PathBuf::from(format!(
+        "{manifest}/../busytok-subagent/tests/fixtures/mock-sidecar.sh"
+    ))
 }
 
 /// Settings with pi_sidecar enabled, using system bash as the "node"
@@ -70,11 +44,27 @@ fn make_sidecar_settings() -> BusytokSettings {
     settings
 }
 
+/// Build a `SidecarConfig` that points at mock-sidecar.sh. Mirrors the
+/// fields `resolve_sidecar_config` would produce for the test settings,
+/// but with `bundle_path` set to the mock fixture (no env var needed).
+fn make_sidecar_config() -> SidecarConfig {
+    SidecarConfig {
+        node_binary: PathBuf::from("/bin/bash"),
+        bundle_path: mock_sidecar_path(),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+    }
+}
+
 /// Construct a supervisor that loads sidecar-enabled settings from the
-/// config file in `tmp`. Mirrors the `make_supervisor_with_settings`
-/// helper in supervisor_control.rs — `with_adapters_and_settings` is
-/// `pub(crate)`, so integration tests must go through the file-based
-/// `new()` constructor.
+/// config file in `tmp` and injects the mock sidecar bundle via
+/// `new_with_sidecar_config`. The settings file must still have
+/// `pi_sidecar.enabled = true` so the sidecar wiring path is taken.
 fn make_sidecar_supervisor(
     db: busytok_store::Database,
     tmp: &tempfile::TempDir,
@@ -84,15 +74,11 @@ fn make_sidecar_supervisor(
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .ok();
-    BusytokSupervisor::new(db, paths)
+    BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
 }
 
 #[tokio::test]
 async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
-    // The env var must be set BEFORE constructing the supervisor —
-    // `resolve_sidecar_config` reads it during `BusytokSupervisor::new`.
-    let _bundle_guard = EnvVarGuard::set("BUSYTOK_TEST_SIDECAR_BUNDLE", &mock_sidecar_path());
-
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let settings = make_sidecar_settings();
@@ -218,7 +204,38 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
         );
     }
 
-    // 7. graceful shutdown — kills the sidecar subprocess.
+    // 7. graceful shutdown — kills the sidecar subprocess and reconciles
+    //    DB state (releases hot bindings, rolls back logical status).
     supervisor.shutdown_sidecar().await;
+
+    // Post-shutdown DB assertion (spec §3.3 end-to-end): after graceful
+    // shutdown, no hot bindings may remain for the harness, and the
+    // previously-hot subagent's status must NOT be 'hot'. This guards the
+    // shutdown reconciliation added to `shutdown_internal` — a dead sidecar
+    // process must never leave a `status='hot'` row or an `is_hot=1`
+    // binding in the store.
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let hot_count: i64 = db_guard
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_harness_bindings \
+                 WHERE is_hot = 1 AND harness = 'pi'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hot_count, 0,
+            "no hot bindings should exist for the pi harness after shutdown"
+        );
+        let sub = db_guard.subagent_get_logical(&sub_id).unwrap();
+        let sub = sub.expect("logical subagent row must still exist after shutdown");
+        assert_ne!(
+            sub.status, "hot",
+            "previously-hot subagent must not be 'hot' after shutdown reconciliation"
+        );
+    }
+
     supervisor.shutdown_writer().await.unwrap();
 }

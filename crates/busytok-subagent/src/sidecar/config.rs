@@ -66,14 +66,7 @@ pub fn resolve_sidecar_config(
             )));
         }
     };
-    // Test escape hatch: when BUSYTOK_TEST_SIDECAR_BUNDLE is set, use that
-    // path instead of the resolved bundle. This allows the busytok-runtime
-    // e2e test (Task 7) to substitute mock-sidecar.sh without a test-only
-    // BusytokSupervisor constructor. The env var is only set by a single
-    // integration test, so parallel-test safety is not a concern.
-    let bundle_path = std::env::var("BUSYTOK_TEST_SIDECAR_BUNDLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| paths.sidecar_bundle_path(runtime_dir));
+    let bundle_path = paths.sidecar_bundle_path(runtime_dir);
     if !bundle_path.exists() {
         return Err(SidecarError::Spawn(format!(
             "sidecar bundle not found at {}",
