@@ -81,6 +81,308 @@ pub(crate) fn load_persisted_codex_model(db: &Database, source_file_id: &str) ->
         })
 }
 
+/// Cross-batch Codex model backfill.
+///
+/// After a batch is written to DB, if any Codex event in the batch carried a
+/// resolved model, attempt to backfill earlier events (from previous batches)
+/// that were persisted with NULL model. Only safe when the session has exactly
+/// one distinct model across all batches.
+///
+/// Returns `true` if any events were updated (caller should rebuild aggregates).
+pub(crate) fn backfill_cross_batch_codex_models(
+    db: &Database,
+    codex_model_resolutions: &[(String, String, String)],
+) -> bool {
+    let mut any_updated = false;
+    for (source_file_id, session_id, model) in codex_model_resolutions {
+        match db.distinct_codex_models_for_session(source_file_id, session_id) {
+            // Explicit model comparison (not just len() == 1): defends against
+            // call-order changes where the current batch's model might differ
+            // from what's already in the DB. Mirrors the check in
+            // cross_batch_backfill_from_turn_context.
+            Ok(models) if models.len() == 1 && models[0] == *model => {
+                match db.backfill_codex_model_for_session(source_file_id, session_id, model) {
+                    Ok(updated) if updated > 0 => {
+                        any_updated = true;
+                        info!(
+                            event_code = "codex_model_backfilled_cross_batch",
+                            session_id = %session_id,
+                            source_file_id = %source_file_id,
+                            resolved_model = %model,
+                            updated_count = updated,
+                            "Cross-batch backfill: updated earlier Codex events with resolved model"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            event_code = "codex_model_backfill_cross_batch_failed",
+                            session_id = %session_id,
+                            source_file_id = %source_file_id,
+                            error = %e,
+                            "Failed to cross-batch backfill Codex model"
+                        );
+                    }
+                }
+            }
+            Ok(models) if models.len() > 1 => {
+                warn!(
+                    event_code = "codex_model_backfill_skipped_multi_model",
+                    session_id = %session_id,
+                    source_file_id = %source_file_id,
+                    seen_models = ?models,
+                    "Cross-batch backfill skipped: multiple distinct models in session"
+                );
+            }
+            Ok(models) if models.len() == 1 && models[0] != *model => {
+                warn!(
+                    event_code = "codex_model_backfill_skipped_model_mismatch",
+                    session_id = %session_id,
+                    source_file_id = %source_file_id,
+                    batch_model = %model,
+                    db_model = %models[0],
+                    "Cross-batch backfill skipped: DB model differs from batch model"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    event_code = "codex_model_backfill_query_failed",
+                    session_id = %session_id,
+                    source_file_id = %source_file_id,
+                    error = %e,
+                    "Failed to query distinct models for cross-batch backfill"
+                );
+            }
+        }
+    }
+    any_updated
+}
+
+/// Collect (source_file_id, session_id, model) tuples from Codex events
+/// that have a resolved model. Used for cross-batch backfill.
+pub(crate) fn collect_codex_model_resolutions(
+    events: &[NormalizedUsageEvent],
+) -> Vec<(String, String, String)> {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for event in events {
+        if event.agent == AgentKind::Codex {
+            if let Some(ref model) = event.model {
+                let key = (event.source_file_id.clone(), event.session_id.clone());
+                if seen.insert(key) {
+                    result.push((
+                        event.source_file_id.clone(),
+                        event.session_id.clone(),
+                        model.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Cross-batch backfill from turn_context lines.
+///
+/// When a batch contains only `turn_context` lines (no usage events), the
+/// model is not persisted to DB. This function extracts the turn_context
+/// model and backfills earlier NULL-model events for the same source file.
+/// Safety check: only backfill if no conflicting model exists in the DB
+/// for the same session, AND the batch itself has exactly one distinct
+/// turn_context model (no ambiguity).
+///
+/// Returns `true` if any events were updated (caller should rebuild aggregates).
+pub(crate) fn cross_batch_backfill_from_turn_context(
+    db: &Database,
+    lines: &[busytok_tailer::TailedLine],
+    source_file_id: &str,
+) -> bool {
+    // Collect ALL distinct turn_context models from this batch.
+    let tc_models: std::collections::HashSet<String> = lines
+        .iter()
+        .filter_map(|l| extract_codex_turn_context_model(&l.text))
+        .collect();
+
+    // If the batch itself has multiple turn_context models, skip entirely.
+    if tc_models.len() != 1 {
+        if tc_models.len() > 1 {
+            warn!(
+                event_code = "codex_model_backfill_skipped_multi_model",
+                source_file_id = %source_file_id,
+                seen_models = ?tc_models,
+                "Cross-batch backfill from turn_context skipped: batch has multiple distinct models"
+            );
+        }
+        return false;
+    }
+
+    let model = tc_models.iter().next().expect("exactly one model");
+    let mut any_updated = false;
+
+    // Find sessions with NULL-model events for this source file.
+    let session_ids = match db.codex_sessions_with_null_model(source_file_id) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(
+                event_code = "codex_model_backfill_query_failed",
+                source_file_id = %source_file_id,
+                error = %e,
+                "Failed to query sessions with NULL model for turn_context backfill"
+            );
+            return false;
+        }
+    };
+
+    // Safety: turn_context lines do not carry an explicit session_id, so we
+    // cannot reliably attribute the model to a specific session when multiple
+    // unresolved sessions exist in the same file. Require exactly one
+    // unresolved session; otherwise skip conservatively.
+    if session_ids.len() != 1 {
+        if session_ids.len() > 1 {
+            warn!(
+                event_code = "codex_model_backfill_skipped_multi_session",
+                source_file_id = %source_file_id,
+                unresolved_session_count = session_ids.len(),
+                seen_sessions = ?session_ids,
+                "Cross-batch backfill from turn_context skipped: multiple unresolved sessions in file"
+            );
+        }
+        return false;
+    }
+
+    let session_id = &session_ids[0];
+
+    // Safety: check no conflicting model exists in DB. Query failure must
+    // NOT be treated as "no existing model" — skip conservatively on error.
+    let existing = match db.distinct_codex_models_for_session(source_file_id, session_id) {
+        Ok(models) => models,
+        Err(e) => {
+            warn!(
+                event_code = "codex_model_backfill_query_failed",
+                session_id = %session_id,
+                source_file_id = %source_file_id,
+                error = %e,
+                "Failed to query distinct models for turn_context backfill; skipping"
+            );
+            return false;
+        }
+    };
+    if !existing.iter().all(|m| m == model) {
+        warn!(
+            event_code = "codex_model_backfill_skipped_multi_model",
+            session_id = %session_id,
+            source_file_id = %source_file_id,
+            turn_context_model = %model,
+            seen_models = ?existing,
+            "Cross-batch backfill from turn_context skipped: conflicting model in DB"
+        );
+        return false;
+    }
+
+    match db.backfill_codex_model_for_session(source_file_id, session_id, model) {
+        Ok(updated) if updated > 0 => {
+            any_updated = true;
+            info!(
+                event_code = "codex_model_backfilled_cross_batch",
+                session_id = %session_id,
+                source_file_id = %source_file_id,
+                resolved_model = %model,
+                updated_count = updated,
+                "Cross-batch backfill from turn_context: updated earlier Codex events"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                event_code = "codex_model_backfill_cross_batch_failed",
+                session_id = %session_id,
+                source_file_id = %source_file_id,
+                error = %e,
+                "Failed to cross-batch backfill from turn_context"
+            );
+        }
+    }
+    any_updated
+}
+
+/// Rebuild model-dependent aggregates after cross-batch backfill.
+///
+/// When `backfill_cross_batch_codex_models` or `cross_batch_backfill_from_turn_context`
+/// updates the `model` field on existing `usage_events`, the aggregate tables
+/// (`model_summary`, `daily_usage`, `sessions`) become stale because they were
+/// built incrementally inside `ingest_store_batch` with the old (NULL) model.
+///
+/// This function rebuilds those tables from the full event corpus, mirroring
+/// what `handle_rebuild_rollups` does in the writer actor.
+///
+/// Error policy: fail-fast. If any table rebuild fails, return immediately
+/// without touching the remaining tables. A half-rebuilt aggregate state is
+/// worse than no rebuild at all — the next scan cycle will retry.
+pub(crate) fn rebuild_model_aggregates(db: &Database, timezone: &str) {
+    let all_events = match db.all_usage_events() {
+        Ok(events) => events,
+        Err(e) => {
+            warn!(
+                event_code = "codex_model_aggregate_rebuild_failed",
+                error = %e,
+                "Failed to load events for model aggregate rebuild"
+            );
+            return;
+        }
+    };
+
+    // Rebuild model_summary (grouped by model).
+    let model_rows = busytok_aggregator::rebuild_model_summaries(&all_events);
+    if let Err(e) = db.replace_model_summaries(&model_rows) {
+        warn!(
+            event_code = "codex_model_aggregate_rebuild_failed",
+            error = %e,
+            "Failed to replace model summaries after backfill; aborting rebuild"
+        );
+        return;
+    }
+
+    // Rebuild sessions (carries model column).
+    let session_rows = busytok_aggregator::rebuild_sessions(&all_events, timezone);
+    if let Err(e) = db.replace_sessions(&session_rows) {
+        warn!(
+            event_code = "codex_model_aggregate_rebuild_failed",
+            error = %e,
+            "Failed to replace sessions after backfill; aborting rebuild"
+        );
+        return;
+    }
+
+    // Rebuild daily_usage atomically (DELETE + upsert in one transaction).
+    let rtz = match busytok_domain::ReportingTimezone::parse(timezone) {
+        Ok(tz) => tz,
+        Err(e) => {
+            warn!(
+                event_code = "codex_model_aggregate_rebuild_failed",
+                error = %e,
+                timezone = %timezone,
+                "Failed to parse timezone for daily_usage rebuild; aborting rebuild"
+            );
+            return;
+        }
+    };
+    if let Err(e) = db.replace_daily_usage(&all_events, &rtz, "rebuild-after-backfill") {
+        warn!(
+            event_code = "codex_model_aggregate_rebuild_failed",
+            error = %e,
+            "Failed to replace daily_usage after backfill; aborting rebuild"
+        );
+        return;
+    }
+
+    info!(
+        event_code = "codex_model_aggregate_rebuilt",
+        event_count = all_events.len(),
+        "Rebuilt model-dependent aggregates after cross-batch backfill"
+    );
+}
+
 fn resolve_codex_event_model(
     snapshot: &CodexTokenSnapshot,
     previous: Option<&CodexTokenSnapshotRow>,
@@ -123,11 +425,29 @@ pub(crate) fn parse_events_with_codex_model_context(
     let mut parse_error_count: usize = 0;
     let mut cap_exceeded = false;
 
+    // Session-level delayed backfill tracking (Codex only).
+    // When a token_count event lacks info.model AND no prior model is known
+    // (forward inheritance fails), the snapshot is recorded as "pending".
+    // After the full batch is parsed, if exactly one model was seen in the
+    // same session, pending snapshots are backfilled. This fixes the common
+    // Codex pattern where turn_context arrives after the first token_count.
+    let mut session_seen_models: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
+    // turn_context lines don't carry session_id, so we key by source_path
+    // (which IS the session-id basis for Codex) to avoid cross-session pollution.
+    let mut turn_context_models_by_path: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
+    let mut session_pending: HashMap<String, Vec<usize>> = HashMap::new();
+
     for tailed_line in lines {
         let ctx = &tailed_line.context;
         if agent == AgentKind::Codex {
             if let Some(model) = extract_codex_turn_context_model(&tailed_line.text) {
-                current_codex_model = Some(model);
+                current_codex_model = Some(model.clone());
+                turn_context_models_by_path
+                    .entry(ctx.source_path.clone())
+                    .or_default()
+                    .insert(model);
             }
         }
         match adapter.parse_line(ctx, &tailed_line.text) {
@@ -138,8 +458,25 @@ pub(crate) fn parse_events_with_codex_model_context(
                             snap.model = normalized_codex_event_model(snap.model);
                             if let Some(ref m) = snap.model {
                                 current_codex_model = Some(m.clone());
+                                session_seen_models
+                                    .entry(snap.session_id.clone())
+                                    .or_default()
+                                    .insert(m.clone());
                             } else {
                                 snap.model = effective_codex_model(&current_codex_model);
+                                if snap.model.is_none() {
+                                    // Forward inheritance failed — record for backfill.
+                                    session_pending
+                                        .entry(snap.session_id.clone())
+                                        .or_default()
+                                        .push(parsed_events.len());
+                                } else {
+                                    // Forward inheritance succeeded — track the model.
+                                    session_seen_models
+                                        .entry(snap.session_id.clone())
+                                        .or_default()
+                                        .insert(snap.model.clone().unwrap());
+                                }
                             }
                             parsed_events.push(ParsedLogEvent::CodexTokenSnapshot(snap));
                         }
@@ -206,6 +543,82 @@ pub(crate) fn parse_events_with_codex_model_context(
                 parsed_events.push(ParsedLogEvent::Normalized(
                     NormalizedEvent::OperationalDiagnostic(diag),
                 ));
+            }
+        }
+    }
+
+    // ── Delayed session-level model backfill (Codex only) ───────────
+    // After parsing the entire batch, attempt to backfill snapshots whose
+    // model is still None. For each session, if exactly one distinct model
+    // was seen (from info.model or turn_context), backfill all pending
+    // snapshots. If multiple models were seen, skip (conservative). If no
+    // model was seen at all, the snapshots remain None (truly unresolved).
+    if agent == AgentKind::Codex && !session_pending.is_empty() {
+        for (session_id, pending_indices) in &session_pending {
+            // Collect all models seen for this session (from snapshots).
+            let mut all_models: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            if let Some(models) = session_seen_models.get(session_id) {
+                for m in models {
+                    all_models.insert(m.as_str());
+                }
+            }
+            // Merge turn_context models only from the same source_path(s)
+            // as the pending snapshots, to avoid cross-session pollution.
+            for &idx in pending_indices {
+                if let ParsedLogEvent::CodexTokenSnapshot(snap) = &parsed_events[idx] {
+                    if let Some(tc_models) = turn_context_models_by_path.get(&snap.source_path) {
+                        for m in tc_models {
+                            all_models.insert(m.as_str());
+                        }
+                    }
+                }
+            }
+
+            let event_count = pending_indices.len();
+            let source_path = pending_indices
+                .first()
+                .and_then(|&idx| {
+                    if let ParsedLogEvent::CodexTokenSnapshot(snap) = &parsed_events[idx] {
+                        Some(snap.source_path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            if all_models.len() == 1 {
+                let resolved_model = all_models.iter().next().expect("exactly one model");
+                for &idx in pending_indices {
+                    if let ParsedLogEvent::CodexTokenSnapshot(ref mut snap) = parsed_events[idx] {
+                        snap.model = Some(resolved_model.to_string());
+                    }
+                }
+                info!(
+                    event_code = "codex_model_backfilled",
+                    session_id = %session_id,
+                    source_path = %source_path,
+                    event_count = event_count,
+                    resolved_model = %resolved_model,
+                    "Backfilled missing Codex model from session-level context"
+                );
+            } else if all_models.len() > 1 {
+                let seen: Vec<&str> = all_models.iter().copied().collect();
+                warn!(
+                    event_code = "codex_model_backfill_skipped_multi_model",
+                    session_id = %session_id,
+                    source_path = %source_path,
+                    event_count = event_count,
+                    seen_models = ?seen,
+                    "Skipped Codex model backfill: multiple distinct models in session"
+                );
+            } else {
+                debug!(
+                    event_code = "codex_model_missing_unresolved",
+                    session_id = %session_id,
+                    source_path = %source_path,
+                    event_count = event_count,
+                    "Codex model unresolved: no model found in session"
+                );
             }
         }
     }
@@ -536,6 +949,10 @@ pub fn scan_once(
                 .map(|e| (e.id.clone(), e.agent.as_str().to_string()))
                 .collect();
 
+            // Capture Codex model resolutions for cross-batch backfill
+            // before events are moved into store_batch.
+            let codex_model_resolutions = collect_codex_model_resolutions(&usage_events);
+
             let usage_count = usage_events.len();
 
             let store_batch = StoreWriteBatch {
@@ -580,6 +997,23 @@ pub fn scan_once(
                     })
                 })
                 .with_context(|| format!("failed to ingest batch for {}", file_path.display()))?;
+
+            // Cross-batch backfill: if this batch resolved a Codex model,
+            // update earlier events from previous batches that had NULL model.
+            let mut backfill_changed = false;
+            if !codex_model_resolutions.is_empty() {
+                backfill_changed |= backfill_cross_batch_codex_models(db, &codex_model_resolutions);
+            }
+            // Also handle batches where only turn_context arrived (no usage events).
+            if *agent == AgentKind::Codex {
+                backfill_changed |=
+                    cross_batch_backfill_from_turn_context(db, &batch.lines, &file_id);
+            }
+            // If backfill changed any events, rebuild model-dependent aggregates
+            // (model_summary, daily_usage, sessions) to stay consistent.
+            if backfill_changed {
+                rebuild_model_aggregates(db, rtz.canonical_name());
+            }
 
             stats.files_scanned += 1;
             stats.events_found += usage_count;
@@ -1668,5 +2102,632 @@ mod tests {
 
     fn first_usage_event(events: &[NormalizedUsageEvent]) -> &NormalizedUsageEvent {
         events.first().expect("at least one usage event")
+    }
+
+    // ── Codex session-level delayed model backfill tests ─────────────
+
+    /// Helper: create a tailed line with a Codex-style source path.
+    /// Accepts a custom source_path so tests can simulate multiple sessions
+    /// in a single `parse_events_with_codex_model_context` call.
+    fn make_codex_tailed_line(text: &str, line_num: u64) -> TailedLine {
+        make_codex_tailed_line_with_path(text, line_num, "/fake/codex-backfill-test.jsonl")
+    }
+
+    fn make_codex_tailed_line_with_path(
+        text: &str,
+        line_num: u64,
+        source_path: &str,
+    ) -> TailedLine {
+        TailedLine {
+            text: text.to_string(),
+            context: busytok_domain::ParseContext {
+                source_file_id: "f-codex-bf".to_string(),
+                source_path: source_path.to_string(),
+                inode: None,
+                source_line: line_num,
+                source_offset_start: 0,
+                source_offset_end: text.len() as u64,
+                replay_sequence: 0,
+            },
+        }
+    }
+
+    fn codex_token_count_line(ts: &str, model: Option<&str>, input: i64, output: i64) -> String {
+        let model_json = match model {
+            Some(m) => format!(r#""model":"{m}","#),
+            None => String::new(),
+        };
+        let total = input + output;
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{{model_json}"total_token_usage":{{"input_tokens":{input},"output_tokens":{output},"total_tokens":{total}}}}}}}}}"#
+        )
+    }
+
+    fn codex_turn_context_line(ts: &str, model: &str) -> String {
+        format!(r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"{model}"}}}}"#)
+    }
+
+    fn extract_snapshots(events: &[ParsedLogEvent]) -> Vec<&CodexTokenSnapshot> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ParsedLogEvent::CodexTokenSnapshot(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Scenario 1: token_count without model, then turn_context with model.
+    /// The earlier snapshot should be backfilled.
+    #[test]
+    fn codex_backfill_fills_missing_model_from_later_turn_context() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        // Line 1: token_count WITHOUT info.model
+        let line1 = codex_token_count_line("2026-05-20T07:16:22.000Z", None, 100, 50);
+        // Line 2: turn_context with model
+        let line2 = codex_turn_context_line("2026-05-20T07:16:23.000Z", "gpt-5.4");
+        // Line 3: token_count WITHOUT info.model (should inherit via forward pass)
+        let line3 = codex_token_count_line("2026-05-20T07:16:24.000Z", None, 200, 100);
+
+        let lines = vec![
+            make_codex_tailed_line(&line1, 0),
+            make_codex_tailed_line(&line2, 1),
+            make_codex_tailed_line(&line3, 2),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0].model.as_deref(),
+            Some("gpt-5.4"),
+            "first snapshot should be backfilled from later turn_context"
+        );
+        assert_eq!(
+            snapshots[1].model.as_deref(),
+            Some("gpt-5.4"),
+            "second snapshot should inherit via forward pass"
+        );
+    }
+
+    /// Scenario 2: same session has two different models → no backfill.
+    #[test]
+    fn codex_backfill_skipped_when_multi_model_session() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        // Line 1: token_count without model (pending)
+        let line1 = codex_token_count_line("2026-05-20T07:16:22.000Z", None, 100, 50);
+        // Line 2: token_count with model A
+        let line2 = codex_token_count_line("2026-05-20T07:16:23.000Z", Some("gpt-5.4"), 200, 100);
+        // Line 3: token_count with model B
+        let line3 = codex_token_count_line("2026-05-20T07:16:24.000Z", Some("o4-mini"), 300, 150);
+
+        let lines = vec![
+            make_codex_tailed_line(&line1, 0),
+            make_codex_tailed_line(&line2, 1),
+            make_codex_tailed_line(&line3, 2),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 3);
+        assert!(
+            snapshots[0].model.is_none(),
+            "pending snapshot should NOT be backfilled when multiple models exist"
+        );
+    }
+
+    /// Scenario 3: snapshot with explicit info.model is never overwritten.
+    #[test]
+    fn codex_backfill_does_not_overwrite_explicit_model() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        // Line 1: token_count with explicit model
+        let line1 = codex_token_count_line("2026-05-20T07:16:22.000Z", Some("gpt-5.4"), 100, 50);
+        // Line 2: turn_context with a DIFFERENT model
+        let line2 = codex_turn_context_line("2026-05-20T07:16:23.000Z", "o4-mini");
+        // Line 3: token_count without model
+        let line3 = codex_token_count_line("2026-05-20T07:16:24.000Z", None, 200, 100);
+
+        let lines = vec![
+            make_codex_tailed_line(&line1, 0),
+            make_codex_tailed_line(&line2, 1),
+            make_codex_tailed_line(&line3, 2),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0].model.as_deref(),
+            Some("gpt-5.4"),
+            "explicit model must not be overwritten"
+        );
+        // snap[1] inherits from current_codex_model which was updated to "o4-mini" by turn_context
+        assert_eq!(
+            snapshots[1].model.as_deref(),
+            Some("o4-mini"),
+            "forward inheritance should use the latest turn_context model"
+        );
+    }
+
+    /// Scenario 4: no model anywhere → stays None.
+    #[test]
+    fn codex_backfill_unresolved_when_no_model_in_session() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        let line1 = codex_token_count_line("2026-05-20T07:16:22.000Z", None, 100, 50);
+        let line2 = codex_token_count_line("2026-05-20T07:16:23.000Z", None, 200, 100);
+
+        let lines = vec![
+            make_codex_tailed_line(&line1, 0),
+            make_codex_tailed_line(&line2, 1),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots[0].model.is_none(),
+            "stays None — no model to backfill"
+        );
+        assert!(
+            snapshots[1].model.is_none(),
+            "stays None — no model to backfill"
+        );
+    }
+
+    /// Scenario 5: backfill only within same session boundary.
+    /// Two different source_paths (different inferred session_ids) in the
+    /// SAME `parse_events_with_codex_model_context` call — model from
+    /// session B must not backfill session A's pending events.
+    #[test]
+    fn codex_backfill_does_not_cross_sessions() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        // Session A: token_count without model (pending), no turn_context
+        let line_a = codex_token_count_line("2026-05-20T07:16:22.000Z", None, 100, 50);
+        // Session B: token_count with explicit model
+        let line_b = codex_token_count_line("2026-05-20T07:16:23.000Z", Some("gpt-5.4"), 200, 100);
+
+        // Both lines in a SINGLE call, but with different source_paths
+        // (which means different inferred session_ids for Codex).
+        let lines = vec![
+            make_codex_tailed_line_with_path(&line_a, 0, "/fake/session-a.jsonl"),
+            make_codex_tailed_line_with_path(&line_b, 1, "/fake/session-b.jsonl"),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots[0].model.is_none(),
+            "session A should stay None — no cross-session backfill from session B"
+        );
+        assert_eq!(
+            snapshots[1].model.as_deref(),
+            Some("gpt-5.4"),
+            "session B should have its own model"
+        );
+    }
+
+    /// Scenario 5b: turn_context from session B must not pollute session A.
+    /// Session A has a pending snapshot; session B has a turn_context with
+    /// a model. Session A should NOT be backfilled with session B's model.
+    #[test]
+    fn codex_backfill_turn_context_does_not_cross_sessions() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        // Session A: token_count without model (pending)
+        let line_a = codex_token_count_line("2026-05-20T07:16:22.000Z", None, 100, 50);
+        // Session B: turn_context with model
+        let line_b = codex_turn_context_line("2026-05-20T07:16:23.000Z", "gpt-5.4");
+
+        let lines = vec![
+            make_codex_tailed_line_with_path(&line_a, 0, "/fake/session-a.jsonl"),
+            make_codex_tailed_line_with_path(&line_b, 1, "/fake/session-b.jsonl"),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 1);
+        assert!(
+            snapshots[0].model.is_none(),
+            "session A must not be backfilled from session B's turn_context"
+        );
+    }
+
+    /// Scenario 6: info.model and turn_context.model conflict → conservative.
+    /// The explicit info.model takes priority; backfill uses the union of
+    /// all seen models. If multiple distinct models exist, no backfill.
+    #[test]
+    fn codex_backfill_conflict_info_vs_turn_context_conservative() {
+        let db = Database::open_in_memory().unwrap();
+        let adapter = CodexAdapter;
+
+        // Line 1: token_count without model (pending)
+        let line1 = codex_token_count_line("2026-05-20T07:16:22.000Z", None, 100, 50);
+        // Line 2: turn_context with model A
+        let line2 = codex_turn_context_line("2026-05-20T07:16:23.000Z", "gpt-5.4");
+        // Line 3: token_count with model B (different from turn_context)
+        let line3 = codex_token_count_line("2026-05-20T07:16:24.000Z", Some("o4-mini"), 200, 100);
+
+        let lines = vec![
+            make_codex_tailed_line(&line1, 0),
+            make_codex_tailed_line(&line2, 1),
+            make_codex_tailed_line(&line3, 2),
+        ];
+
+        let events = parse_events_with_codex_model_context(
+            &db,
+            "f-codex-bf",
+            AgentKind::Codex,
+            &adapter,
+            &lines,
+        );
+
+        let snapshots = extract_snapshots(&events);
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots[0].model.is_none(),
+            "pending snapshot should NOT be backfilled when info.model and turn_context.model conflict"
+        );
+        assert_eq!(
+            snapshots[1].model.as_deref(),
+            Some("o4-mini"),
+            "explicit info.model is preserved"
+        );
+    }
+
+    /// Regression: `cross_batch_backfill_from_turn_context` must skip when
+    /// the batch itself contains multiple distinct turn_context models.
+    /// Previously it took `.last()` and could backfill the wrong model.
+    #[test]
+    fn cross_batch_backfill_from_turn_context_skips_multi_model_batch() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed: one Codex usage event with NULL model from a prior batch.
+        let mut event = NormalizedUsageEvent::minimal_for_test("evt-1", AgentKind::Codex);
+        event.source_file_id = "f-multi-tc".to_string();
+        event.source_path = "/fake/multi-tc.jsonl".to_string();
+        event.session_id = "sess-multi-tc".to_string();
+        event.agent = AgentKind::Codex;
+        event.total_tokens = 42;
+        event.model = None;
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-test")
+            .expect("seed event insert");
+
+        // Batch with TWO different turn_context models — ambiguous.
+        let tc_a = codex_turn_context_line("2026-05-20T07:16:22.000Z", "gpt-5.4");
+        let tc_b = codex_turn_context_line("2026-05-20T07:16:23.000Z", "o4-mini");
+        let lines = vec![
+            make_codex_tailed_line(&tc_a, 0),
+            make_codex_tailed_line(&tc_b, 1),
+        ];
+
+        let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-multi-tc");
+        assert!(
+            !changed,
+            "must skip backfill when batch has multiple distinct turn_context models"
+        );
+
+        // Event should still have NULL model.
+        let events = db.all_usage_events().expect("query events");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].model.is_none(),
+            "event model must remain NULL after ambiguous batch was skipped"
+        );
+    }
+
+    /// Regression: `codex_sessions_with_null_model` must find sessions that
+    /// only have `codex_token_snapshots` (no usage events yet). Previously it
+    /// only checked `usage_events`, so snapshot-only sessions were missed.
+    #[test]
+    fn cross_batch_backfill_from_turn_context_handles_snapshot_only_session() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed: a codex_token_snapshot with NULL model, NO usage event.
+        // This simulates a first heartbeat that produced a snapshot but no
+        // delta event yet.
+        let snapshot = CodexTokenSnapshotRow {
+            id: "codex-snap:f-snap-only:sess-snap:none:1".to_string(),
+            source_file_id: "f-snap-only".to_string(),
+            source_line: 1,
+            source_offset_start: 0,
+            source_offset_end: 100,
+            session_id: "sess-snap".to_string(),
+            turn_id: None,
+            token_event_ordinal: 1,
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_tokens: 5,
+            total_tokens: 155,
+            model: None,
+            raw_usage_json: "{}".to_string(),
+            emitted_event_id: None,
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+        };
+        db.upsert_codex_snapshot(&snapshot).expect("seed snapshot");
+
+        // Verify the session is discoverable via codex_sessions_with_null_model.
+        let sessions = db
+            .codex_sessions_with_null_model("f-snap-only")
+            .expect("query");
+        assert!(
+            sessions.contains(&"sess-snap".to_string()),
+            "snapshot-only session must be found by codex_sessions_with_null_model"
+        );
+
+        // Batch with a single turn_context model — unambiguous.
+        let tc = codex_turn_context_line("2026-05-20T07:16:24.000Z", "gpt-5.4");
+        let lines = vec![make_codex_tailed_line(&tc, 0)];
+
+        let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-snap-only");
+        assert!(changed, "backfill should succeed for snapshot-only session");
+
+        // The snapshot's model should now be backfilled.
+        let models = db
+            .distinct_codex_models_for_session("f-snap-only", "sess-snap")
+            .expect("query distinct models");
+        assert_eq!(
+            models,
+            vec!["gpt-5.4".to_string()],
+            "snapshot model should be backfilled to gpt-5.4"
+        );
+    }
+
+    /// Regression: `cross_batch_backfill_from_turn_context` must skip when the
+    /// source file has multiple unresolved sessions. turn_context lines do not
+    /// carry an explicit session_id, so we cannot safely attribute the model
+    /// to one session over another.
+    #[test]
+    fn cross_batch_backfill_from_turn_context_skips_multi_session_file() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed: TWO Codex usage events with NULL model, different session_ids,
+        // same source_file_id. This simulates a file with multiple sessions.
+        let mut event_a = NormalizedUsageEvent::minimal_for_test("evt-a", AgentKind::Codex);
+        event_a.source_file_id = "f-multi-sess".to_string();
+        event_a.source_path = "/fake/multi-sess.jsonl".to_string();
+        event_a.session_id = "sess-a".to_string();
+        event_a.agent = AgentKind::Codex;
+        event_a.total_tokens = 10;
+        event_a.model = None;
+
+        let mut event_b = NormalizedUsageEvent::minimal_for_test("evt-b", AgentKind::Codex);
+        event_b.source_file_id = "f-multi-sess".to_string();
+        event_b.source_path = "/fake/multi-sess.jsonl".to_string();
+        event_b.session_id = "sess-b".to_string();
+        event_b.agent = AgentKind::Codex;
+        event_b.total_tokens = 20;
+        event_b.model = None;
+
+        busytok_store::write_queries::insert_usage_events_batch(
+            db.conn(),
+            &[event_a, event_b],
+            "gen-test",
+        )
+        .expect("seed events");
+
+        // Sanity: two unresolved sessions exist.
+        let sessions = db
+            .codex_sessions_with_null_model("f-multi-sess")
+            .expect("query");
+        assert_eq!(sessions.len(), 2, "should have two unresolved sessions");
+
+        // Batch with a single turn_context model — unambiguous at the batch
+        // level, but the file has multiple unresolved sessions.
+        let tc = codex_turn_context_line("2026-05-20T07:16:24.000Z", "gpt-5.4");
+        let lines = vec![make_codex_tailed_line(&tc, 0)];
+
+        let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-multi-sess");
+        assert!(
+            !changed,
+            "must skip backfill when file has multiple unresolved sessions"
+        );
+
+        // Neither event should be backfilled.
+        let events = db.all_usage_events().expect("query events");
+        assert_eq!(events.len(), 2);
+        assert!(
+            events.iter().all(|e| e.model.is_none()),
+            "all events must remain NULL after multi-session skip"
+        );
+    }
+
+    /// Regression: `backfill_cross_batch_codex_models` path — when the current
+    /// batch contains a Codex usage event WITH a model, earlier NULL-model
+    /// events from prior batches should be backfilled. This exercises the
+    /// `collect_codex_model_resolutions` → `backfill_cross_batch_codex_models`
+    /// path (not the turn_context-only path).
+    #[test]
+    fn backfill_cross_batch_codex_models_backfills_from_usage_event() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed event 1: prior batch event with NULL model (backfill candidate).
+        let mut event_prior = NormalizedUsageEvent::minimal_for_test("evt-prior", AgentKind::Codex);
+        event_prior.source_file_id = "f-xbatch".to_string();
+        event_prior.source_path = "/fake/xbatch.jsonl".to_string();
+        event_prior.session_id = "sess-xbatch".to_string();
+        event_prior.agent = AgentKind::Codex;
+        event_prior.total_tokens = 42;
+        event_prior.model = None;
+
+        // Seed event 2: current batch event with resolved model (already
+        // written to DB by ingest_store_batch before backfill is called).
+        let mut event_current =
+            NormalizedUsageEvent::minimal_for_test("evt-current", AgentKind::Codex);
+        event_current.source_file_id = "f-xbatch".to_string();
+        event_current.source_path = "/fake/xbatch.jsonl".to_string();
+        event_current.session_id = "sess-xbatch".to_string();
+        event_current.agent = AgentKind::Codex;
+        event_current.total_tokens = 58;
+        event_current.model = Some("gpt-5.4".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(
+            db.conn(),
+            &[event_prior, event_current],
+            "gen-test",
+        )
+        .expect("seed events");
+
+        // Simulate collect_codex_model_resolutions output for the current batch.
+        let resolutions = vec![(
+            "f-xbatch".to_string(),
+            "sess-xbatch".to_string(),
+            "gpt-5.4".to_string(),
+        )];
+
+        let changed = backfill_cross_batch_codex_models(&db, &resolutions);
+        assert!(
+            changed,
+            "backfill should succeed when DB has single matching model"
+        );
+
+        let events = db.all_usage_events().expect("query events");
+        assert_eq!(events.len(), 2);
+        let prior = events
+            .iter()
+            .find(|e| e.id == "evt-prior")
+            .expect("evt-prior");
+        assert_eq!(
+            prior.model.as_deref(),
+            Some("gpt-5.4"),
+            "prior NULL-model event should be backfilled with the resolved model"
+        );
+        let current = events
+            .iter()
+            .find(|e| e.id == "evt-current")
+            .expect("evt-current");
+        assert_eq!(
+            current.model.as_deref(),
+            Some("gpt-5.4"),
+            "current event model should be unchanged"
+        );
+    }
+
+    /// Regression: `backfill_cross_batch_codex_models` must skip when the DB
+    /// already has a different model for the session (explicit model mismatch,
+    /// not just len() > 1). Seeds BOTH a NULL-model event AND a different-model
+    /// event so the test actually exercises the mismatch guard — without it,
+    /// `len() == 1` alone would pass and the NULL event would be wrongly
+    /// overwritten with the batch's model.
+    #[test]
+    fn backfill_cross_batch_codex_models_skips_on_model_mismatch() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed event 1: NULL model (candidate for backfill).
+        let mut event_null = NormalizedUsageEvent::minimal_for_test("evt-null", AgentKind::Codex);
+        event_null.source_file_id = "f-mismatch".to_string();
+        event_null.source_path = "/fake/mismatch.jsonl".to_string();
+        event_null.session_id = "sess-mismatch".to_string();
+        event_null.agent = AgentKind::Codex;
+        event_null.total_tokens = 10;
+        event_null.model = None;
+
+        // Seed event 2: already has a DIFFERENT model from the batch.
+        let mut event_existing =
+            NormalizedUsageEvent::minimal_for_test("evt-existing", AgentKind::Codex);
+        event_existing.source_file_id = "f-mismatch".to_string();
+        event_existing.source_path = "/fake/mismatch.jsonl".to_string();
+        event_existing.session_id = "sess-mismatch".to_string();
+        event_existing.agent = AgentKind::Codex;
+        event_existing.total_tokens = 42;
+        event_existing.model = Some("o4-mini".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(
+            db.conn(),
+            &[event_null, event_existing],
+            "gen-test",
+        )
+        .expect("seed events");
+
+        // Current batch claims model is "gpt-5.4", but DB has "o4-mini".
+        // distinct_codex_models_for_session returns ["o4-mini"] (len == 1),
+        // but models[0] != "gpt-5.4" → must skip.
+        let resolutions = vec![(
+            "f-mismatch".to_string(),
+            "sess-mismatch".to_string(),
+            "gpt-5.4".to_string(),
+        )];
+
+        let changed = backfill_cross_batch_codex_models(&db, &resolutions);
+        assert!(
+            !changed,
+            "backfill must skip when DB model differs from batch model"
+        );
+
+        let events = db.all_usage_events().expect("query events");
+        assert_eq!(events.len(), 2);
+        // The NULL event must NOT be overwritten with the wrong model.
+        let null_event = events
+            .iter()
+            .find(|e| e.id == "evt-null")
+            .expect("evt-null");
+        assert!(
+            null_event.model.is_none(),
+            "NULL event must NOT be backfilled with mismatched model"
+        );
+        let existing_event = events
+            .iter()
+            .find(|e| e.id == "evt-existing")
+            .expect("evt-existing");
+        assert_eq!(
+            existing_event.model.as_deref(),
+            Some("o4-mini"),
+            "existing event model must NOT be overwritten"
+        );
     }
 }
