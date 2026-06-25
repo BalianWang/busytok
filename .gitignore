@@ -62,3 +62,4 @@ updater.key.pub
 
 # Locally-built sidecars — CI builds fresh; committed sidecars removed in PR2.
 apps/gui/src-tauri/binaries/
+.trae/
