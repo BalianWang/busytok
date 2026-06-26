@@ -875,3 +875,72 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
         "no memory_update => hot_summary is None"
     );
 }
+
+#[tokio::test]
+async fn delegate_populates_attempts_after_first_completed_task() {
+    // C-1 regression: recent_tasks must be re-fetched AFTER the task result is
+    // persisted so the attempts logic sees the just-completed task's
+    // result_summary. Before the fix, the pre-execution snapshot (fetched
+    // before set_task_status) had result_summary=None for the current task,
+    // so memory_updater skipped the attempt entry — attempts_json was always
+    // empty on the first completed task. MockTaskExecutor returns a non-empty
+    // summary (which becomes result_summary via set_task_status), so after the
+    // fix the fresh snapshot's most-recent task carries that summary and an
+    // attempt entry is appended.
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let manager = SubagentManager::new(
+        db.clone(),
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+    let req = DelegateRequest {
+        subagent_name: "worker".to_string(),
+        subagent_id: None,
+        cwd: "/repo".to_string(),
+        profile: "pi/review-cheap".to_string(),
+        intent: None,
+        prompt: "investigate the auth module".to_string(),
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+    };
+    let result = manager.delegate(req).await.unwrap();
+    assert_eq!(result.status.as_str(), "completed");
+    let summary = result
+        .summary
+        .as_deref()
+        .expect("delegate always wraps Some(out.summary)");
+    assert!(
+        !summary.is_empty(),
+        "mock executor must return a non-empty summary so it becomes result_summary"
+    );
+
+    // Scoped: db_guard MUST be dropped before any later manager call that
+    // re-locks the same std::sync::Mutex (non-reentrant → deadlock if held).
+    let attempts: Vec<String> = {
+        let db_guard = db.lock().unwrap();
+        let mem = db_guard
+            .subagent_get_memory(&result.subagent_id)
+            .unwrap()
+            .expect("memory row must exist after delegate");
+        serde_json::from_str(mem.attempts_json.as_deref().unwrap_or("[]")).unwrap()
+    };
+    assert!(
+        !attempts.is_empty(),
+        "attempts must be non-empty after the first completed task (C-1 fix), \
+         got: {attempts:?}"
+    );
+    assert!(
+        attempts[0].contains(&result.task_id),
+        "attempts entry must reference the just-completed task id, got: {:?}",
+        attempts[0]
+    );
+    assert!(
+        attempts[0].contains("investigate the auth module"),
+        "attempts entry must include the task summary (from result_summary), \
+         got: {:?}",
+        attempts[0]
+    );
+}

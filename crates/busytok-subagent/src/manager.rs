@@ -137,7 +137,7 @@ impl SubagentManager {
         //    No lock held during execution.
         let model = req.model_override.clone().or(profile_model);
         let started = busytok_domain::now_ms();
-        let (input, memory_row, recent_tasks, tasks_since_last_compaction, profile_cfg) = {
+        let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
             let memory_row = db
                 .subagent_get_memory(&subagent.id)
@@ -199,7 +199,6 @@ impl SubagentManager {
             (
                 input,
                 memory_row,
-                recent_tasks,
                 tasks_since_last_compaction,
                 profile_cfg.cloned(),
             )
@@ -229,6 +228,18 @@ impl SubagentManager {
                 None,
             )
             .map_err(SubagentError::Store)?;
+            // Re-fetch recent_tasks AFTER the task result is persisted so the
+            // snapshot includes the just-completed task's result_summary. The
+            // pre-execution snapshot (used only for context building above)
+            // has result_summary=None for the current task, which would make
+            // the attempts logic skip the entry and exclude the most recent
+            // task from compaction's "Recent findings" section.
+            let recent_tasks = db
+                .subagent_list_tasks(
+                    &subagent.id,
+                    self.settings.context.recent_tasks_limit as i64,
+                )
+                .map_err(SubagentError::Store)?;
             db.subagent_insert_usage_record(&SubagentUsageRecordRow {
                 id: format!("usage_{task_id}"),
                 task_id: task_id.clone(),

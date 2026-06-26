@@ -30,6 +30,17 @@ fn task_row(id: &str, summary: &str, created_at_ms: i64) -> SubagentTaskRow {
     }
 }
 
+/// Like `task_row` but with `result_summary = None` — mirrors the production
+/// data shape for a task that has been inserted but not yet completed (the
+/// pre-execution snapshot fetched by `delegate`).
+fn task_row_no_summary(id: &str, created_at_ms: i64) -> SubagentTaskRow {
+    let mut r = task_row(id, "", created_at_ms);
+    r.result_summary = None;
+    r.status = "queued".into();
+    r.completed_at_ms = None;
+    r
+}
+
 fn cfg() -> SubagentContextConfig {
     SubagentContextConfig::default()
 }
@@ -513,5 +524,76 @@ fn attempts_records_most_recent_task_not_oldest() {
         attempts[0].contains("newest summary"),
         "attempts records MOST RECENT task, got: {:?}",
         attempts[0]
+    );
+}
+
+#[test]
+fn attempts_skips_when_most_recent_summary_is_none() {
+    // C-1 regression: in production, the pre-execution `recent_tasks` snapshot
+    // fetched by `delegate` has result_summary=None for the current (just-
+    // inserted, still-queued) task. The attempts logic must handle this
+    // gracefully — skip the entry rather than panicking — and must NOT fall
+    // back to an older task's summary. The C-1 fix in manager.rs re-fetches
+    // recent_tasks after the result is persisted, so this None shape should
+    // never reach memory_updater in the delegate hot path; this test pins the
+    // defensive behavior so a future regression (stale snapshot) degrades
+    // gracefully instead of panicking.
+    let mut cfg = cfg();
+    cfg.compaction_tasks_threshold = 100; // no compaction
+    let updater = MemoryUpdater::new(cfg);
+    let mut current = mem_row("sub-a");
+    current.attempts_json = Some(serde_json::to_string(&["prior: old run"]).unwrap());
+    let update = MemoryUpdate {
+        current_state_summary: Some("state".into()),
+        key_files: vec![],
+        decisions: vec![],
+        open_questions: vec![],
+    };
+    // Most recent task (first in DESC order) has result_summary=None — the
+    // production shape at fetch time before the result is written.
+    let tasks = vec![
+        task_row_no_summary("t3", 3000),
+        task_row("t2", "middle summary", 2000),
+        task_row("t1", "oldest summary", 1000),
+    ];
+    let result = updater.update(current, update, &tasks, 3, "t3", 4000, REPO);
+    let attempts: Vec<String> =
+        serde_json::from_str(result.attempts_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "no new attempt appended when most recent task has no summary; \
+         existing entry preserved. got: {attempts:?}"
+    );
+    assert!(
+        attempts[0] == "prior: old run",
+        "must NOT fall back to an older task's summary, got: {:?}",
+        attempts[0]
+    );
+}
+
+#[test]
+fn compaction_long_summary_is_none_when_empty() {
+    // m-1 regression: after compaction, long_summary must be None (not
+    // Some("")) when the rebuilt long summary is empty. Some("") would be
+    // semantically wrong (claims a summary exists) and would skew the
+    // compaction trigger (b) size estimate on the next turn.
+    let mut cfg = cfg();
+    cfg.compaction_tasks_threshold = 1; // force compaction
+    let updater = MemoryUpdater::new(cfg);
+    let current = mem_row("sub-a"); // no long_summary, no hot_summary
+    let update = MemoryUpdate {
+        current_state_summary: None,
+        key_files: vec![],
+        decisions: vec![],
+        open_questions: vec![],
+    };
+    // No recent task summaries → rebuilt long_summary is empty → must be None.
+    let result = updater.update(current, update, &[], 1, "t1", 4000, REPO);
+    assert!(
+        result.long_summary.is_none(),
+        "long_summary must be None (not Some(\"\")) when compaction produced \
+         an empty summary, got: {:?}",
+        result.long_summary.as_deref()
     );
 }

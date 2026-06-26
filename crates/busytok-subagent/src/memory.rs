@@ -260,7 +260,11 @@ impl MemoryUpdater {
             format!("{old_long}\n\nRecent findings:\n{recent_summaries}")
         };
         let new_long: String = new_long.chars().take(MAX_LONG_SUMMARY_CHARS).collect();
-        mem.long_summary = Some(new_long);
+        mem.long_summary = if new_long.is_empty() {
+            None
+        } else {
+            Some(new_long)
+        };
 
         // Drop resolved open questions during compaction (§6.2.4 cap: unresolved only).
         let mut questions = parse_json_vec::<OpenQuestion>(&mem.open_questions_json);
