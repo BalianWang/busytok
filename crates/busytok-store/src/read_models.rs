@@ -369,3 +369,39 @@ pub struct DailyUsageTrendRow {
     pub has_cost: bool,
     pub has_no_cost: bool,
 }
+
+/// Hero token/cost totals for one receipt day (aggregated from `daily_usage`,
+/// single date + timezone + generation). `has_cost`/`has_no_cost` drive the
+/// derived `cost_status` (the column does not exist on `daily_usage`).
+#[derive(Debug, Clone)]
+pub struct ReceiptDailyTotalsRow {
+    pub total_tokens: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub has_cost: bool,
+    pub has_no_cost: bool,
+    pub event_count: i64,
+}
+
+/// One model's day slice for the receipt items section.
+#[derive(Debug, Clone)]
+pub struct ReceiptModelSliceRow {
+    pub name: String,
+    pub tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub has_cost: bool,
+    pub has_no_cost: bool,
+    pub event_count: i64,
+}
+
+/// The highest-token UTC hour bucket within the receipt day window.
+/// `bucket_start_ms` is UTC-aligned; the caller converts it to a reporting-TZ
+/// hour label.
+#[derive(Debug, Clone)]
+pub struct PeakHourRow {
+    pub bucket_start_ms: i64,
+    pub tokens: i64,
+}
