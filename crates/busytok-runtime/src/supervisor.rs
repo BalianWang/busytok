@@ -267,9 +267,17 @@ impl BusytokSupervisor {
         };
         match config_result {
             Ok(sidecar_config) => {
-                let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
+                // Wire the deserialized `SubagentResourcePolicyConfig` from
+                // settings → ResourceMonitor so `memory_pressure_free_mb`
+                // and `monitor_interval_seconds` flow from `settings.toml`
+                // into the supervision loop's predicates + sampling cadence.
+                // `PiSidecarSupervisor::new` remains for unit tests that
+                // don't have a policy (it uses the spec-default policy).
+                let policy = settings.subagent.resource_policy.clone();
+                let sup = busytok_subagent::sidecar::PiSidecarSupervisor::with_resource_policy(
                     sidecar_config,
                     Some(Arc::clone(db)),
+                    policy,
                 );
                 let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
                     Arc::new(busytok_subagent::sidecar::SidecarTaskExecutor::with_db(

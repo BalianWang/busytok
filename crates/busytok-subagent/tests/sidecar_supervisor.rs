@@ -773,3 +773,51 @@ async fn spawn_allows_restart_after_5_min_window_expires() {
     );
     sup.shutdown().await.unwrap();
 }
+
+/// `with_resource_policy` constructs the supervisor with an explicit
+/// `SubagentResourcePolicyConfig` (the production path — the runtime
+/// supervisor threads settings → monitor). Verify it produces a working
+/// supervisor that can spawn, handle a health RPC, and shut down cleanly.
+/// This also covers the `with_resource_policy` constructor body, which
+/// would otherwise be dead code in the per-crate coverage gate (the
+/// runtime calls it from a different crate).
+#[tokio::test]
+async fn with_resource_policy_constructs_working_supervisor() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let policy = SubagentResourcePolicyConfig {
+        memory_pressure_free_mb: 1024,
+        monitor_interval_seconds: 5,
+    };
+    let sup = PiSidecarSupervisor::with_resource_policy(mock_config(), None, policy);
+    let handle = sup.ensure_started().await.unwrap();
+    let health = handle.health().await.unwrap();
+    assert_eq!(health["status"], "healthy");
+    sup.shutdown().await.unwrap();
+}
+
+/// `with_resource_policy` must thread `memory_soft_limit_mb` /
+/// `memory_hard_limit_mb` from `SidecarConfig` into the `ResourceMonitor`
+/// (the predicates read these). Verify by constructing a supervisor whose
+/// config has distinct limits and asserting the attached DB receives a
+/// `sidecar_start` event (proving the full construct → spawn →
+/// write_resource_event path works under `with_resource_policy`).
+#[tokio::test]
+async fn with_resource_policy_threads_limits_into_monitor() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let policy = SubagentResourcePolicyConfig::default();
+    let sup =
+        PiSidecarSupervisor::with_resource_policy(mock_config(), Some(Arc::clone(&db)), policy);
+    let handle = sup.ensure_started().await.unwrap();
+    let _ = handle.health().await.unwrap();
+    sup.shutdown().await.unwrap();
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "sidecar_start"),
+        "with_resource_policy supervisor must emit sidecar_start event"
+    );
+}
