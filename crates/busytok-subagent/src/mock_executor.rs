@@ -53,3 +53,27 @@ impl TaskExecutor for MockTaskExecutor {
         })
     }
 }
+
+/// Executor that always fails. Injected when `pi_sidecar.enabled = true`
+/// but the sidecar config could not be resolved at supervisor construction
+/// time. This ensures delegate calls fail loudly instead of silently
+/// succeeding via `MockTaskExecutor` — which would mask a deployment
+/// misconfiguration as "functional". The error is wrapped as
+/// `SubagentError::SidecarSpawn` (via `anyhow::Error::from`) so
+/// `SubagentManager::delegate` can downcast it and preserve the semantic
+/// error code `subagent.sidecar_spawn_failed` through the RPC contract.
+pub struct FailingTaskExecutor {
+    pub reason: String,
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for FailingTaskExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        Err(anyhow::Error::from(
+            crate::error::SubagentError::SidecarSpawn(format!(
+                "sidecar was enabled but failed to initialize: {}",
+                self.reason
+            )),
+        ))
+    }
+}

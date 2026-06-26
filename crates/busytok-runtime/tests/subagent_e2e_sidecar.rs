@@ -73,7 +73,7 @@ fn make_sidecar_supervisor(
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
-        .ok();
+        .expect("failed to save test settings");
     BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
 }
 
@@ -340,6 +340,86 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
             sub.status
         );
     }
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
+    // P1-2 regression: when pi_sidecar.enabled=true but the sidecar config
+    // cannot be resolved (e.g. runtime_dir points at a nonexistent bundle),
+    // the supervisor must NOT silently fall back to MockTaskExecutor —
+    // that would mask a deployment misconfiguration as "functional".
+    // Instead, delegate must fail with a clear error, and
+    // sidecar_init_error() must return Some(reason).
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+
+    // Settings with enabled=true but a runtime_dir that has no bundle —
+    // resolve_sidecar_config will fail with "sidecar bundle not found".
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+    settings.subagent.pi_sidecar.node_runtime = "system".to_string();
+    settings.subagent.pi_sidecar.system_node_path = "bash".to_string();
+    settings.subagent.pi_sidecar.runtime_dir = Some(tmp.path().to_string_lossy().to_string());
+
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(
+        db,
+        paths,
+        vec![], // no adapters needed for this test
+        settings,
+    );
+
+    // sidecar_init_error must be populated — the config resolve failure
+    // must be surfaced, not silently swallowed.
+    assert!(
+        supervisor.sidecar_init_error().is_some(),
+        "sidecar_init_error must be set when config resolve fails"
+    );
+    let init_err = supervisor.sidecar_init_error().unwrap();
+    assert!(
+        init_err.contains("bundle") || init_err.contains("not found"),
+        "error should mention the bundle issue, got: {init_err}"
+    );
+
+    // delegate MUST fail — never return mock output. The error must carry
+    // the semantic code `subagent.sidecar_spawn_failed` (not the generic
+    // `subagent.store_error`), proving FailingTaskExecutor's error
+    // downcasts to SubagentError::SidecarSpawn through the manager.
+    let result = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "misconfigured-test".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!(
+            "delegate must fail when sidecar is enabled but misconfigured — got success (silent mock fallback)"
+        ),
+        Err(e) => e,
+    };
+    // The error string from the runtime layer is formatted as "{code}: {message}".
+    // Assert the code is `subagent.sidecar_spawn_failed` — NOT `subagent.store_error`.
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("subagent.sidecar_spawn_failed"),
+        "delegate error must carry code 'subagent.sidecar_spawn_failed' \
+         (not generic store_error), got: {err_str}"
+    );
 
     supervisor.shutdown_writer().await.unwrap();
 }

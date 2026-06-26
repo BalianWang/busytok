@@ -70,3 +70,45 @@ fn error_display_carries_context() {
         .to_string()
         .contains("database error"));
 }
+
+/// FailingTaskExecutor must always return an error carrying the reason,
+/// AND the error must downcast to `SubagentError::SidecarSpawn` so the
+/// control layer surfaces `subagent.sidecar_spawn_failed` (not the generic
+/// `subagent.store_error`). This preserves the RPC error contract.
+#[tokio::test]
+async fn failing_executor_always_errors() {
+    use busytok_subagent::mock_executor::{ExecutorInput, FailingTaskExecutor, TaskExecutor};
+    use busytok_subagent::SubagentError;
+
+    let exec = FailingTaskExecutor {
+        reason: "bundle not found".to_string(),
+    };
+    let input = ExecutorInput {
+        subagent_id: "test".into(),
+        subagent_name: "test".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do".into(),
+        timeout_seconds: None,
+    };
+    let err = match exec.execute(&input).await {
+        Ok(_) => panic!("FailingTaskExecutor must always fail"),
+        Err(e) => e,
+    };
+    // The error MUST downcast to SubagentError::SidecarSpawn so the manager
+    // preserves the semantic error code through the RPC contract.
+    let sub_err = err
+        .downcast::<SubagentError>()
+        .expect("error must downcast to SubagentError::SidecarSpawn");
+    assert_eq!(sub_err.code(), "subagent.sidecar_spawn_failed");
+    match sub_err {
+        SubagentError::SidecarSpawn(msg) => {
+            assert!(
+                msg.contains("bundle not found"),
+                "error should carry the reason, got: {msg}"
+            );
+        }
+        other => panic!("expected SidecarSpawn, got {other:?}"),
+    }
+}

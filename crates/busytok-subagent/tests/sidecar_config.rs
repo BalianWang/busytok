@@ -5,7 +5,7 @@
 //! rebuild coverage by constructing a `BusytokPaths::for_test` root and
 //! materializing the bundle / node binary files the function looks for.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
 
 use std::path::PathBuf;
 use std::time::Duration;

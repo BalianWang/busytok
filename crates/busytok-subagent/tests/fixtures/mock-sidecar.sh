@@ -10,16 +10,27 @@
 #                                session.turn_auto responses (regression
 #                                fixture for the warm-path fallback).
 #                                0/unset = emit a real session id.
+#   BUSYTOK_MOCK_STDERR_LINES=N  Write N lines to stderr before each response
+#                                (exercises the supervisor's stderr reader —
+#                                verifies the pipe doesn't fill and block).
 
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
 EMPTY_SESSION="${BUSYTOK_MOCK_EMPTY_SESSION:-0}"
+STDERR_LINES="${BUSYTOK_MOCK_STDERR_LINES:-0}"
 COUNT=0
 while IFS= read -r line; do
   COUNT=$((COUNT + 1))
   if [[ "$DELAY_MS" -gt 0 ]]; then
     awk -v ms="$DELAY_MS" 'BEGIN { system("sleep " ms/1000) }'
+  fi
+  # Write N stderr lines before each response (P1-1 fixture: verifies the
+  # supervisor drains stderr so the pipe doesn't fill and block the child).
+  if [[ "$STDERR_LINES" -gt 0 ]]; then
+    for i in $(seq 1 "$STDERR_LINES"); do
+      echo "[mock-sidecar stderr] line $i for msg $COUNT" >&2
+    done
   fi
   # Extract method and id without jq (sed on single-line JSON).
   METHOD=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')

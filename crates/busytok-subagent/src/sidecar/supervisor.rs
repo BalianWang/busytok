@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{error, info, instrument, warn};
@@ -157,6 +158,36 @@ impl PiSidecarSupervisor {
             .stdout
             .take()
             .ok_or_else(|| SidecarError::Spawn("no stdout".into()))?;
+        // Take stderr and spawn a background line-reader that forwards each
+        // line to `tracing`. Without this the piped stderr buffer fills up
+        // and blocks the child process — manifesting as random turn_auto /
+        // health timeouts. The TS sidecar writes to stderr on error paths
+        // (rpc.ts line handler / stop callback exceptions). The task is
+        // detached: it exits naturally when the pipe closes (child exits).
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                loop {
+                    match reader.next_line().await {
+                        Ok(Some(line)) => {
+                            warn!(
+                                event_code = "subagent.sidecar.stderr",
+                                "sidecar stderr: {line}"
+                            );
+                        }
+                        Ok(None) => break, // EOF — child closed stderr
+                        Err(e) => {
+                            warn!(
+                                event_code = "subagent.sidecar.stderr_read_error",
+                                error = %e,
+                                "stderr reader error"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let mut client = SidecarRpcClient::new(stdin, stdout);
         let init = client
             .call(

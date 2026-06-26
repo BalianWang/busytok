@@ -532,3 +532,30 @@ async fn supervisor_returns_spawn_error_on_protocol_mismatch() {
         other => panic!("expected SidecarError::Spawn, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn supervisor_drains_stderr_without_blocking() {
+    // P1-1 regression: the sidecar writes many stderr lines per message.
+    // Without the background stderr reader the pipe buffer (64 KiB on macOS)
+    // fills and the child blocks on its next stderr write — manifesting as
+    // a turn_auto timeout. With the reader, all messages complete normally.
+    let mut cfg = mock_config();
+    // 200 lines × ~40 bytes ≈ 8 KiB per response; across initialize +
+    // health + turn_auto the child writes well over the pipe capacity.
+    cfg.env
+        .insert("BUSYTOK_MOCK_STDERR_LINES".into(), "200".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let handle = sup.ensure_started().await.unwrap();
+    let result = handle
+        .turn_auto(serde_json::json!({
+            "logical_subagent_id": "test",
+            "prompt": "do",
+            "cwd": "/tmp",
+            "profile": "pi/search-cheap",
+        }))
+        .await
+        .expect("turn_auto must not block when sidecar writes lots of stderr");
+    assert_eq!(result["status"], "completed");
+    sup.shutdown().await.unwrap();
+}

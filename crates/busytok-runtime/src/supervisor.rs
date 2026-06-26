@@ -124,7 +124,10 @@ impl BusytokSupervisor {
     }
 
     /// Create a supervisor with custom adapters and pre-loaded settings.
-    pub(crate) fn with_adapters_and_settings(
+    /// Exposed so integration tests can exercise the production config-
+    /// resolution path (including sidecar config failure → FailingTaskExecutor).
+    #[doc(hidden)]
+    pub fn with_adapters_and_settings(
         db: Database,
         paths: BusytokPaths,
         adapters: Vec<BoxedAdapter>,
@@ -275,20 +278,23 @@ impl BusytokSupervisor {
             }
             Err(e) => {
                 // `build_with_settings` returns `Self`, not `Result<Self>`,
-                // so the error cannot propagate. We MUST still boot (the
-                // service runs in degraded mode with MockTaskExecutor),
-                // but the failure is escalated to `error!` with a stable
-                // event_code AND captured in `sidecar_init_error` so Task 6
-                // / status reporting can surface it without re-scanning
-                // logs. This closes the "warn-log-only" observability gap.
+                // so the error cannot propagate. Plan 2 requires that
+                // `enabled=true` MUST use the sidecar — falling back to
+                // MockTaskExecutor would mask a deployment misconfiguration
+                // as "functional" (delegate succeeds with mock output).
+                // Instead inject a FailingTaskExecutor that fails every
+                // delegate call with a clear error, AND capture the reason
+                // in `sidecar_init_error` for status reporting.
                 let msg = e.to_string();
                 error!(
                     event_code = "subagent.sidecar.config_resolve_failed",
                     error = %e,
-                    "sidecar config resolve failed; falling back to MockTaskExecutor (degraded mode)"
+                    "sidecar config resolve failed; injecting FailingTaskExecutor — delegate calls will fail"
                 );
                 (
-                    Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+                    Arc::new(busytok_subagent::mock_executor::FailingTaskExecutor {
+                        reason: msg.clone(),
+                    })
                         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
                     None,
                     Some(msg),

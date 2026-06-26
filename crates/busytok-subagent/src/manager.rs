@@ -340,6 +340,12 @@ impl SubagentManager {
             // §3.3 invariant already holds (no is_hot=1 binding exists), so a
             // non-atomic status flip is safe here.
             self.set_logical_status(&db, &sub.id, new_status)?;
+            info!(
+                event_code = "subagent.session.hibernate_noop",
+                subagent_id = %sub.id,
+                status = %new_status.as_str(),
+                "no hot binding; flipped logical status"
+            );
         }
         Ok(sub.id)
     }
