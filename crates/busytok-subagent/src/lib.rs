@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod manager;
+pub mod memory;
 pub mod mock_executor;
 pub mod models;
 pub mod resolver;
