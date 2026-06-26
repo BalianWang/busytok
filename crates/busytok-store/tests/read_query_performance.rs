@@ -383,7 +383,7 @@ fn assert_query_budgets(db: &Database, budgets: QueryBudgets) {
         )
         .unwrap()
     });
-    assert!(!activity.is_empty());
+    assert!(!activity.items.is_empty());
 
     let recent = record_budget("activity.recent", budgets.facts, &mut failures, || {
         read_queries::read_activity_recent(

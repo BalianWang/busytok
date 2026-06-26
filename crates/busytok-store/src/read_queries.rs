@@ -39,6 +39,31 @@ fn parse_sort_cursor(cursor: Option<&str>) -> Result<Option<SortCursor>> {
     Ok(Some(payload))
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ActivityCursor {
+    t: i64,
+    i: String,
+}
+
+fn encode_activity_cursor(timestamp_ms: i64, id: &str) -> Result<String> {
+    let payload = ActivityCursor {
+        t: timestamp_ms,
+        i: id.to_string(),
+    };
+    let bytes = serde_json::to_vec(&payload).context("failed to serialize activity cursor")?;
+    Ok(hex::encode(bytes))
+}
+
+fn parse_activity_cursor(cursor: Option<&str>) -> Result<Option<(i64, String)>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(cursor).context("invalid activity cursor encoding")?;
+    let payload: ActivityCursor =
+        serde_json::from_slice(&bytes).context("invalid activity cursor payload")?;
+    Ok(Some((payload.t, payload.i)))
+}
+
 fn append_source_health_status_filter(
     sql: &mut String,
     args: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -337,6 +362,10 @@ pub fn read_live_window_exact(
 
 /// Read a paginated activity list from usage_events.
 ///
+/// Uses the "peek one extra" cursor-pagination pattern: requests
+/// `page_size + 1` rows; if that many come back, there is a next page
+/// and the extra row is popped and used to derive `next_cursor`.
+///
 /// Returns events ordered by `timestamp_ms DESC, id DESC`.
 pub fn read_activity_list(
     conn: &Connection,
@@ -344,8 +373,11 @@ pub fn read_activity_list(
     start_ms: i64,
     end_ms: i64,
     limit: i64,
-    cursor: Option<(i64, String)>,
-) -> Result<Vec<ActivityListRow>> {
+    cursor: Option<&str>,
+) -> Result<CursorPage<ActivityListRow>> {
+    let page_size = limit.clamp(1, 500);
+    let query_limit = page_size + 1;
+    let parsed_cursor = parse_activity_cursor(cursor)?;
     let sql = if cursor.is_some() {
         "SELECT \
             id, \
@@ -426,26 +458,38 @@ pub fn read_activity_list(
         })
     };
 
-    let rows = match &cursor {
+    let rows = match &parsed_cursor {
         Some((cursor_ts, cursor_id)) => stmt.query_map(
             params![
                 generation_id,
                 start_ms,
                 end_ms,
-                limit,
+                query_limit,
                 cursor_ts,
                 cursor_id.as_str()
             ],
             map_row,
         )?,
-        None => stmt.query_map(params![generation_id, start_ms, end_ms, limit], map_row)?,
+        None => stmt.query_map(
+            params![generation_id, start_ms, end_ms, query_limit],
+            map_row,
+        )?,
     };
 
-    let mut results = Vec::new();
+    let mut items = Vec::new();
     for row in rows {
-        results.push(row?);
+        items.push(row?);
     }
-    Ok(results)
+
+    let next_cursor = if items.len() > page_size as usize {
+        items.pop().expect("extra cursor row exists");
+        let last = items.last().expect("visible cursor row exists");
+        Some(encode_activity_cursor(last.happened_at_ms, &last.id)?)
+    } else {
+        None
+    };
+
+    Ok(CursorPage { items, next_cursor })
 }
 
 /// Read bounded activity rows filtered by a breakdown detail dimension.
@@ -2007,7 +2051,8 @@ pub fn read_activity_recent(
     end_ms: i64,
     limit: u32,
 ) -> Result<Vec<ActivityListRow>> {
-    read_activity_list(conn, _generation_id, start_ms, end_ms, limit as i64, None)
+    let page = read_activity_list(conn, _generation_id, start_ms, end_ms, limit as i64, None)?;
+    Ok(page.items)
 }
 
 // ── Daily usage read queries (IANA timezone path) ───────────────────────────
@@ -2345,8 +2390,9 @@ mod tests {
     #[test]
     fn read_activity_list_returns_empty_for_no_data() {
         let db = Database::open_in_memory().unwrap();
-        let rows = read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
-        assert!(rows.is_empty());
+        let page = read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]
@@ -2380,8 +2426,10 @@ mod tests {
 
         insert_usage_events_batch_returning_inserted(conn, &[e], "gen1").unwrap();
 
-        let rows = read_activity_list(conn, "gen1", 0, now + 1, 10, None).unwrap();
+        let page = read_activity_list(conn, "gen1", 0, now + 1, 10, None).unwrap();
+        let rows = &page.items;
         assert_eq!(rows.len(), 1);
+        assert_eq!(page.next_cursor, None);
         assert_eq!(rows[0].prompt_input_total_tokens, 1000);
         assert_eq!(rows[0].prompt_input_non_cached_tokens, 10);
         assert_eq!(rows[0].cache_read_tokens, 990);
