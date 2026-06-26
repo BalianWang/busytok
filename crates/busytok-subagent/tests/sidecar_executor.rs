@@ -596,6 +596,43 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         "error should mention the close failure, got: {err_msg}"
     );
 
+    // Verify the fatal-close invariant: the DB HAS been flipped (binding
+    // is_hot=0, status='closed'; logical status='warm') BEFORE close was
+    // attempted. This is the state divergence the fatal-close rule exists
+    // to surface — DB says closed/warm, sidecar still holds the session hot.
+    // Without these assertions a future refactor that accidentally moves
+    // the flip after `close` would still pass the test above.
+    {
+        let db_guard = db.lock().unwrap();
+        let sub_a = db_guard
+            .subagent_get_logical("sub-a")
+            .unwrap()
+            .expect("sub-a logical row must exist");
+        assert_eq!(
+            sub_a.status, "warm",
+            "logical status must be flipped to 'warm' before close (fatal-close invariant)"
+        );
+        // `subagent_hot_binding` filters on is_hot=1, so it returns None after
+        // the flip — query the raw row to verify is_hot=0 and status='closed'.
+        let binding_state: (i32, String) = db_guard
+            .conn()
+            .query_row(
+                "SELECT is_hot, status FROM subagent_harness_bindings \
+                 WHERE subagent_id = ?1 AND harness = 'pi'",
+                rusqlite::params!["sub-a"],
+                |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("sub-a binding row must exist after eviction flip");
+        assert_eq!(
+            binding_state.0, 0,
+            "binding is_hot must be 0 (flipped before close)"
+        );
+        assert_eq!(
+            binding_state.1, "closed",
+            "binding status must be 'closed' (flipped before close)"
+        );
+    }
+
     supervisor.shutdown().await.unwrap();
 }
 
@@ -780,6 +817,12 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
     // error. The executor must propagate the error (the `warn!` +
     // sidecar_to_anyhow map_err path) — it must NOT proceed to flip the DB
     // binding or call close.
+    //
+    // Uses `with_db` (the production path) because the no-DB path now
+    // short-circuits eviction up front (see `evict_session`'s db.is_none()
+    // guard). Seeding the hot binding lets `find_hot_binding_by_session`
+    // succeed so the executor actually reaches `prepare_hibernate`.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let mut cfg = mock_config();
     cfg.max_hot_sessions = 1;
     cfg.env
@@ -787,13 +830,15 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
     cfg.env
         .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
 
-    executor
+    let out1 = executor
         .execute(&evict_input("sub-a"))
         .await
         .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
 
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),

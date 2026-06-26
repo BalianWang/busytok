@@ -40,7 +40,10 @@ impl SidecarTaskExecutor {
 
     /// Construct with a DB handle for the eviction flow (production path).
     /// Without a DB the executor cannot persist memory deltas or flip
-    /// bindings, so `HOT_SESSION_LIMIT_REACHED` surfaces as a fatal error.
+    /// bindings, so `HOT_SESSION_LIMIT_REACHED` surfaces as a fatal error:
+    /// `evict_session` rejects the no-DB path up front (before any RPC) to
+    /// avoid silent state divergence — the sidecar would release its slot on
+    /// `close` but the DB would still believe the session is hot.
     pub fn with_db(supervisor: Arc<PiSidecarSupervisor>, db: Arc<Mutex<Database>>) -> Self {
         Self {
             supervisor,
@@ -138,6 +141,25 @@ impl SidecarTaskExecutor {
     /// 3. RPC: `session.close(adapter_session_id)` — failure is FATAL (see
     ///    `SidecarTaskExecutor` doc comment).
     async fn evict_session(&self, adapter_session_id: &str) -> anyhow::Result<()> {
+        // No-DB path: eviction cannot be performed safely. The persist step
+        // below (write memory + flip binding atomically) is what keeps the DB
+        // and sidecar in sync; without a DB we would skip it, call `close`,
+        // and the sidecar would release its slot while the DB still believes
+        // the session is hot — silent state divergence. Surface this as a
+        // fatal error BEFORE any RPC so the caller knows a sidecar restart is
+        // the recovery path. (Mirrors the `with_db` doc comment contract.)
+        if self.db.is_none() {
+            error!(
+                event_code = "subagent.session.eviction_no_db",
+                adapter_session_id = %adapter_session_id,
+                "eviction requested but executor has no DB handle — \
+                 cannot persist binding flip atomically; aborting to avoid state divergence"
+            );
+            return Err(anyhow::anyhow!(
+                "eviction requires a DB connection for atomic persistence; \
+                 no-DB executor cannot evict safely (adapter_session_id={adapter_session_id})"
+            ));
+        }
         let handle = self
             .supervisor
             .ensure_started()
