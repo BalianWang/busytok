@@ -199,3 +199,25 @@ fn resolve_sidecar_config_carries_timeouts_and_limits() {
         "max_hot_sessions must be passed to the sidecar via env var"
     );
 }
+
+#[test]
+fn resolve_sidecar_config_passes_max_hot_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let paths = paths_for(&tmp);
+    let runtime_dir = tmp.path().to_string_lossy().to_string();
+    write_bundle(tmp.path());
+
+    let mut settings = SubagentPiSidecarConfig::default();
+    settings.node_runtime = "system".to_string();
+    settings.system_node_path = "bash".to_string();
+    settings.runtime_dir = Some(runtime_dir);
+    settings.max_hot_sessions = 5;
+
+    let cfg = resolve_sidecar_config(&settings, &paths).unwrap();
+    assert_eq!(cfg.max_hot_sessions, 5);
+    assert_eq!(
+        cfg.env.get("BUSYTOK_SIDECAR_MAX_HOT_SESSIONS"),
+        Some(&"5".to_string()),
+        "max_hot_sessions must be passed to sidecar via env var"
+    );
+}
