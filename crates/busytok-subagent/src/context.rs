@@ -87,8 +87,10 @@ impl ContextBuilder {
         let parts = ContextParts {
             header,
             recent_summaries,
+            attempts: parse_json_vec::<String>(&memory.attempts_json),
             key_files: snapshot.key_files.clone(),
             open_questions: snapshot.open_questions.clone(),
+            decisions: snapshot.decisions.clone(),
             long_summary: snapshot.long_summary.clone(),
             hot_summary: snapshot.hot_summary.clone(),
             prompt: format!("\nCurrent task:\n{prompt}\n"),
@@ -113,19 +115,24 @@ impl ContextBuilder {
 struct ContextParts {
     header: String,                    // protected (priority 7), never trimmed
     recent_summaries: Vec<String>,     // priority 1: 5 → 3 → 1 → drop
+    attempts: Vec<String>,             // priority 2: all → last 3 → drop (newest last)
     key_files: Vec<KeyFile>,           // priority 3: 20 → 10 → drop
     open_questions: Vec<OpenQuestion>, // priority 4: 10 → 5 → drop
+    decisions: Vec<String>,            // protected (not in trim priority list)
     long_summary: Option<String>,      // priority 5: truncate → drop
     hot_summary: Option<String>,       // priority 6: preserve (never trimmed)
     prompt: String,                    // protected (priority 7), never trimmed
 }
 
 /// Per-section reduction state during progressive trimming.
-/// `Some(n)` on item-based sections = take first `n` items; `None` = drop.
+/// `Some(n)` on item-based sections = take `n` items; `None` = drop.
+/// For `attempts`, the LAST `n` items are kept (newest-last storage order
+/// from `MemoryUpdater`); other item-sections take the first `n`.
 /// `Some(n)` on `long_summary_chars` = truncate text to `n` chars; `None` = drop.
 #[derive(Clone, Copy)]
 struct TrimState {
     recent: Option<usize>,
+    attempts: Option<usize>,
     key_files: Option<usize>,
     open_questions: Option<usize>,
     long_summary_chars: Option<usize>,
@@ -147,6 +154,22 @@ impl ContextParts {
                     slice
                         .iter()
                         .map(|s| format!("- {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+
+        // Attempts (priority 2): stored newest-last by MemoryUpdater, so keep
+        // the LAST n items (most recent) rather than the first n.
+        if let Some(n) = state.attempts {
+            let slice = take_last_slice(&self.attempts, n);
+            if !slice.is_empty() {
+                out.push_str(&format!(
+                    "Attempts:\n{}\n",
+                    slice
+                        .iter()
+                        .map(|a| format!("- {a}"))
                         .collect::<Vec<_>>()
                         .join("\n")
                 ));
@@ -181,6 +204,19 @@ impl ContextParts {
             }
         }
 
+        // Decisions: protected (not in spec §6.1 trim priority list). Always
+        // rendered in full — high-value, typically few entries.
+        if !self.decisions.is_empty() {
+            out.push_str(&format!(
+                "Decisions:\n{}\n",
+                self.decisions
+                    .iter()
+                    .map(|d| format!("- {d}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
         if let Some(chars) = state.long_summary_chars {
             if let Some(long) = &self.long_summary {
                 let truncated: String = long.chars().take(chars).collect();
@@ -201,6 +237,13 @@ fn take_slice<T>(v: &[T], n: usize) -> &[T] {
     &v[..n.min(v.len())]
 }
 
+/// Take the LAST `n` items (used for `attempts`, which `MemoryUpdater` stores
+/// newest-last via `push`). Returns all items if `n >= len`.
+fn take_last_slice<T>(v: &[T], n: usize) -> &[T] {
+    let start = v.len().saturating_sub(n);
+    &v[start..]
+}
+
 /// Render at the given state and return the finalized string if it fits the
 /// budget; otherwise `None`.
 fn try_fit(parts: &ContextParts, budget_chars: usize, state: TrimState) -> Option<String> {
@@ -213,9 +256,10 @@ fn try_fit(parts: &ContextParts, budget_chars: usize, state: TrimState) -> Optio
 }
 
 /// Assemble parts into one string. If over budget, apply progressive
-/// reduction per §6.1 trim priority: priority 1 (recent_summaries) first,
-/// then 3 (key_files), 4 (open_questions), 5 (long_summary). Priorities 6
-/// (hot_summary) and 7 (header/prompt) are never trimmed.
+/// reduction per §6.1 trim priority: priority 1 (recent_summaries), then
+/// 2 (attempts), 3 (key_files), 4 (open_questions), 5 (long_summary).
+/// Priorities 6 (hot_summary) and 7 (header/prompt) are never trimmed.
+/// `decisions` is also protected (not listed in §6.1 trim priority).
 ///
 /// For each trim priority, reduction levels are attempted in order; after each
 /// level the total is rechecked and the algorithm stops as soon as it fits.
@@ -223,6 +267,7 @@ fn try_fit(parts: &ContextParts, budget_chars: usize, state: TrimState) -> Optio
 /// section dropped before moving to the next priority.
 fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
     let recent_full = parts.recent_summaries.len();
+    let attempts_full = parts.attempts.len();
     let key_files_full = parts.key_files.len();
     let open_questions_full = parts.open_questions.len();
     let long_summary_full_chars = parts
@@ -233,6 +278,7 @@ fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
 
     let mut state = TrimState {
         recent: Some(recent_full),
+        attempts: Some(attempts_full),
         key_files: Some(key_files_full),
         open_questions: Some(open_questions_full),
         long_summary_chars: Some(long_summary_full_chars),
@@ -256,6 +302,19 @@ fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
         }
     }
     state.recent = None;
+    if let Some(out) = try_fit(&parts, budget_chars, state) {
+        return out;
+    }
+
+    // Trim priority 2: attempts all → last 3 → drop.
+    // Attempts are stored newest-last, so `Some(3)` keeps the 3 most recent.
+    if attempts_full > 3 {
+        state.attempts = Some(3);
+        if let Some(out) = try_fit(&parts, budget_chars, state) {
+            return out;
+        }
+    }
+    state.attempts = None;
     if let Some(out) = try_fit(&parts, budget_chars, state) {
         return out;
     }
@@ -285,8 +344,9 @@ fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
     }
 
     // Trim priority 5: long_summary truncate to fit → drop. Compute the
-    // remaining budget after all other kept sections (recent/key_files/
-    // open_questions are all dropped by this point), then truncate the
+    // remaining budget after all other kept sections (recent/attempts/
+    // key_files/open_questions are all dropped by this point — decisions,
+    // hot_summary, header, and prompt are protected), then truncate the
     // long_summary text to fit. If the remaining budget can't even fit the
     // section overhead, drop long_summary entirely.
     if parts.long_summary.is_some() {

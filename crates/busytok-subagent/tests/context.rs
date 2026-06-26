@@ -403,3 +403,240 @@ fn zero_budget_treated_as_default() {
         "zero budget falls back to default"
     );
 }
+
+#[test]
+fn compact_context_includes_decisions() {
+    let builder = ContextBuilder::new(cfg());
+    let mut mem = mem_row();
+    mem.decisions_json = Some(
+        serde_json::to_string(&[
+            "Focus on read-only analysis".to_string(),
+            "Use JWT for auth".to_string(),
+        ])
+        .unwrap(),
+    );
+    let (ctx, _snap) = builder.build(
+        &subagent(),
+        &mem,
+        &[],
+        "do thing",
+        cfg().default_budget_tokens,
+    );
+    assert!(
+        ctx.compact_context.contains("Decisions:"),
+        "Decisions section header present"
+    );
+    assert!(
+        ctx.compact_context.contains("Focus on read-only analysis"),
+        "decision 1 present in compact_context"
+    );
+    assert!(
+        ctx.compact_context.contains("Use JWT for auth"),
+        "decision 2 present in compact_context"
+    );
+}
+
+#[test]
+fn compact_context_includes_attempts() {
+    let builder = ContextBuilder::new(cfg());
+    let mut mem = mem_row();
+    mem.attempts_json = Some(
+        serde_json::to_string(&[
+            "task-1: investigated auth".to_string(),
+            "task-2: found refresh gap".to_string(),
+        ])
+        .unwrap(),
+    );
+    let (ctx, _snap) = builder.build(
+        &subagent(),
+        &mem,
+        &[],
+        "do thing",
+        cfg().default_budget_tokens,
+    );
+    assert!(
+        ctx.compact_context.contains("Attempts:"),
+        "Attempts section header present"
+    );
+    assert!(
+        ctx.compact_context.contains("task-1: investigated auth"),
+        "attempt 1 present in compact_context"
+    );
+    assert!(
+        ctx.compact_context.contains("task-2: found refresh gap"),
+        "attempt 2 present in compact_context"
+    );
+}
+
+#[test]
+fn progressive_trimming_reduces_attempts_before_key_files() {
+    let builder = ContextBuilder::new(cfg());
+    // 5 attempts, each 50 chars. attempts are stored newest-last by
+    // MemoryUpdater, so "keep last 3" must retain entries 2, 3, 4 (most
+    // recent) and drop entries 0, 1 (oldest). No recent tasks → priority 1
+    // trim is a no-op, so priority 2 (attempts) is the first effective trim.
+    let mut mem = SubagentMemoryRow::new_empty("sub-a");
+    mem.hot_summary = Some("Hot.".into());
+    mem.long_summary = Some("Long.".into());
+    mem.key_files_json = Some(
+        serde_json::to_string(&[KeyFile {
+            path: "src/auth/token.ts".into(),
+            reason: "refresh logic".into(),
+            last_seen_at_ms: 1000,
+            score: 3,
+        }])
+        .unwrap(),
+    );
+    mem.open_questions_json = Some(
+        serde_json::to_string(&[OpenQuestion {
+            question: "Concurrent refresh handled?".into(),
+            status: "open".into(),
+            created_at_ms: 1000,
+            last_seen_at_ms: 1000,
+        }])
+        .unwrap(),
+    );
+    mem.decisions_json =
+        Some(serde_json::to_string(&["Focus on read-only analysis".to_string()]).unwrap());
+    mem.attempts_json = Some(
+        serde_json::to_string(
+            &(0..5)
+                .map(|i| format!("task-{i}: attempt number {i} with enough padding text"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    // Attempts at 5 ≈ 275 chars; at 3 ≈ 169 chars (diff ~106).
+    // Full total ≈ 96 (header) + 275 + 29 (key_files) + 46 (open_questions)
+    //   + 42 (decisions) + 26 (long_summary) + 20 (hot_summary) + 21 (prompt)
+    //   ≈ 555 chars. Budget 125 tokens = 500 chars: 555 > 500 (5 doesn't fit),
+    // 449 ≤ 500 (3 fits). Reduction stops at priority 2.
+    let (ctx, _snap) = builder.build(&subagent(), &mem, &[], "do thing", 125);
+    // Last 3 attempts (entries 2, 3, 4 — most recent) kept.
+    assert!(
+        ctx.compact_context.contains("task-2: attempt number 2"),
+        "attempt 2 (3rd-newest) kept after 5→3 reduction"
+    );
+    assert!(
+        ctx.compact_context.contains("task-3: attempt number 3"),
+        "attempt 3 (2nd-newest) kept after 5→3 reduction"
+    );
+    assert!(
+        ctx.compact_context.contains("task-4: attempt number 4"),
+        "attempt 4 (newest) kept after 5→3 reduction"
+    );
+    // Oldest 2 attempts dropped.
+    assert!(
+        !ctx.compact_context.contains("task-0: attempt number 0"),
+        "attempt 0 (oldest) dropped after 5→3 reduction"
+    );
+    assert!(
+        !ctx.compact_context.contains("task-1: attempt number 1"),
+        "attempt 1 (2nd-oldest) dropped after 5→3 reduction"
+    );
+    // Lower-priority sections are NOT yet trimmed (reduction stopped at priority 2).
+    assert!(
+        ctx.compact_context.contains("Key files:"),
+        "key_files not yet trimmed (priority 3)"
+    );
+    assert!(
+        ctx.compact_context.contains("Open questions:"),
+        "open_questions not yet trimmed (priority 4)"
+    );
+    assert!(
+        ctx.compact_context.contains("Long-term findings:"),
+        "long_summary not yet trimmed (priority 5)"
+    );
+}
+
+#[test]
+fn decisions_preserved_under_budget_pressure() {
+    let builder = ContextBuilder::new(cfg());
+    // Memory with all section types populated, including 2 decisions. Tight
+    // budget forces dropping priorities 1-5; decisions (protected, not in
+    // §6.1 trim priority list) must remain.
+    let mut mem = SubagentMemoryRow::new_empty("sub-a");
+    mem.hot_summary = Some("Hot.".into());
+    mem.long_summary = Some("L".repeat(500));
+    mem.key_files_json = Some(
+        serde_json::to_string(&[KeyFile {
+            path: "src/auth/token.ts".into(),
+            reason: "refresh logic".into(),
+            last_seen_at_ms: 1000,
+            score: 3,
+        }])
+        .unwrap(),
+    );
+    mem.open_questions_json = Some(
+        serde_json::to_string(&[OpenQuestion {
+            question: "Concurrent refresh handled?".into(),
+            status: "open".into(),
+            created_at_ms: 1000,
+            last_seen_at_ms: 1000,
+        }])
+        .unwrap(),
+    );
+    mem.decisions_json = Some(
+        serde_json::to_string(&[
+            "Focus on read-only analysis".to_string(),
+            "Use JWT for auth".to_string(),
+        ])
+        .unwrap(),
+    );
+    mem.attempts_json = Some(
+        serde_json::to_string(
+            &(0..5)
+                .map(|i| format!("task-{i}: attempt number {i} with enough padding text"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    // 5 recent tasks with non-trivial summaries (priority 1 trimmable).
+    let tasks: Vec<SubagentTaskRow> = (0..5)
+        .map(|i| {
+            task_row(
+                &format!("task_{i}"),
+                &format!("summary_{i} padding ").repeat(3),
+                1000 + i,
+            )
+        })
+        .collect();
+    // Budget 50 tokens = 200 chars. Protected sections (header ~96 + decisions
+    // ~60 + hot_summary ~20 + prompt ~21 = ~197 chars) fit; everything else
+    // (priorities 1-5) dropped.
+    let (ctx, _snap) = builder.build(&subagent(), &mem, &tasks, "do thing", 50);
+    assert!(
+        ctx.compact_context.contains("Decisions:"),
+        "Decisions section present (protected under budget pressure)"
+    );
+    assert!(
+        ctx.compact_context.contains("Focus on read-only analysis"),
+        "decision 1 preserved under budget pressure"
+    );
+    assert!(
+        ctx.compact_context.contains("Use JWT for auth"),
+        "decision 2 preserved under budget pressure"
+    );
+    // Protected sections still present.
+    assert!(
+        ctx.compact_context.contains("do thing"),
+        "prompt preserved (priority 7)"
+    );
+    // Trimmable sections dropped.
+    assert!(
+        !ctx.compact_context.contains("Attempts:"),
+        "attempts dropped (priority 2) under tight budget"
+    );
+    assert!(
+        !ctx.compact_context.contains("Key files:"),
+        "key_files dropped (priority 3) under tight budget"
+    );
+    assert!(
+        !ctx.compact_context.contains("Open questions:"),
+        "open_questions dropped (priority 4) under tight budget"
+    );
+    assert!(
+        !ctx.compact_context.contains("Long-term findings:"),
+        "long_summary dropped (priority 5) under tight budget"
+    );
+}
