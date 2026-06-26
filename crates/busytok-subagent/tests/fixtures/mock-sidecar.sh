@@ -58,8 +58,8 @@ sub_to_sess_remove_by_sub() {
     if [[ "${SUB_IDS[$i]}" == "$target" ]]; then
       unset 'SUB_IDS[i]'
       unset 'SESS_IDS[i]'
-      SUB_IDS=("${SUB_IDS[@]}")
-      SESS_IDS=("${SESS_IDS[@]}")
+      SUB_IDS=(${SUB_IDS[@]+"${SUB_IDS[@]}"})
+      SESS_IDS=(${SESS_IDS[@]+"${SESS_IDS[@]}"})
       return 0
     fi
   done
@@ -72,8 +72,8 @@ sub_to_sess_remove_by_sess() {
     if [[ "${SESS_IDS[$i]}" == "$target" ]]; then
       unset 'SUB_IDS[i]'
       unset 'SESS_IDS[i]'
-      SUB_IDS=("${SUB_IDS[@]}")
-      SESS_IDS=("${SESS_IDS[@]}")
+      SUB_IDS=(${SUB_IDS[@]+"${SUB_IDS[@]}"})
+      SESS_IDS=(${SESS_IDS[@]+"${SESS_IDS[@]}"})
       return 0
     fi
   done
@@ -124,7 +124,7 @@ while IFS= read -r line; do
           for i in "${!SESS_ORDER[@]}"; do
             if [[ "${SESS_ORDER[$i]}" == "$SESS" ]]; then
               unset 'SESS_ORDER[i]'
-              SESS_ORDER=("${SESS_ORDER[@]}")
+              SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
               break
             fi
           done
@@ -155,7 +155,7 @@ while IFS= read -r line; do
         for i in "${!SESS_ORDER[@]}"; do
           if [[ "${SESS_ORDER[$i]}" == "$SESS_ID_PARAM" ]]; then
             unset 'SESS_ORDER[i]'
-            SESS_ORDER=("${SESS_ORDER[@]}")
+            SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
             break
           fi
         done

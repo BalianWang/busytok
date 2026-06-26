@@ -424,3 +424,97 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
 
     supervisor.shutdown_writer().await.unwrap();
 }
+
+// --- hot session pool: e2e eviction (Plan 3 Task 7) ---
+//
+// Exercises the full eviction path end-to-end through the runtime supervisor:
+// delegate fills the hot pool → second delegate (different subagent) triggers
+// HOT_SESSION_LIMIT_REACHED → executor drives prepare_hibernate → persist →
+// close → retries turn_auto. Verifies the evicted subagent lands at 'warm'
+// (memory written) and a `session_hibernate` resource event is recorded.
+
+#[tokio::test]
+async fn sidecar_e2e_eviction_releases_lru_and_retries() {
+    // max_hot_sessions=1: first delegate fills the pool. Second delegate
+    // (different subagent) triggers eviction: executor catches
+    // HOT_SESSION_LIMIT_REACHED, drives prepare_hibernate → persist → close,
+    // then retries turn_auto. The evicted subagent must end up 'warm'
+    // (memory written), the new subagent 'hot'.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.max_hot_sessions = 1;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let mut cfg = make_sidecar_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, cfg);
+
+    // 1. First delegate — fills the pool
+    let resp1 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "evicted".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do 1".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp1.status, "completed");
+    let sub1 = resp1.subagent_id;
+
+    // 2. Second delegate — triggers eviction
+    let resp2 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "winner".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do 2".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp2.status, "completed");
+    let sub2 = resp2.subagent_id;
+
+    // 3. Verify: sub1 is warm (evicted with memory), sub2 is hot
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let s1 = db_guard.subagent_get_logical(&sub1).unwrap().unwrap();
+        assert_eq!(
+            s1.status, "warm",
+            "evicted subagent must be warm (memory written during eviction)"
+        );
+        let s2 = db_guard.subagent_get_logical(&sub2).unwrap().unwrap();
+        assert_eq!(s2.status, "hot", "new subagent must be hot");
+    }
+
+    // 4. Verify session_hibernate resource event was written for the eviction
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let events = db_guard.subagent_list_resource_events(None, 100).unwrap();
+        assert!(
+            events.iter().any(|e| e.event_type == "session_hibernate"),
+            "session_hibernate event must be written during eviction"
+        );
+    }
+
+    supervisor.shutdown_sidecar().await;
+    supervisor.shutdown_writer().await.unwrap();
+}

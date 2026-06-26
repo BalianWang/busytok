@@ -405,3 +405,194 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
 
     supervisor.shutdown().await.unwrap();
 }
+
+// --- eviction failure paths (Plan 3 Task 7) ---
+//
+// Two regression tests for the eviction driver's failure modes:
+//   1. The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X,
+//      but the DB has no hot binding for X (sidecar/service out of sync).
+//      The executor must error out rather than silently succeeding or
+//      retrying indefinitely.
+//   2. session.close fails during eviction (BUSYTOK_MOCK_CLOSE_FAILS=1).
+//      The executor must abort (return Err) — the DB has been flipped to
+//      closed/warm but the sidecar still holds the session hot, so
+//      retrying turn_auto would hit HOT_SESSION_LIMIT_REACHED again and
+//      diverge. State divergence risk → fatal.
+
+#[tokio::test]
+async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
+    // The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X,
+    // but the DB has no hot binding for X (sidecar and busytok-service are
+    // out of sync). The executor must error out rather than silently
+    // succeeding or retrying indefinitely.
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    // HOT_LIMIT=1 means the sidecar's pool is full after 1 session.
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+
+    // First delegate — fills the sidecar's pool (max_hot=1)
+    let input1 = ExecutorInput {
+        subagent_id: "sub-a".into(),
+        subagent_name: "a".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do 1".into(),
+        timeout_seconds: None,
+    };
+    let _out1 = executor
+        .execute(&input1)
+        .await
+        .expect("first delegate must succeed");
+
+    // NOTE: We deliberately do NOT persist the hot binding to the DB.
+    // This simulates the out-of-sync state: the sidecar has session X in
+    // its pool, but the DB has no hot binding for X. When the sidecar
+    // returns data.candidate=X, evict_session's find_hot_binding_by_session
+    // will return None.
+
+    // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with data.candidate,
+    // but eviction can't find the binding in the DB → must error out.
+    let input2 = ExecutorInput {
+        subagent_id: "sub-b".into(),
+        subagent_name: "b".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do 2".into(),
+        timeout_seconds: None,
+    };
+    let result = executor.execute(&input2).await;
+    assert!(
+        result.is_err(),
+        "eviction must fail when the DB has no hot binding for the candidate"
+    );
+    let err = match result {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("no hot binding found"),
+        "error should explain the sync failure, got: {err}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_aborts_when_session_close_fails() {
+    // The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X.
+    // The DB has a hot binding for X (so find_hot_binding_by_session succeeds),
+    // prepare_hibernate succeeds, the binding is flipped to closed in the DB,
+    // BUT session.close(X) fails (BUSYTOK_MOCK_CLOSE_FAILS=1).
+    // The executor must return an error — the DB has been flipped to closed
+    // but the sidecar still holds the session. The caller must not retry.
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let now = busytok_domain::now_ms();
+    // Pre-seed sub-a with a hot binding. The mock sidecar generates session
+    // IDs as "pi_sess_mock_${counter}" (see mock-sidecar.sh), so the first
+    // session it creates will be "pi_sess_mock_1". We pre-seed this binding
+    // because the executor does NOT persist hot bindings itself (that is the
+    // SubagentManager's job) — without this seed, find_hot_binding_by_session
+    // would return None and eviction would fail before reaching close.
+    {
+        let db_guard = db.lock().unwrap();
+        db_guard
+            .subagent_upsert_logical(&SubagentLogicalSubagentRow {
+                id: "sub-a".into(),
+                name: "a".into(),
+                project_id: "p".into(),
+                repo_path: "/r".into(),
+                repo_hash: "h".into(),
+                branch: None,
+                intent: None,
+                default_profile: "pi/search-cheap".into(),
+                default_model: None,
+                status: "hot".into(),
+                created_at_ms: now,
+                updated_at_ms: now,
+                last_active_at_ms: Some(now),
+            })
+            .unwrap();
+        db_guard
+            .subagent_commit_hot_binding_and_status(
+                &SubagentHarnessBindingRow {
+                    id: "bind-a".into(),
+                    subagent_id: "sub-a".into(),
+                    harness: "pi".into(),
+                    adapter_session_id: Some("pi_sess_mock_1".into()),
+                    adapter_process_id: None,
+                    is_hot: 1,
+                    status: "hot".into(),
+                    created_at_ms: now,
+                    last_used_at_ms: Some(now),
+                    closed_at_ms: None,
+                    detail_json: None,
+                },
+                "sub-a",
+            )
+            .unwrap();
+    }
+
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_CLOSE_FAILS".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+
+    // First delegate — fills the sidecar's pool (max_hot=1), session pi_sess_mock_1.
+    let input1 = ExecutorInput {
+        subagent_id: "sub-a".into(),
+        subagent_name: "a".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do 1".into(),
+        timeout_seconds: None,
+    };
+    let _out1 = executor
+        .execute(&input1)
+        .await
+        .expect("first delegate must succeed");
+
+    // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with
+    // data.candidate=pi_sess_mock_1 (the LRU session).
+    // Eviction: find_hot_binding_by_session(pi_sess_mock_1) → OK (pre-seeded),
+    // prepare_hibernate → OK, commit_hibernate_binding_and_status → flips DB,
+    // session.close(pi_sess_mock_1) → FAILS (BUSYTOK_MOCK_CLOSE_FAILS=1).
+    // Executor must return an error, NOT retry.
+    let input2 = ExecutorInput {
+        subagent_id: "sub-b".into(),
+        subagent_name: "b".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do 2".into(),
+        timeout_seconds: None,
+    };
+    let result = executor.execute(&input2).await;
+    assert!(
+        result.is_err(),
+        "eviction must abort when session.close fails — state divergence risk"
+    );
+    let err = match result {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("session.close failed"),
+        "error should mention the close failure, got: {err_msg}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}

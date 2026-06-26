@@ -560,3 +560,46 @@ async fn supervisor_drains_stderr_without_blocking() {
     assert_eq!(result["status"], "completed");
     sup.shutdown().await.unwrap();
 }
+
+// --- hot session pool: session reuse (Plan 3 Task 7) ---
+//
+// Verifies the sidecar's session reuse contract: a second `turn_auto` for
+// the same `logical_subagent_id` must return the SAME `adapter_session_id`
+// with `session_reused: true`, rather than creating a new session. This is
+// the core hot-pool invariant — without it, every turn would burn a new
+// session and the LRU eviction path would never engage.
+
+#[tokio::test]
+async fn supervisor_turn_auto_reuses_session_for_same_subagent() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let handle = sup.ensure_started().await.unwrap();
+
+    // First turn_auto — creates a new session
+    let params1 = serde_json::json!({
+        "logical_subagent_id": "sub-a",
+        "logical_subagent_name": "a",
+        "cwd": "/tmp",
+        "profile": "pi/search-cheap",
+        "prompt": "do 1",
+    });
+    let result1 = handle.turn_auto(params1).await.unwrap();
+    let sess1 = result1["adapter_session_id"].as_str().unwrap().to_string();
+    assert_eq!(result1["session_reused"], false);
+
+    // Second turn_auto — same subagent, must reuse the session
+    let params2 = serde_json::json!({
+        "logical_subagent_id": "sub-a",
+        "logical_subagent_name": "a",
+        "cwd": "/tmp",
+        "profile": "pi/search-cheap",
+        "prompt": "do 2",
+    });
+    let result2 = handle.turn_auto(params2).await.unwrap();
+    let sess2 = result2["adapter_session_id"].as_str().unwrap().to_string();
+    assert_eq!(sess1, sess2, "same subagent must reuse the same session");
+    assert_eq!(result2["session_reused"], true);
+
+    sup.shutdown().await.unwrap();
+}
