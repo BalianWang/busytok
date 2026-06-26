@@ -293,3 +293,22 @@
   color: var(--r-ink-muted);
   font-size: 13px;
 }
+
+/* ── ReceiptPreviewDialog chrome ──────────────────────────────────────
+   The dialog hosts a scaled live preview of ReceiptPaper (transform: scale
+   0.62 matches the export-root scale, so what users see is what they ship). */
+.receipt-preview__overlay {
+  position: fixed; inset: 0; background: rgba(17, 24, 39, 0.42);
+}
+.receipt-preview {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: min(560px, 92vw); max-height: 88vh; display: flex; flex-direction: column;
+  background: #fff; border-radius: 16px; padding: 20px; gap: 12px;
+  box-shadow: 0 24px 70px rgba(0,0,0,0.3);
+}
+.receipt-preview__title { font-size: 16px; font-weight: 600; }
+.receipt-preview__desc { font-size: 12px; color: #6b7280; }
+.receipt-preview__date { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+.receipt-preview__scroll { overflow: auto; flex: 1; }
+.receipt-preview__paper { transform: scale(0.62); transform-origin: top center; height: 0; padding-top: 62%; }
+.receipt-preview__actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
