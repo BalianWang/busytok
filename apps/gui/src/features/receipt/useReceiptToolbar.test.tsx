@@ -1,10 +1,10 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   PageToolbarProvider,
   usePageToolbar,
 } from "../../components/desktop/PageToolbarContext";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useReceiptToolbar } from "./useReceiptToolbar";
 
 // Mock useDailyReceipt so the dialog doesn't fire real Tauri invoke calls
@@ -80,6 +80,10 @@ function Harness() {
 afterEach(() => cleanup());
 
 describe("useReceiptToolbar", () => {
+  beforeEach(() => {
+    STABLE_ON_REFRESH.mockReset();
+  });
+
   it("renders a Share button that opens the dialog", async () => {
     render(<Harness />);
     // findByRole waits for the toolbar's useEffect (which calls setToolbar)
@@ -90,5 +94,16 @@ describe("useReceiptToolbar", () => {
       share.click();
     });
     expect(await screen.findByText("Daily receipt")).toBeDefined();
+  });
+
+  it("renders a Refresh button that invokes onRefresh on click", async () => {
+    render(<Harness />);
+    // findByRole waits for the toolbar's useEffect (which calls setToolbar)
+    // to commit before the button is present in the DOM.
+    const refresh = await screen.findByRole("button", { name: /refresh data/i });
+    await act(async () => {
+      refresh.click();
+    });
+    await waitFor(() => expect(STABLE_ON_REFRESH).toHaveBeenCalledOnce());
   });
 });

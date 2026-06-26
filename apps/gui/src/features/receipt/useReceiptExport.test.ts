@@ -85,4 +85,52 @@ describe("useReceiptExport", () => {
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Busytok"));
     vi.unstubAllGlobals();
   });
+
+  it("copyImage logs gui.receipt.copied_failed when domToBlob rejects (no throw)", async () => {
+    domToBlob.mockRejectedValueOnce(new Error("capture failed"));
+    const el = document.createElement("div");
+    const { result } = renderHook(() =>
+      useReceiptExport({ current: el }, toReceiptViewModel(NORMAL_DAY), "2026-06-26"),
+    );
+    await expect(result.current.copyImage()).resolves.toBeUndefined();
+    expect(reportEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        level: "ERROR",
+        event_code: "gui.receipt.copied_failed",
+      }),
+    );
+  });
+
+  it("copyImage logs gui.receipt.copied_failed when writeImage rejects (no throw)", async () => {
+    domToBlob.mockResolvedValueOnce(blob([1, 2, 3]));
+    writeImage.mockRejectedValueOnce(new Error("write failed"));
+    const el = document.createElement("div");
+    const { result } = renderHook(() =>
+      useReceiptExport({ current: el }, toReceiptViewModel(NORMAL_DAY), "2026-06-26"),
+    );
+    await expect(result.current.copyImage()).resolves.toBeUndefined();
+    expect(reportEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        level: "ERROR",
+        event_code: "gui.receipt.copied_failed",
+      }),
+    );
+  });
+
+  it("savePng logs gui.receipt.exported_failed when invoke rejects (no throw)", async () => {
+    domToBlob.mockResolvedValueOnce(blob([9, 9]));
+    save.mockResolvedValueOnce("/tmp/x.png");
+    invoke.mockRejectedValueOnce(new Error("invoke failed"));
+    const el = document.createElement("div");
+    const { result } = renderHook(() =>
+      useReceiptExport({ current: el }, toReceiptViewModel(NORMAL_DAY), "2026-06-26"),
+    );
+    await expect(result.current.savePng()).resolves.toBeUndefined();
+    expect(reportEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        level: "ERROR",
+        event_code: "gui.receipt.exported_failed",
+      }),
+    );
+  });
 });
