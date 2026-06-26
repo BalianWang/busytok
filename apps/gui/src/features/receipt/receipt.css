@@ -32,7 +32,7 @@
   font-display: block;
 }
 
-.receipt {
+.receipt-stage {
   --r-ink: #211b14;
   --r-ink-muted: #6b5e4a;
   --r-paper-top: #fffdf6;
@@ -285,4 +285,11 @@
   top: 0;
   width: 420px;
   pointer-events: none;
+}
+
+.receipt-paper__empty {
+  text-align: center;
+  padding: 48px 0;
+  color: var(--r-ink-muted);
+  font-size: 13px;
 }
