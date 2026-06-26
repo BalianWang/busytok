@@ -113,7 +113,7 @@ impl SidecarRpcClient {
             let resp: SidecarResponse = serde_json::from_value(val)
                 .map_err(|e| SidecarError::Rpc(format!("deserialize: {e}")))?;
             if let Some(err) = resp.error {
-                return Err(SidecarError::Application(err.code, err.message));
+                return Err(SidecarError::Application(err.code, err.message, err.data));
             }
             return Ok(resp.result.unwrap_or(serde_json::Value::Null));
         }

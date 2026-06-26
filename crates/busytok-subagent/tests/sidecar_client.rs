@@ -198,7 +198,7 @@ sleep 1"#
         .await
         .unwrap_err();
     match err {
-        SidecarError::Application(code, msg) => {
+        SidecarError::Application(code, msg, _) => {
             assert_eq!(code, -32005);
             assert!(msg.contains("profile not found"), "got: {msg}");
         }

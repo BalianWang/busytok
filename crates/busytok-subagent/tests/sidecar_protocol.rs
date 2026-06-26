@@ -46,15 +46,15 @@ fn sidecar_application_error_maps_to_subagent_error() {
     use busytok_subagent::SubagentError;
 
     let e: SubagentError =
-        SidecarError::Application(SESSION_NOT_FOUND, "no such session".into()).into();
+        SidecarError::Application(SESSION_NOT_FOUND, "no such session".into(), None).into();
     assert!(matches!(e, SubagentError::NotFound(_)));
     assert_eq!(e.code(), "subagent.not_found");
 
     let e: SubagentError =
-        SidecarError::Application(PROFILE_NOT_FOUND, "bad profile".into()).into();
+        SidecarError::Application(PROFILE_NOT_FOUND, "bad profile".into(), None).into();
     assert!(matches!(e, SubagentError::ProfileNotFound(_)));
 
-    let e: SubagentError = SidecarError::Application(TASK_TIMEOUT, "slow".into()).into();
+    let e: SubagentError = SidecarError::Application(TASK_TIMEOUT, "slow".into(), None).into();
     assert!(matches!(e, SubagentError::TaskTimeout));
     assert_eq!(e.code(), "subagent.task_timeout");
 
@@ -71,14 +71,13 @@ fn sidecar_application_error_maps_to_subagent_error() {
 
 /// Cover the remaining `From<SidecarError>` arms: Rpc, Timeout, Crashed, and
 /// the `_ =>` catch-all for Application codes that don't have a dedicated
-/// domain variant (HOT_SESSION_LIMIT_REACHED, SIDECAR_UNHEALTHY,
-/// TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA, PROTOCOL_MISMATCH). These surface
-/// as `SidecarRpc("[code] msg")` so the control layer still reports them.
+/// domain variant (SIDECAR_UNHEALTHY, TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA,
+/// PROTOCOL_MISMATCH). These surface as `SidecarRpc("[code] msg")` so the
+/// control layer still reports them. HOT_SESSION_LIMIT_REACHED now has a
+/// dedicated variant — covered by `hot_session_limit_extracts_candidate_from_data`.
 #[test]
 fn sidecar_error_remaining_variants_map_to_subagent_error() {
-    use busytok_subagent::sidecar::{
-        SidecarError, HOT_SESSION_LIMIT_REACHED, PROTOCOL_MISMATCH, SIDECAR_UNHEALTHY,
-    };
+    use busytok_subagent::sidecar::{SidecarError, PROTOCOL_MISMATCH, SIDECAR_UNHEALTHY};
     use busytok_subagent::SubagentError;
 
     // Rpc → SidecarRpc (preserves message verbatim).
@@ -108,11 +107,10 @@ fn sidecar_error_remaining_variants_map_to_subagent_error() {
     // Unmatched Application codes → SidecarRpc with "[code] msg" formatting.
     // Each of these exercises the `_ =>` catch-all arm.
     for (code, label) in [
-        (HOT_SESSION_LIMIT_REACHED, "hot limit"),
         (SIDECAR_UNHEALTHY, "unhealthy"),
         (PROTOCOL_MISMATCH, "mismatch"),
     ] {
-        let e: SubagentError = SidecarError::Application(code, label.into()).into();
+        let e: SubagentError = SidecarError::Application(code, label.into(), None).into();
         match &e {
             SubagentError::SidecarRpc(msg) => {
                 assert!(
@@ -125,6 +123,43 @@ fn sidecar_error_remaining_variants_map_to_subagent_error() {
         }
         assert_eq!(e.code(), "subagent.sidecar_rpc_error");
     }
+}
+
+/// HOT_SESSION_LIMIT_REACHED now maps to a dedicated `SubagentError::HotSessionLimit`
+/// variant. The sidecar is the hot-pool authority (spec §4.4) — its
+/// `data.candidate` names the LRU session to evict, so the `From<SidecarError>`
+/// conversion must extract that field rather than discarding it. Covers both
+/// the with-data and the missing-data (default-empty) cases.
+#[test]
+fn hot_session_limit_extracts_candidate_from_data() {
+    use busytok_subagent::sidecar::{SidecarError, HOT_SESSION_LIMIT_REACHED};
+    use busytok_subagent::SubagentError;
+
+    // With data.candidate present → candidate propagates verbatim.
+    let e: SubagentError = SidecarError::Application(
+        HOT_SESSION_LIMIT_REACHED,
+        "hot limit".into(),
+        Some(json!({"candidate": "sess_abc"})),
+    )
+    .into();
+    match &e {
+        SubagentError::HotSessionLimit { candidate } => {
+            assert_eq!(candidate, "sess_abc");
+        }
+        other => panic!("expected HotSessionLimit, got {other:?}"),
+    }
+    assert_eq!(e.code(), "subagent.hot_session_limit");
+
+    // Missing data → default-empty candidate (no panic, no SidecarRpc fallback).
+    let e: SubagentError =
+        SidecarError::Application(HOT_SESSION_LIMIT_REACHED, "hot limit".into(), None).into();
+    match &e {
+        SubagentError::HotSessionLimit { candidate } => {
+            assert_eq!(candidate, "");
+        }
+        other => panic!("expected HotSessionLimit with empty candidate, got {other:?}"),
+    }
+    assert_eq!(e.code(), "subagent.hot_session_limit");
 }
 
 // `SidecarRpcError` is part of the protocol surface; verify it round-trips

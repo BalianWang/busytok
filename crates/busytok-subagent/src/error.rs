@@ -50,6 +50,9 @@ pub enum SubagentError {
 
     #[error("sidecar crashed: {0}")]
     SidecarCrashed(String),
+
+    #[error("hot session limit reached, candidate: {candidate}")]
+    HotSessionLimit { candidate: String },
 }
 
 impl SubagentError {
@@ -69,6 +72,7 @@ impl SubagentError {
             SubagentError::SidecarIo(_) => "subagent.sidecar_io_error",
             SubagentError::SidecarTimeout(_) => "subagent.sidecar_timeout",
             SubagentError::SidecarCrashed(_) => "subagent.sidecar_crashed",
+            SubagentError::HotSessionLimit { .. } => "subagent.hot_session_limit",
         }
     }
 }
@@ -86,15 +90,27 @@ impl From<SidecarError> for SubagentError {
             SidecarError::Timeout(msg) => SubagentError::SidecarTimeout(msg),
             SidecarError::Crashed(msg) => SubagentError::SidecarCrashed(msg),
             SidecarError::Io(msg) => SubagentError::SidecarIo(msg),
-            SidecarError::Application(code, msg) => {
+            SidecarError::Application(code, msg, data) => {
                 use crate::sidecar::protocol::*;
                 match code {
                     SESSION_NOT_FOUND => SubagentError::NotFound(msg),
                     PROFILE_NOT_FOUND => SubagentError::ProfileNotFound(msg),
                     TASK_TIMEOUT => SubagentError::TaskTimeout,
-                    // Other application codes (HOT_SESSION_LIMIT_REACHED,
-                    // SIDECAR_UNHEALTHY, TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA,
-                    // PROTOCOL_MISMATCH) surface as generic sidecar RPC errors.
+                    HOT_SESSION_LIMIT_REACHED => {
+                        // Extract candidate from the RPC error's data field.
+                        // The sidecar is the hot-pool authority (spec §4.4) —
+                        // its data.candidate names the LRU session to evict.
+                        let candidate = data
+                            .as_ref()
+                            .and_then(|d| d.get("candidate"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        SubagentError::HotSessionLimit { candidate }
+                    }
+                    // Other application codes (SIDECAR_UNHEALTHY,
+                    // TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA, PROTOCOL_MISMATCH)
+                    // surface as generic sidecar RPC errors.
                     _ => SubagentError::SidecarRpc(format!("[{code}] {msg}")),
                 }
             }

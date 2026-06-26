@@ -24,5 +24,5 @@ pub enum SidecarError {
     #[error("sidecar io error: {0}")]
     Io(String),
     #[error("sidecar application error [{0}]: {1}")]
-    Application(i32, String),
+    Application(i32, String, Option<serde_json::Value>),
 }

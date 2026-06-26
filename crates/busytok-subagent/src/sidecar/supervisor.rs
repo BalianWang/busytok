@@ -491,4 +491,28 @@ impl SidecarHandle {
     ) -> Result<serde_json::Value, SidecarError> {
         self.supervisor.call_rpc("session.turn_auto", params).await
     }
+
+    /// Prepare a specific session for hibernate (spec §4.4 eviction flow).
+    /// Returns `{ memory_delta, stats }`.
+    pub async fn prepare_hibernate(
+        &self,
+        adapter_session_id: &str,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.supervisor
+            .call_rpc(
+                "session.prepare_hibernate",
+                serde_json::json!({ "adapter_session_id": adapter_session_id }),
+            )
+            .await
+    }
+
+    /// Close a session (spec §4.4 eviction flow, final step).
+    pub async fn close(&self, adapter_session_id: &str) -> Result<serde_json::Value, SidecarError> {
+        self.supervisor
+            .call_rpc(
+                "session.close",
+                serde_json::json!({ "adapter_session_id": adapter_session_id }),
+            )
+            .await
+    }
 }
