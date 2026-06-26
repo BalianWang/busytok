@@ -30,6 +30,7 @@ fn mock_config() -> SidecarConfig {
         max_restart_attempts: 3,
         restart_backoff_base: Duration::from_millis(10),
         harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
     }
 }
 

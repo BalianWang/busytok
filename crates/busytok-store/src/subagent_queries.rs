@@ -624,11 +624,7 @@ pub fn find_hot_binding_by_session(
 /// Used by the eviction flow to persist the memory delta returned by
 /// `session.prepare_hibernate`. Mirrors `SubagentManager::write_hot_summary`
 /// but lives in the store layer so the executor can call it directly.
-pub fn write_hot_summary(
-    conn: &Connection,
-    subagent_id: &str,
-    hot_summary: &str,
-) -> Result<()> {
+pub fn write_hot_summary(conn: &Connection, subagent_id: &str, hot_summary: &str) -> Result<()> {
     // UPSERT memory row with just hot_summary (other fields unchanged).
     // Mirrors the manager's write_hot_summary pattern: get-or-create, update
     // hot_summary, upsert.
@@ -673,12 +669,7 @@ pub fn write_hot_summary(
                  key_files_json, decisions_json, attempts_json, open_questions_json, \
                  artifact_refs_json, last_compacted_at_ms, last_compacted_task_id, updated_at_ms) \
                  VALUES (?1, ?2, ?3, NULL, '[]', '[]', '[]', '[]', '[]', NULL, NULL, ?4)",
-                params![
-                    format!("mem_{subagent_id}"),
-                    subagent_id,
-                    hot_summary,
-                    now,
-                ],
+                params![format!("mem_{subagent_id}"), subagent_id, hot_summary, now,],
             )?;
         }
     }

@@ -271,9 +271,11 @@ impl BusytokSupervisor {
                     sidecar_config,
                     Some(Arc::clone(db)),
                 );
-                let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> = Arc::new(
-                    busytok_subagent::sidecar::SidecarTaskExecutor::new(Arc::clone(&sup)),
-                );
+                let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
+                    Arc::new(busytok_subagent::sidecar::SidecarTaskExecutor::with_db(
+                        Arc::clone(&sup),
+                        Arc::clone(db),
+                    ));
                 (exec, Some(sup), None)
             }
             Err(e) => {

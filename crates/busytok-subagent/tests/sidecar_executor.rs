@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use busytok_config::SubagentSettings;
+use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
 use busytok_store::Database;
 use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
@@ -33,7 +34,12 @@ fn mock_sidecar_config_with_env(env: HashMap<String, String>) -> SidecarConfig {
         max_restart_attempts: 3,
         restart_backoff_base: Duration::from_millis(10),
         harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
     }
+}
+
+fn mock_config() -> SidecarConfig {
+    mock_sidecar_config_with_env(HashMap::new())
 }
 
 struct TestHarness {
@@ -279,4 +285,123 @@ async fn execute_returns_error_when_sidecar_crashes_during_turn_auto() {
             other.code()
         ),
     }
+}
+
+// --- eviction driver test (Plan 3 Task 5) ---
+//
+// `SidecarTaskExecutor::execute` must catch `HOT_SESSION_LIMIT_REACHED` from
+// `turn_auto`, extract the LRU `candidate` from the RPC error's `data.candidate`
+// field, drive the eviction flow (prepare_hibernate → persist memory + flip
+// binding atomically → close), and retry `turn_auto` once. The retry must
+// succeed because the sidecar released the slot via `session.close`.
+//
+// NOTE: The executor does NOT create subagent rows or persist the initial hot
+// binding — that's `SubagentManager::delegate()`'s job. This test manually
+// persists the binding after the first `execute()` to simulate the
+// post-delegate DB state the eviction flow depends on.
+
+#[tokio::test]
+async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+
+    // First delegate — fills the pool (max_hot=1).
+    let input1 = ExecutorInput {
+        subagent_id: "sub-a".into(),
+        subagent_name: "a".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do 1".into(),
+        timeout_seconds: None,
+    };
+    let out1 = executor
+        .execute(&input1)
+        .await
+        .expect("first delegate must succeed");
+    assert_eq!(out1.status, TaskStatus::Completed);
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Manually persist the hot binding (simulating what
+    // `SubagentManager::delegate()` does after a successful `execute()`). The
+    // eviction flow's `find_hot_binding_by_session` query depends on this
+    // binding existing.
+    {
+        let db_guard = db.lock().unwrap();
+        db_guard
+            .subagent_upsert_logical(&SubagentLogicalSubagentRow {
+                id: "sub-a".into(),
+                name: "a".into(),
+                project_id: "p".into(),
+                repo_path: "/r".into(),
+                repo_hash: "h".into(),
+                branch: None,
+                intent: None,
+                default_profile: "pi/search-cheap".into(),
+                default_model: None,
+                status: "hot".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_active_at_ms: Some(0),
+            })
+            .unwrap();
+        let now = busytok_domain::now_ms();
+        db_guard
+            .subagent_commit_hot_binding_and_status(
+                &SubagentHarnessBindingRow {
+                    id: "bind_a".into(),
+                    subagent_id: "sub-a".into(),
+                    harness: "pi".into(),
+                    adapter_session_id: Some(sess_a),
+                    adapter_process_id: None,
+                    is_hot: 1,
+                    status: "hot".into(),
+                    created_at_ms: now,
+                    last_used_at_ms: Some(now),
+                    closed_at_ms: None,
+                    detail_json: None,
+                },
+                "sub-a",
+            )
+            .unwrap();
+    }
+
+    // Second delegate — different subagent, triggers eviction.
+    let input2 = ExecutorInput {
+        subagent_id: "sub-b".into(),
+        subagent_name: "b".into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: "do 2".into(),
+        timeout_seconds: None,
+    };
+    let out2 = executor
+        .execute(&input2)
+        .await
+        .expect("eviction + retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+    assert!(out2.adapter_session_id.is_some());
+
+    // Verify: sub-a is now warm (evicted), with memory written by the
+    // eviction flow's prepare_hibernate → write_hot_summary path.
+    {
+        let db_guard = db.lock().unwrap();
+        let sub_a = db_guard.subagent_get_logical("sub-a").unwrap().unwrap();
+        assert_eq!(sub_a.status, "warm", "evicted subagent must be warm");
+        let mem = db_guard.subagent_get_memory("sub-a").unwrap();
+        assert!(mem.is_some(), "evicted subagent must have memory row");
+        assert!(
+            mem.unwrap().hot_summary.is_some(),
+            "hot_summary must be written"
+        );
+    }
+
+    supervisor.shutdown().await.unwrap();
 }

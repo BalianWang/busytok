@@ -28,6 +28,10 @@ pub struct SidecarConfig {
     /// Harness name scopes crash reconciliation (spec §5.4). "pi" for Plan 2;
     /// future harnesses (Claude Code, Codex) set their own.
     pub harness_name: String,
+    /// Maximum concurrent hot sessions the sidecar will hold before evicting
+    /// the LRU (spec §4.4). Mirrored to the sidecar via the
+    /// `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS` env var (spec §8.2).
+    pub max_hot_sessions: u32,
 }
 
 /// Resolve a `SidecarConfig` from settings + paths.
@@ -73,10 +77,15 @@ pub fn resolve_sidecar_config(
             bundle_path.display()
         )));
     }
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_SIDECAR_MAX_HOT_SESSIONS".to_string(),
+        settings.max_hot_sessions.to_string(),
+    );
     Ok(SidecarConfig {
         node_binary,
         bundle_path,
-        env: HashMap::new(), // API keys added at spawn in Plan 4
+        env,
         idle_exit_seconds: settings.idle_exit_seconds,
         // Spec §5.4: health ping every 30s. Fixed in MVP (no config knob).
         health_interval: Duration::from_secs(30),
@@ -86,5 +95,6 @@ pub fn resolve_sidecar_config(
         max_restart_attempts: 3,
         restart_backoff_base: Duration::from_secs(1),
         harness_name: "pi".to_string(),
+        max_hot_sessions: settings.max_hot_sessions,
     })
 }

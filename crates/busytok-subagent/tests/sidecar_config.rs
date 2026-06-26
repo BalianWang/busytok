@@ -190,6 +190,12 @@ fn resolve_sidecar_config_carries_timeouts_and_limits() {
     assert_eq!(cfg.max_restart_attempts, 3);
     assert_eq!(cfg.restart_backoff_base, Duration::from_secs(1));
     assert_eq!(cfg.harness_name, "pi");
-    // env is empty in MVP — API keys are added at spawn in Plan 4.
-    assert!(cfg.env.is_empty());
+    assert_eq!(cfg.max_hot_sessions, settings.max_hot_sessions);
+    // env now carries the hot session limit (spec §8.2); API keys are added
+    // at spawn in Plan 4.
+    assert_eq!(
+        cfg.env.get("BUSYTOK_SIDECAR_MAX_HOT_SESSIONS"),
+        Some(&settings.max_hot_sessions.to_string()),
+        "max_hot_sessions must be passed to the sidecar via env var"
+    );
 }

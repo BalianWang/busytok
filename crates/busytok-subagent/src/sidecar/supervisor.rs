@@ -74,6 +74,13 @@ impl PiSidecarSupervisor {
         })
     }
 
+    /// Access the resolved sidecar config. Used by `SidecarTaskExecutor` to
+    /// read `harness_name` (for `find_hot_binding_by_session`) during the
+    /// eviction flow.
+    pub fn config(&self) -> &SidecarConfig {
+        &self.config
+    }
+
     /// Lazy-spawn the sidecar if not running, then return a handle.
     /// If the sidecar crashed previously, applies exponential backoff before
     /// respawning (capped at `max_restart_attempts`).

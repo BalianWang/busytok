@@ -13,12 +13,26 @@
 #   BUSYTOK_MOCK_STDERR_LINES=N  Write N lines to stderr before each response
 #                                (exercises the supervisor's stderr reader —
 #                                verifies the pipe doesn't fill and block).
+#   BUSYTOK_MOCK_HOT_SESSION_LIMIT=N
+#                                When > 0, track active hot sessions and
+#                                return HOT_SESSION_LIMIT_REACHED (-32002)
+#                                with data.candidate=<LRU session id> once the
+#                                pool is full. session.close releases a slot.
+#                                0/unset = unlimited (legacy behavior).
 
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
 EMPTY_SESSION="${BUSYTOK_MOCK_EMPTY_SESSION:-0}"
 STDERR_LINES="${BUSYTOK_MOCK_STDERR_LINES:-0}"
+HOT_LIMIT="${BUSYTOK_MOCK_HOT_SESSION_LIMIT:-0}"
+
+# Track active hot sessions as a newline-separated string (bash 3.x — no
+# associative arrays on macOS /bin/bash). Each entry is the adapter_session_id
+# assigned when the session was created; LRU order is insertion order (the
+# first line is the oldest).
+ACTIVE_SESSIONS=""
+
 COUNT=0
 while IFS= read -r line; do
   COUNT=$((COUNT + 1))
@@ -49,14 +63,53 @@ while IFS= read -r line; do
     session.turn_auto)
       if [[ "$EMPTY_SESSION" == "1" ]]; then
         printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$ID"
+      elif [[ "$HOT_LIMIT" -gt 0 ]]; then
+        # Count active sessions (lines in ACTIVE_SESSIONS).
+        ACTIVE_COUNT=0
+        if [[ -n "$ACTIVE_SESSIONS" ]]; then
+          ACTIVE_COUNT=$(printf '%s\n' "$ACTIVE_SESSIONS" | grep -c . || true)
+        fi
+        if [[ "$ACTIVE_COUNT" -ge "$HOT_LIMIT" ]]; then
+          # Evict the LRU (first session in insertion order).
+          CANDIDATE=$(printf '%s\n' "$ACTIVE_SESSIONS" | head -n1)
+          printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
+        else
+          SESS_ID="pi_sess_mock_${COUNT}"
+          if [[ -z "$ACTIVE_SESSIONS" ]]; then
+            ACTIVE_SESSIONS="$SESS_ID"
+          else
+            ACTIVE_SESSIONS="${ACTIVE_SESSIONS}"$'\n'"${SESS_ID}"
+          fi
+          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS_ID" "$ID"
+        fi
       else
         printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"pi_sess_mock_%s","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$COUNT" "$ID"
       fi
       ;;
     session.prepare_hibernate)
-      printf '{"jsonrpc":"2.0","result":{"memory_delta":null,"stats":{}},"id":%s}\n' "$ID"
+      # Return a non-null memory_delta so the executor's eviction flow writes
+      # hot_summary to the store. The stats field is opaque to the executor
+      # (passed through to the resource event detail_json).
+      printf '{"jsonrpc":"2.0","result":{"memory_delta":{"hot_summary":"mock hot summary"},"stats":{"turns":3,"tokens":120}},"id":%s}\n' "$ID"
       ;;
     session.close)
+      # Extract adapter_session_id from params (sed on single-line JSON) and
+      # remove it from ACTIVE_SESSIONS so the slot is released.
+      CLOSE_SESS=$(printf '%s' "$line" | sed -n 's/.*"adapter_session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)
+      if [[ -n "$CLOSE_SESS" && -n "$ACTIVE_SESSIONS" ]]; then
+        NEW_SESSIONS=""
+        while IFS= read -r s; do
+          [[ -z "$s" ]] && continue
+          if [[ "$s" != "$CLOSE_SESS" ]]; then
+            if [[ -z "$NEW_SESSIONS" ]]; then
+              NEW_SESSIONS="$s"
+            else
+              NEW_SESSIONS="${NEW_SESSIONS}"$'\n'"${s}"
+            fi
+          fi
+        done <<< "$ACTIVE_SESSIONS"
+        ACTIVE_SESSIONS="$NEW_SESSIONS"
+      fi
       printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
       ;;
     *)
