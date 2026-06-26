@@ -21,6 +21,26 @@
 #                                     (-32001 SESSION_NOT_FOUND) instead of
 #                                     ok. Used to test the fatal-close-failure
 #                                     eviction path.
+#   BUSYTOK_MOCK_TURN_STATUS=<s>      Override the "status" field in
+#                                     session.turn_auto success responses
+#                                     (default "completed"). Set to "failed",
+#                                     "timeout", or any unknown value to
+#                                     exercise parse_turn_auto_result arms.
+#   BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS=1  session.prepare_hibernate returns a
+#                                     JSON-RPC error (-32001) instead of the
+#                                     memory_delta payload. Exercises the
+#                                     evict_session prepare_hibernate error path.
+#   BUSYTOK_MOCK_NULL_MEMORY_DELTA=1  session.prepare_hibernate returns
+#                                     {"memory_delta":null,...} so the executor
+#                                     skips write_hot_summary.
+#   BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE=1  After a successful session.close,
+#                                     the next session.turn_auto returns a
+#                                     JSON-RPC error (-32603). Exercises the
+#                                     retry-turn_auto-failed-after-eviction path.
+#   BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE=1  Emit HOT_SESSION_LIMIT_REACHED with no
+#                                     data.candidate field (sidecar protocol
+#                                     violation). Exercises
+#                                     extract_candidate_from_data error path.
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
@@ -28,7 +48,16 @@ EMPTY_SESSION="${BUSYTOK_MOCK_EMPTY_SESSION:-0}"
 STDERR_LINES="${BUSYTOK_MOCK_STDERR_LINES:-0}"
 HOT_LIMIT="${BUSYTOK_MOCK_HOT_SESSION_LIMIT:-0}"
 CLOSE_FAILS="${BUSYTOK_MOCK_CLOSE_FAILS:-0}"
+TURN_STATUS="${BUSYTOK_MOCK_TURN_STATUS:-}"
+PREPARE_HIBERNATE_FAILS="${BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS:-0}"
+NULL_MEMORY_DELTA="${BUSYTOK_MOCK_NULL_MEMORY_DELTA:-0}"
+TURN_AUTO_FAILS_AFTER_CLOSE="${BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE:-0}"
+HOT_LIMIT_NO_CANDIDATE="${BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE:-0}"
 COUNT=0
+# Number of successful session.close responses sent. Used by
+# BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE to fail the retry turn_auto issued
+# after an eviction close.
+CLOSES=0
 
 # Track active sessions using parallel indexed arrays (portable to bash 3.2
 # which does NOT support `declare -A`). SUB_IDS[i] maps to SESS_IDS[i].
@@ -108,42 +137,70 @@ while IFS= read -r line; do
       exit 0
       ;;
     session.turn_auto)
-      if [[ "$EMPTY_SESSION" == "1" ]]; then
-        printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$ID"
+      if [[ "$TURN_AUTO_FAILS_AFTER_CLOSE" == "1" && "$CLOSES" -gt 0 ]]; then
+        # Simulate a sidecar that fails the turn_auto retry issued AFTER a
+        # successful session.close (eviction released the slot, but the retry
+        # turn itself errors). Exercises executor.rs lines 92-98.
+        printf '{"jsonrpc":"2.0","error":{"code":-32603,"message":"turn_auto failed: internal error"},"id":%s}\n' "$ID"
       else
-        EXISTING_SESS=$(sub_to_sess_lookup "$SUB_ID")
-        if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" ]]; then
-          # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED
-          CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
-          printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
-        elif [[ -n "$EXISTING_SESS" ]]; then
-          # Reuse existing session for this subagent
-          SESS="$EXISTING_SESS"
-          REUSED="true"
-          # Move to MRU (end of array): remove and re-append
-          for i in "${!SESS_ORDER[@]}"; do
-            if [[ "${SESS_ORDER[$i]}" == "$SESS" ]]; then
-              unset 'SESS_ORDER[i]'
-              SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
-              break
-            fi
-          done
-          SESS_ORDER+=("$SESS")
-          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$ID"
+        if [[ -n "$TURN_STATUS" ]]; then
+          STATUS_OUT="$TURN_STATUS"
         else
-          # Create new session
-          SESS_COUNTER=$((SESS_COUNTER + 1))
-          SESS="pi_sess_mock_${SESS_COUNTER}"
-          SUB_IDS+=("$SUB_ID")
-          SESS_IDS+=("$SESS")
-          SESS_ORDER+=("$SESS")
-          REUSED="false"
-          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$ID"
+          STATUS_OUT="completed"
+        fi
+        if [[ "$EMPTY_SESSION" == "1" ]]; then
+          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"%s","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$STATUS_OUT" "$ID"
+        else
+          EXISTING_SESS=$(sub_to_sess_lookup "$SUB_ID")
+          if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" ]]; then
+            # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED
+            CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
+            if [[ "$HOT_LIMIT_NO_CANDIDATE" == "1" ]]; then
+              # Omit data.candidate — sidecar protocol violation. Exercises
+              # executor.rs extract_candidate_from_data error path.
+              printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached"},"id":%s}\n' "$ID"
+            else
+              printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
+            fi
+          elif [[ -n "$EXISTING_SESS" ]]; then
+            # Reuse existing session for this subagent
+            SESS="$EXISTING_SESS"
+            REUSED="true"
+            # Move to MRU (end of array): remove and re-append
+            for i in "${!SESS_ORDER[@]}"; do
+              if [[ "${SESS_ORDER[$i]}" == "$SESS" ]]; then
+                unset 'SESS_ORDER[i]'
+                SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
+                break
+              fi
+            done
+            SESS_ORDER+=("$SESS")
+            printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$ID"
+          else
+            # Create new session
+            SESS_COUNTER=$((SESS_COUNTER + 1))
+            SESS="pi_sess_mock_${SESS_COUNTER}"
+            SUB_IDS+=("$SUB_ID")
+            SESS_IDS+=("$SESS")
+            SESS_ORDER+=("$SESS")
+            REUSED="false"
+            printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$ID"
+          fi
         fi
       fi
       ;;
     session.prepare_hibernate)
-      printf '{"jsonrpc":"2.0","result":{"memory_delta":{"hot_summary":"hibernated"},"stats":{"adapter_session_id":"%s"}},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
+      if [[ "$PREPARE_HIBERNATE_FAILS" == "1" ]]; then
+        # Simulate a sidecar that fails prepare_hibernate — exercises
+        # executor.rs evict_session prepare_hibernate error path (lines 150-156).
+        printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"prepare_hibernate failed: adapter error"},"id":%s}\n' "$ID"
+      elif [[ "$NULL_MEMORY_DELTA" == "1" ]]; then
+        # Return a null memory_delta — exercises executor.rs null-delta skip
+        # path (lines 189-190): write_hot_summary is skipped.
+        printf '{"jsonrpc":"2.0","result":{"memory_delta":null,"stats":{}},"id":%s}\n' "$ID"
+      else
+        printf '{"jsonrpc":"2.0","result":{"memory_delta":{"hot_summary":"hibernated"},"stats":{"adapter_session_id":"%s"}},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
+      fi
       ;;
     session.close)
       if [[ "$CLOSE_FAILS" == "1" ]]; then
@@ -161,6 +218,9 @@ while IFS= read -r line; do
         done
         # Remove from subagent map
         sub_to_sess_remove_by_sess "$SESS_ID_PARAM"
+        # Track successful closes so BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE
+        # can fail the retry turn_auto issued after an eviction close.
+        CLOSES=$((CLOSES + 1))
         printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
       fi
       ;;

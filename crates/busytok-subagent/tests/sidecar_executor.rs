@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use busytok_config::SubagentSettings;
-use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
+use busytok_store::repository::{
+    SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
+};
 use busytok_store::Database;
 use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
@@ -592,6 +594,305 @@ async fn executor_eviction_aborts_when_session_close_fails() {
     assert!(
         err_msg.contains("session.close failed"),
         "error should mention the close failure, got: {err_msg}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+// --- parse_turn_auto_result status arms (Plan 3 Task 8 coverage backfill) ---
+//
+// `parse_turn_auto_result` maps the sidecar's `status` field to a
+// `TaskStatus`. The happy-path mock always returns "completed", so the
+// "failed", "timeout", and unknown-status (`_`) arms are uncovered. Each test
+// drives one arm via the `BUSYTOK_MOCK_TURN_STATUS` mock env var so the
+// executor parses the crafted status through the real code path.
+
+#[tokio::test]
+async fn executor_turn_auto_failed_status_maps_to_failed() {
+    let mut env = HashMap::new();
+    env.insert("BUSYTOK_MOCK_TURN_STATUS".to_string(), "failed".to_string());
+    let mut cfg = mock_sidecar_config_with_env(env);
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    let out = executor
+        .execute(&executor_input())
+        .await
+        .expect("turn_auto succeeds; status=failed is a result, not an error");
+    assert_eq!(out.status, TaskStatus::Failed);
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_turn_auto_timeout_status_maps_to_failed() {
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_MOCK_TURN_STATUS".to_string(),
+        "timeout".to_string(),
+    );
+    let mut cfg = mock_sidecar_config_with_env(env);
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    let out = executor
+        .execute(&executor_input())
+        .await
+        .expect("turn_auto succeeds; status=timeout is a result, not an error");
+    assert_eq!(out.status, TaskStatus::Failed);
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_turn_auto_unknown_status_falls_back_to_completed() {
+    // An unrecognized status string hits the `_` arm of the match and falls
+    // back to `TaskStatus::Completed` (spec: unknown statuses are tolerated,
+    // not fatal).
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_MOCK_TURN_STATUS".to_string(),
+        "bogus-xyz".to_string(),
+    );
+    let mut cfg = mock_sidecar_config_with_env(env);
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    let out = executor
+        .execute(&executor_input())
+        .await
+        .expect("turn_auto succeeds; unknown status falls back to Completed");
+    assert_eq!(out.status, TaskStatus::Completed);
+
+    supervisor.shutdown().await.unwrap();
+}
+
+// --- eviction driver error-path coverage (Plan 3 Task 8 backfill) ---
+//
+// Four more eviction-flow branches are uncovered because the happy-path mock
+// always succeeds: (1) HOT_SESSION_LIMIT_REACHED with no data.candidate
+// (sidecar protocol violation), (2) prepare_hibernate failure, (3) null
+// memory_delta (skip write_hot_summary), (4) retry turn_auto failure after a
+// successful eviction close. Each is driven by a dedicated mock env var so
+// the executor exercises the real error/skip/propagation path.
+
+fn evict_input(id: &str) -> ExecutorInput {
+    ExecutorInput {
+        subagent_id: id.into(),
+        subagent_name: id.into(),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        model: None,
+        prompt: format!("do {id}"),
+        timeout_seconds: None,
+    }
+}
+
+// Pre-seed a hot binding (and an empty memory row) for a subagent. The
+// executor does NOT persist hot bindings or subagent rows itself — that is
+// `SubagentManager::delegate()`'s job. Eviction-flow tests that need
+// `find_hot_binding_by_session` to resolve must pre-seed the binding, mirroring
+// the post-delegate DB state the eviction flow depends on.
+fn seed_hot_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &str) {
+    let now = busytok_domain::now_ms();
+    let db_guard = db.lock().unwrap();
+    db_guard
+        .subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: subagent_id.into(),
+            name: name.into(),
+            project_id: "p".into(),
+            repo_path: "/r".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            default_model: None,
+            status: "hot".into(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_active_at_ms: Some(now),
+        })
+        .unwrap();
+    db_guard
+        .subagent_upsert_memory(&SubagentMemoryRow::new_empty(subagent_id))
+        .unwrap();
+    db_guard
+        .subagent_commit_hot_binding_and_status(
+            &SubagentHarnessBindingRow {
+                id: format!("bind-{subagent_id}"),
+                subagent_id: subagent_id.into(),
+                harness: "pi".into(),
+                adapter_session_id: Some(session_id.into()),
+                adapter_process_id: None,
+                is_hot: 1,
+                status: "hot".into(),
+                created_at_ms: now,
+                last_used_at_ms: Some(now),
+                closed_at_ms: None,
+                detail_json: None,
+            },
+            subagent_id,
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_fails_when_candidate_missing_from_error() {
+    // The sidecar returns HOT_SESSION_LIMIT_REACHED but omits data.candidate
+    // (sidecar protocol violation). `extract_candidate_from_data` must error
+    // and the executor must propagate it — never silently retry or evict a
+    // phantom session.
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    // Fill the pool (max_hot=1).
+    executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+
+    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with no candidate.
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("missing data.candidate"),
+        "error should explain the protocol violation, got: {err}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_fails_when_prepare_hibernate_fails() {
+    // Eviction reaches prepare_hibernate, but the sidecar returns a JSON-RPC
+    // error. The executor must propagate the error (the `warn!` +
+    // sidecar_to_anyhow map_err path) — it must NOT proceed to flip the DB
+    // binding or call close.
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("prepare_hibernate"),
+        "error should mention prepare_hibernate, got: {err}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_skips_memory_write_when_memory_delta_null() {
+    // prepare_hibernate returns {"memory_delta":null,...}. The executor must
+    // skip write_hot_summary (wrote_summary=false) but still flip the binding
+    // to closed/warm, close the session, and retry turn_auto successfully.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_NULL_MEMORY_DELTA".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Pre-seed the hot binding + an empty memory row (mirrors what
+    // SubagentManager::delegate persists after a successful execute).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+
+    let out2 = executor
+        .execute(&evict_input("sub-b"))
+        .await
+        .expect("eviction + retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+
+    // sub-a is evicted (warm) and its hot_summary was NOT written (null delta).
+    {
+        let db_guard = db.lock().unwrap();
+        let sub_a = db_guard.subagent_get_logical("sub-a").unwrap().unwrap();
+        assert_eq!(sub_a.status, "warm", "evicted subagent must be warm");
+        let mem = db_guard
+            .subagent_get_memory("sub-a")
+            .unwrap()
+            .expect("memory row should exist (seeded empty)");
+        assert!(
+            mem.hot_summary.is_none(),
+            "hot_summary must NOT be written when memory_delta is null, got: {:?}",
+            mem.hot_summary
+        );
+    }
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_propagates_error_when_retry_turn_auto_fails() {
+    // Full eviction succeeds (prepare_hibernate OK, binding flipped, close OK),
+    // but the retry turn_auto fails. The executor must propagate the error
+    // (the `warn!` + sidecar_to_anyhow map_err path after eviction) — it must
+    // NOT swallow the retry failure and return a phantom success.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env.insert(
+        "BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE".into(),
+        "1".into(),
+    );
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    // -32603 is an unknown application code → SubagentError::SidecarRpc
+    // ("[-32603] turn_auto failed: internal error").
+    assert!(
+        format!("{err}").contains("turn_auto failed"),
+        "error should mention the turn_auto failure, got: {err}"
     );
 
     supervisor.shutdown().await.unwrap();
