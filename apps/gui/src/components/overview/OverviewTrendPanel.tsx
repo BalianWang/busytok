@@ -5,13 +5,14 @@
 //! states independently so the rest of the overview page renders even
 //! while trend data is still arriving.
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useOverviewTrend } from "../../api/useBusytokData";
 import { SegmentedControl } from "../desktop/SegmentedControl";
 import { NivoTimelineChart } from "../charts/NivoTimelineChart";
 import { PanelSkeleton } from "./PanelSkeleton";
 import { buildTimelineBars } from "../../lib/chartGrammar";
-import type { RangePresetDto, CostStatusDto } from "@busytok/protocol-types";
+import { safeReportEvent } from "../../logging/reporter";
+import type { RangePresetDto } from "@busytok/protocol-types";
 
 const RANGE_OPTIONS: Array<{ value: RangePresetDto; label: string }> = [
   { value: "day", label: "Day" },
@@ -32,6 +33,26 @@ interface OverviewTrendPanelProps {
 
 export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelProps) {
   const [chartMetric, setChartMetric] = useState<"cost" | "tokens">("tokens");
+
+  const handleRangeChange = useCallback((v: RangePresetDto) => {
+    if (v !== range) {
+      safeReportEvent("gui.trend.range_changed", "Trend range preset changed", {
+        from: range,
+        to: v,
+      });
+    }
+    onRangeChange(v);
+  }, [range, onRangeChange]);
+
+  const handleMetricChange = useCallback((v: "cost" | "tokens") => {
+    if (v !== chartMetric) {
+      safeReportEvent("gui.trend.metric_changed", "Trend chart metric changed", {
+        from: chartMetric,
+        to: v,
+      });
+    }
+    setChartMetric(v);
+  }, [chartMetric]);
 
   const { data: envelope, isLoading, isError, isFetching } = useOverviewTrend(range);
 
@@ -102,13 +123,13 @@ export function OverviewTrendPanel({ range, onRangeChange }: OverviewTrendPanelP
             label="Range"
             value={range}
             options={RANGE_OPTIONS}
-            onChange={(v) => onRangeChange(v)}
+            onChange={handleRangeChange}
           />
           <SegmentedControl
             label="Chart metric"
             value={effectiveMetric}
             options={METRIC_OPTIONS}
-            onChange={(v) => setChartMetric(v)}
+            onChange={handleMetricChange}
           />
         </div>
       </div>

@@ -4,9 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { OverviewTrendPanel } from "./OverviewTrendPanel";
 
 const mockUseOverviewTrend = vi.fn();
+const mockSafeReportEvent = vi.fn();
 
 vi.mock("../../api/useBusytokData", () => ({
   useOverviewTrend: (...args: unknown[]) => mockUseOverviewTrend(...args),
+}));
+
+vi.mock("../../logging/reporter", () => ({
+  safeReportEvent: (...args: unknown[]) => mockSafeReportEvent(...args),
 }));
 
 vi.mock("../charts/NivoTimelineChart", () => ({
@@ -188,5 +193,65 @@ describe("OverviewTrendPanel", () => {
     await user.click(screen.getByRole("button", { name: "Cost" }));
 
     expect(screen.getByTestId("mock-trend-chart").textContent).toContain("metric:cost");
+  });
+
+  it("renders the trend header with title and vertically-aligned controls", () => {
+    mockUseOverviewTrend.mockReturnValue({
+      data: trendEnvelope(),
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    });
+
+    render(<OverviewTrendPanel range="day" onRangeChange={() => {}} />);
+
+    const header = document.querySelector(".overview-console__trend-header");
+    expect(header).not.toBeNull();
+    expect(header!.querySelector("h2")!.textContent).toBe("Trend");
+    const controls = header!.querySelector(".overview-console__trend-controls");
+    expect(controls).not.toBeNull();
+    expect(controls!.querySelectorAll(".segmented-control")).toHaveLength(2);
+  });
+
+  it("emits telemetry when range preset changes", async () => {
+    const user = userEvent.setup();
+    const onRangeChange = vi.fn();
+
+    mockUseOverviewTrend.mockReturnValue({
+      data: trendEnvelope(),
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    });
+
+    render(<OverviewTrendPanel range="day" onRangeChange={onRangeChange} />);
+    await user.click(screen.getByRole("button", { name: "Week" }));
+
+    expect(onRangeChange).toHaveBeenCalledWith("week");
+    expect(mockSafeReportEvent).toHaveBeenCalledWith(
+      "gui.trend.range_changed",
+      "Trend range preset changed",
+      expect.objectContaining({ from: "day", to: "week" }),
+    );
+  });
+
+  it("emits telemetry when chart metric toggles", async () => {
+    const user = userEvent.setup();
+
+    mockUseOverviewTrend.mockReturnValue({
+      data: trendEnvelope(),
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    });
+
+    render(<OverviewTrendPanel range="day" onRangeChange={() => {}} />);
+    await user.click(screen.getByRole("button", { name: "Cost" }));
+
+    expect(mockSafeReportEvent).toHaveBeenCalledWith(
+      "gui.trend.metric_changed",
+      "Trend chart metric changed",
+      expect.objectContaining({ from: "tokens", to: "cost" }),
+    );
   });
 });
