@@ -221,3 +221,22 @@ fn resolve_sidecar_config_passes_max_hot_sessions() {
         "max_hot_sessions must be passed to sidecar via env var"
     );
 }
+
+#[test]
+fn resolve_sidecar_config_threads_memory_limits() {
+    let tmp = TempDir::new().unwrap();
+    let paths = paths_for(&tmp);
+    let runtime_dir = tmp.path().to_string_lossy().to_string();
+    write_bundle(tmp.path());
+
+    let mut settings = SubagentPiSidecarConfig::default();
+    settings.node_runtime = "system".to_string();
+    settings.system_node_path = "bash".to_string();
+    settings.runtime_dir = Some(runtime_dir);
+    settings.memory_soft_limit_mb = 700;
+    settings.memory_hard_limit_mb = 1100;
+
+    let cfg = resolve_sidecar_config(&settings, &paths).unwrap();
+    assert_eq!(cfg.memory_soft_limit_mb, 700);
+    assert_eq!(cfg.memory_hard_limit_mb, 1100);
+}

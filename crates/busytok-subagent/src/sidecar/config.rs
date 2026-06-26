@@ -32,6 +32,12 @@ pub struct SidecarConfig {
     /// the LRU (spec §4.4). Mirrored to the sidecar via the
     /// `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS` env var (spec §8.2).
     pub max_hot_sessions: u32,
+    /// Soft RSS limit (MB) — at/above this, log warning + plan graceful
+    /// restart (spec §8.3 step 3).
+    pub memory_soft_limit_mb: u32,
+    /// Hard RSS limit (MB) — at/above this, write `rss_limit_exceeded`
+    /// event; existing crash path will restart (spec §8.3 step 5).
+    pub memory_hard_limit_mb: u32,
 }
 
 /// Resolve a `SidecarConfig` from settings + paths.
@@ -96,5 +102,7 @@ pub fn resolve_sidecar_config(
         restart_backoff_base: Duration::from_secs(1),
         harness_name: "pi".to_string(),
         max_hot_sessions: settings.max_hot_sessions,
+        memory_soft_limit_mb: settings.memory_soft_limit_mb,
+        memory_hard_limit_mb: settings.memory_hard_limit_mb,
     })
 }

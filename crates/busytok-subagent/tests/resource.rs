@@ -2,7 +2,7 @@
 //! ResourceMonitor unit tests (spec §8.1, §5.1 spike note).
 
 use busytok_config::SubagentResourcePolicyConfig;
-use busytok_subagent::resource::{ResourceMonitor, ResourceSample};
+use busytok_subagent::resource::{ResourceMonitor, ResourcePressureState, ResourceSample};
 
 fn sample(
     service_rss_mb: f64,
@@ -181,4 +181,107 @@ fn second_sample_returns_meaningful_cpu() {
         "second-sample CPU must be finite, got {cpu}"
     );
     assert!(cpu >= 0.0, "CPU percent is non-negative, got {cpu}");
+}
+
+// --- edge-trigger latch tests (Task 2 — pure functions, no async) ---
+//
+// `transition_event` and `is_recovery` are pure functions on the
+// `ResourcePressureState` enum. These tests verify the edge-trigger
+// semantics without spinning up the supervisor: escalation transitions
+// return a DB event type, recovery transitions return None (DB event
+// deferred to Plan 6), and same-state transitions are debounced.
+
+#[test]
+fn transition_event_returns_memory_pressure_on_normal_to_pressure() {
+    let event = ResourcePressureState::transition_event(
+        ResourcePressureState::Normal,
+        ResourcePressureState::Pressure,
+    );
+    assert_eq!(event, Some("memory_pressure"));
+}
+
+#[test]
+fn transition_event_returns_rss_limit_on_normal_to_limit_exceeded() {
+    let event = ResourcePressureState::transition_event(
+        ResourcePressureState::Normal,
+        ResourcePressureState::LimitExceeded,
+    );
+    assert_eq!(event, Some("rss_limit_exceeded"));
+}
+
+#[test]
+fn transition_event_returns_rss_limit_on_pressure_to_limit_exceeded() {
+    let event = ResourcePressureState::transition_event(
+        ResourcePressureState::Pressure,
+        ResourcePressureState::LimitExceeded,
+    );
+    assert_eq!(event, Some("rss_limit_exceeded"));
+}
+
+#[test]
+fn transition_event_returns_none_on_pressure_to_normal_recovery() {
+    // Recovery: no DB event (resource_recovered not in spec §3.2 enum).
+    // The supervisor logs recovery to tracing only; DB event deferred to Plan 6.
+    let event = ResourcePressureState::transition_event(
+        ResourcePressureState::Pressure,
+        ResourcePressureState::Normal,
+    );
+    assert_eq!(event, None);
+    // But is_recovery returns true so the caller knows to log.
+    assert!(ResourcePressureState::is_recovery(
+        ResourcePressureState::Pressure,
+        ResourcePressureState::Normal,
+    ));
+}
+
+#[test]
+fn transition_event_returns_none_on_limit_exceeded_to_normal_recovery() {
+    let event = ResourcePressureState::transition_event(
+        ResourcePressureState::LimitExceeded,
+        ResourcePressureState::Normal,
+    );
+    assert_eq!(event, None);
+    assert!(ResourcePressureState::is_recovery(
+        ResourcePressureState::LimitExceeded,
+        ResourcePressureState::Normal,
+    ));
+}
+
+#[test]
+fn transition_event_returns_none_on_limit_exceeded_to_pressure() {
+    // Downgrade within warning tier — no new lifecycle event.
+    let event = ResourcePressureState::transition_event(
+        ResourcePressureState::LimitExceeded,
+        ResourcePressureState::Pressure,
+    );
+    assert_eq!(event, None);
+}
+
+#[test]
+fn transition_event_returns_none_on_same_state() {
+    // Debounce — sustained pressure produces ONE event, not 40.
+    assert_eq!(
+        ResourcePressureState::transition_event(
+            ResourcePressureState::Normal,
+            ResourcePressureState::Normal,
+        ),
+        None,
+        "Normal → Normal must be debounced (no event)"
+    );
+    assert_eq!(
+        ResourcePressureState::transition_event(
+            ResourcePressureState::Pressure,
+            ResourcePressureState::Pressure,
+        ),
+        None,
+        "Pressure → Pressure must be debounced (spec §6.5 lifecycle-boundaries-only)"
+    );
+    assert_eq!(
+        ResourcePressureState::transition_event(
+            ResourcePressureState::LimitExceeded,
+            ResourcePressureState::LimitExceeded,
+        ),
+        None,
+        "LimitExceeded → LimitExceeded must be debounced"
+    );
 }

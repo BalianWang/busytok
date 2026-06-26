@@ -25,8 +25,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{error, info, instrument, warn};
 
+use busytok_config::SubagentResourcePolicyConfig;
 use busytok_store::{Database, SubagentResourceEventRow};
 
+use crate::resource::{ResourceMonitor, ResourcePressureState};
 use crate::sidecar::client::SidecarRpcClient;
 use crate::sidecar::config::SidecarConfig;
 use crate::sidecar::protocol::PROTOCOL_VERSION;
@@ -44,6 +46,9 @@ pub struct PiSidecarSupervisor {
     config: SidecarConfig,
     state: Mutex<SupervisorState>,
     db: Option<SharedDb>,
+    /// Resource monitor — None in unit tests that don't pass a policy.
+    /// Mutex because `sample(&mut self)` mutates the internal `sysinfo::System`.
+    resource_monitor: Option<std::sync::Mutex<ResourceMonitor>>,
 }
 
 struct SupervisorState {
@@ -57,10 +62,25 @@ struct SupervisorState {
     /// Set true when the supervision loop is running; prevents double-spawn
     /// of the loop across concurrent `ensure_started` calls.
     supervision_started: bool,
+    /// Edge-trigger latch for resource pressure (spec §6.5: lifecycle
+    /// boundaries only). Updated on EVERY transition (escalation OR recovery)
+    /// so re-pressurization after recovery writes a fresh `memory_pressure`
+    /// event. DB events fire ONLY on escalation; recovery logs to tracing.
+    resource_pressure_state: ResourcePressureState,
 }
 
 impl PiSidecarSupervisor {
     pub fn new(config: SidecarConfig, db: Option<SharedDb>) -> Arc<Self> {
+        // Default policy — production callers pass settings via
+        // `with_resource_policy` (added below) when they have a
+        // SubagentResourcePolicyConfig. For the default-constructed path
+        // (tests), we use the spec-default policy so the monitor still works.
+        let policy = SubagentResourcePolicyConfig::default();
+        let monitor = ResourceMonitor::new(
+            policy,
+            config.memory_soft_limit_mb,
+            config.memory_hard_limit_mb,
+        );
         Arc::new(Self {
             config,
             state: Mutex::new(SupervisorState {
@@ -69,8 +89,37 @@ impl PiSidecarSupervisor {
                 last_activity: tokio::time::Instant::now(),
                 restart_attempts: 0,
                 supervision_started: false,
+                resource_pressure_state: ResourcePressureState::Normal,
             }),
             db,
+            resource_monitor: Some(std::sync::Mutex::new(monitor)),
+        })
+    }
+
+    /// Construct with an explicit resource policy (used by the runtime
+    /// supervisor which has the deserialized SubagentResourcePolicyConfig).
+    pub fn with_resource_policy(
+        config: SidecarConfig,
+        db: Option<SharedDb>,
+        policy: SubagentResourcePolicyConfig,
+    ) -> Arc<Self> {
+        let monitor = ResourceMonitor::new(
+            policy,
+            config.memory_soft_limit_mb,
+            config.memory_hard_limit_mb,
+        );
+        Arc::new(Self {
+            config,
+            state: Mutex::new(SupervisorState {
+                child: None,
+                client: None,
+                last_activity: tokio::time::Instant::now(),
+                restart_attempts: 0,
+                supervision_started: false,
+                resource_pressure_state: ResourcePressureState::Normal,
+            }),
+            db,
+            resource_monitor: Some(std::sync::Mutex::new(monitor)),
         })
     }
 
@@ -244,11 +293,21 @@ impl PiSidecarSupervisor {
         Ok(())
     }
 
-    /// Background loop: crash watcher + health pinger + idle timer.
-    /// Exits when the child is taken (shutdown) or crashes (handled, then
-    /// exits — next `ensure_started` respawns and re-spawns the loop).
+    /// Background loop: crash watcher + health pinger + idle timer +
+    /// resource sampling. Exits when the child is taken (shutdown) or
+    /// crashes (handled, then exits — next `ensure_started` respawns and
+    /// re-spawns the loop).
     async fn supervision_loop(self: Arc<Self>) {
         let mut last_health = tokio::time::Instant::now();
+        let mut last_resource_sample = tokio::time::Instant::now();
+        // Read the monitor interval from the resource_monitor's policy (not
+        // from SidecarConfig — the policy is the source of truth per spec §8.2).
+        // Fallback to 30s if no monitor is attached (unit tests).
+        let monitor_interval = self
+            .resource_monitor
+            .as_ref()
+            .and_then(|m| m.lock().ok().map(|g| g.monitor_interval()))
+            .unwrap_or_else(|| Duration::from_secs(30));
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             let mut state = self.state.lock().await;
@@ -284,11 +343,13 @@ impl PiSidecarSupervisor {
                 self.write_resource_event("sidecar_crash");
                 return; // loop exits; next ensure_started respawns
             }
+            let sidecar_pid = state.child.as_ref().and_then(|c| c.id());
+            let last_activity = state.last_activity;
             // --- idle exit timer ---
             // idle_exit_seconds=0 means "exit immediately when idle" (test-
             // friendly). A large value effectively disables idle exit.
             let idle_threshold = Duration::from_secs(self.config.idle_exit_seconds);
-            let idle = state.last_activity.elapsed();
+            let idle = last_activity.elapsed();
             if idle > idle_threshold {
                 drop(state);
                 info!(
@@ -298,13 +359,19 @@ impl PiSidecarSupervisor {
                 let _ = self.shutdown_internal().await;
                 return;
             }
-            // --- health pinger (best-effort; failures logged not fatal) ---
-            if last_health.elapsed() >= self.config.health_interval {
+            // --- health pinger + resource sampling (piggybacked) ---
+            // Both run on the same ~30s cadence. We do ONE adapter.health RPC
+            // and parse `sessions` from its response for the hot-session count,
+            // avoiding a redundant second RPC (spec §8.1 collection).
+            if last_health.elapsed() >= self.config.health_interval
+                || last_resource_sample.elapsed() >= monitor_interval
+            {
                 last_health = tokio::time::Instant::now();
+                last_resource_sample = tokio::time::Instant::now();
                 let client = state.client.clone();
-                drop(state);
-                if let Some(client) = client {
-                    let _ = client
+                drop(state); // release state lock before .await
+                let hot_sessions = if let Some(client) = client {
+                    match client
                         .lock()
                         .await
                         .call_with_timeout(
@@ -313,12 +380,142 @@ impl PiSidecarSupervisor {
                             Duration::from_secs(2),
                         )
                         .await
-                        .map_err(|e| {
+                    {
+                        Ok(resp) => resp
+                            .get("sessions")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u32)
+                            .unwrap_or(0),
+                        Err(e) => {
                             warn!(event_code = "subagent.sidecar.health_failed", error = %e);
-                        });
-                }
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                // Resource sampling on the same tick (no second RPC needed).
+                self.maybe_sample_resources(sidecar_pid, hot_sessions).await;
+                continue;
             }
         }
+    }
+
+    /// Sample resources, log every tick to `tracing` (time-series signal),
+    /// and write a DB event ONLY on escalation transitions (lifecycle signal).
+    /// Spec §6.5: "Emit resource events at lifecycle boundaries only (not a
+    /// metrics time-series table)". The `resource_pressure_state` latch in
+    /// `SupervisorState` debounces — a sustained 20-min pressure condition
+    /// produces ONE `memory_pressure` event, not 40.
+    ///
+    /// State machine (edge-triggered):
+    ///   Normal → Pressure        : write `memory_pressure` DB event (warn log)
+    ///   Normal → LimitExceeded   : write `rss_limit_exceeded` DB event (error log)
+    ///   Pressure → LimitExceeded : write `rss_limit_exceeded` DB event (error log)
+    ///   Pressure → Normal        : info log ONLY (no DB event — `resource_recovered`
+    ///                              not in spec §3.2 enum, deferred to Plan 6)
+    ///   LimitExceeded → Normal   : info log ONLY (no DB event — same as above)
+    ///   LimitExceeded → Pressure : no event (still in warning tier)
+    ///   same → same              : no event (debounced)
+    ///
+    /// The latch state updates on EVERY transition (including recovery) so a
+    /// re-pressurization after recovery writes a fresh `memory_pressure` event.
+    async fn maybe_sample_resources(&self, sidecar_pid: Option<u32>, hot_sessions: u32) {
+        let monitor = match &self.resource_monitor {
+            Some(m) => m,
+            None => return,
+        };
+        let sample = {
+            let mut guard = match monitor.lock() {
+                Ok(g) => g,
+                Err(_) => return, // poisoned — skip this tick
+            };
+            guard.sample(sidecar_pid, hot_sessions)
+        };
+        // Time-series signal — logged EVERY tick (level-triggered).
+        info!(
+            event_code = "subagent.resource.sample",
+            service_rss_mb = sample.service_rss_mb,
+            sidecar_rss_mb = ?sample.sidecar_rss_mb,
+            sidecar_cpu_percent = ?sample.sidecar_cpu_percent,
+            hot_session_count = sample.hot_session_count,
+            system_available_mb = sample.system_available_mb,
+            "resource sample"
+        );
+        // Compute new pressure state from predicates.
+        let (under_pressure, exceeds_soft, exceeds_hard) = {
+            let guard = match monitor.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            (
+                guard.is_under_pressure(&sample),
+                guard.exceeds_soft_limit(&sample),
+                guard.exceeds_hard_limit(&sample),
+            )
+        };
+        let new_state = if exceeds_hard {
+            ResourcePressureState::LimitExceeded
+        } else if under_pressure || exceeds_soft {
+            ResourcePressureState::Pressure
+        } else {
+            ResourcePressureState::Normal
+        };
+        // Lifecycle signal — write DB event ONLY on escalation transitions
+        // (edge-triggered). Recovery transitions log to tracing only (no DB
+        // event — `resource_recovered` is not in spec §3.2's enum; deferred
+        // to Plan 6). The latch state updates on every transition so
+        // re-pressurization after recovery writes a fresh event.
+        let (db_event, is_recovery, old_state) = {
+            let mut state = match self.state.try_lock() {
+                Ok(g) => g,
+                Err(_) => return, // supervision loop holds it — skip this tick
+            };
+            let old = state.resource_pressure_state;
+            let event = ResourcePressureState::transition_event(old, new_state);
+            let recovery = ResourcePressureState::is_recovery(old, new_state);
+            // Update latch on ANY real transition (escalation OR recovery).
+            if old != new_state {
+                state.resource_pressure_state = new_state;
+            }
+            (event, recovery, old)
+        };
+        // Recovery: log to tracing only, no DB event.
+        if is_recovery {
+            info!(
+                event_code = "subagent.resource.recovered",
+                old_state = ?old_state,
+                new_state = ?new_state,
+                sidecar_rss_mb = ?sample.sidecar_rss_mb,
+                system_available_mb = sample.system_available_mb,
+                "resource pressure recovered to normal (DB event deferred to Plan 6)"
+            );
+            return;
+        }
+        // Escalation: log + write DB event.
+        let Some(event_type) = db_event else {
+            return; // debounced or same-tier downgrade — no event
+        };
+        match event_type {
+            "memory_pressure" => {
+                warn!(
+                    event_code = "subagent.resource.memory_pressure",
+                    system_available_mb = sample.system_available_mb,
+                    sidecar_rss_mb = ?sample.sidecar_rss_mb,
+                    "entered memory pressure (Plan 6 will pause queue + hibernate LRU)"
+                );
+            }
+            "rss_limit_exceeded" => {
+                error!(
+                    event_code = "subagent.resource.rss_limit_exceeded",
+                    sidecar_rss_mb = ?sample.sidecar_rss_mb,
+                    hard_limit_mb = self.config.memory_hard_limit_mb,
+                    "sidecar RSS exceeded hard limit (Plan 6 will force-kill)"
+                );
+            }
+            _ => unreachable!("transition_event only returns known escalation event types"),
+        }
+        self.write_resource_event_with_sample(event_type, Some(&sample));
     }
 
     /// Converge DB state after a sidecar crash (spec §3.3 + §5.4). Calls
@@ -463,21 +660,60 @@ impl PiSidecarSupervisor {
 
     /// Write a row to `subagent_resource_events` if a DB handle is attached.
     /// No-op (but still logged at debug) in unit tests where `db` is `None`.
+    /// When `sample` is `Some`, populates `rss_mb`, `cpu_percent`, and
+    /// `detail_json` with the full sample (spec §3.2 columns).
     fn write_resource_event(&self, event_type: &str) {
+        self.write_resource_event_with_sample(event_type, None);
+    }
+
+    /// Extended resource event writer that attaches a `ResourceSample`.
+    /// Public to test harness (via `#[doc(hidden)]`) so tests can exercise
+    /// the column-population path without driving the full supervision loop.
+    #[doc(hidden)]
+    pub fn write_resource_event_with_sample(
+        &self,
+        event_type: &str,
+        sample: Option<&crate::resource::ResourceSample>,
+    ) {
         if let Some(db) = &self.db {
             if let Ok(db) = db.lock() {
                 let now = busytok_domain::now_ms();
+                let (rss_mb, cpu_percent, detail_json) = match sample {
+                    Some(s) => {
+                        let detail = serde_json::json!({
+                            "service_rss_mb": s.service_rss_mb,
+                            "hot_session_count": s.hot_session_count,
+                            "system_available_mb": s.system_available_mb,
+                        });
+                        (
+                            s.sidecar_rss_mb,
+                            s.sidecar_cpu_percent,
+                            Some(detail.to_string()),
+                        )
+                    }
+                    None => (None, None, None),
+                };
                 let _ = db.subagent_insert_resource_event(&SubagentResourceEventRow {
                     id: format!("re_{}", uuid::Uuid::new_v4()),
                     event_type: event_type.to_string(),
                     target_id: None,
-                    rss_mb: None,
-                    cpu_percent: None,
-                    detail_json: None,
+                    rss_mb,
+                    cpu_percent,
+                    detail_json,
                     created_at_ms: now,
                 });
             }
         }
+    }
+
+    /// Test-only accessor for the shared DB handle. Used by integration tests
+    /// that assert on `subagent_resource_events` rows after driving the
+    /// supervisor. `#[doc(hidden)]` keeps it out of public API surface.
+    #[doc(hidden)]
+    pub fn db_for_test(&self) -> &SharedDb {
+        self.db
+            .as_ref()
+            .expect("db_for_test called but supervisor has no DB handle")
     }
 }
 

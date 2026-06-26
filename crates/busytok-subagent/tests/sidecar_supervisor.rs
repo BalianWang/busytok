@@ -31,6 +31,8 @@ fn mock_config() -> SidecarConfig {
         restart_backoff_base: Duration::from_millis(10),
         harness_name: "pi".to_string(),
         max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
     }
 }
 
@@ -606,4 +608,49 @@ async fn supervisor_turn_auto_reuses_session_for_same_subagent() {
     assert_eq!(result2["session_reused"], true);
 
     sup.shutdown().await.unwrap();
+}
+
+#[test]
+fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let config = busytok_subagent::sidecar::SidecarConfig {
+        node_binary: std::path::PathBuf::from("bash"),
+        bundle_path: std::path::PathBuf::from("/dev/null"),
+        env: std::collections::HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: std::time::Duration::from_secs(30),
+        task_timeout: std::time::Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: std::time::Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    };
+    let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
+        config,
+        Some(std::sync::Arc::new(std::sync::Mutex::new(db))),
+    );
+    let sample = busytok_subagent::resource::ResourceSample {
+        service_rss_mb: 25.0,
+        sidecar_rss_mb: Some(150.0),
+        sidecar_cpu_percent: Some(3.5),
+        hot_session_count: 2,
+        system_available_mb: 4096.0,
+    };
+    sup.write_resource_event_with_sample("sidecar_start", Some(&sample));
+
+    let db = sup.db_for_test().lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let evt = events
+        .iter()
+        .find(|e| e.event_type == "sidecar_start")
+        .expect("sidecar_start event must be written");
+    assert_eq!(evt.rss_mb, Some(150.0), "sidecar_rss_mb must be populated");
+    assert_eq!(evt.cpu_percent, Some(3.5), "cpu_percent must be populated");
+    let detail: serde_json::Value =
+        serde_json::from_str(evt.detail_json.as_deref().unwrap_or("null")).unwrap();
+    assert_eq!(detail["service_rss_mb"], 25.0);
+    assert_eq!(detail["hot_session_count"], 2);
+    assert_eq!(detail["system_available_mb"], 4096.0);
 }

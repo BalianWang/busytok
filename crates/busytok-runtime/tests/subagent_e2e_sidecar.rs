@@ -59,6 +59,8 @@ fn make_sidecar_config() -> SidecarConfig {
         restart_backoff_base: Duration::from_secs(1),
         harness_name: "pi".to_string(),
         max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
     }
 }
 

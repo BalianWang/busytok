@@ -32,6 +32,8 @@ fn mock_sidecar_config() -> SidecarConfig {
         restart_backoff_base: Duration::from_millis(10),
         harness_name: "pi".to_string(),
         max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
     }
 }
 
