@@ -76,12 +76,6 @@ enum DatabaseHandle<'a> {
     Detached(Database),
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct ActivitySortCursor {
-    t: i64,
-    i: String,
-}
-
 impl Deref for DatabaseHandle<'_> {
     type Target = Database;
 
@@ -832,19 +826,6 @@ fn to_store_exact_windows(
         .collect()
 }
 
-fn decode_activity_cursor(cursor: &str) -> Result<(i64, String)> {
-    let bytes = hex::decode(cursor).context("invalid cursor: not valid hex")?;
-    let payload: ActivitySortCursor =
-        serde_json::from_slice(&bytes).context("invalid cursor: JSON parse error")?;
-    Ok((payload.t, payload.i))
-}
-
-fn encode_activity_cursor(timestamp_ms: i64, id: &str) -> Result<String> {
-    Ok(hex::encode(serde_json::to_vec(&ActivitySortCursor {
-        t: timestamp_ms,
-        i: id.to_string(),
-    })?))
-}
 
 fn aggregate_trend_bucket(
     bucket: &range::TrendBucketWindow,
@@ -1971,32 +1952,31 @@ impl RuntimeControl for BusytokSupervisor {
         let (year, month, day) = rtz.today_civil_ymd().unwrap_or((2026, 1, 1));
         let range = range::resolve_range(&rtz, year, month, day, req.range, week_starts_on);
         let generation_id = self.active_generation_id_from_snapshot().await?;
-        let cursor = req
-            .cursor
-            .as_deref()
-            .map(decode_activity_cursor)
-            .transpose()?;
+        let cursor = req.cursor.as_deref();
         let limit = req.limit.unwrap_or(100).clamp(1, 500) as i64;
         let list_generation_id = generation_id.clone();
-        let list_cursor = cursor.clone();
-        let list_rows: Vec<busytok_store::read_models::ActivityListRow> = self
+        let list_cursor = cursor.map(|s| s.to_string());
+        let list_page: busytok_store::read_models::CursorPage<
+            busytok_store::read_models::ActivityListRow,
+        > = self
             .run_read_with_mode("activity.list", "activity_list", false, move |conn| {
-                let rows = busytok_store::read_queries::read_activity_list(
+                let page = busytok_store::read_queries::read_activity_list(
                     conn,
                     &list_generation_id,
                     range.start_ms,
                     range.end_ms,
                     limit,
-                    list_cursor,
+                    list_cursor.as_deref(),
                 )?;
-                let row_count = rows.len();
+                let row_count = page.items.len();
                 Ok(crate::read_service::ReadOutcome::with_row_count(
-                    rows, row_count,
+                    page, row_count,
                 ))
             })
             .await?;
 
-        let items: Vec<ActivityListItemDto> = list_rows
+        let items: Vec<ActivityListItemDto> = list_page
+            .items
             .iter()
             .map(Self::activity_item_from_read_row)
             .collect();
@@ -2027,10 +2007,7 @@ impl RuntimeControl for BusytokSupervisor {
             ActivityListResponseDto {
                 generated_at_ms: now_ms,
                 items,
-                next_cursor: list_rows
-                    .last()
-                    .map(|last| encode_activity_cursor(last.happened_at_ms, &last.id))
-                    .transpose()?,
+                next_cursor: list_page.next_cursor,
                 summary,
             },
             now_ms,
