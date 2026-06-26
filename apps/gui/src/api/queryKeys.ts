@@ -57,4 +57,7 @@ export const queryKeys = {
   // ── Live ──────────────────────────────────────────────────────────
   liveWindow: (windowSeconds: number | null) =>
     ["live", "window", windowSeconds] as const,
+
+  // ── Receipt ───────────────────────────────────────────────────────
+  receiptDaily: (date: string) => ["receipt", "daily", date] as const,
 };
