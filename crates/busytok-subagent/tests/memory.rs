@@ -241,9 +241,8 @@ fn compaction_uses_most_recent_5_summaries_not_oldest() {
         decisions: vec![],
         open_questions: vec![],
     };
-    // 8 tasks; recent_tasks_limit is the default 5, so recent_tasks has 5 (DESC).
-    // Compaction must take the 5 most recent (the whole returned set), with the
-    // newest summary appearing first in the "Recent findings" section.
+    // 5 tasks (all returned, DESC); compaction must take the 5 most recent,
+    // with the newest summary appearing first in the "Recent findings" section.
     let tasks = vec![
         task_row("t5", "newest", 5000),
         task_row("t4", "newer", 4000),

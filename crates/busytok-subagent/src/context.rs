@@ -238,9 +238,11 @@ fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
         long_summary_chars: Some(long_summary_full_chars),
     };
 
-    // Initial: all sections at full size.
+    // Initial: all sections at full size. `budget_chars` is always ≥ 4
+    // (caller clamps `budget` to ≥ 1 token, then ×4 chars/token), so the
+    // zero-budget case is handled upstream by the default-budget fallback.
     let full = parts.render(state);
-    if full.len() <= budget_chars || budget_chars == 0 {
+    if full.len() <= budget_chars {
         return finalize(full);
     }
 
