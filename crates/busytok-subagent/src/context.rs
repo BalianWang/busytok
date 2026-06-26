@@ -76,69 +76,24 @@ impl ContextBuilder {
             .map(String::from)
             .collect();
 
-        let mut sections: Vec<Section> = Vec::new();
         // Identity + intent (never trimmed — tiny).
         let mut header = format!("You are Busytok logical subagent: {}\n", subagent.name);
         if let Some(intent) = &subagent.intent {
             header.push_str(&format!("\nLong-term goal: {intent}\n"));
         }
-        sections.push(Section::header(header));
 
-        // Recent task summaries (trim priority 1).
-        if !recent_summaries.is_empty() {
-            sections.push(Section::recent_summaries(format!(
-                "Recent tasks:\n{}\n",
-                recent_summaries
-                    .iter()
-                    .map(|s| format!("- {s}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )));
-        }
-
-        // Key files (trim priority 3).
-        if !snapshot.key_files.is_empty() {
-            sections.push(Section::key_files(format!(
-                "Key files: {}\n",
-                snapshot
-                    .key_files
-                    .iter()
-                    .map(|f| f.path.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-
-        // Open questions (trim priority 4).
-        if !snapshot.open_questions.is_empty() {
-            sections.push(Section::open_questions(format!(
-                "Open questions:\n{}\n",
-                snapshot
-                    .open_questions
-                    .iter()
-                    .map(|q| format!("- {}", q.question))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )));
-        }
-
-        // Long summary (trim priority 5).
-        if let Some(long) = &snapshot.long_summary {
-            sections.push(Section::long_summary(format!(
-                "Long-term findings:\n{long}\n"
-            )));
-        }
-
-        // Hot summary (trim priority 6 — preserve as much as possible).
-        if let Some(hot) = &snapshot.hot_summary {
-            sections.push(Section::hot_summary(format!("Current state:\n{hot}\n")));
-        }
-
-        // Current task prompt (trim priority 7 — NEVER trimmed).
-        sections.push(Section::prompt(format!("\nCurrent task:\n{prompt}\n")));
+        let parts = ContextParts {
+            header,
+            recent_summaries,
+            key_files: snapshot.key_files.clone(),
+            open_questions: snapshot.open_questions.clone(),
+            long_summary: snapshot.long_summary.clone(),
+            hot_summary: snapshot.hot_summary.clone(),
+            prompt: format!("\nCurrent task:\n{prompt}\n"),
+        };
 
         let budget_chars = (budget as usize) * 4; // token ≈ 4 chars heuristic
-        let compact = assemble_with_budget(sections, budget_chars);
+        let compact = assemble_with_budget(parts, budget_chars);
 
         (
             CompactContext {
@@ -151,109 +106,212 @@ impl ContextBuilder {
     }
 }
 
-/// A labeled section with a trim priority (lower number = trimmed first).
-/// `protected` sections (header, prompt) are never dropped.
-struct Section {
-    priority: u8,
-    text: String,
-    protected: bool,
+/// Raw components for context assembly. `assemble_with_budget` re-slices
+/// these to apply progressive reduction per §6.1 trim priority.
+struct ContextParts {
+    header: String,                    // protected (priority 7), never trimmed
+    recent_summaries: Vec<String>,     // priority 1: 5 → 3 → 1 → drop
+    key_files: Vec<KeyFile>,           // priority 3: 20 → 10 → drop
+    open_questions: Vec<OpenQuestion>, // priority 4: 10 → 5 → drop
+    long_summary: Option<String>,      // priority 5: truncate → drop
+    hot_summary: Option<String>,       // priority 6: preserve (never trimmed)
+    prompt: String,                    // protected (priority 7), never trimmed
 }
 
-impl Section {
-    fn header(text: String) -> Self {
-        Self {
-            priority: 7,
-            text,
-            protected: true,
+/// Per-section reduction state during progressive trimming.
+/// `Some(n)` on item-based sections = take first `n` items; `None` = drop.
+/// `Some(n)` on `long_summary_chars` = truncate text to `n` chars; `None` = drop.
+#[derive(Clone, Copy)]
+struct TrimState {
+    recent: Option<usize>,
+    key_files: Option<usize>,
+    open_questions: Option<usize>,
+    long_summary_chars: Option<usize>,
+}
+
+impl ContextParts {
+    /// Render the full context at the given reduction levels. Empty sections
+    /// (no items or dropped) emit nothing; this mirrors the original gate
+    /// `if !foo.is_empty()` so reduced-to-zero item sections stay absent.
+    fn render(&self, state: TrimState) -> String {
+        let mut out = String::new();
+        out.push_str(&self.header);
+
+        if let Some(n) = state.recent {
+            let slice = take_slice(&self.recent_summaries, n);
+            if !slice.is_empty() {
+                out.push_str(&format!(
+                    "Recent tasks:\n{}\n",
+                    slice
+                        .iter()
+                        .map(|s| format!("- {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
-    }
-    fn recent_summaries(text: String) -> Self {
-        Self {
-            priority: 1,
-            text,
-            protected: false,
+
+        if let Some(n) = state.key_files {
+            let slice = take_slice(&self.key_files, n);
+            if !slice.is_empty() {
+                out.push_str(&format!(
+                    "Key files: {}\n",
+                    slice
+                        .iter()
+                        .map(|f| f.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
-    }
-    fn key_files(text: String) -> Self {
-        Self {
-            priority: 3,
-            text,
-            protected: false,
+
+        if let Some(n) = state.open_questions {
+            let slice = take_slice(&self.open_questions, n);
+            if !slice.is_empty() {
+                out.push_str(&format!(
+                    "Open questions:\n{}\n",
+                    slice
+                        .iter()
+                        .map(|q| format!("- {}", q.question))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
-    }
-    fn open_questions(text: String) -> Self {
-        Self {
-            priority: 4,
-            text,
-            protected: false,
+
+        if let Some(chars) = state.long_summary_chars {
+            if let Some(long) = &self.long_summary {
+                let truncated: String = long.chars().take(chars).collect();
+                out.push_str(&format!("Long-term findings:\n{truncated}\n"));
+            }
         }
-    }
-    fn long_summary(text: String) -> Self {
-        Self {
-            priority: 5,
-            text,
-            protected: false,
+
+        if let Some(hot) = &self.hot_summary {
+            out.push_str(&format!("Current state:\n{hot}\n"));
         }
-    }
-    fn hot_summary(text: String) -> Self {
-        Self {
-            priority: 6,
-            text,
-            protected: false,
-        }
-    }
-    fn prompt(text: String) -> Self {
-        Self {
-            priority: 7,
-            text,
-            protected: true,
-        }
+
+        out.push_str(&self.prompt);
+        out
     }
 }
 
-/// Assemble sections into one string. If over budget, progressively drop
-/// lowest-priority non-protected sections (never header/prompt) until it fits.
-/// Rebuilds from kept sections directly (no string-replace, which could
-/// corrupt the context when a section's text appears inside another).
-fn assemble_with_budget(sections: Vec<Section>, budget_chars: usize) -> String {
-    let full: String = sections.iter().map(|s| s.text.as_str()).collect();
+fn take_slice<T>(v: &[T], n: usize) -> &[T] {
+    &v[..n.min(v.len())]
+}
+
+/// Render at the given state and return the finalized string if it fits the
+/// budget; otherwise `None`.
+fn try_fit(parts: &ContextParts, budget_chars: usize, state: TrimState) -> Option<String> {
+    let rendered = parts.render(state);
+    if rendered.len() <= budget_chars {
+        Some(finalize(rendered))
+    } else {
+        None
+    }
+}
+
+/// Assemble parts into one string. If over budget, apply progressive
+/// reduction per §6.1 trim priority: priority 1 (recent_summaries) first,
+/// then 3 (key_files), 4 (open_questions), 5 (long_summary). Priorities 6
+/// (hot_summary) and 7 (header/prompt) are never trimmed.
+///
+/// For each trim priority, reduction levels are attempted in order; after each
+/// level the total is rechecked and the algorithm stops as soon as it fits.
+/// Only after all reduction levels for a priority are exhausted is that
+/// section dropped before moving to the next priority.
+fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
+    let recent_full = parts.recent_summaries.len();
+    let key_files_full = parts.key_files.len();
+    let open_questions_full = parts.open_questions.len();
+    let long_summary_full_chars = parts
+        .long_summary
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+
+    let mut state = TrimState {
+        recent: Some(recent_full),
+        key_files: Some(key_files_full),
+        open_questions: Some(open_questions_full),
+        long_summary_chars: Some(long_summary_full_chars),
+    };
+
+    // Initial: all sections at full size.
+    let full = parts.render(state);
     if full.len() <= budget_chars || budget_chars == 0 {
-        return full;
+        return finalize(full);
     }
 
-    // Over budget: sort drop candidates by priority ascending (lowest = dropped first).
-    let mut drop_order: Vec<usize> = sections
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !s.protected)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|(i, _)| i)
-        .collect();
-    drop_order.sort_by_key(|&i| sections[i].priority);
-
-    let mut dropped: Vec<usize> = Vec::new();
-    for &idx in &drop_order {
-        let current_len: usize = sections
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !dropped.contains(i))
-            .map(|(_, s)| s.text.len())
-            .sum();
-        if current_len <= budget_chars {
-            break;
-        }
-        dropped.push(idx);
-    }
-
-    // Rebuild from kept sections, preserving original order.
-    let mut result = String::new();
-    for (i, s) in sections.iter().enumerate() {
-        if !dropped.contains(&i) {
-            result.push_str(&s.text);
+    // Trim priority 1: recent_summaries 5 → 3 → 1 → drop.
+    for &level in &[3usize, 1] {
+        if recent_full > level {
+            state.recent = Some(level);
+            if let Some(out) = try_fit(&parts, budget_chars, state) {
+                return out;
+            }
         }
     }
-    result.trim_end_matches('\n').to_string() + "\n"
+    state.recent = None;
+    if let Some(out) = try_fit(&parts, budget_chars, state) {
+        return out;
+    }
+
+    // Trim priority 3: key_files 20 → 10 → drop.
+    if key_files_full > 10 {
+        state.key_files = Some(10);
+        if let Some(out) = try_fit(&parts, budget_chars, state) {
+            return out;
+        }
+    }
+    state.key_files = None;
+    if let Some(out) = try_fit(&parts, budget_chars, state) {
+        return out;
+    }
+
+    // Trim priority 4: open_questions 10 → 5 → drop.
+    if open_questions_full > 5 {
+        state.open_questions = Some(5);
+        if let Some(out) = try_fit(&parts, budget_chars, state) {
+            return out;
+        }
+    }
+    state.open_questions = None;
+    if let Some(out) = try_fit(&parts, budget_chars, state) {
+        return out;
+    }
+
+    // Trim priority 5: long_summary truncate to fit → drop. Compute the
+    // remaining budget after all other kept sections (recent/key_files/
+    // open_questions are all dropped by this point), then truncate the
+    // long_summary text to fit. If the remaining budget can't even fit the
+    // section overhead, drop long_summary entirely.
+    if parts.long_summary.is_some() {
+        state.long_summary_chars = None;
+        let without_long = parts.render(state);
+        if without_long.len() < budget_chars {
+            let remaining = budget_chars - without_long.len();
+            // Section overhead: "Long-term findings:\n" (20) + trailing "\n" (1) = 21.
+            let long_overhead = "Long-term findings:\n".len() + "\n".len();
+            if remaining > long_overhead {
+                state.long_summary_chars = Some(remaining - long_overhead);
+                let rendered = parts.render(state);
+                if rendered.len() <= budget_chars {
+                    return finalize(rendered);
+                }
+            }
+        }
+        // Drop long_summary entirely (best effort — hot_summary and prompt are
+        // protected, so we can't trim further even if still over budget).
+        return finalize(without_long);
+    }
+
+    // long_summary was None — nothing more to trim. Return current state
+    // (hot_summary + prompt + header, all protected).
+    finalize(parts.render(state))
+}
+
+fn finalize(s: String) -> String {
+    s.trim_end_matches('\n').to_string() + "\n"
 }
 
 fn parse_json_vec<T: serde::de::DeserializeOwned>(json: &Option<String>) -> Vec<T> {

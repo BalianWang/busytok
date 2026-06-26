@@ -192,6 +192,12 @@ fn trim_priority_drops_lowest_priority_sections_first() {
     // recent_summaries + key_files + open_questions. Trim priority:
     //   1=recent_summaries (drop), 3=key_files (drop), 4=open_questions (drop),
     //   5=long_summary (keep), 6=hot_summary (keep), 7=prompt (keep).
+    //
+    // With 1 item per trimmable section, the progressive reduction levels
+    // (5→3, 20→10, 10→5) don't apply (counts already below thresholds), so
+    // sections are dropped directly in priority order. Progressive reduction
+    // is exercised by `progressive_trimming_reduces_recent_summaries_5_to_3_*`
+    // and `progressive_trimming_truncates_long_summary_to_fit`.
     let tasks = vec![task_row(
         "t1",
         "recent summary that is long enough to matter here padding",
@@ -222,6 +228,113 @@ fn trim_priority_drops_lowest_priority_sections_first() {
     assert!(
         !ctx.compact_context.contains("Open questions:"),
         "open_questions dropped (priority 4)"
+    );
+}
+
+#[test]
+fn progressive_trimming_reduces_recent_summaries_5_to_3_before_dropping() {
+    let builder = ContextBuilder::new(cfg());
+    // 5 recent summaries (each 57 chars). recent_summaries section: 314 chars
+    // at N=5, 194 chars at N=3. Other sections are small so reducing recent
+    // from 5 to 3 is enough to fit.
+    let tasks: Vec<SubagentTaskRow> = (0..5)
+        .map(|i| {
+            task_row(
+                &format!("task_{i}"),
+                &format!("summary_{i} padding ").repeat(3),
+                1000 + i,
+            )
+        })
+        .collect();
+    // Use a small long_summary so it doesn't dominate the budget.
+    let mut mem = mem_row();
+    mem.long_summary = Some("Short long summary.".into());
+    // Total with 5 summaries ≈ 607 chars; with 3 summaries ≈ 487 chars.
+    // Budget 140 tokens = 560 chars: 5 doesn't fit (607 > 560), 3 fits (487 ≤ 560).
+    let (ctx, _snap) = builder.build(&subagent(), &mem, &tasks, "do thing", 140);
+    // Tasks are DESC-sorted by created_at_ms (1000+i). Take 3 = task_4, task_3,
+    // task_2 (most recent). Dropped = task_1, task_0 (oldest).
+    assert!(
+        ctx.compact_context.contains("summary_4"),
+        "most recent summary kept (task_4)"
+    );
+    assert!(
+        ctx.compact_context.contains("summary_3"),
+        "2nd most recent summary kept (task_3)"
+    );
+    assert!(
+        ctx.compact_context.contains("summary_2"),
+        "3rd most recent summary kept (task_2)"
+    );
+    assert!(
+        !ctx.compact_context.contains("summary_1"),
+        "4th most recent summary dropped (progressive reduction 5→3)"
+    );
+    assert!(
+        !ctx.compact_context.contains("summary_0"),
+        "5th most recent summary dropped (progressive reduction 5→3)"
+    );
+    // Lower-priority sections are NOT yet trimmed (reduction stopped at priority 1).
+    assert!(
+        ctx.compact_context.contains("Key files:"),
+        "key_files not yet trimmed (priority 3)"
+    );
+    assert!(
+        ctx.compact_context.contains("Open questions:"),
+        "open_questions not yet trimmed (priority 4)"
+    );
+    assert!(
+        ctx.compact_context.contains("Long-term findings:"),
+        "long_summary not yet trimmed (priority 5)"
+    );
+    assert!(
+        ctx.compact_context.contains("Current state:"),
+        "hot_summary preserved (priority 6)"
+    );
+    assert!(
+        ctx.compact_context.contains("do thing"),
+        "prompt preserved (priority 7)"
+    );
+}
+
+#[test]
+fn progressive_trimming_truncates_long_summary_to_fit() {
+    let builder = ContextBuilder::new(cfg());
+    // No recent tasks, no key_files, no open_questions — only long_summary
+    // is trimmable. long_summary is 1000 'X' chars; budget forces truncation
+    // (not dropping) of the long_summary section.
+    let mut mem = SubagentMemoryRow::new_empty("sub-a");
+    mem.hot_summary = Some("Hot.".into());
+    mem.long_summary = Some("X".repeat(1000));
+    // Sections: header (~95) + long_summary (~1021) + hot_summary (~20) + prompt (~23) ≈ 1159 chars.
+    // Budget 200 tokens = 800 chars: full (1159) > 800, so trim.
+    // No recent/key_files/open_questions to trim (all empty). Reach priority 5:
+    //   without_long = 95 + 20 + 23 = 138 chars. remaining = 800 - 138 = 662.
+    //   overhead = 21 ("Long-term findings:\n" + "\n"). long_chars = 662 - 21 = 641.
+    //   Truncated total = 138 + 20 + 641 + 1 = 800 ≤ 800. Fits!
+    // So long_summary is truncated to 641 'X' chars (not dropped).
+    let (ctx, _snap) = builder.build(&subagent(), &mem, &[], "do thing", 200);
+    assert!(
+        ctx.compact_context.contains("Long-term findings:"),
+        "long_summary section present (truncated, not dropped)"
+    );
+    let x_count = ctx.compact_context.matches('X').count();
+    assert!(
+        x_count > 0,
+        "long_summary content present (truncated, not empty): {x_count} Xs"
+    );
+    assert!(
+        x_count < 1000,
+        "long_summary truncated (not full 1000): {x_count} Xs"
+    );
+    // Protected sections preserved.
+    assert!(
+        ctx.compact_context.contains("Current state:"),
+        "hot_summary preserved (priority 6)"
+    );
+    assert!(
+        ctx.compact_context.contains("do thing"),
+        "prompt preserved (priority 7)"
     );
 }
 
