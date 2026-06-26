@@ -39,6 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serial_test = "3"
 sha2 = "0.10"
+sysinfo = "0.32"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tempfile = "3"
