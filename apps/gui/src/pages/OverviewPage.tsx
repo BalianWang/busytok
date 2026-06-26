@@ -19,7 +19,7 @@ import {
   useActivityRecent,
 } from "../api/useBusytokData";
 import { PageState } from "../components/PageState";
-import { useRefreshToolbar } from "../components/desktop/useRefreshToolbar";
+import { useReceiptToolbar } from "../features/receipt/useReceiptToolbar";
 import { LedgerTable } from "../components/desktop/LedgerTable";
 import { StatusPill } from "../components/desktop/StatusPill";
 import type { StatusTone } from "../components/desktop/StatusPill";
@@ -147,10 +147,12 @@ export function OverviewPage() {
     refetch: refetchSummary,
   } = useOverviewSummary(range);
 
-  useRefreshToolbar({
+  const today = new Date().toISOString().slice(0, 10);
+  const receiptDialog = useReceiptToolbar({
     surface: "overview",
     onRefresh: refetchSummary,
     isFetching: summaryFetching,
+    today,
   });
 
   // ── Catastrophic loading: summary is the most critical panel ─────────
@@ -217,6 +219,10 @@ export function OverviewPage() {
 
       {/* 6. Recent Activity */}
       <OverviewRecentActivity range={range} />
+
+      {/* Receipt preview dialog (portaled by Radix Dialog; rendered here so
+          the share button in the toolbar can open it once data is loaded). */}
+      {receiptDialog}
     </div>
   );
 }
