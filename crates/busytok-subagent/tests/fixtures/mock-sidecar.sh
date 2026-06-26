@@ -13,48 +13,95 @@
 #   BUSYTOK_MOCK_STDERR_LINES=N  Write N lines to stderr before each response
 #                                (exercises the supervisor's stderr reader —
 #                                verifies the pipe doesn't fill and block).
-#   BUSYTOK_MOCK_HOT_SESSION_LIMIT=N
-#                                When > 0, track active hot sessions and
-#                                return HOT_SESSION_LIMIT_REACHED (-32002)
-#                                with data.candidate=<LRU session id> once the
-#                                pool is full. session.close releases a slot.
-#                                0/unset = unlimited (legacy behavior).
-
+#   BUSYTOK_MOCK_HOT_SESSION_LIMIT=N  When N sessions are active, the next
+#                                     session.turn_auto for a NEW subagent
+#                                     returns HOT_SESSION_LIMIT_REACHED
+#                                     (-32002) with data.candidate.
+#   BUSYTOK_MOCK_CLOSE_FAILS=1        session.close returns a JSON-RPC error
+#                                     (-32001 SESSION_NOT_FOUND) instead of
+#                                     ok. Used to test the fatal-close-failure
+#                                     eviction path.
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
 EMPTY_SESSION="${BUSYTOK_MOCK_EMPTY_SESSION:-0}"
 STDERR_LINES="${BUSYTOK_MOCK_STDERR_LINES:-0}"
 HOT_LIMIT="${BUSYTOK_MOCK_HOT_SESSION_LIMIT:-0}"
-
-# Track active hot sessions as a newline-separated string (bash 3.x — no
-# associative arrays on macOS /bin/bash). Each entry is the adapter_session_id
-# assigned when the session was created; LRU order is insertion order (the
-# first line is the oldest).
-ACTIVE_SESSIONS=""
-
+CLOSE_FAILS="${BUSYTOK_MOCK_CLOSE_FAILS:-0}"
 COUNT=0
+
+# Track active sessions using parallel indexed arrays (portable to bash 3.2
+# which does NOT support `declare -A`). SUB_IDS[i] maps to SESS_IDS[i].
+# SESS_ORDER tracks LRU order: index 0 = oldest (LRU), last = newest (MRU).
+SUB_IDS=()
+SESS_IDS=()
+SESS_ORDER=()
+SESS_COUNTER=0
+
+# Look up a subagent's session by iterating the parallel arrays.
+# Echoes the session_id, or empty string if not found.
+sub_to_sess_lookup() {
+  local target="$1" i
+  for i in "${!SUB_IDS[@]}"; do
+    if [[ "${SUB_IDS[$i]}" == "$target" ]]; then
+      printf '%s' "${SESS_IDS[$i]}"
+      return 0
+    fi
+  done
+  return 0  # not found, prints nothing
+}
+
+# Remove a subagent→session mapping by subagent_id.
+sub_to_sess_remove_by_sub() {
+  local target="$1" i
+  for i in "${!SUB_IDS[@]}"; do
+    if [[ "${SUB_IDS[$i]}" == "$target" ]]; then
+      unset 'SUB_IDS[i]'
+      unset 'SESS_IDS[i]'
+      SUB_IDS=("${SUB_IDS[@]}")
+      SESS_IDS=("${SESS_IDS[@]}")
+      return 0
+    fi
+  done
+}
+
+# Remove a subagent→session mapping by session_id.
+sub_to_sess_remove_by_sess() {
+  local target="$1" i
+  for i in "${!SESS_IDS[@]}"; do
+    if [[ "${SESS_IDS[$i]}" == "$target" ]]; then
+      unset 'SUB_IDS[i]'
+      unset 'SESS_IDS[i]'
+      SUB_IDS=("${SUB_IDS[@]}")
+      SESS_IDS=("${SESS_IDS[@]}")
+      return 0
+    fi
+  done
+}
+
 while IFS= read -r line; do
   COUNT=$((COUNT + 1))
   if [[ "$DELAY_MS" -gt 0 ]]; then
     awk -v ms="$DELAY_MS" 'BEGIN { system("sleep " ms/1000) }'
   fi
-  # Write N stderr lines before each response (P1-1 fixture: verifies the
-  # supervisor drains stderr so the pipe doesn't fill and block the child).
   if [[ "$STDERR_LINES" -gt 0 ]]; then
     for i in $(seq 1 "$STDERR_LINES"); do
       echo "[mock-sidecar stderr] line $i for msg $COUNT" >&2
     done
   fi
-  # Extract method and id without jq (sed on single-line JSON).
   METHOD=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   ID=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+  # Extract logical_subagent_id from params (for turn_auto)
+  SUB_ID=$(printf '%s' "$line" | sed -n 's/.*"logical_subagent_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  # Extract adapter_session_id from params (for prepare_hibernate/close)
+  SESS_ID_PARAM=$(printf '%s' "$line" | sed -n 's/.*"adapter_session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
   case "$METHOD" in
     adapter.initialize)
       printf '{"jsonrpc":"2.0","result":{"protocol_version":1,"sidecar_version":"mock-1.0"},"id":%s}\n' "$ID"
       ;;
     adapter.health)
-      printf '{"jsonrpc":"2.0","result":{"status":"healthy","sessions":0,"rss_mb":42},"id":%s}\n' "$ID"
+      printf '{"jsonrpc":"2.0","result":{"status":"healthy","sessions":%d,"rss_mb":42},"id":%s}\n' "${#SESS_ORDER[@]}" "$ID"
       ;;
     adapter.shutdown)
       printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
@@ -63,62 +110,64 @@ while IFS= read -r line; do
     session.turn_auto)
       if [[ "$EMPTY_SESSION" == "1" ]]; then
         printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$ID"
-      elif [[ "$HOT_LIMIT" -gt 0 ]]; then
-        # Count active sessions (lines in ACTIVE_SESSIONS).
-        ACTIVE_COUNT=0
-        if [[ -n "$ACTIVE_SESSIONS" ]]; then
-          ACTIVE_COUNT=$(printf '%s\n' "$ACTIVE_SESSIONS" | grep -c . || true)
-        fi
-        if [[ "$ACTIVE_COUNT" -ge "$HOT_LIMIT" ]]; then
-          # Evict the LRU (first session in insertion order).
-          CANDIDATE=$(printf '%s\n' "$ACTIVE_SESSIONS" | head -n1)
-          printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
-        else
-          SESS_ID="pi_sess_mock_${COUNT}"
-          if [[ -z "$ACTIVE_SESSIONS" ]]; then
-            ACTIVE_SESSIONS="$SESS_ID"
-          else
-            ACTIVE_SESSIONS="${ACTIVE_SESSIONS}"$'\n'"${SESS_ID}"
-          fi
-          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS_ID" "$ID"
-        fi
       else
-        printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"pi_sess_mock_%s","session_reused":false,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$COUNT" "$ID"
+        EXISTING_SESS=$(sub_to_sess_lookup "$SUB_ID")
+        if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" ]]; then
+          # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED
+          CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
+          printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
+        elif [[ -n "$EXISTING_SESS" ]]; then
+          # Reuse existing session for this subagent
+          SESS="$EXISTING_SESS"
+          REUSED="true"
+          # Move to MRU (end of array): remove and re-append
+          for i in "${!SESS_ORDER[@]}"; do
+            if [[ "${SESS_ORDER[$i]}" == "$SESS" ]]; then
+              unset 'SESS_ORDER[i]'
+              SESS_ORDER=("${SESS_ORDER[@]}")
+              break
+            fi
+          done
+          SESS_ORDER+=("$SESS")
+          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$ID"
+        else
+          # Create new session
+          SESS_COUNTER=$((SESS_COUNTER + 1))
+          SESS="pi_sess_mock_${SESS_COUNTER}"
+          SUB_IDS+=("$SUB_ID")
+          SESS_IDS+=("$SESS")
+          SESS_ORDER+=("$SESS")
+          REUSED="false"
+          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"completed","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$ID"
+        fi
       fi
       ;;
     session.prepare_hibernate)
-      # Return a non-null memory_delta so the executor's eviction flow writes
-      # hot_summary to the store. The stats field is opaque to the executor
-      # (passed through to the resource event detail_json).
-      printf '{"jsonrpc":"2.0","result":{"memory_delta":{"hot_summary":"mock hot summary"},"stats":{"turns":3,"tokens":120}},"id":%s}\n' "$ID"
+      printf '{"jsonrpc":"2.0","result":{"memory_delta":{"hot_summary":"hibernated"},"stats":{"adapter_session_id":"%s"}},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
       ;;
     session.close)
-      # Extract adapter_session_id from params (sed on single-line JSON) and
-      # remove it from ACTIVE_SESSIONS so the slot is released.
-      CLOSE_SESS=$(printf '%s' "$line" | sed -n 's/.*"adapter_session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)
-      if [[ -n "$CLOSE_SESS" && -n "$ACTIVE_SESSIONS" ]]; then
-        NEW_SESSIONS=""
-        while IFS= read -r s; do
-          [[ -z "$s" ]] && continue
-          if [[ "$s" != "$CLOSE_SESS" ]]; then
-            if [[ -z "$NEW_SESSIONS" ]]; then
-              NEW_SESSIONS="$s"
-            else
-              NEW_SESSIONS="${NEW_SESSIONS}"$'\n'"${s}"
-            fi
+      if [[ "$CLOSE_FAILS" == "1" ]]; then
+        # Simulate a sidecar that fails to close the session — used to test
+        # the fatal-close-failure eviction path (P1-2 fix).
+        printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"session.close failed: adapter error"},"id":%s}\n' "$ID"
+      else
+        # Remove from pool
+        for i in "${!SESS_ORDER[@]}"; do
+          if [[ "${SESS_ORDER[$i]}" == "$SESS_ID_PARAM" ]]; then
+            unset 'SESS_ORDER[i]'
+            SESS_ORDER=("${SESS_ORDER[@]}")
+            break
           fi
-        done <<< "$ACTIVE_SESSIONS"
-        ACTIVE_SESSIONS="$NEW_SESSIONS"
+        done
+        # Remove from subagent map
+        sub_to_sess_remove_by_sess "$SESS_ID_PARAM"
+        printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
       fi
-      printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
       ;;
     *)
       printf '{"jsonrpc":"2.0","error":{"code":-32601,"message":"method not found: %s"},"id":%s}\n' "$METHOD" "$ID"
       ;;
   esac
-  # Crash AFTER sending the response for the Nth message. This lets the
-  # supervisor's `ensure_started` (which sends adapter.initialize as message 1)
-  # succeed; the crash surfaces on the next supervision-loop poll via try_wait.
   if [[ "$CRASH_AFTER" -ge 0 && "$COUNT" -ge "$CRASH_AFTER" ]]; then
     echo "mock-sidecar crashing after $CRASH_AFTER messages" >&2
     exit 1
