@@ -826,7 +826,6 @@ fn to_store_exact_windows(
         .collect()
 }
 
-
 fn aggregate_trend_bucket(
     bucket: &range::TrendBucketWindow,
     granularity: &TrendBucketGranularityDto,
