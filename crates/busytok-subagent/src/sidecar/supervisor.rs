@@ -17,6 +17,7 @@
 //! the actual RPC runs with the state lock released, serialized on the
 //! client's own `tokio::Mutex`.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,8 @@ pub type SharedDb = Arc<std::sync::Mutex<Database>>;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// Spec §5.4: rolling 5-min window for crash restart attempts.
+const RESTART_WINDOW: Duration = Duration::from_secs(300);
 
 pub struct PiSidecarSupervisor {
     config: SidecarConfig,
@@ -51,7 +54,7 @@ pub struct PiSidecarSupervisor {
     resource_monitor: Option<std::sync::Mutex<ResourceMonitor>>,
 }
 
-struct SupervisorState {
+pub struct SupervisorState {
     child: Option<Child>,
     /// The RPC client is wrapped in `Arc<Mutex<…>>` so `call_rpc` can clone
     /// the Arc and release the state lock before performing the (potentially
@@ -67,6 +70,11 @@ struct SupervisorState {
     /// so re-pressurization after recovery writes a fresh `memory_pressure`
     /// event. DB events fire ONLY on escalation; recovery logs to tracing.
     resource_pressure_state: ResourcePressureState,
+    /// Rolling window of crash timestamps (spec §5.4: "max 3 attempts per
+    /// 5 min"). Pruned in `spawn_internal` before checking the cap. NOT
+    /// reset on successful spawn (unlike `restart_attempts`) — the window
+    /// is the hard cap, `restart_attempts` is for backoff calculation.
+    pub restart_history: VecDeque<tokio::time::Instant>,
 }
 
 impl PiSidecarSupervisor {
@@ -90,6 +98,7 @@ impl PiSidecarSupervisor {
                 restart_attempts: 0,
                 supervision_started: false,
                 resource_pressure_state: ResourcePressureState::Normal,
+                restart_history: VecDeque::new(),
             }),
             db,
             resource_monitor: Some(std::sync::Mutex::new(monitor)),
@@ -117,6 +126,7 @@ impl PiSidecarSupervisor {
                 restart_attempts: 0,
                 supervision_started: false,
                 resource_pressure_state: ResourcePressureState::Normal,
+                restart_history: VecDeque::new(),
             }),
             db,
             resource_monitor: Some(std::sync::Mutex::new(monitor)),
@@ -155,7 +165,7 @@ impl PiSidecarSupervisor {
     async fn spawn_internal(self: &Arc<Self>) -> Result<(), SidecarError> {
         // Exponential backoff if this is a restart after a crash.
         let backoff = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             // Double-checked locking: `ensure_started` checks `needs_spawn`
             // without holding the lock, so two concurrent callers can both see
             // `needs_spawn=true` and both call `spawn_internal`. Re-check here
@@ -172,6 +182,20 @@ impl PiSidecarSupervisor {
                     .unwrap_or(false)
             {
                 return Ok(());
+            }
+            // Spec §5.4: rolling 5-min window. Prune entries older than
+            // 5 min, then check if we've exceeded the cap. This is the
+            // HARD limit — `restart_attempts` (below) is only for backoff.
+            let now = tokio::time::Instant::now();
+            state
+                .restart_history
+                .retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+            if state.restart_history.len() >= self.config.max_restart_attempts as usize {
+                return Err(SidecarError::Crashed(format!(
+                    "max restart attempts ({}) exceeded within 5-min window ({} recent crashes)",
+                    self.config.max_restart_attempts,
+                    state.restart_history.len()
+                )));
             }
             if state.restart_attempts > self.config.max_restart_attempts {
                 return Err(SidecarError::Crashed(format!(
@@ -327,10 +351,12 @@ impl PiSidecarSupervisor {
                 state.client = None;
                 state.child = None;
                 state.restart_attempts += 1;
+                state.restart_history.push_back(tokio::time::Instant::now());
                 warn!(
                     event_code = "subagent.sidecar.crash",
                     exit = ?status,
                     attempts = state.restart_attempts,
+                    recent_crashes = state.restart_history.len(),
                     "sidecar crashed"
                 );
                 drop(state);
@@ -715,10 +741,24 @@ impl PiSidecarSupervisor {
             .as_ref()
             .expect("db_for_test called but supervisor has no DB handle")
     }
+
+    /// Test-only accessor for the supervisor state. Used by integration
+    /// tests that need to pre-populate `restart_history` to test the 5-min
+    /// rolling window limiter without driving the full crash/restart cycle.
+    #[doc(hidden)]
+    pub fn state_for_test(&self) -> &Mutex<SupervisorState> {
+        &self.state
+    }
 }
 
 pub struct SidecarHandle {
     supervisor: Arc<PiSidecarSupervisor>,
+}
+
+impl std::fmt::Debug for SidecarHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidecarHandle").finish_non_exhaustive()
+    }
 }
 
 impl SidecarHandle {

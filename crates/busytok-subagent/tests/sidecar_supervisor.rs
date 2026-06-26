@@ -444,15 +444,22 @@ async fn supervisor_call_after_shutdown_returns_crashed() {
 
 #[tokio::test]
 async fn supervisor_max_restart_attempts_exceeded_returns_error() {
-    // `max_restart_attempts = 0` means NO restarts are allowed. The mock
-    // sidecar crashes after responding to `adapter.initialize` (message 1).
-    // The supervision loop detects the crash, increments `restart_attempts`
-    // to 1. The next `ensure_started` calls `spawn_internal`, which checks
-    // `restart_attempts (1) > max (0)` → returns `SidecarError::Crashed`.
+    // `max_restart_attempts = 1` means at most 1 crash-attempt is allowed per
+    // 5-min window (Plan 5 Task 4, spec §5.4). The mock sidecar crashes after
+    // responding to `adapter.initialize` (message 1). The supervision loop
+    // detects the crash, increments `restart_attempts` to 1 AND pushes the
+    // crash timestamp to `restart_history` (len=1). The next `ensure_started`
+    // calls `spawn_internal`, which checks `restart_history.len() (1) >= max
+    // (1)` → returns `SidecarError::Crashed`.
+    //
+    // (Pre-Task-4 this test used max=0 to exercise the consecutive-attempt
+    // cap; the new rolling-window limiter treats max=0 as "no spawns at all",
+    // so the test was migrated to max=1 — the smallest value that still
+    // observes the cap-after-one-crash behavior.)
     let mut cfg = mock_config();
     cfg.env
         .insert("BUSYTOK_MOCK_CRASH_AFTER".to_string(), "1".to_string());
-    cfg.max_restart_attempts = 0;
+    cfg.max_restart_attempts = 1;
     cfg.health_interval = Duration::from_secs(3600);
     cfg.idle_exit_seconds = 3600;
     let sup = PiSidecarSupervisor::new(cfg, None);
@@ -460,7 +467,7 @@ async fn supervisor_max_restart_attempts_exceeded_returns_error() {
     // after responding).
     let _ = sup.ensure_started().await.unwrap();
     // Wait for the supervision loop to detect the crash and increment
-    // restart_attempts.
+    // restart_attempts + push to restart_history.
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Second ensure_started must fail with "max restart attempts exceeded".
     let err = match sup.ensure_started().await {
@@ -653,4 +660,104 @@ fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
     assert_eq!(detail["service_rss_mb"], 25.0);
     assert_eq!(detail["hot_session_count"], 2);
     assert_eq!(detail["system_available_mb"], 4096.0);
+}
+
+// --- 5-min rolling crash window (Plan 5 Task 4, spec §5.4) ---
+
+/// Test that after 3 crashes within 5 min, the 4th restart attempt is
+/// rejected with `SidecarError::Crashed`. The existing code only counts
+/// consecutive `restart_attempts` (reset on successful spawn); this test
+/// verifies the NEW rolling window limiter.
+#[tokio::test]
+async fn spawn_rejects_after_3_crashes_within_5_min_window() {
+    use busytok_subagent::sidecar::SidecarError;
+    use std::collections::VecDeque;
+    use tokio::time::Instant;
+
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let shared_db: std::sync::Arc<std::sync::Mutex<busytok_store::Database>> =
+        std::sync::Arc::new(std::sync::Mutex::new(db));
+    let config = busytok_subagent::sidecar::SidecarConfig {
+        node_binary: std::path::PathBuf::from("bash"),
+        bundle_path: std::path::PathBuf::from("/dev/null"),
+        env: std::collections::HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: std::time::Duration::from_secs(30),
+        task_timeout: std::time::Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: std::time::Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    };
+    let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
+        config,
+        Some(std::sync::Arc::clone(&shared_db)),
+    );
+
+    // Simulate 3 crashes within the 5-min window by pre-populating
+    // restart_history with 3 recent timestamps. This bypasses the
+    // supervision loop and directly tests the limiter in spawn_internal.
+    {
+        let mut state = sup.state_for_test().lock().await;
+        let now = Instant::now();
+        state.restart_history = VecDeque::from([now, now, now]);
+    }
+
+    // The 4th spawn attempt should be rejected.
+    let result = sup.ensure_started().await;
+    assert!(
+        matches!(result, Err(SidecarError::Crashed(_))),
+        "4th restart within 5 min must be rejected with SidecarError::Crashed, got: {result:?}"
+    );
+}
+
+/// Test that crashes older than 5 min are pruned, allowing restart.
+#[tokio::test]
+async fn spawn_allows_restart_after_5_min_window_expires() {
+    use std::collections::VecDeque;
+    use tokio::time::{Duration, Instant};
+
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let shared_db: std::sync::Arc<std::sync::Mutex<busytok_store::Database>> =
+        std::sync::Arc::new(std::sync::Mutex::new(db));
+    let config = busytok_subagent::sidecar::SidecarConfig {
+        node_binary: std::path::PathBuf::from("bash"),
+        bundle_path: mock_sidecar_script(),
+        env: std::collections::HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: std::time::Duration::from_secs(30),
+        task_timeout: std::time::Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: std::time::Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    };
+    let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
+        config,
+        Some(std::sync::Arc::clone(&shared_db)),
+    );
+
+    // Simulate 3 crashes 6 minutes ago (outside the 5-min window).
+    {
+        let mut state = sup.state_for_test().lock().await;
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(360))
+            .expect("6 min ago should be representable");
+        state.restart_history = VecDeque::from([old, old, old]);
+    }
+
+    // After pruning, restart_history should be empty, so spawn should
+    // proceed. The mock sidecar responds to adapter.initialize with the
+    // correct protocol_version, so spawn succeeds — strongest verification
+    // that the limiter did NOT fire.
+    let result = sup.ensure_started().await;
+    assert!(
+        result.is_ok(),
+        "after 5-min window expires, spawn must succeed (limiter must not fire), got: {result:?}"
+    );
+    sup.shutdown().await.unwrap();
 }
