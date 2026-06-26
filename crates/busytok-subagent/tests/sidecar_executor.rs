@@ -10,6 +10,7 @@ use busytok_store::repository::{
     SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
 };
 use busytok_store::Database;
+use busytok_subagent::context::{CompactContext, MemorySnapshot};
 use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
 use busytok_subagent::sidecar::config::SidecarConfig;
@@ -18,6 +19,24 @@ use busytok_subagent::sidecar::PiSidecarSupervisor;
 use busytok_subagent::SubagentManager;
 
 type SharedDb = Arc<std::sync::Mutex<Database>>;
+
+fn empty_memory_snapshot() -> MemorySnapshot {
+    MemorySnapshot {
+        hot_summary: None,
+        long_summary: None,
+        key_files: vec![],
+        decisions: vec![],
+        open_questions: vec![],
+    }
+}
+
+fn empty_compact_context() -> CompactContext {
+    CompactContext {
+        compact_context: String::new(),
+        budget_tokens: 0,
+        source: String::new(),
+    }
+}
 
 fn mock_sidecar_script() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -147,11 +166,13 @@ async fn delegate_via_sidecar_reuses_hot_binding_on_redelegate() {
 }
 
 #[tokio::test]
-async fn delegate_via_sidecar_empty_session_id_falls_to_warm() {
+async fn delegate_via_sidecar_empty_session_id_falls_to_cold() {
     // Regression: an empty `adapter_session_id` from the sidecar must NOT
     // trigger the hot path. Spec §3.3 requires a real backing session for a
-    // hot binding; an empty id has no real session, so the delegate falls
-    // back to warm (no hot binding row, status stays Warm).
+    // hot binding; an empty id has no real session, so the delegate takes the
+    // warm/cold path. Per §3.3 (P1-1 fix): warm iff hot_summary IS NOT NULL.
+    // The sidecar mock produces no memory_update (current_state_summary=None),
+    // so hot_summary stays None → status is Cold (not Warm).
     let mut env = HashMap::new();
     env.insert("BUSYTOK_MOCK_EMPTY_SESSION".to_string(), "1".to_string());
     let h = make_harness_with_env(env);
@@ -162,7 +183,7 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_warm() {
         .unwrap();
 
     // The executor extracts Some("") verbatim — the delegate is the authority
-    // that decides hot vs warm, and an empty id must be treated as warm.
+    // that decides hot vs warm/cold, and an empty id must NOT create a hot binding.
     assert_eq!(
         r.adapter_session_id.as_deref(),
         Some(""),
@@ -180,10 +201,12 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_warm() {
             "empty adapter_session_id must not create a hot binding"
         );
 
-        // Logical subagent status is Warm (not Hot).
+        // Logical subagent status is Cold: no memory_update → hot_summary is
+        // None → §3.3 says cold (not warm). P1-1 regression: the old code
+        // unconditionally set Warm, violating "warm iff hot_summary IS NOT NULL".
         let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
         assert!(sub.is_some());
-        assert_eq!(sub.unwrap().status, "warm");
+        assert_eq!(sub.unwrap().status, "cold");
     }
     h.supervisor.shutdown().await.unwrap();
 }
@@ -205,6 +228,10 @@ fn executor_input() -> ExecutorInput {
         model: None,
         prompt: "do something".to_string(),
         timeout_seconds: Some(5),
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     }
 }
 
@@ -322,6 +349,10 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         model: None,
         prompt: "do 1".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     };
     let out1 = executor
         .execute(&input1)
@@ -383,6 +414,10 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         model: None,
         prompt: "do 2".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     };
     let out2 = executor
         .execute(&input2)
@@ -446,6 +481,10 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         model: None,
         prompt: "do 1".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     };
     let _out1 = executor
         .execute(&input1)
@@ -468,6 +507,10 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         model: None,
         prompt: "do 2".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -560,6 +603,10 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         model: None,
         prompt: "do 1".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     };
     let _out1 = executor
         .execute(&input1)
@@ -580,6 +627,10 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         model: None,
         prompt: "do 2".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -725,6 +776,10 @@ fn evict_input(id: &str) -> ExecutorInput {
         model: None,
         prompt: format!("do {id}"),
         timeout_seconds: None,
+        tools: vec![],
+        memory: empty_memory_snapshot(),
+        context: empty_compact_context(),
+        write_access: false,
     }
 }
 

@@ -98,6 +98,20 @@ async fn failing_executor_always_errors() {
         model: None,
         prompt: "do".into(),
         timeout_seconds: None,
+        tools: vec![],
+        memory: busytok_subagent::context::MemorySnapshot {
+            hot_summary: None,
+            long_summary: None,
+            key_files: vec![],
+            decisions: vec![],
+            open_questions: vec![],
+        },
+        context: busytok_subagent::context::CompactContext {
+            compact_context: String::new(),
+            budget_tokens: 0,
+            source: String::new(),
+        },
+        write_access: false,
     };
     let err = match exec.execute(&input).await {
         Ok(_) => panic!("FailingTaskExecutor must always fail"),

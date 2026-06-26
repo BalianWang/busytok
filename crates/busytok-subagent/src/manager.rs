@@ -8,7 +8,9 @@ use busytok_store::{
 };
 use tracing::{error, info, warn};
 
+use crate::context::ContextBuilder;
 use crate::error::{Result, SubagentError};
+use crate::memory::MemoryUpdater;
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
     DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
@@ -23,6 +25,8 @@ pub struct SubagentManager {
     settings: SubagentSettings,
     adapter: String,
     executor: Arc<dyn TaskExecutor>,
+    context_builder: ContextBuilder,
+    memory_updater: MemoryUpdater,
 }
 
 impl SubagentManager {
@@ -32,11 +36,15 @@ impl SubagentManager {
         adapter: &str,
         executor: Arc<dyn TaskExecutor>,
     ) -> Self {
+        let context_builder = ContextBuilder::new(settings.context.clone());
+        let memory_updater = MemoryUpdater::new(settings.context.clone());
         Self {
             db,
             settings,
             adapter: adapter.to_string(),
             executor,
+            context_builder,
+            memory_updater,
         }
     }
 
@@ -125,21 +133,78 @@ impl SubagentManager {
             "delegating task"
         );
 
-        // 3. mock-execute (Plan 2: sidecar turn). No lock held during execution.
+        // 3. Build context + memory snapshot from the store, then execute.
+        //    No lock held during execution.
         let model = req.model_override.clone().or(profile_model);
         let started = busytok_domain::now_ms();
-        let input = ExecutorInput {
-            subagent_id: subagent.id.clone(),
-            subagent_name: subagent.name.clone(),
-            cwd: req.cwd.clone(),
-            profile: req.profile.clone(),
-            model: model.clone(),
-            prompt: req.prompt.clone(),
-            timeout_seconds: req.timeout_seconds,
+        let (input, memory_row, recent_tasks, tasks_since_last_compaction, profile_cfg) = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            let memory_row = db
+                .subagent_get_memory(&subagent.id)
+                .map_err(SubagentError::Store)?
+                .unwrap_or_else(|| SubagentMemoryRow::new_empty(&subagent.id));
+            let recent_tasks = db
+                .subagent_list_tasks(
+                    &subagent.id,
+                    self.settings.context.recent_tasks_limit as i64,
+                )
+                .map_err(SubagentError::Store)?;
+            // Authoritative count of tasks since last compaction — NOT derived
+            // from recent_tasks.len() (which is capped by recent_tasks_limit).
+            let tasks_since_last_compaction = db
+                .subagent_count_tasks_since(
+                    &subagent.id,
+                    memory_row.last_compacted_at_ms.unwrap_or(0),
+                )
+                .map_err(SubagentError::Store)?;
+            let profile_cfg = self.settings.profiles.get(&req.profile);
+            let profile_budget = profile_cfg
+                .map(|p| p.context_budget_tokens)
+                .unwrap_or(self.settings.context.default_budget_tokens);
+            let tools = profile_cfg.map(|p| p.tools.clone()).unwrap_or_default();
+            let write_access = profile_cfg.map(|p| p.write_access).unwrap_or(false);
+            let sub_row = db
+                .subagent_get_logical(&subagent.id)
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| SubagentError::NotFound(subagent.id.clone()))?;
+            let (compact, snapshot) = self.context_builder.build(
+                &sub_row,
+                &memory_row,
+                &recent_tasks,
+                &req.prompt,
+                profile_budget,
+            );
+            info!(
+                event_code = "subagent.context.built",
+                subagent_id = %subagent.id,
+                budget_tokens = compact.budget_tokens,
+                context_chars = compact.compact_context.len(),
+                recent_tasks_count = recent_tasks.len(),
+                tasks_since_last_compaction,
+                "built context for delegate"
+            );
+            let input = ExecutorInput {
+                subagent_id: subagent.id.clone(),
+                subagent_name: subagent.name.clone(),
+                cwd: req.cwd.clone(),
+                profile: req.profile.clone(),
+                model: model.clone(),
+                prompt: req.prompt.clone(),
+                timeout_seconds: req.timeout_seconds,
+                tools,
+                memory: snapshot,
+                context: compact,
+                write_access,
+            };
+            (
+                input,
+                memory_row,
+                recent_tasks,
+                tasks_since_last_compaction,
+                profile_cfg.cloned(),
+            )
         };
         let out = self.executor.execute(&input).await.map_err(|e| {
-            // If the executor wrapped a SubagentError (SidecarTaskExecutor does this
-            // via sidecar_to_anyhow), downcast to recover the semantic variant.
             match e.downcast::<SubagentError>() {
                 Ok(se) => se,
                 Err(other) => {
@@ -150,12 +215,11 @@ impl SubagentManager {
         })?;
         let duration_ms = busytok_domain::now_ms().saturating_sub(started);
 
-        // 4. persist results: task status, usage, memory (hot_summary), status.
-        //    Writing hot_summary satisfies the `warm` invariant (recoverable
-        //    memory exists). For the hot path (real adapter_session_id), the
-        //    binding + status flip commit in a single transaction so the spec
-        //    §3.3 invariant ("status='hot' iff is_hot=1 binding exists") holds
-        //    at every observable point.
+        // 4. persist results: task status, usage, memory, status.
+        //    For the hot path (real adapter_session_id), the binding + status
+        //    flip commit in a single transaction so the spec §3.3 invariant
+        //    ("status='hot' iff is_hot=1 binding exists") holds at every
+        //    observable point.
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
             db.subagent_set_task_status(
@@ -183,8 +247,32 @@ impl SubagentManager {
             })
             .map_err(SubagentError::Store)?;
 
-            // memory: write hot_summary so hibernate/restore recovers context.
-            self.write_hot_summary(&db, &subagent.id, &out.summary)?;
+            // memory: merge the sidecar's memory_update into the memory row
+            // (spec §6.2). hot_summary comes from current_state_summary, NOT
+            // task_summary. When memory_update is absent, hot_summary is
+            // preserved. Compaction runs if triggers fire.
+            let profile_budget = profile_cfg
+                .as_ref()
+                .map(|p| p.context_budget_tokens)
+                .unwrap_or(self.settings.context.default_budget_tokens);
+            let updated_mem = self.memory_updater.update(
+                memory_row,
+                out.memory_update.clone(),
+                &recent_tasks,
+                tasks_since_last_compaction,
+                &task_id,
+                profile_budget,
+                &subagent.repo_path,
+            );
+            info!(
+                event_code = "subagent.memory.updated",
+                subagent_id = %subagent.id,
+                has_hot_summary = updated_mem.hot_summary.is_some(),
+                compacted = updated_mem.last_compacted_at_ms.is_some(),
+                "memory updated after delegate"
+            );
+            db.subagent_upsert_memory(&updated_mem)
+                .map_err(SubagentError::Store)?;
 
             // Spec §3.3 invariant: status='hot' iff is_hot=1 binding exists.
             // Hot path: commit binding + status atomically; failure fails the
@@ -192,10 +280,11 @@ impl SubagentManager {
             // backing binding). Warm path (mock executor, no adapter_session_id):
             // just flip status — no real session to bind.
             //
-            // An empty `adapter_session_id` is treated as warm — there is no
-            // real backing session, so committing a hot binding would violate
-            // spec §3.3 semantically. The delegate is the authority that
-            // decides hot vs warm (the executor only extracts the raw value).
+            // An empty `adapter_session_id` is treated as warm/cold — there is
+            // no real backing session, so committing a hot binding would
+            // violate spec §3.3 semantically. The delegate is the authority
+            // that decides hot vs warm/cold (the executor only extracts the
+            // raw value).
             let hot_sid = out.adapter_session_id.as_deref().filter(|s| !s.is_empty());
             if let Some(sid) = hot_sid {
                 let now_ms = busytok_domain::now_ms();
@@ -223,8 +312,15 @@ impl SubagentManager {
                     })?;
             } else {
                 // Mock executor path OR empty adapter_session_id — no real
-                // session to bind, status stays Warm.
-                self.set_logical_status(&db, &subagent.id, SubagentStatus::Warm)?;
+                // session to bind. Derive warm/cold from memory state (§3.3:
+                // warm iff hot_summary IS NOT NULL). On a fresh subagent with
+                // no memory_update, hot_summary is None → Cold.
+                let status = if updated_mem.hot_summary.is_some() {
+                    SubagentStatus::Warm
+                } else {
+                    SubagentStatus::Cold
+                };
+                self.set_logical_status(&db, &subagent.id, status)?;
             }
         }
 
@@ -435,24 +531,6 @@ impl SubagentManager {
             profile,
             "pi/search-cheap" | "pi/review-cheap" | "pi/plan-cheap"
         ) || self.settings.profiles.contains_key(profile)
-    }
-
-    /// Persist the most recent task summary as the recoverable `hot_summary`.
-    fn write_hot_summary(
-        &self,
-        db: &busytok_store::Database,
-        subagent_id: &str,
-        summary: &str,
-    ) -> Result<()> {
-        let mut mem = db
-            .subagent_get_memory(subagent_id)
-            .map_err(SubagentError::Store)?
-            .unwrap_or_else(|| SubagentMemoryRow::new_empty(subagent_id));
-        mem.hot_summary = Some(summary.to_string());
-        mem.updated_at_ms = busytok_domain::now_ms();
-        db.subagent_upsert_memory(&mem)
-            .map_err(SubagentError::Store)?;
-        Ok(())
     }
 
     fn set_logical_status(

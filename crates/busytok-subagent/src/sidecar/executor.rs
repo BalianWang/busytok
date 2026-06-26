@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 use busytok_store::{Database, SubagentResourceEventRow};
 
 use crate::error::SubagentError;
+use crate::memory::MemoryUpdate;
 use crate::mock_executor::{ExecutorInput, ExecutorOutput, TaskExecutor};
 use crate::models::{TaskStatus, TaskUsage};
 use crate::sidecar::supervisor::PiSidecarSupervisor;
@@ -335,6 +336,10 @@ fn parse_turn_auto_result(result: &serde_json::Value) -> ExecutorOutput {
         status,
         summary,
         usage,
+        // Plan 4 Task 3: the sidecar's full memory_update parsing lands in a
+        // later plan; for now default() preserves "no memory_update emitted"
+        // so the manager's MemoryUpdater preserves existing memory.
+        memory_update: MemoryUpdate::default(),
     }
 }
 

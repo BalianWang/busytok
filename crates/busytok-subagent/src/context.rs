@@ -11,6 +11,7 @@ use busytok_store::{SubagentLogicalSubagentRow, SubagentMemoryRow, SubagentTaskR
 use crate::memory::{KeyFile, OpenQuestion};
 
 /// The prompt-ready context string + budget metadata (spec §6.1 output).
+#[derive(Clone)]
 pub struct CompactContext {
     pub compact_context: String,
     pub budget_tokens: u32,
@@ -20,6 +21,7 @@ pub struct CompactContext {
 /// Raw structured memory for the RPC `memory` field (spec §4.3). The sidecar
 /// uses `compact_context` as authoritative; this carries full structured data
 /// for debugging (key_files retain score/reason, open_questions retain status).
+#[derive(Clone)]
 pub struct MemorySnapshot {
     pub hot_summary: Option<String>,
     pub long_summary: Option<String>,

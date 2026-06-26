@@ -1945,6 +1945,10 @@ impl Database {
     ) -> Result<Vec<SubagentTaskRow>> {
         subagent_queries::list_tasks(self.conn(), subagent_id, limit)
     }
+    /// Count tasks with `created_at_ms > since_ms` (compaction trigger (a)).
+    pub fn subagent_count_tasks_since(&self, subagent_id: &str, since_ms: i64) -> Result<u32> {
+        subagent_queries::count_tasks_since(self.conn(), subagent_id, since_ms)
+    }
     pub fn subagent_set_task_status(
         &self,
         id: &str,

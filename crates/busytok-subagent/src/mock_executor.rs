@@ -1,9 +1,13 @@
 //! Task executor abstraction. Plan 1 had a mock; Plan 2 adds a sidecar-backed
 //! executor. The trait lets `SubagentManager` stay executor-agnostic.
 
+use crate::context::CompactContext;
+use crate::context::MemorySnapshot;
+use crate::memory::MemoryUpdate;
 use crate::models::{TaskStatus, TaskUsage};
 
 /// Input to a task executor — everything needed to run one turn.
+#[derive(Clone)]
 pub struct ExecutorInput {
     pub subagent_id: String,
     pub subagent_name: String,
@@ -12,6 +16,10 @@ pub struct ExecutorInput {
     pub model: Option<String>,
     pub prompt: String,
     pub timeout_seconds: Option<u64>,
+    pub tools: Vec<String>,
+    pub memory: MemorySnapshot,
+    pub context: CompactContext,
+    pub write_access: bool,
 }
 
 /// Output from a task executor — mapped into `DelegateResult` by the manager.
@@ -21,6 +29,7 @@ pub struct ExecutorOutput {
     pub status: TaskStatus,
     pub summary: String,
     pub usage: TaskUsage,
+    pub memory_update: MemoryUpdate,
 }
 
 /// Executor trait — `SubagentManager` calls this to run a task.
@@ -50,6 +59,7 @@ impl TaskExecutor for MockTaskExecutor {
                 output_tokens: Some(summary.len() as i64),
                 ..Default::default()
             },
+            memory_update: MemoryUpdate::default(),
         })
     }
 }

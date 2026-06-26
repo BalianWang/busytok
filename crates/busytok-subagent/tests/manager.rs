@@ -1,10 +1,17 @@
 #![allow(clippy::unwrap_used)]
 
+use std::sync::Mutex;
+
 use busytok_config::SubagentSettings;
 use busytok_store::{Database, SubagentHarnessBindingRow};
 use busytok_subagent::manager::SubagentManager;
-use busytok_subagent::mock_executor::MockTaskExecutor;
-use busytok_subagent::models::{DelegateRequest, ResolveParams, SubagentStatus};
+use busytok_subagent::memory::{KeyFile, MemoryUpdate, OpenQuestion};
+use busytok_subagent::mock_executor::{
+    ExecutorInput, ExecutorOutput, MockTaskExecutor, TaskExecutor,
+};
+use busytok_subagent::models::{
+    DelegateRequest, ResolveParams, SubagentStatus, TaskStatus, TaskUsage,
+};
 use busytok_subagent::SubagentError;
 
 async fn manager() -> SubagentManager {
@@ -67,12 +74,17 @@ async fn list_returns_active_subagents() {
     // no filters → all active subagents
     let list = m.list(None, None, false).await.unwrap();
     assert_eq!(list.len(), 2);
-    // status filter narrows the set
-    let warm = m
-        .list(Some(SubagentStatus::Warm), None, false)
+    // status filter narrows the set. MockTaskExecutor produces no memory_update,
+    // so hot_summary stays None and §3.3 says cold (NOT warm) on a fresh subagent.
+    let cold = m
+        .list(Some(SubagentStatus::Cold), None, false)
         .await
         .unwrap();
-    assert_eq!(warm.len(), 2, "both go warm after a mock task");
+    assert_eq!(
+        cold.len(),
+        2,
+        "both go cold after a mock task with no memory_update"
+    );
 }
 
 #[tokio::test]
@@ -594,7 +606,7 @@ async fn list_with_include_deleted_returns_soft_deleted_rows() {
 }
 
 #[tokio::test]
-async fn hibernate_then_show_status_is_warm() {
+async fn hibernate_then_show_status_is_cold_when_no_memory() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
     m.hibernate(ResolveParams {
@@ -610,8 +622,9 @@ async fn hibernate_then_show_status_is_warm() {
         })
         .await
         .unwrap();
-    // memory was written during delegate, so hibernate leaves it warm
-    assert_eq!(detail.status.as_str(), "warm");
+    // MockTaskExecutor produces no memory_update, so hot_summary is None and
+    // hibernate leaves the subagent cold (§3.3: warm iff hot_summary IS NOT NULL).
+    assert_eq!(detail.status.as_str(), "cold");
 }
 
 #[tokio::test]
@@ -660,5 +673,205 @@ async fn hibernate_closes_existing_hot_binding() {
     assert!(
         binding.is_none(),
         "hot binding should be cleared after hibernate"
+    );
+}
+
+// --- Plan 4 Task 3: ContextBuilder + MemoryUpdater wiring -------------------
+
+struct MemoryUpdateExecutor {
+    captured_input: Mutex<Option<ExecutorInput>>,
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for MemoryUpdateExecutor {
+    async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        // Capture a clone of the input's context string to verify it was built.
+        let captured = ExecutorInput {
+            subagent_id: input.subagent_id.clone(),
+            subagent_name: input.subagent_name.clone(),
+            cwd: input.cwd.clone(),
+            profile: input.profile.clone(),
+            model: input.model.clone(),
+            prompt: input.prompt.clone(),
+            timeout_seconds: input.timeout_seconds,
+            tools: input.tools.clone(),
+            memory: busytok_subagent::context::MemorySnapshot {
+                hot_summary: input.memory.hot_summary.clone(),
+                long_summary: input.memory.long_summary.clone(),
+                key_files: input.memory.key_files.clone(),
+                decisions: input.memory.decisions.clone(),
+                open_questions: input.memory.open_questions.clone(),
+            },
+            context: busytok_subagent::context::CompactContext {
+                compact_context: input.context.compact_context.clone(),
+                budget_tokens: input.context.budget_tokens,
+                source: input.context.source.clone(),
+            },
+            write_access: input.write_access,
+        };
+        *self.captured_input.lock().unwrap() = Some(captured);
+        Ok(ExecutorOutput {
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: "task done".into(),
+            usage: TaskUsage::default(),
+            memory_update: MemoryUpdate {
+                current_state_summary: Some("Investigated auth; found refresh gap.".into()),
+                key_files: vec![KeyFile {
+                    path: "src/auth/token.ts".into(),
+                    reason: "refresh logic".into(),
+                    last_seen_at_ms: 5000,
+                    score: 3,
+                }],
+                decisions: vec!["Focus on read-only analysis".into()],
+                open_questions: vec![OpenQuestion {
+                    question: "Concurrent refresh handled?".into(),
+                    status: "open".into(),
+                    created_at_ms: 5000,
+                    last_seen_at_ms: 5000,
+                }],
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn delegate_builds_context_and_merges_memory_update() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let executor = std::sync::Arc::new(MemoryUpdateExecutor {
+        captured_input: Mutex::new(None),
+    });
+    let manager = SubagentManager::new(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        executor.clone(),
+    );
+    let req = DelegateRequest {
+        subagent_name: "auth-investigator".into(),
+        subagent_id: None,
+        cwd: "/repo".into(),
+        profile: "pi/review-cheap".into(),
+        intent: Some("Study auth".into()),
+        prompt: "Check refresh logic".into(),
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: Some("cli".into()),
+        source_session_id: None,
+    };
+    let result = manager.delegate(req).await.unwrap();
+    assert_eq!(result.status, TaskStatus::Completed);
+
+    // Verify context was built and sent to the executor.
+    let captured = executor
+        .captured_input
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("input captured");
+    assert!(
+        captured
+            .context
+            .compact_context
+            .contains("Check refresh logic"),
+        "context contains the prompt"
+    );
+    assert!(
+        captured
+            .context
+            .compact_context
+            .contains("auth-investigator"),
+        "context contains the subagent name"
+    );
+    assert_eq!(captured.context.source, "busytok-context-builder/v1");
+
+    // Verify memory merged: hot_summary from current_state_summary (not task_summary).
+    // Scoped: db_guard MUST be dropped before manager.show() below, since show()
+    // re-locks the same std::sync::Mutex (non-reentrant → deadlock if held).
+    {
+        let db_guard = db.lock().unwrap();
+        let mem = db_guard
+            .subagent_get_memory(&result.subagent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mem.hot_summary.as_deref(),
+            Some("Investigated auth; found refresh gap."),
+            "hot_summary from current_state_summary, not task_summary"
+        );
+        let files: Vec<serde_json::Value> =
+            serde_json::from_str(mem.key_files_json.as_deref().unwrap()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "src/auth/token.ts");
+        let decisions: Vec<String> =
+            serde_json::from_str(mem.decisions_json.as_deref().unwrap()).unwrap();
+        assert_eq!(decisions, vec!["Focus on read-only analysis"]);
+        let qs: Vec<serde_json::Value> =
+            serde_json::from_str(mem.open_questions_json.as_deref().unwrap()).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0]["question"], "Concurrent refresh handled?");
+    }
+
+    // Memory was written → status is Warm (not Cold) per §3.3.
+    let shown = manager
+        .show(ResolveParams {
+            id: Some(result.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        shown.status.as_str(),
+        "warm",
+        "hot_summary IS NOT NULL after memory_update → status='warm' (§3.3)"
+    );
+}
+
+#[tokio::test]
+async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
+    // P1-1 regression: no adapter_session_id + no memory_update => hot_summary
+    // is None => status must be Cold (NOT Warm). The old code unconditionally
+    // set Warm, violating §3.3: "warm iff hot_summary IS NOT NULL".
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let settings = SubagentSettings::default();
+    let executor = std::sync::Arc::new(MockTaskExecutor);
+    let manager = SubagentManager::new(db.clone(), settings, "mock", executor);
+    let req = DelegateRequest {
+        subagent_name: "cold-test".to_string(),
+        subagent_id: None,
+        cwd: "/repo".to_string(),
+        profile: "pi/review-cheap".to_string(),
+        intent: None,
+        prompt: "do something".to_string(),
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+    };
+    let result = manager.delegate(req).await.unwrap();
+    // Verify status is Cold, not Warm.
+    let shown = manager
+        .show(ResolveParams {
+            name: None,
+            id: Some(result.subagent_id.clone()),
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        shown.status.as_str(),
+        "cold",
+        "fresh subagent with no memory_update must be Cold (§3.3: warm iff hot_summary IS NOT NULL)"
+    );
+    // Verify hot_summary is None.
+    let db_guard = db.lock().unwrap();
+    let mem = db_guard
+        .subagent_get_memory(&result.subagent_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        mem.hot_summary.is_none(),
+        "no memory_update => hot_summary is None"
     );
 }

@@ -423,3 +423,40 @@ fn find_hot_binding_by_session_excludes_closed_bindings() {
         .unwrap();
     assert!(result.is_none(), "closed bindings must not be returned");
 }
+
+#[test]
+fn count_tasks_since_returns_authoritative_count() {
+    let db = Database::open_in_memory().unwrap();
+    let sub_id = "sub-count-test";
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(sub_id, "count-test"))
+        .unwrap();
+    // Insert 8 tasks with varying created_at_ms.
+    for i in 0..8 {
+        let task = SubagentTaskRow {
+            id: format!("task-{i}"),
+            subagent_id: sub_id.into(),
+            source_harness: None,
+            source_session_id: None,
+            intent: None,
+            profile: "pi/review-cheap".into(),
+            prompt: Some("do".into()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: "completed".into(),
+            result_summary: Some(format!("summary-{i}")),
+            result_json: None,
+            error: None,
+            created_at_ms: 1000 * (i as i64 + 1),
+            started_at_ms: None,
+            completed_at_ms: None,
+        };
+        db.subagent_insert_task(&task).unwrap();
+    }
+    // Count since 3000 → tasks at 4000..8000 = 5 tasks.
+    let count = db.subagent_count_tasks_since(sub_id, 3000).unwrap();
+    assert_eq!(count, 5);
+    // Count since 0 → all 8 tasks.
+    let count_all = db.subagent_count_tasks_since(sub_id, 0).unwrap();
+    assert_eq!(count_all, 8);
+}

@@ -222,9 +222,10 @@ fn set_logical_status(db: &Database, subagent_id: &str, status: &str) {
 async fn crash_reconciliation_marks_tasks_failed_releases_bindings_rolls_back_status() {
     let h = make_harness().await;
     // Delegate a subagent that will be affected by the crash. delegate() runs
-    // the mock executor (which writes memory and sets status to "warm"), but
-    // does NOT create a hot binding (Plan 2 mock executor). We seed the hot
-    // binding manually below to simulate a real sidecar session.
+    // the mock executor (which produces no memory_update → status is "cold"
+    // per §3.3: warm iff hot_summary IS NOT NULL), but does NOT create a hot
+    // binding (Plan 2 mock executor). We seed the hot binding manually below
+    // to simulate a real sidecar session.
     let r = h
         .manager
         .delegate(req("crash-test", "in-flight work"))
@@ -332,12 +333,15 @@ async fn crash_reconciliation_marks_tasks_failed_releases_bindings_rolls_back_st
         assert!(!crashed.is_empty(), "crashed binding row must be retained");
         assert_eq!(crashed[0].is_hot, 0);
 
-        // (c) Logical status rolled back to 'warm' (memory was written by mock
-        //     executor during delegate, so the warm invariant holds).
+        // (c) Logical status rolled back to 'cold' (§3.3: warm iff hot_summary
+        //     IS NOT NULL). The mock sidecar produces no memory_update
+        //     (current_state_summary=None), so hot_summary stays None → cold.
+        //     P1-1 regression: the old delegate unconditionally set Warm, but
+        //     the §3.3 invariant requires warm iff hot_summary IS NOT NULL.
         let sub = db.subagent_get_logical(&r.subagent_id).unwrap().unwrap();
         assert_eq!(
-            sub.status, "warm",
-            "logical status must roll back to warm (memory exists)"
+            sub.status, "cold",
+            "logical status must roll back to cold (no hot_summary → cold per §3.3)"
         );
 
         // (d) Regression: the soft-deleted subagent's status is STILL 'deleted'.

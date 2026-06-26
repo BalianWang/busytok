@@ -431,6 +431,21 @@ pub fn set_task_status(
     .with_context(|| format!("set task {} status {}", id, status))
 }
 
+/// Count tasks for a subagent with `created_at_ms > since_ms`.
+/// Used by `MemoryUpdater` for compaction trigger (a) — the authoritative
+/// count of tasks since last compaction, NOT capped by `recent_tasks_limit`.
+pub fn count_tasks_since(conn: &Connection, subagent_id: &str, since_ms: i64) -> Result<u32> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subagent_tasks \
+             WHERE subagent_id = ?1 AND created_at_ms > ?2",
+            params![subagent_id, since_ms],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("count tasks since {} for {}", since_ms, subagent_id))?;
+    Ok(count as u32)
+}
+
 // --- harness bindings ------------------------------------------------------
 
 pub fn upsert_binding(conn: &Connection, row: &SubagentHarnessBindingRow) -> Result<()> {
