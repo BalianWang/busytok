@@ -4,7 +4,7 @@
 //! caller's transaction. `Database` thin wrappers live in `db.rs`.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::repository::{
     SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
@@ -591,14 +591,16 @@ pub fn commit_eviction(
     }
     upsert_binding(&tx, binding)?;
     // Compute final logical status from the memory row AFTER the optional
-    // write: 'warm' iff hot_summary IS NOT NULL, else 'cold'. If no memory
-    // row exists at all, query_row returns Err → treated as no memory → cold.
+    // write: 'warm' iff hot_summary IS NOT NULL, else 'cold'. `.optional()`
+    // maps "no memory row" to None → false (cold); real DB errors propagate.
     let has_memory: bool = tx
         .query_row(
             "SELECT hot_summary IS NOT NULL FROM subagent_memory WHERE subagent_id = ?1",
             params![subagent_id],
             |row| row.get(0),
         )
+        .optional()
+        .with_context(|| format!("query memory state for {subagent_id}"))?
         .unwrap_or(false);
     let new_status = if has_memory { "warm" } else { "cold" };
     let now = busytok_domain::now_ms();

@@ -133,8 +133,9 @@ fn extract_candidate_from_data(data: Option<&serde_json::Value>) -> anyhow::Resu
 impl SidecarTaskExecutor {
     /// Drive the eviction flow for a single session (spec §4.4):
     /// 1. RPC: `session.prepare_hibernate(adapter_session_id)` → `{memory_delta, stats}`
-    /// 2. Persist: write memory delta + flip binding atomically
-    ///    (`commit_hibernate_binding_and_status`) + write `session_hibernate`
+    /// 2. Persist: write memory delta (optional) + flip binding atomically
+    ///    (`commit_eviction`, which computes the logical `warm`/`cold` status
+    ///    from the final memory state per §3.3) + write `session_hibernate`
     ///    resource event. The DB lock (`std::sync::Mutex`) is acquired in a
     ///    scoped block and released before the `.await` on `session.close` —
     ///    never held across an RPC call.
