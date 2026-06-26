@@ -59,6 +59,7 @@ fn sidecar_application_error_maps_to_subagent_error() {
     assert_eq!(e.code(), "subagent.task_timeout");
 
     let e: SubagentError = SidecarError::Spawn("no node".into()).into();
+    assert!(matches!(e, SubagentError::SidecarSpawn(_)));
     assert_eq!(e.code(), "subagent.sidecar_spawn_failed");
 
     // IO errors (stdin/stdout pipe closed) must map to SidecarIo, NOT
@@ -66,6 +67,64 @@ fn sidecar_application_error_maps_to_subagent_error() {
     let e: SubagentError = SidecarError::Io("pipe closed".into()).into();
     assert!(matches!(e, SubagentError::SidecarIo(_)));
     assert_eq!(e.code(), "subagent.sidecar_io_error");
+}
+
+/// Cover the remaining `From<SidecarError>` arms: Rpc, Timeout, Crashed, and
+/// the `_ =>` catch-all for Application codes that don't have a dedicated
+/// domain variant (HOT_SESSION_LIMIT_REACHED, SIDECAR_UNHEALTHY,
+/// TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA, PROTOCOL_MISMATCH). These surface
+/// as `SidecarRpc("[code] msg")` so the control layer still reports them.
+#[test]
+fn sidecar_error_remaining_variants_map_to_subagent_error() {
+    use busytok_subagent::sidecar::{
+        SidecarError, HOT_SESSION_LIMIT_REACHED, PROTOCOL_MISMATCH, SIDECAR_UNHEALTHY,
+    };
+    use busytok_subagent::SubagentError;
+
+    // Rpc → SidecarRpc (preserves message verbatim).
+    let e: SubagentError = SidecarError::Rpc("serialize boom".into()).into();
+    match &e {
+        SubagentError::SidecarRpc(msg) => assert_eq!(msg, "serialize boom"),
+        other => panic!("expected SidecarRpc, got {other:?}"),
+    }
+    assert_eq!(e.code(), "subagent.sidecar_rpc_error");
+
+    // Timeout → SidecarTimeout.
+    let e: SubagentError = SidecarError::Timeout("adapter.health".into()).into();
+    match &e {
+        SubagentError::SidecarTimeout(msg) => assert_eq!(msg, "adapter.health"),
+        other => panic!("expected SidecarTimeout, got {other:?}"),
+    }
+    assert_eq!(e.code(), "subagent.sidecar_timeout");
+
+    // Crashed → SidecarCrashed.
+    let e: SubagentError = SidecarError::Crashed("stdout closed".into()).into();
+    match &e {
+        SubagentError::SidecarCrashed(msg) => assert_eq!(msg, "stdout closed"),
+        other => panic!("expected SidecarCrashed, got {other:?}"),
+    }
+    assert_eq!(e.code(), "subagent.sidecar_crashed");
+
+    // Unmatched Application codes → SidecarRpc with "[code] msg" formatting.
+    // Each of these exercises the `_ =>` catch-all arm.
+    for (code, label) in [
+        (HOT_SESSION_LIMIT_REACHED, "hot limit"),
+        (SIDECAR_UNHEALTHY, "unhealthy"),
+        (PROTOCOL_MISMATCH, "mismatch"),
+    ] {
+        let e: SubagentError = SidecarError::Application(code, label.into()).into();
+        match &e {
+            SubagentError::SidecarRpc(msg) => {
+                assert!(
+                    msg.contains(&format!("[{code}]")),
+                    "expected '[{code}]' prefix in '{msg}'"
+                );
+                assert!(msg.contains(label), "expected '{label}' in '{msg}'");
+            }
+            other => panic!("expected SidecarRpc for code {code}, got {other:?}"),
+        }
+        assert_eq!(e.code(), "subagent.sidecar_rpc_error");
+    }
 }
 
 // `SidecarRpcError` is part of the protocol surface; verify it round-trips

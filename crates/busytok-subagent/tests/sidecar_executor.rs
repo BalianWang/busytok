@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use busytok_config::SubagentSettings;
 use busytok_store::Database;
-use busytok_subagent::mock_executor::TaskExecutor;
+use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
 use busytok_subagent::sidecar::config::SidecarConfig;
 use busytok_subagent::sidecar::executor::SidecarTaskExecutor;
@@ -178,4 +178,105 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_warm() {
         assert_eq!(sub.unwrap().status, "warm");
     }
     h.supervisor.shutdown().await.unwrap();
+}
+
+// --- executor error-path tests ---
+//
+// `SidecarTaskExecutor::execute` has two `map_err(sidecar_to_anyhow)` sites
+// (ensure_started failure, turn_auto failure) plus the `sidecar_to_anyhow`
+// helper itself. The happy-path tests above cover neither; these tests
+// exercise both error paths so the error mapping + `SubagentError` downcast
+// contract is honored.
+
+fn executor_input() -> ExecutorInput {
+    ExecutorInput {
+        subagent_id: "sub-test".to_string(),
+        subagent_name: "reviewer".to_string(),
+        cwd: "/tmp/repo".to_string(),
+        profile: "pi/search-cheap".to_string(),
+        model: None,
+        prompt: "do something".to_string(),
+        timeout_seconds: Some(5),
+    }
+}
+
+#[tokio::test]
+async fn execute_returns_error_when_supervisor_cannot_spawn() {
+    // A non-existent node_binary forces `cmd.spawn()` to fail in
+    // `spawn_internal`, so `ensure_started` returns `SidecarError::Spawn`.
+    // `execute` must propagate that via `sidecar_to_anyhow` →
+    // `SubagentError::SidecarSpawn`.
+    let mut cfg = mock_sidecar_config_with_env(HashMap::new());
+    cfg.node_binary = PathBuf::from("/nonexistent/busytok-node-binary");
+    cfg.bundle_path = PathBuf::from("/nonexistent/bundle.js");
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    let err = match executor.execute(&executor_input()).await {
+        Ok(_) => panic!("expected error when supervisor cannot spawn"),
+        Err(e) => e,
+    };
+    // The error round-trips through SubagentError → anyhow, so downcasting
+    // back to SubagentError must yield SidecarSpawn (spec: control contract
+    // preserves the sidecar spawn failure code).
+    let subagent_err = err
+        .downcast_ref::<busytok_subagent::SubagentError>()
+        .expect("error should downcast to SubagentError");
+    assert!(
+        matches!(
+            subagent_err,
+            busytok_subagent::SubagentError::SidecarSpawn(_)
+        ),
+        "expected SidecarSpawn, got {subagent_err:?}"
+    );
+    assert_eq!(subagent_err.code(), "subagent.sidecar_spawn_failed");
+}
+
+#[tokio::test]
+async fn execute_returns_error_when_sidecar_crashes_during_turn_auto() {
+    // BUSYTOK_MOCK_CRASH_AFTER=1 → sidecar crashes after responding to
+    // adapter.initialize (message 1). `ensure_started` succeeds (it got the
+    // initialize response), but the sidecar exits before `turn_auto` can
+    // get a response. Depending on timing, `turn_auto` fails with one of:
+    //   - SidecarError::Io("Broken pipe") — write to stdin fails because the
+    //     sidecar process has exited and the pipe is closed
+    //   - SidecarError::Crashed("sidecar stdout closed") — write succeeds
+    //     (buffered) but read returns EOF
+    //   - SidecarError::Crashed("sidecar not running") — supervision loop
+    //     detected the crash and cleared the client before turn_auto ran
+    // All three are valid crash-detection outcomes; the test verifies that
+    // `execute` propagates the error via `sidecar_to_anyhow` and the
+    // downcast yields a sidecar-domain SubagentError variant.
+    let mut env = HashMap::new();
+    env.insert("BUSYTOK_MOCK_CRASH_AFTER".to_string(), "1".to_string());
+    let mut cfg = mock_sidecar_config_with_env(env);
+    // Keep the health interval long so the health pinger doesn't race the
+    // crash detection.
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None);
+    let executor = SidecarTaskExecutor::new(supervisor.clone());
+
+    let err = match executor.execute(&executor_input()).await {
+        Ok(_) => panic!("expected error when sidecar crashes during turn_auto"),
+        Err(e) => e,
+    };
+    let subagent_err = err
+        .downcast_ref::<busytok_subagent::SubagentError>()
+        .expect("error should downcast to SubagentError");
+    match subagent_err {
+        busytok_subagent::SubagentError::SidecarCrashed(_) => {
+            // Crash detected via EOF or client-None path.
+        }
+        busytok_subagent::SubagentError::SidecarIo(msg) => {
+            // Crash detected via broken-pipe on stdin write.
+            assert!(
+                msg.contains("Broken pipe") || msg.contains("pipe"),
+                "expected pipe-related IO error, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected SidecarCrashed or SidecarIo, got {other:?} (code: {})",
+            other.code()
+        ),
+    }
 }

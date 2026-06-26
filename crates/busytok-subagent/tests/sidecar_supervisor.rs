@@ -11,7 +11,7 @@ use busytok_store::Database;
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::DelegateRequest;
-use busytok_subagent::sidecar::{PiSidecarSupervisor, SidecarConfig};
+use busytok_subagent::sidecar::{PiSidecarSupervisor, SidecarConfig, SidecarError};
 
 fn mock_sidecar_script() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -363,4 +363,172 @@ async fn crash_reconciliation_marks_tasks_failed_releases_bindings_rolls_back_st
     } // db guard dropped here — before the `.await` below
 
     let _ = crashing_sup.shutdown().await;
+}
+
+// --- supervisor error-path and lifecycle tests ---
+//
+// These tests cover branches not exercised by the happy-path tests above:
+// spawn failure, health pinger, call-after-shutdown, and max-restart-attempts
+// exhaustion.
+
+#[tokio::test]
+async fn supervisor_spawn_fails_with_nonexistent_node_binary() {
+    // A non-existent node_binary forces `cmd.spawn()` to fail in
+    // `spawn_internal` → `SidecarError::Spawn`. Covers the spawn-error branch.
+    let mut cfg = mock_config();
+    cfg.node_binary = PathBuf::from("/nonexistent/busytok-node-binary");
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let err = match sup.ensure_started().await {
+        Ok(_) => panic!("expected spawn error for non-existent node binary"),
+        Err(e) => e,
+    };
+    match err {
+        busytok_subagent::sidecar::SidecarError::Spawn(msg) => {
+            assert!(
+                msg.contains("busytok-node-binary") || !msg.is_empty(),
+                "expected spawn error, got: {msg}"
+            );
+        }
+        other => panic!("expected SidecarError::Spawn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn supervisor_health_pinger_sends_periodic_health_checks() {
+    // A short `health_interval` forces the supervision loop's health pinger
+    // to fire within the test window. The mock sidecar responds to
+    // `adapter.health`, so the ping succeeds (best-effort). We just need to
+    // exercise the health-pinger branch — if the sidecar is still healthy
+    // after the ping, the test passes.
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600; // disable idle exit
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let handle = sup.ensure_started().await.unwrap();
+    // Wait long enough for at least 2 health-ping cycles (200ms each).
+    // The supervision loop polls every 100ms, so 600ms covers ~3 polls.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // If the sidecar is still responsive after health pings, the pinger
+    // didn't kill it.
+    let health = handle.health().await.unwrap();
+    assert_eq!(health["status"], "healthy");
+    sup.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_call_after_shutdown_returns_crashed() {
+    // After `shutdown()`, `state.client` is `None`. A subsequent `call_rpc`
+    // (via `SidecarHandle::health`) must return `SidecarError::Crashed` with
+    // the "sidecar not running" message — NOT a timeout or IO error.
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let handle = sup.ensure_started().await.unwrap();
+    sup.shutdown().await.unwrap();
+    let err = handle.health().await.unwrap_err();
+    match err {
+        busytok_subagent::sidecar::SidecarError::Crashed(msg) => {
+            assert!(
+                msg.contains("not running"),
+                "expected 'not running' message, got: {msg}"
+            );
+        }
+        other => panic!("expected SidecarError::Crashed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn supervisor_max_restart_attempts_exceeded_returns_error() {
+    // `max_restart_attempts = 0` means NO restarts are allowed. The mock
+    // sidecar crashes after responding to `adapter.initialize` (message 1).
+    // The supervision loop detects the crash, increments `restart_attempts`
+    // to 1. The next `ensure_started` calls `spawn_internal`, which checks
+    // `restart_attempts (1) > max (0)` → returns `SidecarError::Crashed`.
+    let mut cfg = mock_config();
+    cfg.env
+        .insert("BUSYTOK_MOCK_CRASH_AFTER".to_string(), "1".to_string());
+    cfg.max_restart_attempts = 0;
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    // First ensure_started succeeds (initialize is message 1; sidecar crashes
+    // after responding).
+    let _ = sup.ensure_started().await.unwrap();
+    // Wait for the supervision loop to detect the crash and increment
+    // restart_attempts.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Second ensure_started must fail with "max restart attempts exceeded".
+    let err = match sup.ensure_started().await {
+        Ok(_) => panic!("expected max-restart-attempts error"),
+        Err(e) => e,
+    };
+    match err {
+        busytok_subagent::sidecar::SidecarError::Crashed(msg) => {
+            assert!(
+                msg.contains("max restart attempts"),
+                "expected max-restart-attempts message, got: {msg}"
+            );
+        }
+        other => panic!("expected SidecarError::Crashed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn supervisor_concurrent_ensure_started_does_not_double_spawn() {
+    // Two concurrent `ensure_started` calls should both succeed and share
+    // the same sidecar process. The double-checked locking in
+    // `spawn_internal` ensures the second caller returns early if the first
+    // has already installed the client. This test is primarily a regression
+    // guard — if the locking is broken, both calls spawn and the second
+    // overwrites the first's client (leaking a process).
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let sup1 = Arc::clone(&sup);
+    let sup2 = Arc::clone(&sup);
+    let (r1, r2) = tokio::join!(async move { sup1.ensure_started().await }, async move {
+        sup2.ensure_started().await
+    },);
+    let h1 = r1.unwrap();
+    let h2 = r2.unwrap();
+    // Both handles should be functional.
+    let health1 = h1.health().await.unwrap();
+    let health2 = h2.health().await.unwrap();
+    assert_eq!(health1["status"], "healthy");
+    assert_eq!(health2["status"], "healthy");
+    sup.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_returns_spawn_error_on_protocol_mismatch() {
+    // A sidecar that reports a different `protocol_version` than
+    // `PROTOCOL_VERSION` (1) must cause `spawn_internal` to return
+    // `SidecarError::Spawn("protocol mismatch: ...")`. Covers the
+    // protocol-version check branch.
+    let tmp = tempfile::tempdir().unwrap();
+    let script_path = tmp.path().join("protocol-mismatch.sh");
+    std::fs::write(
+        &script_path,
+        "#!/usr/bin/env bash\n\
+         IFS= read -r LINE\n\
+         ID=$(printf '%s' \"$LINE\" | sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p')\n\
+         printf '{\"jsonrpc\":\"2.0\",\"result\":{\"protocol_version\":99},\"id\":%s}\\n' \"$ID\"\n\
+         sleep 5\n",
+    )
+    .unwrap();
+
+    let mut cfg = mock_config();
+    cfg.bundle_path = script_path;
+    cfg.health_interval = Duration::from_secs(3600);
+    let sup = PiSidecarSupervisor::new(cfg, None);
+
+    let err = match sup.ensure_started().await {
+        Ok(_) => panic!("expected protocol mismatch error"),
+        Err(e) => e,
+    };
+    match err {
+        SidecarError::Spawn(msg) => {
+            assert!(
+                msg.contains("protocol mismatch"),
+                "expected protocol mismatch message, got: {msg}"
+            );
+        }
+        other => panic!("expected SidecarError::Spawn, got {other:?}"),
+    }
 }

@@ -19,6 +19,10 @@ fn error_code_covers_all_variants() {
         "subagent.invalid_name"
     );
     assert_eq!(
+        SubagentError::InvalidArgument("x".into()).code(),
+        "subagent.invalid_argument"
+    );
+    assert_eq!(
         SubagentError::ProfileNotFound("x".into()).code(),
         "subagent.profile_not_found"
     );
@@ -26,6 +30,28 @@ fn error_code_covers_all_variants() {
     assert_eq!(
         SubagentError::Store(anyhow::anyhow!("boom")).code(),
         "subagent.store_error"
+    );
+    // Sidecar (Plan 2) variants — these were previously uncovered.
+    assert_eq!(SubagentError::TaskTimeout.code(), "subagent.task_timeout");
+    assert_eq!(
+        SubagentError::SidecarSpawn("x".into()).code(),
+        "subagent.sidecar_spawn_failed"
+    );
+    assert_eq!(
+        SubagentError::SidecarRpc("x".into()).code(),
+        "subagent.sidecar_rpc_error"
+    );
+    assert_eq!(
+        SubagentError::SidecarIo("x".into()).code(),
+        "subagent.sidecar_io_error"
+    );
+    assert_eq!(
+        SubagentError::SidecarTimeout("x".into()).code(),
+        "subagent.sidecar_timeout"
+    );
+    assert_eq!(
+        SubagentError::SidecarCrashed("x".into()).code(),
+        "subagent.sidecar_crashed"
     );
 }
 
