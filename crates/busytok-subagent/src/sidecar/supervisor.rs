@@ -44,6 +44,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Spec §5.4: rolling 5-min window for crash restart attempts.
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
+/// Spec §5.4: max 3 crash-restarts per 5-min rolling window (fixed,
+/// independent of `max_restart_attempts` which governs backoff only).
+const MAX_CRASHES_PER_WINDOW: usize = 3;
 
 pub struct PiSidecarSupervisor {
     config: SidecarConfig,
@@ -186,14 +189,19 @@ impl PiSidecarSupervisor {
             // Spec §5.4: rolling 5-min window. Prune entries older than
             // 5 min, then check if we've exceeded the cap. This is the
             // HARD limit — `restart_attempts` (below) is only for backoff.
+            // The cap is a FIXED 3 per spec §5.4, NOT tied to
+            // `max_restart_attempts` (which governs backoff only). Tying
+            // them would let a deployment that raises `max_restart_attempts`
+            // silently allow more crashes per 5 min, violating the spec's
+            // safety invariant, and would break `max=0` (first spawn
+            // blocked because `len() >= 0` is always true).
             let now = tokio::time::Instant::now();
             state
                 .restart_history
                 .retain(|t| now.duration_since(*t) < RESTART_WINDOW);
-            if state.restart_history.len() >= self.config.max_restart_attempts as usize {
+            if state.restart_history.len() >= MAX_CRASHES_PER_WINDOW {
                 return Err(SidecarError::Crashed(format!(
-                    "max restart attempts ({}) exceeded within 5-min window ({} recent crashes)",
-                    self.config.max_restart_attempts,
+                    "max crashes per 5-min window ({MAX_CRASHES_PER_WINDOW}) exceeded ({} recent crashes)",
                     state.restart_history.len()
                 )));
             }

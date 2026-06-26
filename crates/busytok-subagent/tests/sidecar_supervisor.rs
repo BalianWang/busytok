@@ -444,22 +444,25 @@ async fn supervisor_call_after_shutdown_returns_crashed() {
 
 #[tokio::test]
 async fn supervisor_max_restart_attempts_exceeded_returns_error() {
-    // `max_restart_attempts = 1` means at most 1 crash-attempt is allowed per
-    // 5-min window (Plan 5 Task 4, spec §5.4). The mock sidecar crashes after
-    // responding to `adapter.initialize` (message 1). The supervision loop
-    // detects the crash, increments `restart_attempts` to 1 AND pushes the
-    // crash timestamp to `restart_history` (len=1). The next `ensure_started`
-    // calls `spawn_internal`, which checks `restart_history.len() (1) >= max
-    // (1)` → returns `SidecarError::Crashed`.
+    // `max_restart_attempts = 0` means NO restarts are allowed. The mock
+    // sidecar crashes after responding to `adapter.initialize` (message 1).
+    // The supervision loop detects the crash, increments `restart_attempts`
+    // to 1 (and pushes to `restart_history`). The next `ensure_started`
+    // calls `spawn_internal`, which checks the FIXED rolling-window cap
+    // (`restart_history.len() (1) >= MAX_CRASHES_PER_WINDOW (3)` → false,
+    // so the window limiter does NOT fire), then falls through to the
+    // consecutive-attempt check `restart_attempts (1) > max (0)` → true →
+    // returns `SidecarError::Crashed`.
     //
-    // (Pre-Task-4 this test used max=0 to exercise the consecutive-attempt
-    // cap; the new rolling-window limiter treats max=0 as "no spawns at all",
-    // so the test was migrated to max=1 — the smallest value that still
-    // observes the cap-after-one-crash behavior.)
+    // This verifies the `max_restart_attempts = 0` semantic is preserved:
+    // the first spawn succeeds (the rolling window is empty), and the
+    // restart after a crash is blocked by the consecutive-attempt check —
+    // NOT by the rolling window. The rolling window cap is FIXED at 3 per
+    // spec §5.4 and is decoupled from `max_restart_attempts`.
     let mut cfg = mock_config();
     cfg.env
         .insert("BUSYTOK_MOCK_CRASH_AFTER".to_string(), "1".to_string());
-    cfg.max_restart_attempts = 1;
+    cfg.max_restart_attempts = 0;
     cfg.health_interval = Duration::from_secs(3600);
     cfg.idle_exit_seconds = 3600;
     let sup = PiSidecarSupervisor::new(cfg, None);
@@ -668,6 +671,12 @@ fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
 /// rejected with `SidecarError::Crashed`. The existing code only counts
 /// consecutive `restart_attempts` (reset on successful spawn); this test
 /// verifies the NEW rolling window limiter.
+///
+/// The config uses `max_restart_attempts = 5` (NOT 3) to PROVE the cap is
+/// FIXED at 3 independent of the config — spec §5.4 mandates "max 3 attempts
+/// per 5 min" as a hard safety bound, NOT tied to `max_restart_attempts`
+/// (which governs backoff only). If the limiter were tied to the config,
+/// this test would NOT fire on 3 entries and would wrongly proceed to spawn.
 #[tokio::test]
 async fn spawn_rejects_after_3_crashes_within_5_min_window() {
     use busytok_subagent::sidecar::SidecarError;
@@ -684,7 +693,9 @@ async fn spawn_rejects_after_3_crashes_within_5_min_window() {
         idle_exit_seconds: 300,
         health_interval: std::time::Duration::from_secs(30),
         task_timeout: std::time::Duration::from_secs(30),
-        max_restart_attempts: 3,
+        // Deliberately non-3 (5) to prove the rolling-window cap is a FIXED
+        // const (MAX_CRASHES_PER_WINDOW=3), NOT derived from this config.
+        max_restart_attempts: 5,
         restart_backoff_base: std::time::Duration::from_secs(1),
         harness_name: "pi".to_string(),
         max_hot_sessions: 3,
@@ -705,7 +716,8 @@ async fn spawn_rejects_after_3_crashes_within_5_min_window() {
         state.restart_history = VecDeque::from([now, now, now]);
     }
 
-    // The 4th spawn attempt should be rejected.
+    // The 4th spawn attempt should be rejected — even though
+    // `max_restart_attempts = 5`, the FIXED cap of 3 fires first.
     let result = sup.ensure_started().await;
     assert!(
         matches!(result, Err(SidecarError::Crashed(_))),
