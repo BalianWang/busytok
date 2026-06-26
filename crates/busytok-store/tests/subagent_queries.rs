@@ -314,3 +314,63 @@ fn commit_hibernate_binding_and_status_is_atomic_and_excludes_tombstones() {
     //    intermediate point, which SQLite's tx isolation prevents — so this
     //    test asserts the post-commit invariant instead.)
 }
+
+// --- find_hot_binding_by_session (Plan 3 / Task 1) -------------------------
+//
+// These tests verify the store-layer query used by the eviction flow (Task 5)
+// to locate a hot binding row by adapter_session_id + harness. The candidate
+// itself comes from the RPC error's `data.candidate`, not a DB query — this
+// query is what the executor uses to find the binding to persist.
+
+#[test]
+fn find_hot_binding_by_session_returns_binding_for_known_session() {
+    let db = Database::open_in_memory().unwrap();
+    let now = busytok_domain::now_ms();
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+        id: "sub_a".into(), name: "a".into(), project_id: "p".into(),
+        repo_path: "/r".into(), repo_hash: "h".into(), branch: None, intent: None,
+        default_profile: "pi/search-cheap".into(), default_model: None,
+        status: "hot".into(), created_at_ms: now, updated_at_ms: now, last_active_at_ms: Some(now),
+    }).unwrap();
+    db.subagent_commit_hot_binding_and_status(&SubagentHarnessBindingRow {
+        id: "bind_a".into(), subagent_id: "sub_a".into(), harness: "pi".into(),
+        adapter_session_id: Some("sess_a".into()), adapter_process_id: None,
+        is_hot: 1, status: "hot".into(), created_at_ms: now,
+        last_used_at_ms: Some(now), closed_at_ms: None, detail_json: None,
+    }, "sub_a").unwrap();
+
+    let binding = db.subagent_find_hot_binding_by_session("sess_a", "pi").unwrap();
+    assert!(binding.is_some());
+    let binding = binding.unwrap();
+    assert_eq!(binding.subagent_id, "sub_a");
+    assert_eq!(binding.adapter_session_id.as_deref(), Some("sess_a"));
+}
+
+#[test]
+fn find_hot_binding_by_session_returns_none_for_unknown_session() {
+    let db = Database::open_in_memory().unwrap();
+    let result = db.subagent_find_hot_binding_by_session("nonexistent", "pi").unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn find_hot_binding_by_session_excludes_closed_bindings() {
+    let db = Database::open_in_memory().unwrap();
+    let now = busytok_domain::now_ms();
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+        id: "sub_b".into(), name: "b".into(), project_id: "p".into(),
+        repo_path: "/r".into(), repo_hash: "h".into(), branch: None, intent: None,
+        default_profile: "pi/search-cheap".into(), default_model: None,
+        status: "warm".into(), created_at_ms: now, updated_at_ms: now, last_active_at_ms: Some(now),
+    }).unwrap();
+    // Insert a closed (is_hot=0) binding — should NOT be found
+    db.subagent_commit_hibernate_binding_and_status(&SubagentHarnessBindingRow {
+        id: "bind_b".into(), subagent_id: "sub_b".into(), harness: "pi".into(),
+        adapter_session_id: Some("sess_b".into()), adapter_process_id: None,
+        is_hot: 0, status: "closed".into(), created_at_ms: now,
+        last_used_at_ms: Some(now), closed_at_ms: Some(now), detail_json: None,
+    }, "sub_b", "warm").unwrap();
+
+    let result = db.subagent_find_hot_binding_by_session("sess_b", "pi").unwrap();
+    assert!(result.is_none(), "closed bindings must not be returned");
+}

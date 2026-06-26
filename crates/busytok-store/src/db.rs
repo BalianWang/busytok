@@ -1990,6 +1990,22 @@ impl Database {
     ) -> Result<Option<SubagentHarnessBindingRow>> {
         subagent_queries::hot_binding(self.conn(), subagent_id, harness)
     }
+    pub fn subagent_find_hot_binding_by_session(
+        &self,
+        adapter_session_id: &str,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        let conn = self.conn();
+        subagent_queries::find_hot_binding_by_session(conn, adapter_session_id, harness)
+    }
+    pub fn subagent_write_hot_summary(
+        &self,
+        subagent_id: &str,
+        hot_summary: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::write_hot_summary(conn, subagent_id, hot_summary)
+    }
     pub fn subagent_insert_usage_record(&self, row: &SubagentUsageRecordRow) -> Result<()> {
         subagent_queries::insert_usage_record(self.conn(), row)
     }

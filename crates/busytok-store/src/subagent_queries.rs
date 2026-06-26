@@ -587,6 +587,104 @@ pub fn hot_binding(
     Ok(row_opt)
 }
 
+/// Find a hot binding by adapter_session_id and harness.
+/// Used by the eviction flow to locate the binding for a specific session.
+pub fn find_hot_binding_by_session(
+    conn: &Connection,
+    adapter_session_id: &str,
+    harness: &str,
+) -> Result<Option<SubagentHarnessBindingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, subagent_id, harness, adapter_session_id, adapter_process_id, \
+                is_hot, status, created_at_ms, last_used_at_ms, closed_at_ms, detail_json \
+         FROM subagent_harness_bindings \
+         WHERE adapter_session_id = ?1 AND harness = ?2 AND is_hot = 1",
+    )?;
+    let row_opt = stmt
+        .query_row(params![adapter_session_id, harness], |row| {
+            Ok(SubagentHarnessBindingRow {
+                id: row.get(0)?,
+                subagent_id: row.get(1)?,
+                harness: row.get(2)?,
+                adapter_session_id: row.get(3)?,
+                adapter_process_id: row.get(4)?,
+                is_hot: row.get(5)?,
+                status: row.get(6)?,
+                created_at_ms: row.get(7)?,
+                last_used_at_ms: row.get(8)?,
+                closed_at_ms: row.get(9)?,
+                detail_json: row.get(10)?,
+            })
+        })
+        .ok();
+    Ok(row_opt)
+}
+
+/// Write just the `hot_summary` field of a subagent's memory row.
+/// Used by the eviction flow to persist the memory delta returned by
+/// `session.prepare_hibernate`. Mirrors `SubagentManager::write_hot_summary`
+/// but lives in the store layer so the executor can call it directly.
+pub fn write_hot_summary(
+    conn: &Connection,
+    subagent_id: &str,
+    hot_summary: &str,
+) -> Result<()> {
+    // UPSERT memory row with just hot_summary (other fields unchanged).
+    // Mirrors the manager's write_hot_summary pattern: get-or-create, update
+    // hot_summary, upsert.
+    let existing: Option<SubagentMemoryRow> = conn
+        .query_row(
+            "SELECT id, subagent_id, hot_summary, long_summary, key_files_json, \
+                    decisions_json, attempts_json, open_questions_json, artifact_refs_json, \
+                    last_compacted_at_ms, last_compacted_task_id, updated_at_ms \
+             FROM subagent_memory WHERE subagent_id = ?1",
+            params![subagent_id],
+            |row| {
+                Ok(SubagentMemoryRow {
+                    id: row.get(0)?,
+                    subagent_id: row.get(1)?,
+                    hot_summary: row.get(2)?,
+                    long_summary: row.get(3)?,
+                    key_files_json: row.get(4)?,
+                    decisions_json: row.get(5)?,
+                    attempts_json: row.get(6)?,
+                    open_questions_json: row.get(7)?,
+                    artifact_refs_json: row.get(8)?,
+                    last_compacted_at_ms: row.get(9)?,
+                    last_compacted_task_id: row.get(10)?,
+                    updated_at_ms: row.get(11)?,
+                })
+            },
+        )
+        .ok();
+    let now = busytok_domain::now_ms();
+    match existing {
+        Some(mut mem) => {
+            mem.hot_summary = Some(hot_summary.to_string());
+            mem.updated_at_ms = now;
+            conn.execute(
+                "UPDATE subagent_memory SET hot_summary = ?1, updated_at_ms = ?2 WHERE subagent_id = ?3",
+                params![mem.hot_summary, mem.updated_at_ms, subagent_id],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO subagent_memory (id, subagent_id, hot_summary, long_summary, \
+                 key_files_json, decisions_json, attempts_json, open_questions_json, \
+                 artifact_refs_json, last_compacted_at_ms, last_compacted_task_id, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, NULL, '[]', '[]', '[]', '[]', '[]', NULL, NULL, ?4)",
+                params![
+                    format!("mem_{subagent_id}"),
+                    subagent_id,
+                    hot_summary,
+                    now,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // --- usage + resource events ----------------------------------------------
 
 pub fn insert_usage_record(conn: &Connection, row: &SubagentUsageRecordRow) -> Result<()> {
