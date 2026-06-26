@@ -4,7 +4,7 @@
 
 **Goal:** Replace the stub delegate flow with a real ContextBuilder (budget-controlled prompt assembly) and MemoryUpdater (merge + rule-based compaction), so `subagent.delegate` builds a compact context from SQLite, sends it to the sidecar, and merges the sidecar's `memory_update` response back into `subagent_memory`.
 
-**Architecture:** Two new pure-Rust modules (`context.rs`, `memory.rs`) sit between the store and the executor. `SubagentManager::delegate` calls `ContextBuilder::build` before `executor.execute` and `MemoryUpdater::update` after it. The executor grows `ExecutorInput.context` / `ExecutorInput.memory` (inbound) and `ExecutorOutput.memory_update` (outbound). The mock sidecar gains a `BUSYTOK_MOCK_MEMORY_UPDATE` env var so e2e tests exercise the full merge path, and echoes the received `compact_context` back in `task_summary` so the e2e test can prove context was built from memory. No new DB migrations — `subagent_memory` already has all required columns from Plan 1.
+**Architecture:** Two new pure-Rust modules (`context.rs`, `memory.rs`) sit between the store and the executor. `SubagentManager::delegate` calls `ContextBuilder::build` before `executor.execute` and `MemoryUpdater::update` after it. The executor grows `ExecutorInput.context` / `ExecutorInput.memory` (inbound) and `ExecutorOutput.memory_update` (outbound). The mock sidecar gains a `BUSYTOK_MOCK_MEMORY_UPDATE` env var so e2e tests exercise the full merge path, and the bash mock fixture (mock-sidecar.sh) echoes the received `compact_context` back in `task_summary` so the e2e test can prove context was built from memory — the production TS handler does NOT echo context (that would pollute `task_summary` semantics). A new `subagent_count_tasks_since` store query provides the authoritative task count for compaction trigger (a), decoupled from the capped `recent_tasks` slice. No new DB migrations — `subagent_memory` already has all required columns from Plan 1.
 
 **Tech Stack:** Rust (busytok-subagent, busytok-store, busytok-config), TypeScript (apps/pi-sidecar), vitest, cargo-llvm-cov, bash mock fixture.
 
@@ -14,10 +14,10 @@
 - **Spec §6.1 budget:** Default 4000 tokens, per-profile configurable via `SubagentProfileConfig.context_budget_tokens`. Hard max 8000 tokens (`SubagentContextConfig.max_budget_tokens`). Current task prompt is NEVER trimmed unless it exceeds the hard limit.
 - **Spec §6.1 trim priority (over budget):** 1) recent task summaries (N=5→3→1); 2) attempts (keep last 3); 3) key_files (20→10); 4) open_questions (10→5); 5) long_summary (truncate); 6) hot_summary (preserve); 7) current task prompt (never trimmed). Plan 4 implements priorities 1, 3, 4, 5, 6, 7. Priority 2 (attempts trimming in the context) is folded into the long_summary during compaction; the context builder does not emit a separate attempts section (attempts live inside `long_summary` after compaction).
 - **Spec §6.2 hot_summary source:** `hot_summary = result.memory_update.current_state_summary` — NOT `result.task_summary`. The current code (manager.rs `write_hot_summary(&db, &subagent.id, &out.summary)`) writes the wrong field and MUST be fixed. When `memory_update` is absent (mock executor or older sidecar), `hot_summary` is PRESERVED (not erased) — a missing update must not destroy existing memory or trigger a spurious warm→cold transition.
-- **Spec §6.2 compaction triggers (any):** (a) ≥ `compaction_tasks_threshold` tasks since last compaction (counted via `created_at_ms > last_compacted_at_ms`, NOT via the capped `recent_tasks.len()`), (b) `hot_summary` + `long_summary` + recent summaries > `compaction_budget_ratio` of the **profile** context budget (NOT the global default), (c) hibernate is about to happen. Plan 4 implements (a) and (b); (c) is deferred to the hibernate flow (already wired in Plan 1/3's `commit_eviction` path which calls `write_hot_summary` — that path does NOT trigger compaction and that's acceptable for MVP).
+- **Spec §6.2 compaction triggers (any):** (a) ≥ `compaction_tasks_threshold` tasks since last compaction (counted via a dedicated `subagent_count_tasks_since` store query — NOT the capped `recent_tasks.len()` which would mask the real count when `compaction_tasks_threshold > recent_tasks_limit`), (b) `hot_summary` + `long_summary` + recent task summaries > `compaction_budget_ratio` of the **profile** context budget (NOT the global default), (c) hibernate is about to happen. Plan 4 implements (a) and (b); (c) is deferred to the hibernate flow (already wired in Plan 1/3's `commit_eviction` path which calls `write_hot_summary` — that path does NOT trigger compaction and that's acceptable for MVP).
 - **Spec §6.2 compaction algorithm:** Rule-based (concatenation + truncation), NOT LLM-based. `new_long_summary = old.long_summary[:2000] + "\n\nRecent findings:\n" + last_5_task_summaries[:1000]`, capped at 3000 chars. "Last 5" means the 5 MOST RECENT (recent_tasks is DESC-ordered by the store; take the first 5, no reversal). Per-category caps applied DURING compaction: decisions ≤20, key_files ≤20, open_questions ≤10 (unresolved only), attempts last 10.
 - **Spec §6.3 normalization:** key_files: **repo-relative** (strip `repo_path`/cwd prefix), forward slashes, strip `./` prefix, macOS case-insensitive dedup. open_questions: trim whitespace, dedupe by lowercase exact match, preserve original casing for display, status `open`|`resolved`.
-- **Spec §3.3 invariant (preserved):** `status='warm'` iff `subagent_memory.hot_summary IS NOT NULL`. Plan 3's `commit_eviction` already computes this from memory state. Plan 4's `MemoryUpdater` writes `hot_summary` from `current_state_summary` when provided; when `memory_update` is absent, `hot_summary` is preserved (unchanged), so the invariant holds.
+- **Spec §3.3 invariant (preserved):** `status='warm'` iff `subagent_memory.hot_summary IS NOT NULL`. Plan 3's `commit_eviction` already computes this from memory state. Plan 4's `MemoryUpdater` writes `hot_summary` from `current_state_summary` when provided; when `memory_update` is absent, `hot_summary` is preserved (unchanged). **Task 3 MUST also fix the delegate's warm-path status transition**: the existing `else` branch in `delegate` (manager.rs:224-228) unconditionally sets `Warm` when there is no `adapter_session_id` — but on a fresh subagent with no `memory_update`, `hot_summary` is `None`, so `Warm` would violate the invariant. Task 3 derives `Warm` vs `Cold` from `updated_mem.hot_summary.is_some()` instead.
 - **No new DB migrations:** `subagent_memory` (migration `0003_subagent.sql`) already has all 12 columns. `last_compacted_at_ms` and `last_compacted_task_id` exist.
 - **Reuse existing infrastructure:** `SubagentContextConfig` (busytok-config), `SubagentProfileConfig`, `subagent_get_memory` / `subagent_upsert_memory` / `subagent_list_tasks` / `subagent_get_logical` (busytok-store), `SubagentMemoryRow::new_empty`, tracing `event_code` convention (`subagent.<area>.<event>`), mock-sidecar.sh env-var pattern, vitest for TS tests, cargo-llvm-cov for coverage.
 - **Coverage gates:** workspace ≥ 82% (hard), per-crate `busytok-subagent` ≥ 90% (hard). New modules (`context.rs`, `memory.rs`) must be comprehensively unit-tested to maintain the per-crate gate.
@@ -36,15 +36,18 @@
 
 **Modified files:**
 - `crates/busytok-subagent/src/mock_executor.rs` — grow `ExecutorInput` (`memory`, `context`, `tools`), grow `ExecutorOutput` (`memory_update`), update `MockTaskExecutor`/`FailingTaskExecutor`.
-- `crates/busytok-subagent/src/manager.rs` — insert `ContextBuilder::build` before execute, replace `write_hot_summary` with `MemoryUpdater::update`, pass enriched `ExecutorInput`.
+- `crates/busytok-subagent/src/manager.rs` — insert `ContextBuilder::build` before execute, replace `write_hot_summary` with `MemoryUpdater::update`, pass enriched `ExecutorInput`, derive warm/cold status from `updated_mem.hot_summary.is_some()` (P1-1 fix).
 - `crates/busytok-subagent/src/sidecar/executor.rs` — send `memory`/`context`/`tools`/`constraints` in turn_auto params, parse `result.memory_update` into `ExecutorOutput.memory_update`.
 - `crates/busytok-subagent/src/lib.rs` — declare `pub mod context; pub mod memory;`.
-- `crates/busytok-subagent/tests/manager.rs` — update tests for new `ExecutorInput` fields, assert memory merge in delegate, assert context built.
+- `crates/busytok-subagent/tests/manager.rs` — update tests for new `ExecutorInput` fields, assert memory merge in delegate, assert context built, P1-1 regression test (cold status on fresh subagent).
 - `crates/busytok-subagent/tests/sidecar_executor.rs` — update tests for new `ExecutorOutput.memory_update` field.
-- `crates/busytok-subagent/tests/fixtures/mock-sidecar.sh` — add `BUSYTOK_MOCK_MEMORY_UPDATE=1` env var emitting `result.memory_update`, and echo `context.compact_context` back in `task_summary` so e2e can verify context building.
+- `crates/busytok-subagent/tests/fixtures/mock-sidecar.sh` — add `BUSYTOK_MOCK_MEMORY_UPDATE=1` env var emitting `result.memory_update`, and echo `context.compact_context` back in `task_summary` so e2e can verify context building (echo lives ONLY in this bash mock, NOT in the production TS handler — P2-4 fix).
+- `crates/busytok-store/src/subagent_queries.rs` — add `count_tasks_since` query (P1-2 fix: authoritative task count for compaction trigger (a)).
+- `crates/busytok-store/src/db.rs` — add `subagent_count_tasks_since` wrapper.
+- `crates/busytok-store/tests/subagent_queries.rs` — test for `count_tasks_since`.
 - `apps/pi-sidecar/src/types.ts` — add structured `Memory`, `CompactContext` to `TurnAutoParams`; add typed `memory_update` to `TurnAutoResult.result`.
-- `apps/pi-sidecar/src/handlers/turn_auto.ts` — accept (and echo) `memory`/`context`; emit `memory_update` when `BUSYTOK_MOCK_MEMORY_UPDATE=1`; echo `compact_context` into `task_summary`.
-- `apps/pi-sidecar/tests/turn_auto.test.ts` — test that `memory`/`context` are accepted and `memory_update` is emitted.
+- `apps/pi-sidecar/src/handlers/turn_auto.ts` — accept `memory`/`context`; emit `memory_update` when `BUSYTOK_MOCK_MEMORY_UPDATE=1`; does NOT echo `compact_context` into `task_summary` (P2-4 fix — echo is mock-only).
+- `apps/pi-sidecar/tests/turn_auto_memory.test.ts` — test that `memory`/`context` are accepted, `memory_update` is emitted, and `task_summary` does NOT echo `compact_context`.
 - `crates/busytok-runtime/tests/subagent_e2e_sidecar.rs` — add e2e test: delegate twice, assert second delegate's `task_summary` contains the first delegate's `hot_summary` (proving context was built from merged memory).
 
 **Deleted code:**
@@ -66,7 +69,8 @@
   - `pub struct OpenQuestion { question, status, created_at_ms, last_seen_at_ms }`
   - `pub struct MemoryUpdate { current_state_summary, key_files, decisions, open_questions }`
   - `pub struct MemoryUpdater { config: SubagentContextConfig }`
-  - `impl MemoryUpdater { pub fn new(config) -> Self; pub fn update(&self, current: SubagentMemoryRow, update: MemoryUpdate, recent_tasks: &[SubagentTaskRow], task_id: &str, profile_budget_tokens: u32, repo_path: &str) -> SubagentMemoryRow }`
+  - `impl MemoryUpdater { pub fn new(config) -> Self; pub fn update(&self, current: SubagentMemoryRow, update: MemoryUpdate, recent_tasks: &[SubagentTaskRow], tasks_since_last_compaction: u32, task_id: &str, profile_budget_tokens: u32, repo_path: &str) -> SubagentMemoryRow }`
+  - `tasks_since_last_compaction`: authoritative count from `subagent_count_tasks_since` store query (NOT derived from the capped `recent_tasks` slice, which would undercount when `compaction_tasks_threshold > recent_tasks_limit`).
 
 - [ ] **Step 1: Write failing tests for merge, normalize, and compaction**
 
@@ -145,7 +149,7 @@ fn merges_key_files_dedupes_and_updates_score() {
         decisions: vec![],
         open_questions: vec![],
     };
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     let files: Vec<KeyFile> = serde_json::from_str(result.key_files_json.as_deref().unwrap()).unwrap();
     assert_eq!(files.len(), 2, "dedupe by normalized path");
     let token = files.iter().find(|f| f.path == "src/auth/token.ts").unwrap();
@@ -169,7 +173,7 @@ fn normalizes_absolute_path_to_repo_relative() {
         decisions: vec![],
         open_questions: vec![],
     };
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     let files: Vec<KeyFile> = serde_json::from_str(result.key_files_json.as_deref().unwrap()).unwrap();
     assert_eq!(files[0].path, "src/auth/token.ts", "absolute path stripped to repo-relative");
 }
@@ -206,7 +210,7 @@ fn merges_open_questions_dedupes_by_lowercase() {
             },
         ],
     };
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     let qs: Vec<OpenQuestion> =
         serde_json::from_str(result.open_questions_json.as_deref().unwrap()).unwrap();
     assert_eq!(qs.len(), 2, "dedupe by lowercase exact match after trim");
@@ -223,7 +227,7 @@ fn hot_summary_set_from_current_state_summary() {
         decisions: vec![],
         open_questions: vec![],
     };
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     assert_eq!(
         result.hot_summary.as_deref(),
         Some("Review completed: gaps found."),
@@ -237,7 +241,7 @@ fn hot_summary_preserved_when_memory_update_absent() {
     let mut current = mem_row("sub-a");
     current.hot_summary = Some("Previous state.".into());
     let update = MemoryUpdate::default(); // no current_state_summary
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     assert_eq!(
         result.hot_summary.as_deref(),
         Some("Previous state."),
@@ -326,13 +330,78 @@ fn compaction_trigger_b_fires_on_oversized_memory_using_profile_budget() {
     };
     // profile_budget_tokens=4000 → budget_chars=16000, threshold=1600.
     // hot+long = 1000 chars < 1600 → no trigger.
-    let result_no_trigger = updater.update(current.clone(), update.clone(), &[], "t1", 4000, REPO);
+    let result_no_trigger = updater.update(current.clone(), update.clone(), &[], 0, "t1", 4000, REPO);
     assert!(result_no_trigger.last_compacted_at_ms.is_none(), "should not compact under threshold");
 
     // profile_budget_tokens=1000 → budget_chars=4000, threshold=400.
     // hot+long = 1000 chars > 400 → trigger (b).
-    let result_trigger = updater.update(current, update, &[], "t1", 1000, REPO);
+    let result_trigger = updater.update(current, update, &[], 0, "t1", 1000, REPO);
     assert!(result_trigger.last_compacted_at_ms.is_some(), "trigger (b) fires using profile budget");
+}
+
+#[test]
+fn compaction_trigger_a_fires_when_tasks_since_exceeds_recent_tasks_len() {
+    // P1-2 regression: the authoritative `tasks_since_last_compaction` count
+    // comes from a dedicated store query, NOT from `recent_tasks.len()`.
+    // When `compaction_tasks_threshold > recent_tasks_limit`, the capped
+    // recent_tasks slice would undercount and trigger (a) would never fire.
+    // This test proves the authoritative count drives the trigger even when
+    // recent_tasks is shorter than the threshold.
+    let mut cfg = cfg();
+    cfg.compaction_tasks_threshold = 10;
+    cfg.compaction_budget_ratio = 0.99; // disable trigger (b)
+    let updater = MemoryUpdater::new(cfg);
+    let current = mem_row("sub-a");
+    let update = MemoryUpdate {
+        current_state_summary: Some("state".into()),
+        key_files: vec![],
+        decisions: vec![],
+        open_questions: vec![],
+    };
+    // recent_tasks has only 3 entries (capped by recent_tasks_limit in real
+    // usage), but the store reports 10 tasks since last compaction.
+    let tasks = vec![
+        task_row("t1", "old", 1000),
+        task_row("t2", "mid", 2000),
+        task_row("t3", "new", 3000),
+    ];
+    let result = updater.update(current, update, &tasks, 10, "t3", 4000, REPO);
+    assert!(
+        result.last_compacted_at_ms.is_some(),
+        "trigger (a) must fire using authoritative count (10 >= threshold 10), \
+         even though recent_tasks.len() == 3 < threshold"
+    );
+}
+
+#[test]
+fn compaction_trigger_b_fires_when_recent_summaries_large_but_memory_small() {
+    // P2-3 regression: trigger (b) must include recent task summaries in the
+    // size estimate (§6.2: "hot_summary + long_summary + recent summaries").
+    // When memory itself is small but recent summaries are large, compaction
+    // must still fire.
+    let mut cfg = cfg();
+    cfg.compaction_tasks_threshold = 100; // disable trigger (a)
+    cfg.compaction_budget_ratio = 0.1; // trigger (b) fires easily
+    let updater = MemoryUpdater::new(cfg);
+    let mut current = mem_row("sub-a");
+    current.hot_summary = Some("tiny".into()); // 4 chars
+    current.long_summary = Some("tiny".into()); // 4 chars
+    let update = MemoryUpdate {
+        current_state_summary: Some("state".into()),
+        key_files: vec![],
+        decisions: vec![],
+        open_questions: vec![],
+    };
+    // profile_budget_tokens=1000 → budget_chars=4000, threshold=400.
+    // hot+long = 8 chars < 400 → no trigger WITHOUT recent summaries.
+    // But recent summaries add 500 chars → total = 508 > 400 → trigger (b).
+    let tasks = vec![task_row("t1", &"x".repeat(500), 1000)];
+    let result = updater.update(current, update, &tasks, 0, "t1", 1000, REPO);
+    assert!(
+        result.last_compacted_at_ms.is_some(),
+        "trigger (b) must fire when recent summaries push total over threshold, \
+         even if hot_summary + long_summary alone are small"
+    );
 }
 
 #[test]
@@ -348,7 +417,7 @@ fn no_compaction_when_below_threshold() {
         decisions: vec![],
         open_questions: vec![],
     };
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     assert_eq!(
         result.long_summary.as_deref(),
         Some("existing summary"),
@@ -386,7 +455,7 @@ fn caps_key_files_at_20_only_during_compaction() {
         open_questions: vec![],
     };
     let tasks = vec![task_row("task_1", "did thing", 1000)];
-    let result = updater.update(current, update, &tasks, "task_1", 4000, REPO);
+    let result = updater.update(current, update, &tasks, 1, "task_1", 4000, REPO);
     let files: Vec<KeyFile> = serde_json::from_str(result.key_files_json.as_deref().unwrap()).unwrap();
     assert!(files.len() <= 20, "key_files capped at 20 during compaction, got {}", files.len());
 }
@@ -405,7 +474,7 @@ fn caps_not_applied_outside_compaction() {
         decisions: vec![],
         open_questions: vec![],
     };
-    let result = updater.update(current, update, &[], "task_1", 4000, REPO);
+    let result = updater.update(current, update, &[], 0, "task_1", 4000, REPO);
     let decisions: Vec<String> =
         serde_json::from_str(result.decisions_json.as_deref().unwrap()).unwrap();
     assert_eq!(decisions.len(), 25, "caps NOT applied outside compaction — preserve data");
@@ -441,7 +510,7 @@ fn drops_resolved_open_questions_during_compaction() {
         open_questions: vec![],
     };
     let tasks = vec![task_row("task_1", "did thing", 1000)];
-    let result = updater.update(current, update, &tasks, "task_1", 4000, REPO);
+    let result = updater.update(current, update, &tasks, 1, "task_1", 4000, REPO);
     let qs: Vec<OpenQuestion> =
         serde_json::from_str(result.open_questions_json.as_deref().unwrap()).unwrap();
     assert_eq!(qs.len(), 1, "resolved questions dropped during compaction");
@@ -466,7 +535,7 @@ fn attempts_records_most_recent_task_not_oldest() {
         task_row("t2", "middle summary", 2000),
         task_row("t1", "oldest summary", 1000),
     ];
-    let result = updater.update(current, update, &tasks, "t3", 4000, REPO);
+    let result = updater.update(current, update, &tasks, 3, "t3", 4000, REPO);
     let attempts: Vec<String> =
         serde_json::from_str(result.attempts_json.as_deref().unwrap()).unwrap();
     assert_eq!(attempts.len(), 1, "one attempt appended");
@@ -547,16 +616,23 @@ impl MemoryUpdater {
 
     /// Produce the next memory row. Pure — no DB I/O.
     ///
+    /// - `recent_tasks`: DESC-ordered by `created_at_ms` (as returned by
+    ///   `subagent_list_tasks`); `recent_tasks[0]` is the most recent. Used
+    ///   for compaction's "recent findings" and for trigger (b) size estimate.
+    /// - `tasks_since_last_compaction`: authoritative count of tasks with
+    ///   `created_at_ms > last_compacted_at_ms`, from a dedicated store query.
+    ///   NOT derived from `recent_tasks.len()` — that slice is capped by
+    ///   `recent_tasks_limit` and would undercount when
+    ///   `compaction_tasks_threshold > recent_tasks_limit`.
     /// - `profile_budget_tokens`: the per-profile context budget, used for
     ///   compaction trigger (b) (§6.2: "> 70% of context budget").
     /// - `repo_path`: used to normalize key_files paths to repo-relative (§6.3).
-    /// - `recent_tasks`: DESC-ordered by `created_at_ms` (as returned by
-    ///   `subagent_list_tasks`); `recent_tasks[0]` is the most recent.
     pub fn update(
         &self,
         mut current: SubagentMemoryRow,
         update: MemoryUpdate,
         recent_tasks: &[SubagentTaskRow],
+        tasks_since_last_compaction: u32,
         task_id: &str,
         profile_budget_tokens: u32,
         repo_path: &str,
@@ -642,17 +718,14 @@ impl MemoryUpdater {
         current.attempts_json = Some(serde_json::to_string(&attempts).unwrap_or_default());
 
         // Compaction triggers (§6.2.3).
-        // (a) ≥ threshold tasks since last compaction. Count via created_at_ms
-        //     > last_compacted_at_ms (NOT recent_tasks.len(), which is capped
-        //     by the SQL LIMIT and would mask the real count).
-        // (b) hot_summary + long_summary > ratio of profile budget.
-        let last_compacted = current.last_compacted_at_ms.unwrap_or(0);
-        let tasks_since = recent_tasks
-            .iter()
-            .filter(|t| t.created_at_ms > last_compacted)
-            .count() as u32;
-        let should_compact = tasks_since >= self.config.compaction_tasks_threshold
-            || self.memory_oversized(&current, profile_budget_tokens);
+        // (a) ≥ threshold tasks since last compaction. Uses the authoritative
+        //     `tasks_since_last_compaction` count from the store query — NOT
+        //     `recent_tasks.len()`, which is capped by `recent_tasks_limit`
+        //     and would undercount when threshold > limit.
+        // (b) hot_summary + long_summary + recent summaries > ratio of profile
+        //     budget (§6.2: "hot_summary + long_summary + recent summaries").
+        let should_compact = tasks_since_last_compaction >= self.config.compaction_tasks_threshold
+            || self.memory_oversized(&current, recent_tasks, profile_budget_tokens);
         if should_compact {
             self.compact(&mut current, recent_tasks);
             // Per-category caps apply DURING compaction (§6.2.4).
@@ -678,12 +751,18 @@ impl MemoryUpdater {
         current
     }
 
-    /// Compaction trigger (b): hot_summary + long_summary exceed
-    /// `compaction_budget_ratio` of the profile context budget. We approximate
-    /// tokens as chars / 4 (a standard heuristic); this is a conservative
-    /// over-count. Uses the PROFILE budget (§6.1: per-profile configurable),
-    /// NOT the global default.
-    fn memory_oversized(&self, mem: &SubagentMemoryRow, profile_budget_tokens: u32) -> bool {
+    /// Compaction trigger (b): hot_summary + long_summary + recent task
+    /// summaries exceed `compaction_budget_ratio` of the profile context
+    /// budget (§6.2: "hot_summary + long_summary + recent summaries > 70%
+    /// of context budget"). We approximate tokens as chars / 4 (a standard
+    /// heuristic); this is a conservative over-count. Uses the PROFILE budget
+    /// (§6.1: per-profile configurable), NOT the global default.
+    fn memory_oversized(
+        &self,
+        mem: &SubagentMemoryRow,
+        recent_tasks: &[SubagentTaskRow],
+        profile_budget_tokens: u32,
+    ) -> bool {
         let budget_chars = (profile_budget_tokens as usize) * 4;
         let threshold = (budget_chars as f64 * self.config.compaction_budget_ratio) as usize;
         let mut total = 0usize;
@@ -692,6 +771,14 @@ impl MemoryUpdater {
         }
         if let Some(s) = &mem.long_summary {
             total += s.len();
+        }
+        // §6.2: include recent task summaries in the size estimate so that
+        // "memory itself is small but recent summaries are large" still
+        // triggers compaction.
+        for t in recent_tasks {
+            if let Some(s) = &t.result_summary {
+                total += s.len();
+            }
         }
         total > threshold
     }
@@ -1312,12 +1399,92 @@ git commit -m "feat(subagent): add ContextBuilder with budget control and trim p
 - Modify: `crates/busytok-subagent/src/mock_executor.rs`
 - Modify: `crates/busytok-subagent/src/manager.rs`
 - Modify: `crates/busytok-subagent/tests/manager.rs`
+- Modify: `crates/busytok-store/src/subagent_queries.rs` (add `count_tasks_since`)
+- Modify: `crates/busytok-store/src/db.rs` (add `subagent_count_tasks_since` wrapper)
+- Modify: `crates/busytok-store/tests/subagent_queries.rs` (test for `count_tasks_since`)
 
 **Interfaces:**
 - Consumes: `ContextBuilder` (Task 2), `MemoryUpdater` (Task 1), `SubagentContextConfig`, `SubagentProfileConfig`
-- Produces: updated `ExecutorInput` (with `memory`, `context`, `tools`), updated `ExecutorOutput` (with `memory_update`), updated `SubagentManager::delegate` that builds context before execute and updates memory after.
+- Produces: updated `ExecutorInput` (with `memory`, `context`, `tools`), updated `ExecutorOutput` (with `memory_update`), updated `SubagentManager::delegate` that builds context before execute and updates memory after, new `subagent_count_tasks_since` store query.
 
-- [ ] **Step 1: Update `ExecutorInput` and `ExecutorOutput`**
+- [ ] **Step 1: Add `subagent_count_tasks_since` store query**
+
+In `crates/busytok-store/src/subagent_queries.rs`, add after `list_tasks`:
+
+```rust
+/// Count tasks for a subagent with `created_at_ms > since_ms`.
+/// Used by `MemoryUpdater` for compaction trigger (a) — the authoritative
+/// count of tasks since last compaction, NOT capped by `recent_tasks_limit`.
+pub fn count_tasks_since(
+    conn: &Connection,
+    subagent_id: &str,
+    since_ms: i64,
+) -> Result<u32> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM subagent_tasks \
+         WHERE subagent_id = ?1 AND created_at_ms > ?2",
+        params![subagent_id, since_ms],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("count tasks since {} for {}", since_ms, subagent_id))?;
+    Ok(count as u32)
+}
+```
+
+In `crates/busytok-store/src/db.rs`, add after `subagent_list_tasks`:
+
+```rust
+    /// Count tasks with `created_at_ms > since_ms` (compaction trigger (a)).
+    pub fn subagent_count_tasks_since(
+        &self,
+        subagent_id: &str,
+        since_ms: i64,
+    ) -> Result<u32> {
+        subagent_queries::count_tasks_since(self.conn(), subagent_id, since_ms)
+    }
+```
+
+Add a test in `crates/busytok-store/tests/subagent_queries.rs`:
+
+```rust
+#[test]
+fn count_tasks_since_returns_authoritative_count() {
+    let db = Database::open_in_memory().unwrap();
+    let sub_id = "sub-count-test";
+    db.subagent_upsert_logical(&logical_row(sub_id)).unwrap();
+    // Insert 8 tasks with varying created_at_ms.
+    for i in 0..8 {
+        let task = SubagentTaskRow {
+            id: format!("task-{i}"),
+            subagent_id: sub_id.into(),
+            source_harness: None,
+            source_session_id: None,
+            intent: None,
+            profile: "pi/review-cheap".into(),
+            prompt: Some("do".into()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: "completed".into(),
+            result_summary: Some(format!("summary-{i}")),
+            result_json: None,
+            error: None,
+            created_at_ms: 1000 * (i as i64 + 1),
+            started_at_ms: None,
+            completed_at_ms: None,
+        };
+        db.subagent_insert_task(&task).unwrap();
+    }
+    // Count since 3000 → tasks at 4000..8000 = 5 tasks.
+    let count = db.subagent_count_tasks_since(sub_id, 3000).unwrap();
+    assert_eq!(count, 5);
+    // Count since 0 → all 8 tasks.
+    let count_all = db.subagent_count_tasks_since(sub_id, 0).unwrap();
+    assert_eq!(count_all, 8);
+}
+```
+
+- [ ] **Step 2: Update `ExecutorInput` and `ExecutorOutput`**
 
 In `crates/busytok-subagent/src/mock_executor.rs`, replace the struct definitions and add imports. The full new file content:
 
@@ -1412,7 +1579,7 @@ impl TaskExecutor for FailingTaskExecutor {
 }
 ```
 
-- [ ] **Step 2: Update `SubagentManager::delegate` to build context and update memory**
+- [ ] **Step 3: Update `SubagentManager::delegate` to build context and update memory**
 
 In `crates/busytok-subagent/src/manager.rs`, add imports at the top:
 
@@ -1460,7 +1627,7 @@ In `delegate`, find the section that constructs `ExecutorInput` and calls `self.
         //    No lock held during execution.
         let model = req.model_override.clone().or(profile_model);
         let started = busytok_domain::now_ms();
-        let (input, memory_row, recent_tasks, profile_cfg) = {
+        let (input, memory_row, recent_tasks, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
             let memory_row = db
                 .subagent_get_memory(&subagent.id)
@@ -1468,6 +1635,14 @@ In `delegate`, find the section that constructs `ExecutorInput` and calls `self.
                 .unwrap_or_else(|| SubagentMemoryRow::new_empty(&subagent.id));
             let recent_tasks = db
                 .subagent_list_tasks(&subagent.id, self.settings.context.recent_tasks_limit as i64)
+                .map_err(SubagentError::Store)?;
+            // Authoritative count of tasks since last compaction — NOT derived
+            // from recent_tasks.len() (which is capped by recent_tasks_limit).
+            let tasks_since_last_compaction = db
+                .subagent_count_tasks_since(
+                    &subagent.id,
+                    memory_row.last_compacted_at_ms.unwrap_or(0),
+                )
                 .map_err(SubagentError::Store)?;
             let profile_cfg = self.settings.profiles.get(&req.profile);
             let profile_budget = profile_cfg
@@ -1492,6 +1667,7 @@ In `delegate`, find the section that constructs `ExecutorInput` and calls `self.
                 budget_tokens = compact.budget_tokens,
                 context_chars = compact.compact_context.len(),
                 recent_tasks_count = recent_tasks.len(),
+                tasks_since_last_compaction,
                 "built context for delegate"
             );
             let input = ExecutorInput {
@@ -1507,7 +1683,7 @@ In `delegate`, find the section that constructs `ExecutorInput` and calls `self.
                 context: compact,
                 write_access,
             };
-            (input, memory_row, recent_tasks, profile_cfg.cloned())
+            (input, memory_row, recent_tasks, tasks_since_last_compaction, profile_cfg.cloned())
         };
         let out = self.executor.execute(&input).await.map_err(|e| {
             match e.downcast::<SubagentError>() {
@@ -1536,6 +1712,7 @@ Then replace the `write_hot_summary` call (the line `self.write_hot_summary(&db,
                 memory_row,
                 out.memory_update.clone(),
                 &recent_tasks,
+                tasks_since_last_compaction,
                 &task_id,
                 profile_budget,
                 &subagent.repo_path,
@@ -1553,7 +1730,26 @@ Then replace the `write_hot_summary` call (the line `self.write_hot_summary(&db,
 
 Delete the `write_hot_summary` method — fully replaced by `MemoryUpdater::update`.
 
-- [ ] **Step 3: Update existing manager tests for the new `ExecutorInput` fields**
+**P1-1 fix (§3.3 invariant):** The existing `else` branch at manager.rs:224-228 unconditionally sets `Warm` when there is no `adapter_session_id`. On a fresh subagent with no `memory_update`, `hot_summary` is `None`, so `Warm` would violate the invariant (`warm` iff `hot_summary IS NOT NULL`). Replace the `else` branch to derive `Warm` vs `Cold` from `updated_mem.hot_summary.is_some()`:
+
+```rust
+            } else {
+                // Mock executor path OR empty adapter_session_id — no real
+                // session to bind. Derive warm/cold from memory state (§3.3:
+                // warm iff hot_summary IS NOT NULL). On a fresh subagent with
+                // no memory_update, hot_summary is None → Cold.
+                let status = if updated_mem.hot_summary.is_some() {
+                    SubagentStatus::Warm
+                } else {
+                    SubagentStatus::Cold
+                };
+                self.set_logical_status(&db, &subagent.id, status)?;
+            }
+```
+
+This change sits in the same scope as `updated_mem` (both are in the `delegate` method body, after the `MemoryUpdater::update` block). Verify that `SubagentStatus::Cold` exists in the codebase (it should — it's used in Plan 1/3's `commit_eviction`). If the variant is named differently, adapt to match.
+
+- [ ] **Step 4: Update existing manager tests for the new `ExecutorInput` fields**
 
 In `crates/busytok-subagent/tests/manager.rs`, existing tests use `MockTaskExecutor` which returns `MemoryUpdate::default()` → `hot_summary` is PRESERVED (not erased). Tests that previously asserted `hot_summary` is `Some("[mock] ...")` (written by the old buggy `write_hot_summary`) must be updated: with the mock executor producing no `memory_update`, `hot_summary` stays `None` on a fresh subagent (no prior memory). Update assertions to match.
 
@@ -1684,20 +1880,67 @@ async fn delegate_builds_context_and_merges_memory_update() {
 
 Note: `MemorySnapshot` and `CompactContext` need to be constructible in tests — they have public fields, so this works. If the test cannot clone `ExecutorInput` fields because `CompactContext`/`MemorySnapshot` don't derive `Clone`, add `#[derive(Clone)]` to both structs in `context.rs`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+Add a P1-1 regression test: delegate with `MockTaskExecutor` (no `adapter_session_id`, no `memory_update`) on a fresh subagent must result in `Cold` status (NOT `Warm`), because `hot_summary` is `None` and §3.3 requires `warm iff hot_summary IS NOT NULL`:
 
-Run: `cargo test -p busytok-subagent --test manager 2>&1 | tail -20`
-Expected: PASS — all tests pass (existing + new `delegate_builds_context_and_merges_memory_update`).
+```rust
+#[tokio::test]
+async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
+    // P1-1 regression: no adapter_session_id + no memory_update => hot_summary
+    // is None => status must be Cold (NOT Warm). The old code unconditionally
+    // set Warm, violating §3.3: "warm iff hot_summary IS NOT NULL".
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = SubagentSettings::default();
+    let executor = Arc::new(MockTaskExecutor::default());
+    let manager = SubagentManager::new(
+        Arc::new(Mutex::new(db)),
+        settings,
+        "mock",
+        executor,
+    );
+    let req = SubagentDelegateRequest {
+        subagent_name: "cold-test".to_string(),
+        subagent_id: None,
+        cwd: "/repo".to_string(),
+        profile: "pi/review-cheap".to_string(),
+        intent: None,
+        prompt: "do something".to_string(),
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+    };
+    let result = manager.delegate(req).await.unwrap();
+    // Verify status is Cold, not Warm.
+    let shown = manager.show(SubagentResolveRequest {
+        name: None,
+        id: Some(result.subagent_id.clone()),
+        cwd: None,
+    }).await.unwrap();
+    assert_eq!(
+        shown.status, "cold",
+        "fresh subagent with no memory_update must be Cold (§3.3: warm iff hot_summary IS NOT NULL)"
+    );
+    // Verify hot_summary is None.
+    let db = manager.db_handle().lock().unwrap();
+    let mem = db.subagent_get_memory(&result.subagent_id).unwrap().unwrap();
+    assert!(mem.hot_summary.is_none(), "no memory_update => hot_summary is None");
+}
+```
 
-- [ ] **Step 5: Run clippy + fmt**
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test -p busytok-subagent --test manager 2>&1 | tail -20 && cargo test -p busytok-store --test subagent_queries count_tasks_since 2>&1 | tail -5`
+Expected: PASS — all tests pass (existing + new `delegate_builds_context_and_merges_memory_update` + store query test).
+
+- [ ] **Step 6: Run clippy + fmt**
 
 Run: `cargo fmt --all && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5`
 Expected: clean.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/busytok-subagent/src/mock_executor.rs crates/busytok-subagent/src/manager.rs crates/busytok-subagent/tests/manager.rs
+git add crates/busytok-subagent/src/mock_executor.rs crates/busytok-subagent/src/manager.rs crates/busytok-subagent/tests/manager.rs crates/busytok-store/src/subagent_queries.rs crates/busytok-store/src/db.rs crates/busytok-store/tests/subagent_queries.rs
 git commit -m "feat(subagent): wire ContextBuilder + MemoryUpdater into delegate flow"
 ```
 
@@ -2000,7 +2243,7 @@ git commit -m "feat(subagent): send context/memory in turn_auto and parse memory
 
 **Interfaces:**
 - Consumes: existing `TurnAutoParams`, `SessionPool`
-- Produces: `BUSYTOK_MOCK_MEMORY_UPDATE=1` env var in bash mock; typed `memory_update` in TS `TurnAutoResult.result`; structured `MemoryField` + `CompactContext` types in `TurnAutoParams`. The mock sidecar echoes the received `context.compact_context` back inside `task_summary` so the e2e test can prove context was built from memory.
+- Produces: `BUSYTOK_MOCK_MEMORY_UPDATE=1` env var in bash mock; typed `memory_update` in TS `TurnAutoResult.result`; structured `MemoryField` + `CompactContext` types in `TurnAutoParams`. The bash mock fixture (mock-sidecar.sh) echoes the received `context.compact_context` back inside `task_summary` so the e2e test can prove context was built from memory — the production TS handler does NOT echo context (P2-4: no production pollution).
 
 - [ ] **Step 1: Add `BUSYTOK_MOCK_MEMORY_UPDATE` + context echo to bash mock-sidecar.sh**
 
@@ -2133,9 +2376,9 @@ export interface TurnAutoResult {
 }
 ```
 
-- [ ] **Step 3: Update TS `turn_auto` handler to emit `memory_update` and echo context**
+- [ ] **Step 3: Update TS `turn_auto` handler to emit `memory_update`**
 
-In `apps/pi-sidecar/src/handlers/turn_auto.ts`, update the handler to (a) echo `context.compact_context` into `task_summary` and (b) conditionally include `memory_update` when `BUSYTOK_MOCK_MEMORY_UPDATE=1`:
+In `apps/pi-sidecar/src/handlers/turn_auto.ts`, update the handler to accept structured `memory`/`context` params and conditionally include `memory_update` when `BUSYTOK_MOCK_MEMORY_UPDATE=1`. **Do NOT echo `compact_context` into `task_summary`** — that would pollute production semantics. The context-echo behavior lives only in the bash mock fixture (Step 1), which is the fixture the e2e test actually uses. The TS handler returns a real task summary:
 
 ```typescript
 export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
@@ -2154,17 +2397,14 @@ export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
           open_questions: [{ question: 'Concurrent refresh handled?', status: 'open' as const, created_at_ms: now, last_seen_at_ms: now }],
         }
       : undefined;
-    // Echo the received compact_context back in task_summary so the Rust
-    // e2e test can verify the context was built from memory (Task 6).
-    const echoedSummary = p.context?.compact_context
-      ? `[echo] ${p.context.compact_context}`
-      : `[mock] turn completed for: ${p.prompt.slice(0, 80)}`;
+    // task_summary is a REAL summary, NOT an echo of compact_context.
+    // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
     const result: TurnAutoResult = {
       adapter_session_id,
       session_reused: reused,
       status: 'completed',
       result: {
-        task_summary: echoedSummary,
+        task_summary: `[mock] turn completed for: ${p.prompt.slice(0, 80)}`,
         ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
       },
       usage: {
@@ -2182,7 +2422,7 @@ export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
 }
 ```
 
-- [ ] **Step 4: Write vitest test for memory_update emission + context echo**
+- [ ] **Step 4: Write vitest test for memory_update emission + structured params**
 
 Create `apps/pi-sidecar/tests/turn_auto_memory.test.ts`:
 
@@ -2191,7 +2431,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { SessionPool } from '../src/session_pool';
 import { turnAutoHandlerWithPool } from '../src/handlers/turn_auto';
 
-describe('turn_auto memory_update + context echo', () => {
+describe('turn_auto memory_update + structured params', () => {
   const origEnv = process.env.BUSYTOK_MOCK_MEMORY_UPDATE;
 
   afterEach(() => {
@@ -2229,20 +2469,7 @@ describe('turn_auto memory_update + context echo', () => {
     expect(result.result.memory_update).toBeUndefined();
   });
 
-  it('echoes context.compact_context in task_summary', async () => {
-    const pool = new SessionPool(3);
-    const handler = turnAutoHandlerWithPool(pool);
-    const result = await handler({
-      logical_subagent_id: 'sub-a',
-      prompt: 'check auth',
-      cwd: '/repo',
-      profile: 'pi/review-cheap',
-      context: { compact_context: 'BUILT CONTEXT FROM MEMORY', budget_tokens: 4000, source: 'busytok-context-builder/v1' },
-    } as any) as any;
-    expect(result.result.task_summary).toContain('BUILT CONTEXT FROM MEMORY');
-  });
-
-  it('accepts structured memory params without error', async () => {
+  it('accepts structured memory + context params without error', async () => {
     process.env.BUSYTOK_MOCK_MEMORY_UPDATE = '1';
     const pool = new SessionPool(3);
     const handler = turnAutoHandlerWithPool(pool);
@@ -2260,6 +2487,8 @@ describe('turn_auto memory_update + context echo', () => {
       context: { compact_context: 'full context', budget_tokens: 4000, source: 'busytok-context-builder/v1' },
     } as any) as any;
     expect(result.status).toBe('completed');
+    // task_summary is NOT an echo of compact_context (P2-4: no production pollution).
+    expect(result.result.task_summary).not.toContain('full context');
   });
 });
 ```
@@ -2278,7 +2507,7 @@ Expected: PASS (existing tests unaffected — `MEMORY_UPDATE` defaults to 0, `CO
 
 ```bash
 git add crates/busytok-subagent/tests/fixtures/mock-sidecar.sh apps/pi-sidecar/src/types.ts apps/pi-sidecar/src/handlers/turn_auto.ts apps/pi-sidecar/tests/turn_auto_memory.test.ts
-git commit -m "feat(sidecar): emit memory_update, echo context, and type Memory/Context in TS"
+git commit -m "feat(sidecar): emit memory_update, type Memory/Context in TS, echo context in mock only"
 ```
 
 ---
@@ -2477,11 +2706,17 @@ After writing the complete plan (and incorporating the strict subagent review), 
 - ✅ §6.3 open_questions: trim, lowercase dedup, preserve casing, status open|resolved → Task 1
 - ✅ §4.3 turn_auto params (tools, structured memory, context, constraints, output_schema) → Task 4
 - ✅ §4.3 result.memory_update parsing → Task 4 (with parse tests)
-- ✅ §3.3 invariant preserved: warm iff hot_summary IS NOT NULL → Task 1 (preserve-when-absent keeps the invariant intact)
-- ✅ End-to-end: delegate → build context → sidecar turn → update memory → Tasks 3, 4, 6 (e2e now verifies context WAS built from memory by echoing compact_context back)
+- ✅ §3.3 invariant preserved: warm iff hot_summary IS NOT NULL → Task 1 (preserve-when-absent keeps the invariant intact), Task 3 (P1-1 fix: delegate's `else` branch now derives Warm/Cold from `updated_mem.hot_summary.is_some()` instead of unconditional Warm; regression test `delegate_mock_executor_fresh_subagent_status_is_cold_not_warm`)
+- ✅ End-to-end: delegate → build context → sidecar turn → update memory → Tasks 3, 4, 6 (e2e verifies context WAS built from memory via bash mock echo — NOT via production TS handler)
 - ✅ Bug fix: manager.rs `write_hot_summary(task_summary)` → fixed in Task 3 (replaced by `MemoryUpdater::update`)
 - ⚠️ §6.2 compaction trigger (c) "hibernate is about to happen" — deferred (hibernate flow in Plan 1/3 doesn't trigger compaction; acceptable for MVP, documented in Global Constraints)
 - ⚠️ §6.1 "prompt exceeds hard limit → route to artifact store" — deferred (future enhancement, acceptable for MVP)
+
+**Round-2 review findings (P1/P2) addressed:**
+- P1-1 (warm invariant violation): Task 3 `else` branch now derives Warm/Cold from `updated_mem.hot_summary.is_some()`; added regression test `delegate_mock_executor_fresh_subagent_status_is_cold_not_warm`.
+- P1-2 (compaction trigger (a) uses capped slice): added `subagent_count_tasks_since` store query (Task 3 Step 1); `MemoryUpdater::update` now takes `tasks_since_last_compaction: u32` from the authoritative query; added test `compaction_trigger_a_fires_when_tasks_since_exceeds_recent_tasks_len`.
+- P2-3 (trigger (b) missing recent summaries): `memory_oversized()` now accepts `recent_tasks` and includes their `result_summary` lengths in the size estimate; added test `compaction_trigger_b_fires_when_recent_summaries_large_but_memory_small`.
+- P2-4 (production TS handler echoes context): removed echo from `turn_auto.ts`; echo lives only in bash mock fixture (mock-sidecar.sh); vitest test updated to assert `task_summary` does NOT contain `compact_context`.
 
 **2. Placeholder scan:** No TBD/TODO/placeholders found. All steps contain complete code. Task 6 includes a note to adapt the DB-accessor pattern to match the existing e2e file (since the exact accessor wasn't read), with concrete fallback guidance — this is a verified-unknown, not a placeholder.
 
@@ -2490,14 +2725,14 @@ After writing the complete plan (and incorporating the strict subagent review), 
 - `CompactContext` (Task 2) used in `ExecutorInput` (Task 3) and sent in `params.context` (Task 4) — consistent fields: `compact_context`, `budget_tokens`, `source`.
 - `MemorySnapshot` (Task 2) now uses structured `Vec<KeyFile>` / `Vec<OpenQuestion>` (fixed I-3) — consistent with Task 4's structured `memory` JSON and Task 5's TS `MemoryField` type.
 - `KeyFile` / `OpenQuestion` (Task 1) used in `MemoryUpdate`, `MemorySnapshot`, `parse_memory_update`, and TS types — consistent field names: `path`, `reason`, `last_seen_at_ms`, `score` / `question`, `status`, `created_at_ms`, `last_seen_at_ms`.
-- `MemoryUpdater::update` signature (Task 1) matches the call site in Task 3: `(current, update, recent_tasks, task_id, profile_budget_tokens, repo_path)`.
+- `MemoryUpdater::update` signature (Task 1) matches the call site in Task 3: `(current, update, recent_tasks, tasks_since_last_compaction, task_id, profile_budget_tokens, repo_path)`. The `tasks_since_last_compaction` parameter comes from `subagent_count_tasks_since` (Task 3 Step 1).
 - `ExecutorInput` (Task 3) now includes `write_access` (fixed M-2) — consumed by Task 4's `constraints.write_access`.
 
 **4. Deleted code:** `write_hot_summary` helper (manager.rs) fully replaced by `MemoryUpdater::update`. No dangling references. Four duplicate `parse_*` helpers collapsed into one generic `parse_json_vec` (fixed I-8). `Section` enum simplified to a struct (fixed M-1). `assemble_with_budget` rebuilt from kept sections instead of fragile `replacen` (fixed I-2).
 
 **5. Review findings addressed:**
 - C-1 (e2e non-existent helpers): Task 6 rewritten to use `make_sidecar_supervisor` + `supervisor.subagent_delegate`.
-- C-2 (tasks_since = recent_tasks.len()): now counts `created_at_ms > last_compacted_at_ms`.
+- C-2 (tasks_since = recent_tasks.len()): now uses authoritative `subagent_count_tasks_since` store query (P1-2 round-2 fix: the initial C-2 fix still used the capped `recent_tasks` slice; round-2 added a dedicated store query and `tasks_since_last_compaction` parameter).
 - C-3 (attempts .last() = oldest): now uses `.first()` (most recent in DESC order).
 - C-4 (compact .rev().take(5) = 5 oldest): now `.take(5)` (5 most recent).
 - C-5 (memory_oversized uses default budget): `update()` now takes `profile_budget_tokens`; `memory_oversized` uses it.
@@ -2510,7 +2745,7 @@ After writing the complete plan (and incorporating the strict subagent review), 
 - I-7 (caps outside compaction): moved caps inside `if should_compact`.
 - I-8 (4 parse helpers): collapsed into generic `parse_json_vec<T>`.
 - I-9 (bash printf duplicated): factored into `build_mem_fragment` + `COMPACT_CTX`.
-- I-10 (e2e doesn't verify context built): mock sidecar echoes `compact_context` in `task_summary`; e2e asserts it contains the first delegate's `hot_summary`.
+- I-10 (e2e doesn't verify context built): bash mock fixture (mock-sidecar.sh) echoes `compact_context` in `task_summary`; e2e asserts it contains the first delegate's `hot_summary`. P2-4 round-2 fix: echo removed from production TS handler (`turn_auto.ts`); lives only in the bash mock.
 - M-1 (Section enum over-engineered): simplified to struct with `(priority, text, protected)`.
 - M-2 (write_access hardcoded): now pulled from profile config via `ExecutorInput.write_access`.
 - M-3 (clamp(1, max) on 0): zero budget now falls back to default.
