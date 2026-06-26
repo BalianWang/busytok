@@ -21,6 +21,7 @@ use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
 use busytok_subagent::sidecar::SidecarConfig;
+use serial_test::serial;
 
 /// Path to the mock-sidecar.sh fixture, resolved relative to
 /// CARGO_MANIFEST_DIR (crates/busytok-runtime). The fixture lives in
@@ -81,6 +82,7 @@ fn make_sidecar_supervisor(
 }
 
 #[tokio::test]
+#[serial]
 async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
@@ -244,6 +246,7 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
 }
 
 #[tokio::test]
+#[serial]
 async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
     // Delegate creates a hot binding (is_hot=1, status='hot').
     // Graceful shutdown must release it (is_hot=0, status='closed')
@@ -373,6 +376,7 @@ fn make_sidecar_config_with_memory_update() -> SidecarConfig {
 }
 
 #[tokio::test]
+#[serial]
 async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
@@ -557,6 +561,7 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
 // (memory written) and a `session_hibernate` resource event is recorded.
 
 #[tokio::test]
+#[serial]
 async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     // max_hot_sessions=1: first delegate fills the pool. Second delegate
     // (different subagent) triggers eviction: executor catches
@@ -803,6 +808,7 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
 // turn_auto response, matching the brief's behavioral expectations.
 
 #[tokio::test]
+#[serial]
 async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
@@ -944,6 +950,7 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
 // (delegate to one subagent, count node/bash children).
 
 #[tokio::test]
+#[serial]
 async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
@@ -1056,6 +1063,13 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
     // measurement instance (refreshed with ProcessesToUpdate::Some) does not
     // reliably pick up newly-spawned processes on macOS when later switching
     // to ProcessesToUpdate::All — a fresh System::new_all() does.
+    //
+    // Spec §12.2: "exactly 1 process when active." This relies on every
+    // sidecar-spawning test in this file being marked `#[serial]` so that no
+    // sibling test's sidecar is running concurrently — the mock-sidecar.sh
+    // scan is global and all tests in the binary share one PID, so neither
+    // a parent-PID filter nor an unserialized run can isolate this test's
+    // sidecar from siblings. `#[serial]` guarantees mutual exclusion.
     let mut sys_all = sysinfo::System::new_all();
     sys_all.refresh_processes(ProcessesToUpdate::All, true);
     let sidecar_count = sys_all
@@ -1067,17 +1081,9 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
                 .any(|arg| arg.to_string_lossy().contains("mock-sidecar.sh"))
         })
         .count();
-    // Spec §12.2: "exactly 1 process when active." When run in isolation
-    // (cargo test ... sidecar_e2e_stress_100_...), this is exactly 1. When
-    // run in the full test binary, sibling tests may have their own sidecar
-    // processes running in parallel — so we assert >= 1 (proves the delegate
-    // spawned a sidecar at all). The "100 subagents → 100 sidecars"
-    // regression is caught by the RSS growth assertion above (100 bash
-    // processes would blow well past 10MB).
-    assert!(
-        sidecar_count >= 1,
-        "at least 1 sidecar process must exist when active (got {sidecar_count}); \
-         in isolation this is exactly 1"
+    assert_eq!(
+        sidecar_count, 1,
+        "exactly 1 sidecar process must exist when active (got {sidecar_count})"
     );
 
     supervisor.shutdown_sidecar().await;
