@@ -345,6 +345,127 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
+// --- context built from memory: e2e (Plan 4 Task 6) ---
+//
+// Verifies the full memory ↔ context loop end-to-end through the real
+// supervisor + mock sidecar subprocess:
+//   1. First delegate — the mock returns `result.memory_update` (because
+//      `BUSYTOK_MOCK_MEMORY_UPDATE=1` is injected into SidecarConfig.env).
+//      The manager merges it: `hot_summary` becomes the mock's
+//      `current_state_summary`; `key_files`/`decisions`/`open_questions`
+//      are merged into the memory row.
+//   2. Second delegate — the ContextBuilder reads the merged memory and
+//      assembles a `compact_context` that includes the `hot_summary` text.
+//      The mock sidecar echoes `context.compact_context` back in
+//      `task_summary`, so the response summary MUST contain the first
+//      delegate's `hot_summary` text. This proves the ContextBuilder read
+//      the merged memory and the manager sent it to the sidecar.
+
+/// Build a SidecarConfig that injects BUSYTOK_MOCK_MEMORY_UPDATE=1 so the
+/// mock sidecar emits result.memory_update and echoes compact_context.
+fn make_sidecar_config_with_memory_update() -> SidecarConfig {
+    let mut cfg = make_sidecar_config();
+    cfg.env
+        .insert("BUSYTOK_MOCK_MEMORY_UPDATE".into(), "1".into());
+    cfg
+}
+
+#[tokio::test]
+async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sidecar_cfg = make_sidecar_config_with_memory_update();
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
+
+    // First delegate — mock returns memory_update with current_state_summary.
+    let resp1 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "auth-investigator".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/review-cheap".to_string(),
+            intent: Some("Study auth".to_string()),
+            prompt: "Check refresh logic".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: Some("cli".to_string()),
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    let sub_id = resp1.subagent_id.clone();
+    assert_eq!(resp1.status, "completed");
+
+    // Assert memory merged after first delegate.
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let mem = db_guard
+            .subagent_get_memory(&sub_id)
+            .unwrap()
+            .expect("memory row must exist after first delegate");
+        assert_eq!(
+            mem.hot_summary.as_deref(),
+            Some("Investigated context; produced memory update."),
+            "hot_summary from memory_update.current_state_summary"
+        );
+        let files: Vec<serde_json::Value> =
+            serde_json::from_str(mem.key_files_json.as_deref().unwrap()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "src/auth/token.ts");
+        let decisions: Vec<String> =
+            serde_json::from_str(mem.decisions_json.as_deref().unwrap()).unwrap();
+        assert_eq!(decisions, vec!["Focus on read-only analysis".to_string()]);
+    }
+
+    // Second delegate — the mock sidecar echoes context.compact_context back
+    // in task_summary. If the ContextBuilder read the merged memory, the
+    // echoed summary MUST contain the first delegate's hot_summary text.
+    let resp2 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "auth-investigator".to_string(),
+            subagent_id: Some(sub_id.clone()),
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/review-cheap".to_string(),
+            intent: Some("Study auth".to_string()),
+            prompt: "Continue investigation".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: Some("cli".to_string()),
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp2.status, "completed");
+    assert!(
+        resp2.summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("Investigated context; produced memory update."),
+        "second delegate's summary echoes compact_context which must contain the first delegate's hot_summary; got: {:?}",
+        resp2.summary
+    );
+
+    // After the second delegate, key_files should still have 1 entry (deduped).
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let mem = db_guard
+            .subagent_get_memory(&sub_id)
+            .unwrap()
+            .expect("memory row must still exist after second delegate");
+        let files: Vec<serde_json::Value> =
+            serde_json::from_str(mem.key_files_json.as_deref().unwrap()).unwrap();
+        assert_eq!(files.len(), 1, "key_files deduped across delegates");
+    }
+
+    supervisor.shutdown_sidecar().await;
+    supervisor.shutdown_writer().await.unwrap();
+}
+
 #[tokio::test]
 async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
     // P1-2 regression: when pi_sidecar.enabled=true but the sidecar config

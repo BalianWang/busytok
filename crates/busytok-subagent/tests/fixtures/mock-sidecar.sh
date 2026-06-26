@@ -153,7 +153,10 @@ while IFS= read -r line; do
         fi
         # Extract context.compact_context from the request to echo it back in
         # task_summary — lets e2e tests verify the context was built from memory.
-        COMPACT_CTX="$(printf '%s' "$line" | sed -n 's/.*"context"[[:space:]]*:[[:space:]]*{"compact_context"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+        # Match "compact_context":"..." anywhere in the line (serde_json sorts
+        # object keys alphabetically, so compact_context is NOT necessarily the
+        # first key in the context object — budget_tokens comes first).
+        COMPACT_CTX="$(printf '%s' "$line" | sed -n 's/.*"compact_context"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
         if [[ -z "$COMPACT_CTX" ]]; then
           COMPACT_CTX="mock turn completed"
         fi
