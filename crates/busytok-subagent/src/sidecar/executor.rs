@@ -199,24 +199,35 @@ impl SidecarTaskExecutor {
                     .subagent_commit_hibernate_binding_and_status(&flipped, &subagent_id, "warm")
                     .map_err(|e| anyhow::anyhow!("commit hibernate binding failed: {e}"))?;
                 // Write `session_hibernate` resource event for observability.
-                db_guard
-                    .subagent_insert_resource_event(&SubagentResourceEventRow {
-                        id: format!("re_{}", uuid::Uuid::new_v4()),
-                        event_type: "session_hibernate".into(),
-                        target_id: Some(subagent_id.clone()),
-                        rss_mb: None,
-                        cpu_percent: None,
-                        detail_json: Some(
-                            serde_json::to_string(&serde_json::json!({
-                                "adapter_session_id": adapter_session_id,
-                                "reason": "evicted",
-                                "stats": stats,
-                            }))
-                            .unwrap_or_default(),
-                        ),
-                        created_at_ms: now,
-                    })
-                    .map_err(|e| anyhow::anyhow!("insert resource event failed: {e}"))?;
+                // Best-effort: this is pure observability. If it fails we must
+                // NOT propagate — doing so would skip `session.close`, leaving
+                // the DB flipped to closed/warm while the sidecar still holds
+                // the session hot (the exact state divergence the fatal-close
+                // rule exists to prevent). Log and continue to `close`.
+                if let Err(e) = db_guard.subagent_insert_resource_event(&SubagentResourceEventRow {
+                    id: format!("re_{}", uuid::Uuid::new_v4()),
+                    event_type: "session_hibernate".into(),
+                    target_id: Some(subagent_id.clone()),
+                    rss_mb: None,
+                    cpu_percent: None,
+                    detail_json: Some(
+                        serde_json::to_string(&serde_json::json!({
+                            "adapter_session_id": adapter_session_id,
+                            "reason": "evicted",
+                            "stats": stats,
+                        }))
+                        .unwrap_or_default(),
+                    ),
+                    created_at_ms: now,
+                }) {
+                    warn!(
+                        event_code = "subagent.session.eviction_event_failed",
+                        subagent_id = %subagent_id,
+                        adapter_session_id = %adapter_session_id,
+                        error = %e,
+                        "insert resource event failed during eviction — continuing to close"
+                    );
+                }
                 (subagent_id, wrote_summary)
             }; // db_guard dropped here — before the `.await` on close.
 
