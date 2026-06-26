@@ -85,11 +85,14 @@ export class JsonRpcServer {
       const result = await handler(req.params, ctx);
       this.writeResponse(req.id, result);
     } catch (err: unknown) {
-      // SidecarError carries a specific JSON-RPC code; anything else is
-      // surfaced as the default -32603 (internal error).
-      const code = err instanceof SidecarError ? err.code : -32603;
-      const message = err instanceof Error ? err.message : String(err);
-      this.writeError(req.id, code, message);
+      // SidecarError carries a specific JSON-RPC code (and optional data);
+      // anything else is surfaced as the default -32603 (internal error).
+      if (err instanceof SidecarError) {
+        this.writeError(req.id, err.code, err.message, err.data);
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        this.writeError(req.id, -32603, message);
+      }
     }
     // Stop AFTER the response is written — no race.
     if (shouldStop) {
@@ -102,8 +105,8 @@ export class JsonRpcServer {
     this.output.write(JSON.stringify(resp) + '\n');
   }
 
-  private writeError(id: number, code: number, message: string): void {
-    const err: JsonRpcError = { code, message };
+  private writeError(id: number, code: number, message: string, data?: unknown): void {
+    const err: JsonRpcError = { code, message, ...(data !== undefined ? { data } : {}) };
     const resp: JsonRpcResponse = { jsonrpc: '2.0', error: err, id };
     this.output.write(JSON.stringify(resp) + '\n');
   }

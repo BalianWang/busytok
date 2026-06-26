@@ -62,3 +62,41 @@ export interface TurnAutoResult {
     cost_usd: number;
   };
 }
+
+export interface PrepareHibernateParams {
+  adapter_session_id?: string;
+  all?: boolean;
+}
+
+export interface MemoryDelta {
+  hot_summary?: string;
+  key_files?: string[];
+  decisions?: string[];
+  open_questions?: string[];
+}
+
+export interface PrepareHibernateResult {
+  // Single-session path (adapter_session_id provided)
+  memory_delta?: MemoryDelta | null;
+  stats: Record<string, unknown>;
+  // All-sessions path (all:true) — per-session breakdown so the Rust
+  // shutdown/idle-exit path can persist each session's memory delta
+  // individually (spec §5.4). Plan 3 returns the shape; Plan 4 wires the
+  // real ContextBuilder memory and the Rust-side consumer.
+  sessions?: HibernateSessionEntry[];
+}
+
+export interface HibernateSessionEntry {
+  adapter_session_id: string;
+  logical_subagent_id: string;
+  memory_delta: MemoryDelta | null;
+  stats: Record<string, unknown>;
+}
+
+export interface CloseParams {
+  adapter_session_id: string;
+}
+
+export interface CloseResult {
+  ok: boolean;
+}
