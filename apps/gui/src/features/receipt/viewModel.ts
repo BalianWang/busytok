@@ -29,8 +29,6 @@ export interface ReceiptViewModel {
   };
   items: ReceiptItem[];
   total: { tokens: string; cost: string };
-  sessionCount: number;
-  eventCount: number;
   peakHour: string | null;
   serial: string; // "#0626-A3F2"
 }
@@ -108,8 +106,6 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
       tokens: formatCompactNumber(m.total_tokens),
       cost: formatReceiptCost(m.cost_usd, m.cost_status),
     },
-    sessionCount: m.session_count,
-    eventCount: m.event_count,
     peakHour: m.peak_hour?.label ?? null,
     serial: receiptSerial(dto.date),
   };
