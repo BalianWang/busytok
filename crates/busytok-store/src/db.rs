@@ -2002,6 +2002,17 @@ impl Database {
         let conn = self.conn();
         subagent_queries::write_hot_summary(conn, subagent_id, hot_summary)
     }
+    /// Atomically commit an eviction: optional hot_summary write + binding
+    /// flip + logical status computed from final memory state (§3.3).
+    pub fn subagent_commit_eviction(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+        hot_summary: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::commit_eviction(conn, binding, subagent_id, hot_summary)
+    }
     pub fn subagent_insert_usage_record(&self, row: &SubagentUsageRecordRow) -> Result<()> {
         subagent_queries::insert_usage_record(self.conn(), row)
     }

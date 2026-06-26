@@ -557,6 +557,62 @@ pub fn commit_hibernate_binding_and_status(
     Ok(())
 }
 
+/// Atomically commit an eviction: (1) optionally write the `hot_summary`
+/// returned by `session.prepare_hibernate`, (2) flip the binding to closed
+/// (`is_hot=0, status='closed'`), (3) set the logical subagent status to
+/// `warm` if `subagent_memory.hot_summary IS NOT NULL` after the write, else
+/// `cold`.
+///
+/// Spec §3.3 invariant: `status='warm'` iff recoverable memory exists
+/// (`subagent_memory.hot_summary IS NOT NULL`); `status='cold'` when no
+/// memory. This honors the invariant even when `prepare_hibernate` returned
+/// a null `memory_delta` — the subagent keeps `warm` if a prior session wrote
+/// a `hot_summary`, and falls to `cold` only when no memory exists at all.
+///
+/// `hot_summary`: `Some(s)` writes `s` to the memory row; `None` skips the
+/// write (the delta was null/absent) but the status is still computed from
+/// the final memory state.
+///
+/// The caller must pre-populate `binding` with `is_hot=0`, `status='closed'`,
+/// and `closed_at_ms=Some(now)` before calling. Unlike
+/// `commit_hibernate_binding_and_status` (which takes a hardcoded
+/// `new_status`), this computes the logical status from memory state so the
+/// §3.3 `warm`/`cold` rule cannot be violated by a caller passing the wrong
+/// string.
+pub fn commit_eviction(
+    conn: &Connection,
+    binding: &SubagentHarnessBindingRow,
+    subagent_id: &str,
+    hot_summary: Option<&str>,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if let Some(summary) = hot_summary {
+        write_hot_summary(&tx, subagent_id, summary)?;
+    }
+    upsert_binding(&tx, binding)?;
+    // Compute final logical status from the memory row AFTER the optional
+    // write: 'warm' iff hot_summary IS NOT NULL, else 'cold'. If no memory
+    // row exists at all, query_row returns Err → treated as no memory → cold.
+    let has_memory: bool = tx
+        .query_row(
+            "SELECT hot_summary IS NOT NULL FROM subagent_memory WHERE subagent_id = ?1",
+            params![subagent_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let new_status = if has_memory { "warm" } else { "cold" };
+    let now = busytok_domain::now_ms();
+    tx.execute(
+        "UPDATE subagent_logical_subagents SET status = ?1, updated_at_ms = ?2, \
+            last_active_at_ms = COALESCE(last_active_at_ms, ?2) \
+         WHERE id = ?3 AND status != 'deleted'",
+        params![new_status, now, subagent_id],
+    )
+    .with_context(|| format!("set logical status {new_status} for {subagent_id}"))?;
+    tx.commit().context("commit eviction transaction")?;
+    Ok(())
+}
+
 pub fn hot_binding(
     conn: &Connection,
     subagent_id: &str,

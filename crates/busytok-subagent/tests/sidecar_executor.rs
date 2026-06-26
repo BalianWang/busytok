@@ -898,7 +898,9 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
 async fn executor_eviction_skips_memory_write_when_memory_delta_null() {
     // prepare_hibernate returns {"memory_delta":null,...}. The executor must
     // skip write_hot_summary (wrote_summary=false) but still flip the binding
-    // to closed/warm, close the session, and retry turn_auto successfully.
+    // to closed, close the session, and retry turn_auto successfully. With no
+    // prior memory, the logical status MUST be 'cold' (spec §3.3: 'warm' iff
+    // hot_summary IS NOT NULL).
     let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let mut cfg = mock_config();
     cfg.max_hot_sessions = 1;
@@ -926,11 +928,14 @@ async fn executor_eviction_skips_memory_write_when_memory_delta_null() {
         .expect("eviction + retry must succeed");
     assert_eq!(out2.status, TaskStatus::Completed);
 
-    // sub-a is evicted (warm) and its hot_summary was NOT written (null delta).
+    // sub-a is evicted with no memory (null delta, empty seeded row) → 'cold'.
     {
         let db_guard = db.lock().unwrap();
         let sub_a = db_guard.subagent_get_logical("sub-a").unwrap().unwrap();
-        assert_eq!(sub_a.status, "warm", "evicted subagent must be warm");
+        assert_eq!(
+            sub_a.status, "cold",
+            "evicted subagent with no memory must be cold (§3.3)"
+        );
         let mem = db_guard
             .subagent_get_memory("sub-a")
             .unwrap()
@@ -939,6 +944,69 @@ async fn executor_eviction_skips_memory_write_when_memory_delta_null() {
             mem.hot_summary.is_none(),
             "hot_summary must NOT be written when memory_delta is null, got: {:?}",
             mem.hot_summary
+        );
+    }
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_keeps_warm_when_prior_memory_exists_and_delta_null() {
+    // Regression for §3.3: prepare_hibernate returns a null memory_delta, but
+    // the subagent already has a hot_summary from a prior session. The
+    // executor must skip write_hot_summary (null delta) yet keep the logical
+    // status 'warm' because recoverable memory still exists
+    // (hot_summary IS NOT NULL). Falling to 'cold' here would discard the
+    // prior memory's recoverability signal.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_NULL_MEMORY_DELTA".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Pre-seed the hot binding + a memory row that already has a hot_summary
+    // (simulates a prior session that wrote memory).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    {
+        let db_guard = db.lock().unwrap();
+        db_guard
+            .subagent_write_hot_summary("sub-a", "prior session memory")
+            .unwrap();
+    }
+
+    let out2 = executor
+        .execute(&evict_input("sub-b"))
+        .await
+        .expect("eviction + retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+
+    // sub-a keeps 'warm' because the prior hot_summary is still present.
+    {
+        let db_guard = db.lock().unwrap();
+        let sub_a = db_guard.subagent_get_logical("sub-a").unwrap().unwrap();
+        assert_eq!(
+            sub_a.status, "warm",
+            "evicted subagent with prior memory must stay warm (§3.3)"
+        );
+        let mem = db_guard
+            .subagent_get_memory("sub-a")
+            .unwrap()
+            .expect("memory row should exist");
+        assert_eq!(
+            mem.hot_summary.as_deref(),
+            Some("prior session memory"),
+            "prior hot_summary must be preserved when delta is null"
         );
     }
 

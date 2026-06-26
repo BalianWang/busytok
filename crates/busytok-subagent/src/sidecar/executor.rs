@@ -195,34 +195,34 @@ impl SidecarTaskExecutor {
                         )
                     })?;
                 let subagent_id = binding.subagent_id.clone();
-                // Write memory delta (hot_summary) if present and non-null.
-                let mut wrote_summary = false;
-                if let Some(delta) = &memory_delta {
-                    if !delta.is_null() {
-                        let hot_summary = delta
-                            .get("hot_summary")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        db_guard
-                            .subagent_write_hot_summary(&subagent_id, hot_summary)
-                            .map_err(|e| anyhow::anyhow!("write hot_summary failed: {e}"))?;
-                        wrote_summary = true;
-                    }
-                }
-                // Atomic: flip binding (is_hot=0, status='closed',
-                // closed_at_ms=Some(now)) + logical status='warm'.
+                // Compute the hot_summary to persist: only when memory_delta
+                // is present, non-null, and has a `hot_summary` field. A null
+                // or absent delta means prepare_hibernate produced no memory;
+                // the subagent's final warm/cold status is then decided by
+                // `commit_eviction` based on whether any prior hot_summary
+                // exists (spec §3.3).
+                let hot_summary: Option<&str> = memory_delta
+                    .as_ref()
+                    .filter(|d| !d.is_null())
+                    .and_then(|d| d.get("hot_summary"))
+                    .and_then(|v| v.as_str());
+                let wrote_summary = hot_summary.is_some();
+                // Atomic: optional hot_summary write + flip binding
+                // (is_hot=0, status='closed', closed_at_ms=Some(now)) +
+                // logical status computed from final memory state (§3.3:
+                // 'warm' iff hot_summary IS NOT NULL, else 'cold').
                 let now = busytok_domain::now_ms();
                 let mut flipped = binding.clone();
                 flipped.is_hot = 0;
                 flipped.status = "closed".into();
                 flipped.closed_at_ms = Some(now);
                 db_guard
-                    .subagent_commit_hibernate_binding_and_status(&flipped, &subagent_id, "warm")
-                    .map_err(|e| anyhow::anyhow!("commit hibernate binding failed: {e}"))?;
+                    .subagent_commit_eviction(&flipped, &subagent_id, hot_summary)
+                    .map_err(|e| anyhow::anyhow!("commit eviction failed: {e}"))?;
                 // Write `session_hibernate` resource event for observability.
                 // Best-effort: this is pure observability. If it fails we must
                 // NOT propagate — doing so would skip `session.close`, leaving
-                // the DB flipped to closed/warm while the sidecar still holds
+                // the DB flipped to closed while the sidecar still holds
                 // the session hot (the exact state divergence the fatal-close
                 // rule exists to prevent). Log and continue to `close`.
                 if let Err(e) = db_guard.subagent_insert_resource_event(&SubagentResourceEventRow {
