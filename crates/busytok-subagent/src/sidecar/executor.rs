@@ -152,8 +152,7 @@ impl SidecarTaskExecutor {
             error!(
                 event_code = "subagent.session.eviction_no_db",
                 adapter_session_id = %adapter_session_id,
-                "eviction requested but executor has no DB handle — \
-                 cannot persist binding flip atomically; aborting to avoid state divergence"
+                "eviction requested but executor has no DB handle — cannot persist binding flip atomically; aborting to avoid state divergence"
             );
             return Err(anyhow::anyhow!(
                 "eviction requires a DB connection for atomic persistence; \

@@ -812,6 +812,48 @@ async fn executor_eviction_fails_when_candidate_missing_from_error() {
 }
 
 #[tokio::test]
+async fn executor_eviction_fails_without_db() {
+    // The no-DB executor cannot evict safely (no atomic persistence). When
+    // HOT_SESSION_LIMIT_REACHED is hit and `self.db.is_none()`, `evict_session`
+    // must return an error rather than proceeding — calling `close` without
+    // first flipping the DB binding would leave the sidecar and DB diverged
+    // (sidecar releases its slot, DB still believes the session is hot).
+    // This covers the `db.is_none()` short-circuit at the top of `evict_session`.
+    //
+    // Unlike `executor_eviction_fails_when_candidate_missing_from_error` (which
+    // also uses a no-DB executor but errors in `extract_candidate_from_data`
+    // before reaching `evict_session`), this test lets candidate extraction
+    // succeed so `evict_session` itself is entered and the no-DB guard fires.
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let supervisor = PiSidecarSupervisor::new(cfg, None); // No DB
+    let executor = SidecarTaskExecutor::new(supervisor.clone()); // No DB
+
+    // First delegate — fills the pool (max_hot=1).
+    executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+
+    // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with a valid
+    // data.candidate (extract_candidate_from_data succeeds), then evict_session
+    // hits the no-DB guard and returns an error before any RPC.
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("eviction requires a DB"),
+        "error should explain the no-DB guard, got: {err}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn executor_eviction_fails_when_prepare_hibernate_fails() {
     // Eviction reaches prepare_hibernate, but the sidecar returns a JSON-RPC
     // error. The executor must propagate the error (the `warn!` +
