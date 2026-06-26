@@ -270,7 +270,7 @@ fn compaction_rebuilds_long_summary_when_task_threshold_reached() {
         task_row("task_2", "fixed token refresh", 3000),
         task_row("task_3", "added concurrent test", 4000),
     ];
-    let result = updater.update(current, update, &tasks, "task_3", 4000, REPO);
+    let result = updater.update(current, update, &tasks, 3, "task_3", 4000, REPO);
     let long = result.long_summary.as_deref().unwrap();
     assert!(long.contains("old long summary"), "preserves old long_summary");
     assert!(long.contains("Recent findings:"), "appends recent findings header");
@@ -306,7 +306,7 @@ fn compaction_uses_most_recent_5_summaries_not_oldest() {
         task_row("t4", "newer", 4000),
         task_row("t5", "newest", 5000),
     ];
-    let result = updater.update(current, update, &tasks, "t5", 4000, REPO);
+    let result = updater.update(current, update, &tasks, 5, "t5", 4000, REPO);
     let long = result.long_summary.as_deref().unwrap();
     let findings_start = long.find("Recent findings:\n").map(|i| i + "Recent findings:\n".len()).unwrap();
     let findings = &long[findings_start..];
@@ -2518,11 +2518,11 @@ git commit -m "feat(sidecar): emit memory_update, type Memory/Context in TS, ech
 - Modify: `crates/busytok-runtime/tests/subagent_e2e_sidecar.rs`
 
 **Interfaces:**
-- Consumes: existing `make_sidecar_supervisor`, `make_sidecar_config`, `make_sidecar_settings`, `supervisor.subagent_delegate`, `SubagentDelegateRequestDto`, mock-sidecar.sh with `BUSYTOK_MOCK_MEMORY_UPDATE=1`.
+- Consumes: existing `make_sidecar_config`, `make_sidecar_settings`, `BusytokSupervisor::new_with_sidecar_config`, `supervisor.subagent_delegate`, `SubagentDelegateRequestDto`, mock-sidecar.sh with `BUSYTOK_MOCK_MEMORY_UPDATE=1`.
 
 - [ ] **Step 1: Write the e2e test**
 
-In `crates/busytok-runtime/tests/subagent_e2e_sidecar.rs`, add a new test. The test uses the EXISTING helpers (verified to exist): `make_sidecar_settings()`, `make_sidecar_config()` (which returns a `SidecarConfig` with an `env: HashMap` field), and `make_sidecar_supervisor(db, &tmp, settings)`. To inject `BUSYTOK_MOCK_MEMORY_UPDATE=1`, extend the `env` map on the `SidecarConfig`. The test delegates twice to the same subagent, then asserts:
+In `crates/busytok-runtime/tests/subagent_e2e_sidecar.rs`, add a new test. The test reuses the EXISTING helpers (verified to exist): `make_sidecar_settings()` and `make_sidecar_config()` (which returns a `SidecarConfig` with an `env: HashMap` field). Because `make_sidecar_supervisor` internally calls `make_sidecar_config()` with no extension hook, this test builds the supervisor directly via `BusytokSupervisor::new_with_sidecar_config` so it can inject a `SidecarConfig` whose `env` carries `BUSYTOK_MOCK_MEMORY_UPDATE=1`. The test delegates twice to the same subagent, then asserts:
 1. First delegate: `hot_summary` is set to the mock's `current_state_summary`; `key_files`/`decisions`/`open_questions` are merged.
 2. Second delegate: the response `summary` (which the mock sidecar echoes from `context.compact_context`) contains the first delegate's `hot_summary` text — proving the ContextBuilder read the merged memory and assembled it into the context sent to the sidecar.
 
@@ -2731,7 +2731,7 @@ After writing the complete plan (and incorporating the strict subagent review), 
 **4. Deleted code:** `write_hot_summary` helper (manager.rs) fully replaced by `MemoryUpdater::update`. No dangling references. Four duplicate `parse_*` helpers collapsed into one generic `parse_json_vec` (fixed I-8). `Section` enum simplified to a struct (fixed M-1). `assemble_with_budget` rebuilt from kept sections instead of fragile `replacen` (fixed I-2).
 
 **5. Review findings addressed:**
-- C-1 (e2e non-existent helpers): Task 6 rewritten to use `make_sidecar_supervisor` + `supervisor.subagent_delegate`.
+- C-1 (e2e non-existent helpers): Task 6 rewritten to use `make_sidecar_config` + `make_sidecar_settings` + `BusytokSupervisor::new_with_sidecar_config` + `supervisor.subagent_delegate` (supervisor built directly because `make_sidecar_supervisor` has no env-extension hook).
 - C-2 (tasks_since = recent_tasks.len()): now uses authoritative `subagent_count_tasks_since` store query (P1-2 round-2 fix: the initial C-2 fix still used the capped `recent_tasks` slice; round-2 added a dedicated store query and `tasks_since_last_compaction` parameter).
 - C-3 (attempts .last() = oldest): now uses `.first()` (most recent in DESC order).
 - C-4 (compact .rev().take(5) = 5 oldest): now `.take(5)` (5 most recent).
