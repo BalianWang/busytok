@@ -274,6 +274,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(desktop_shortcut::ShortcutState {
             diagnostics: std::sync::Mutex::new(desktop_shortcut::ShortcutDiagnostics::default()),
         })
@@ -625,6 +626,7 @@ pub fn run() {
             commands::desktop_lifecycle_settings_update,
             commands::desktop_background_service_diagnostics,
             commands::desktop_background_service_repair,
+            commands::save_receipt_png,
             logging::log_frontend_event,
             logging::flush_frontend_logs,
             prompt_palette::prompt_palette_paste_active_app,

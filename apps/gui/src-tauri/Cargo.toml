@@ -28,6 +28,7 @@ time.workspace = true
 tauri-plugin-global-shortcut = "=2.3.1"
 tauri-plugin-clipboard-manager = "=2.3.2"
 tauri-plugin-process = "=2.3.1"
+tauri-plugin-dialog = "=2.4.0"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = { version = "=2.10.1", default-features = false, features = ["native-tls", "zip"] }
 # native-tls (NOT default-tls=rustls): matches the updater's TLS backend so the
