@@ -755,8 +755,11 @@ pub struct SettingsDiagnosticsDto {
     /// Recent runtime diagnostic events (e.g. subscription lifecycle,
     /// writer thresholds, drift events).
     pub recent_diagnostics: Vec<SettingsDiagnosticEventDto>,
-    /// Subagent doctor checks (spec §7.1). `None` when the subagent feature
-    /// is disabled or not yet checked. Reuses the existing
+    /// Subagent doctor checks (spec §7.1). Always populated when the runtime
+    /// constructs this DTO; per-check status reflects current configuration
+    /// (e.g. `sidecar_launchable` is "ok" when `pi_sidecar.enabled=false`).
+    /// The `Option` is for wire-level backwards-compatibility only — older
+    /// clients may omit the field on deserialize. Reuses the existing
     /// `settings.diagnostics` RPC path — no separate `subagent.doctor` RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentDoctorResultDto>,

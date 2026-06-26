@@ -489,11 +489,15 @@ impl BusytokSupervisor {
             });
         }
 
-        // 11. Subagents unused > 30 days (warning, not error).
+        // 11. Subagents unused > 30 days (warning, not error). SQL errors
+        //     (table missing, DB locked) must NOT be swallowed into a
+        //     false-green "ok" — surface them as "error" so overall_ok
+        //     reflects the real state, mirroring the `sqlite_readable`
+        //     check's `is_ok()` pattern above.
         {
             let db = self.db.lock().unwrap();
             let threshold_ms = now_ms() - (30 * 24 * 60 * 60 * 1000);
-            let stale: Vec<String> = db
+            let stale_result: rusqlite::Result<Vec<String>> = db
                 .conn()
                 .prepare(
                     "SELECT id FROM subagent_logical_subagents \
@@ -506,22 +510,32 @@ impl BusytokSupervisor {
                         row.get::<_, String>(0)
                     })?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap_or_default();
-            let is_warning = !stale.is_empty();
-            checks.push(DoctorCheckDto {
-                name: "subagents_unused_30d".into(),
-                status: if is_warning { "warning" } else { "ok" }.into(),
-                detail: if is_warning {
-                    Some(format!(
-                        "{} stale subagent(s): {}",
-                        stale.len(),
-                        stale.join(", ")
-                    ))
-                } else {
-                    None
-                },
-            });
+                });
+            match stale_result {
+                Ok(stale) => {
+                    let is_warning = !stale.is_empty();
+                    checks.push(DoctorCheckDto {
+                        name: "subagents_unused_30d".into(),
+                        status: if is_warning { "warning" } else { "ok" }.into(),
+                        detail: if is_warning {
+                            Some(format!(
+                                "{} stale subagent(s): {}",
+                                stale.len(),
+                                stale.join(", ")
+                            ))
+                        } else {
+                            None
+                        },
+                    });
+                }
+                Err(e) => {
+                    checks.push(DoctorCheckDto {
+                        name: "subagents_unused_30d".into(),
+                        status: "error".into(),
+                        detail: Some(format!("SQL error: {e}")),
+                    });
+                }
+            }
         }
 
         let overall_ok = checks.iter().all(|c| c.status != "error");
