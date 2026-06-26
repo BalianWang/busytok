@@ -8,6 +8,7 @@ import {
   NO_DATA,
   NORMAL_DAY,
   OTHERS_ALL_UNAVAILABLE,
+  OTHERS_MIXED_COST,
   PARTIAL_COST,
 } from "./fixtures";
 
@@ -34,6 +35,12 @@ describe("ReceiptPaper", () => {
   it("renders OTHERS as — (not ≈$0.00) when all overflow models are unavailable", () => {
     renderVm(OTHERS_ALL_UNAVAILABLE); // top 5 exact; overflow (2) all unavailable
     expect(screen.getAllByText("—").length).toBe(1); // the OTHERS row cost only
+  });
+
+  it("renders OTHERS as ≈$X.XX when overflow mixes exact + unavailable", () => {
+    renderVm(OTHERS_MIXED_COST); // overflow: 1 exact ($1.50) + 1 unavailable → partial
+    // $1.50 (the paid-overflow cost; free-overflow contributes 0)
+    expect(screen.getByText("≈$1.50")).toBeDefined(); // OTHERS row cost
   });
 
   it("marks partial aggregate cost with ≈ and keeps exact item cost plain", () => {

@@ -1,3 +1,4 @@
+import { useId } from "react";
 import type { ReceiptViewModel } from "./viewModel";
 import "./receipt.css";
 
@@ -7,6 +8,9 @@ interface ReceiptPaperProps {
 
 export function ReceiptPaper({ vm }: ReceiptPaperProps) {
   const empty = vm.hero.totalTokensRaw === 0 && vm.items.length === 0;
+  // Unique per-instance ID so preview + export root (both render <ReceiptPaper>)
+  // don't collide on the same SVG pattern id in the DOM.
+  const scallopId = `receipt-scallop-${useId()}`;
   return (
     <div className="receipt-stage">
       <div className="receipt-paper">
@@ -78,11 +82,11 @@ export function ReceiptPaper({ vm }: ReceiptPaperProps) {
             foreignObject capture). */}
         <svg className="receipt__tear" width="420" height="14" aria-hidden="true">
           <defs>
-            <pattern id="receipt-scallop" width="20" height="14" patternUnits="userSpaceOnUse">
+            <pattern id={scallopId} width="20" height="14" patternUnits="userSpaceOnUse">
               <path d="M0,4 H20 a10,10 0 0,1 -20,0 Z" fill="#f6efe2" />
             </pattern>
           </defs>
-          <rect width="420" height="14" fill="url(#receipt-scallop)" />
+          <rect width="420" height="14" fill={`url(#${scallopId})`} />
         </svg>
       </div>
     </div>

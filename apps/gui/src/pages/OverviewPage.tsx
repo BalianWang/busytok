@@ -147,7 +147,9 @@ export function OverviewPage() {
     refetch: refetchSummary,
   } = useOverviewSummary(range);
 
-  const today = new Date().toISOString().slice(0, 10);
+  // Local-TZ "YYYY-MM-DD" — toISOString() returns UTC, which would drift by a day
+  // for users in negative offsets at certain hours. en-CA yields ISO 8601 order.
+  const today = new Date().toLocaleDateString("en-CA");
   const receiptDialog = useReceiptToolbar({
     surface: "overview",
     onRefresh: refetchSummary,

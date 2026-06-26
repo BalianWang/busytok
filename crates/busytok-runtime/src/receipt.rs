@@ -252,4 +252,37 @@ mod tests {
         assert!(cache_hit_rate(0, 0).is_none());
         assert!(cache_hit_rate(10, -10).is_none()); // guarded against negative
     }
+
+    /// `peak_hour_label` formats a reporting-TZ wall-clock hour from a UTC ms
+    /// bucket. The `(bucket - local_midnight) / 3_600_000` difference is
+    /// `.rem_euclid(24)` (not `%`) precisely because a DST backward transition
+    /// can push `bucket_start_ms` *before* the just-computed local midnight,
+    /// yielding a negative dividend. This test exercises the happy path
+    /// (positive offset) and asserts the label format; the negative path is
+    /// exercised structurally by `rem_euclid` mapping into `[0, 24)`.
+    #[test]
+    fn peak_hour_label_formats_local_hour() {
+        // Asia/Shanghai (+08:00) on 2026-06-26: local 14:00 = UTC 06:00.
+        // 2026-06-26T06:00:00Z in ms since epoch:
+        let bucket_start_ms = 1_782_453_600_000; // = 2026-06-26T06:00:00Z
+        let peak = PeakHourRow {
+            bucket_start_ms,
+            tokens: 612_000,
+        };
+        let dto = assemble_receipt_daily(
+            ReceiptDailyData {
+                totals: totals(true, false),
+                models: vec![],
+                session_count: 1,
+                peak_hour: Some(peak),
+            },
+            &rtz(),
+            "2026-06-26",
+            0,
+        )
+        .unwrap();
+        let peak = dto.metrics.peak_hour.expect("peak hour present");
+        assert_eq!(peak.label, "14:00");
+        assert_eq!(peak.tokens, 612_000);
+    }
 }

@@ -81,3 +81,18 @@ export const OTHERS_ALL_UNAVAILABLE: ReceiptDailyDto = {
     { name: "free-b", tokens: 120, cost_usd: null, cost_status: "unavailable" },
   ],
 };
+
+// >5 models where the overflow is MIXED (one exact + one unavailable) → the
+// OTHERS row's cost_status must be "partial" (render "≈$X.XX"), not "exact".
+export const OTHERS_MIXED_COST: ReceiptDailyDto = {
+  ...NORMAL_DAY,
+  top_models: [
+    { name: "m1", tokens: 500, cost_usd: 5, cost_status: "exact" },
+    { name: "m2", tokens: 400, cost_usd: 4, cost_status: "exact" },
+    { name: "m3", tokens: 300, cost_usd: 3, cost_status: "exact" },
+    { name: "m4", tokens: 250, cost_usd: 2.5, cost_status: "exact" },
+    { name: "m5", tokens: 200, cost_usd: 2, cost_status: "exact" },
+    { name: "paid-overflow", tokens: 150, cost_usd: 1.5, cost_status: "exact" },
+    { name: "free-overflow", tokens: 120, cost_usd: null, cost_status: "unavailable" },
+  ],
+};
