@@ -41,6 +41,12 @@
 #                                     data.candidate field (sidecar protocol
 #                                     violation). Exercises
 #                                     extract_candidate_from_data error path.
+#   BUSYTOK_MOCK_MEMORY_UPDATE=1
+#                                When set, session.turn_auto includes a
+#                                `result.memory_update` object with
+#                                current_state_summary, key_files, decisions,
+#                                and open_questions. 0/unset = no memory_update
+#                                (hot_summary preserved — no destructive clear).
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
@@ -53,6 +59,7 @@ PREPARE_HIBERNATE_FAILS="${BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS:-0}"
 NULL_MEMORY_DELTA="${BUSYTOK_MOCK_NULL_MEMORY_DELTA:-0}"
 TURN_AUTO_FAILS_AFTER_CLOSE="${BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE:-0}"
 HOT_LIMIT_NO_CANDIDATE="${BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE:-0}"
+MEMORY_UPDATE="${BUSYTOK_MOCK_MEMORY_UPDATE:-0}"
 COUNT=0
 # Number of successful session.close responses sent. Used by
 # BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE to fail the retry turn_auto issued
@@ -92,6 +99,16 @@ sub_to_sess_remove_by_sess() {
       return 0
     fi
   done
+}
+
+# Build the memory_update JSON fragment (empty when MEMORY_UPDATE != 1).
+# Interpolated into the turn_auto response to avoid duplicating the JSON
+# payload across the create/reuse/empty branches.
+build_mem_fragment() {
+  if [[ "$MEMORY_UPDATE" == "1" ]]; then
+    NOW_MS="$(date +%s)000"
+    printf ',"memory_update":{"current_state_summary":"Investigated context; produced memory update.","key_files":[{"path":"src/auth/token.ts","reason":"refresh logic","last_seen_at_ms":%s,"score":3}],"decisions":["Focus on read-only analysis"],"open_questions":[{"question":"Concurrent refresh handled?","status":"open","created_at_ms":%s,"last_seen_at_ms":%s}]}' "$NOW_MS" "$NOW_MS" "$NOW_MS"
+  fi
 }
 
 while IFS= read -r line; do
@@ -134,8 +151,17 @@ while IFS= read -r line; do
         else
           STATUS_OUT="completed"
         fi
+        # Extract context.compact_context from the request to echo it back in
+        # task_summary — lets e2e tests verify the context was built from memory.
+        COMPACT_CTX="$(printf '%s' "$line" | sed -n 's/.*"context"[[:space:]]*:[[:space:]]*{"compact_context"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+        if [[ -z "$COMPACT_CTX" ]]; then
+          COMPACT_CTX="mock turn completed"
+        fi
+        # Memory-update fragment is empty when MEMORY_UPDATE != 1, keeping the
+        # JSON valid ("task_summary":"..." with no trailing comma).
+        MEM_FRAGMENT="$(build_mem_fragment)"
         if [[ "$EMPTY_SESSION" == "1" ]]; then
-          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"%s","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$STATUS_OUT" "$ID"
+          printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"%s","result":{"task_summary":"%s"%s},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$STATUS_OUT" "$COMPACT_CTX" "$MEM_FRAGMENT" "$ID"
         else
           EXISTING_SESS=$(sub_to_sess_lookup "$SUB_ID")
           if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" ]]; then
@@ -161,7 +187,7 @@ while IFS= read -r line; do
               fi
             done
             SESS_ORDER+=("$SESS")
-            printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$ID"
+            printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"%s"%s},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$COMPACT_CTX" "$MEM_FRAGMENT" "$ID"
           else
             # Create new session
             SESS_COUNTER=$((SESS_COUNTER + 1))
@@ -170,7 +196,7 @@ while IFS= read -r line; do
             SESS_IDS+=("$SESS")
             SESS_ORDER+=("$SESS")
             REUSED="false"
-            printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"mock turn completed"},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$ID"
+            printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"%s"%s},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$COMPACT_CTX" "$MEM_FRAGMENT" "$ID"
           fi
         fi
       fi

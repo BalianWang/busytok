@@ -32,6 +32,34 @@ export interface HealthResult {
   rss_mb: number;
 }
 
+export interface KeyFile {
+  path: string;
+  reason: string;
+  last_seen_at_ms: number;
+  score: number;
+}
+
+export interface OpenQuestion {
+  question: string;
+  status: 'open' | 'resolved';
+  created_at_ms: number;
+  last_seen_at_ms: number;
+}
+
+export interface MemoryField {
+  hot_summary?: string;
+  long_summary?: string;
+  key_files: KeyFile[];
+  decisions: string[];
+  open_questions: OpenQuestion[];
+}
+
+export interface CompactContext {
+  compact_context: string;
+  budget_tokens: number;
+  source: string;
+}
+
 export interface TurnAutoParams {
   logical_subagent_id: string;
   logical_subagent_name?: string;
@@ -42,6 +70,16 @@ export interface TurnAutoParams {
   prompt: string;
   prompt_artifact_ref?: string | null;
   timeout_ms?: number;
+  memory?: MemoryField;
+  context?: CompactContext;
+  constraints?: { write_access: boolean; timeout_ms: number };
+}
+
+export interface MemoryUpdate {
+  current_state_summary?: string;
+  key_files?: KeyFile[];
+  decisions?: string[];
+  open_questions?: OpenQuestion[];
 }
 
 export interface TurnAutoResult {
@@ -50,6 +88,7 @@ export interface TurnAutoResult {
   status: 'completed' | 'failed' | 'timeout';
   result: {
     task_summary: string;
+    memory_update?: MemoryUpdate;
     [key: string]: unknown;
   };
   usage: {

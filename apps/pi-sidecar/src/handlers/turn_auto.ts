@@ -22,12 +22,24 @@ export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
       throw new SidecarError('missing required fields', -32602);
     }
     const { adapter_session_id, reused } = pool.ensure(p.logical_subagent_id, nextSessionId);
+    const now = Date.now();
+    const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
+      ? {
+          current_state_summary: 'Investigated context; produced memory update.',
+          key_files: [{ path: 'src/auth/token.ts', reason: 'refresh logic', last_seen_at_ms: now, score: 3 }],
+          decisions: ['Focus on read-only analysis'],
+          open_questions: [{ question: 'Concurrent refresh handled?', status: 'open' as const, created_at_ms: now, last_seen_at_ms: now }],
+        }
+      : undefined;
+    // task_summary is a REAL summary, NOT an echo of compact_context.
+    // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
     const result: TurnAutoResult = {
       adapter_session_id,
       session_reused: reused,
       status: 'completed',
       result: {
         task_summary: `[mock] turn completed for: ${p.prompt.slice(0, 80)}`,
+        ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
       },
       usage: {
         model: p.model ?? 'deepseek-chat',
