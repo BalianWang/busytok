@@ -80,20 +80,6 @@ sub_to_sess_lookup() {
   return 0  # not found, prints nothing
 }
 
-# Remove a subagent→session mapping by subagent_id.
-sub_to_sess_remove_by_sub() {
-  local target="$1" i
-  for i in "${!SUB_IDS[@]}"; do
-    if [[ "${SUB_IDS[$i]}" == "$target" ]]; then
-      unset 'SUB_IDS[i]'
-      unset 'SESS_IDS[i]'
-      SUB_IDS=(${SUB_IDS[@]+"${SUB_IDS[@]}"})
-      SESS_IDS=(${SESS_IDS[@]+"${SESS_IDS[@]}"})
-      return 0
-    fi
-  done
-}
-
 # Remove a subagent→session mapping by session_id.
 sub_to_sess_remove_by_sess() {
   local target="$1" i
