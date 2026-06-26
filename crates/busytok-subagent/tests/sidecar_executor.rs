@@ -1107,3 +1107,55 @@ async fn executor_eviction_propagates_error_when_retry_turn_auto_fails() {
 
     supervisor.shutdown().await.unwrap();
 }
+
+// --- parse_turn_auto_result memory_update extraction (Plan 4 Task 4) ---
+//
+// `parse_turn_auto_result` must extract `result.memory_update` from the
+// sidecar's turn_auto response into `ExecutorOutput.memory_update` (Plan 4
+// replaces the Task 3 `MemoryUpdate::default()` placeholder). Two cases:
+//   1. memory_update present → parse current_state_summary, key_files,
+//      decisions, open_questions verbatim into MemoryUpdate.
+//   2. memory_update absent → MemoryUpdate::default() (preserves existing
+//      memory per §6.2: current_state_summary None → no overwrite).
+
+#[test]
+fn parse_turn_auto_result_extracts_memory_update() {
+    let resp = serde_json::json!({
+        "adapter_session_id": "sess-1",
+        "session_reused": false,
+        "status": "completed",
+        "result": {
+            "task_summary": "did thing",
+            "memory_update": {
+                "current_state_summary": "new state",
+                "key_files": [{"path": "src/a.ts", "reason": "r", "last_seen_at_ms": 1, "score": 2}],
+                "decisions": ["decide"],
+                "open_questions": [{"question": "q?", "status": "open", "created_at_ms": 1, "last_seen_at_ms": 1}],
+            },
+        },
+        "usage": {"model": "m", "provider": "p", "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0},
+    });
+    let out = busytok_subagent::sidecar::executor::parse_turn_auto_result_for_test(&resp);
+    assert_eq!(
+        out.memory_update.current_state_summary.as_deref(),
+        Some("new state")
+    );
+    assert_eq!(out.memory_update.key_files.len(), 1);
+    assert_eq!(out.memory_update.key_files[0].path, "src/a.ts");
+    assert_eq!(out.memory_update.decisions, vec!["decide".to_string()]);
+    assert_eq!(out.memory_update.open_questions.len(), 1);
+}
+
+#[test]
+fn parse_turn_auto_result_omits_memory_update_when_absent() {
+    let resp = serde_json::json!({
+        "adapter_session_id": "sess-1",
+        "session_reused": false,
+        "status": "completed",
+        "result": {"task_summary": "did thing"},
+        "usage": {"model": "m", "provider": "p", "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0},
+    });
+    let out = busytok_subagent::sidecar::executor::parse_turn_auto_result_for_test(&resp);
+    assert!(out.memory_update.current_state_summary.is_none());
+    assert!(out.memory_update.key_files.is_empty());
+}

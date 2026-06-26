@@ -61,16 +61,67 @@ impl TaskExecutor for SidecarTaskExecutor {
             .ensure_started()
             .await
             .map_err(sidecar_to_anyhow)?;
-        // Note: `tools`, `prompt_artifact_ref`, and `memory_snapshot` are
-        // deferred to Plan 4 (ContextBuilder). Plan 2 sends the minimal set.
+        // Build turn_auto params (spec §4.3). Plan 4 adds tools, memory,
+        // context, and constraints. Memory carries structured objects.
+        let key_files_json: Vec<serde_json::Value> = input
+            .memory
+            .key_files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "path": f.path,
+                    "reason": f.reason,
+                    "last_seen_at_ms": f.last_seen_at_ms,
+                    "score": f.score,
+                })
+            })
+            .collect();
+        let open_questions_json: Vec<serde_json::Value> = input
+            .memory
+            .open_questions
+            .iter()
+            .map(|q| {
+                serde_json::json!({
+                    "question": q.question,
+                    "status": q.status,
+                    "created_at_ms": q.created_at_ms,
+                    "last_seen_at_ms": q.last_seen_at_ms,
+                })
+            })
+            .collect();
+        let memory_json = serde_json::json!({
+            "hot_summary": input.memory.hot_summary,
+            "long_summary": input.memory.long_summary,
+            "key_files": key_files_json,
+            "decisions": input.memory.decisions,
+            "open_questions": open_questions_json,
+        });
         let params = serde_json::json!({
             "logical_subagent_id": input.subagent_id,
             "logical_subagent_name": input.subagent_name,
             "cwd": input.cwd,
             "profile": input.profile,
             "model": input.model,
+            "tools": input.tools,
             "prompt": input.prompt,
+            "prompt_artifact_ref": null,
+            "memory": memory_json,
+            "context": {
+                "compact_context": input.context.compact_context,
+                "budget_tokens": input.context.budget_tokens,
+                "source": input.context.source,
+            },
             "timeout_ms": input.timeout_seconds.map(|s| s * 1000),
+            "constraints": {
+                "write_access": input.write_access,
+                "timeout_ms": input.timeout_seconds.map(|s| s * 1000).unwrap_or(180000),
+            },
+            "output_schema": {
+                "format": "json",
+                "name": "review_result",
+                "version": 1,
+            },
+            "adapter_options": {},
         });
         info!(
             event_code = "subagent.sidecar.turn_auto.start",
@@ -293,6 +344,7 @@ impl SidecarTaskExecutor {
 /// - `session_reused`: true if an existing hot session was reused
 /// - `status`: "completed" | "failed" | "timeout"
 /// - `result.task_summary`: short human-readable summary
+/// - `result.memory_update`: structured memory delta (spec §4.3)
 /// - `usage`: token/cost breakdown
 fn parse_turn_auto_result(result: &serde_json::Value) -> ExecutorOutput {
     let adapter_session_id = result
@@ -330,16 +382,105 @@ fn parse_turn_auto_result(result: &serde_json::Value) -> ExecutorOutput {
             cost_usd: u.get("cost_usd").and_then(|v| v.as_f64()),
         })
         .unwrap_or_default();
+
+    // Extract memory_update (spec §4.3 result.memory_update). If absent,
+    // MemoryUpdate::default() → current_state_summary None → MemoryUpdater
+    // preserves the existing hot_summary (no overwrite).
+    let memory_update = result
+        .pointer("/result/memory_update")
+        .map(parse_memory_update)
+        .unwrap_or_default();
+
     ExecutorOutput {
         adapter_session_id,
         session_reused,
         status,
         summary,
         usage,
-        // Plan 4 Task 3: the sidecar's full memory_update parsing lands in a
-        // later plan; for now default() preserves "no memory_update emitted"
-        // so the manager's MemoryUpdater preserves existing memory.
-        memory_update: MemoryUpdate::default(),
+        memory_update,
+    }
+}
+
+/// Test-visible wrapper around `parse_turn_auto_result`. The inner function
+/// stays private to keep the call sites within this module; tests exercise the
+/// parsing logic via this thin shim so they don't need to spin up a sidecar.
+pub fn parse_turn_auto_result_for_test(result: &serde_json::Value) -> ExecutorOutput {
+    parse_turn_auto_result(result)
+}
+
+/// Parse the `result.memory_update` object (spec §4.3) into a `MemoryUpdate`.
+///
+/// Each field is extracted defensively: missing/null fields fall back to
+/// empty/None so a partial update from the sidecar still parses. A missing
+/// `path` (KeyFile) or `question` (OpenQuestion) drops that entry via
+/// `filter_map` — those are the identity keys, and an entry without them is
+/// meaningless.
+fn parse_memory_update(mu: &serde_json::Value) -> MemoryUpdate {
+    use crate::memory::{KeyFile, OpenQuestion};
+    let current_state_summary = mu
+        .get("current_state_summary")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let key_files = mu
+        .get("key_files")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    Some(KeyFile {
+                        path: f.get("path")?.as_str()?.to_string(),
+                        reason: f
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        last_seen_at_ms: f
+                            .get("last_seen_at_ms")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                        score: f.get("score").and_then(|v| v.as_i64()).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let decisions = mu
+        .get("decisions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let open_questions = mu
+        .get("open_questions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| {
+                    Some(OpenQuestion {
+                        question: q.get("question")?.as_str()?.to_string(),
+                        status: q
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("open")
+                            .to_string(),
+                        created_at_ms: q.get("created_at_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+                        last_seen_at_ms: q
+                            .get("last_seen_at_ms")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    MemoryUpdate {
+        current_state_summary,
+        key_files,
+        decisions,
+        open_questions,
     }
 }
 
