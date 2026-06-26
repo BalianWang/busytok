@@ -398,6 +398,128 @@ impl BusytokSupervisor {
         self.sidecar_init_error.as_deref()
     }
 
+    /// Run the 11 spec §7.1 doctor checks. The subagent-specific checks
+    /// (SQLite, sidecar launchable, resource policy, stale subagents) are
+    /// real; the 6 bundle-inspection checks return `status: "warning"` with
+    /// a "not yet implemented" detail — they must NOT return "ok" because
+    /// unverified checks claiming green would mislead users. `overall_ok`
+    /// is true iff no check has `status == "error"` (warnings don't fail).
+    fn run_subagent_doctor(&self) -> SubagentDoctorResultDto {
+        let mut checks: Vec<DoctorCheckDto> = Vec::new();
+
+        // 1. busytok-service running — always ok (we're running this code).
+        checks.push(DoctorCheckDto {
+            name: "service_running".into(),
+            status: "ok".into(),
+            detail: None,
+        });
+
+        // 2. SQLite readable/writable + schema version.
+        {
+            let db = self.db.lock().unwrap();
+            let schema_ok = db
+                .conn()
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .is_ok();
+            let schema_version = db
+                .conn()
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap_or(0);
+            checks.push(DoctorCheckDto {
+                name: "sqlite_readable".into(),
+                status: if schema_ok { "ok" } else { "error" }.into(),
+                detail: Some(format!("schema_version={schema_version}")),
+            });
+        }
+
+        // 3. Pi sidecar launchable — surface sidecar_init_error if present.
+        //    When pi_sidecar.enabled=false, this is "ok" (feature off).
+        checks.push(DoctorCheckDto {
+            name: "sidecar_launchable".into(),
+            status: if self.sidecar_init_error().is_some() {
+                "error"
+            } else {
+                "ok"
+            }
+            .into(),
+            detail: self.sidecar_init_error().map(|s| s.to_string()),
+        });
+
+        // 4-9. Bundled node arch, manifest, protocol version, model config,
+        //      Pi runtime, artifact store — NOT YET IMPLEMENTED. Return
+        //      "warning" (not "ok") so overall_ok doesn't claim green on
+        //      unverified ground. Plan 6+ will implement bundle inspection.
+        for name in [
+            "bundled_node_arch",
+            "bundle_manifest_readable",
+            "protocol_version",
+            "default_model_config",
+            "pi_runtime_installed",
+            "artifact_store_writable",
+        ] {
+            checks.push(DoctorCheckDto {
+                name: name.into(),
+                status: "warning".into(),
+                detail: Some("not yet implemented (Plan 6+ bundle inspection)".into()),
+            });
+        }
+
+        // 10. Resource policy valid — check the deserialized policy fields.
+        {
+            let settings = self.settings.lock().unwrap();
+            let p = &settings.subagent.resource_policy;
+            let ok = p.memory_pressure_free_mb > 0 && p.monitor_interval_seconds > 0;
+            checks.push(DoctorCheckDto {
+                name: "resource_policy_valid".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(format!(
+                    "memory_pressure_free_mb={}, monitor_interval_seconds={}",
+                    p.memory_pressure_free_mb, p.monitor_interval_seconds
+                )),
+            });
+        }
+
+        // 11. Subagents unused > 30 days (warning, not error).
+        {
+            let db = self.db.lock().unwrap();
+            let threshold_ms = now_ms() - (30 * 24 * 60 * 60 * 1000);
+            let stale: Vec<String> = db
+                .conn()
+                .prepare(
+                    "SELECT id FROM subagent_logical_subagents \
+                     WHERE last_active_at_ms IS NOT NULL \
+                     AND last_active_at_ms < ?1 \
+                     AND status != 'deleted'",
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![threshold_ms], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap_or_default();
+            let is_warning = !stale.is_empty();
+            checks.push(DoctorCheckDto {
+                name: "subagents_unused_30d".into(),
+                status: if is_warning { "warning" } else { "ok" }.into(),
+                detail: if is_warning {
+                    Some(format!(
+                        "{} stale subagent(s): {}",
+                        stale.len(),
+                        stale.join(", ")
+                    ))
+                } else {
+                    None
+                },
+            });
+        }
+
+        let overall_ok = checks.iter().all(|c| c.status != "error");
+        SubagentDoctorResultDto { checks, overall_ok }
+    }
+
     // ── Scan methods ────────────────────────────────────────────────────
     //
     // Two families of scan entry points:
@@ -3521,6 +3643,15 @@ impl RuntimeControl for BusytokSupervisor {
             )
             .collect();
 
+        // Spec §7.1 + §7.3: extend settings.diagnostics with subagent doctor
+        // checks. Reuses the existing RPC path — no new method. Always
+        // populate when the runtime is constructed; the per-check status
+        // (e.g. sidecar_launchable "ok" when pi_sidecar.enabled=false)
+        // reflects the current configuration rather than gating the whole
+        // section. The DTO field is still `Option<...>` for wire-level
+        // backwards-compat with older clients.
+        let subagent = Some(self.run_subagent_doctor());
+
         let now_ms = busytok_domain::now_ms();
         self.build_read_envelope(
             SettingsDiagnosticsDto {
@@ -3532,6 +3663,7 @@ impl RuntimeControl for BusytokSupervisor {
                 writer_queue_depth,
                 aggregate_lag_ms,
                 recent_diagnostics,
+                subagent,
             },
             now_ms,
         )

@@ -298,6 +298,62 @@ pub async fn handle_diagnostics_store_health() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Doctor
+// ---------------------------------------------------------------------------
+
+/// `busytok doctor` — run health checks (spec §855, §1068).
+///
+/// Calls the existing `settings.diagnostics` RPC (no new RPC method) and
+/// pretty-prints the `subagent` section of the response. If the subagent
+/// feature is disabled, prints a notice and exits 0.
+pub async fn handle_doctor() -> Result<()> {
+    let mut client = connect_client().await?;
+    let request = ControlRequest::new("settings.diagnostics", serde_json::json!({}));
+    let response = client.call(request).await?;
+    let value = match response {
+        ControlResponse::Ok(v) => v,
+        ControlResponse::Err(err) => {
+            anyhow::bail!("RPC error [{}]: {}", err.code, err.message);
+        }
+    };
+    // The RPC returns a `ReadEnvelopeDto<SettingsDiagnosticsDto>`; we only
+    // need the inner `data` for the subagent section.
+    let data = value
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let dto: SettingsDiagnosticsDto = serde_json::from_value(data)?;
+    match dto.subagent {
+        None => {
+            println!("subagent feature disabled — no doctor checks to run");
+            Ok(())
+        }
+        Some(sub) => {
+            if sub.overall_ok {
+                println!("✓ subagent doctor: all checks passed (warnings allowed)");
+            } else {
+                println!("✗ subagent doctor: one or more checks failed");
+            }
+            for check in &sub.checks {
+                let symbol = match check.status.as_str() {
+                    "ok" => "✓",
+                    "warning" => "⚠",
+                    _ => "✗",
+                };
+                match &check.detail {
+                    Some(detail) => println!("  {symbol} {}: {detail}", check.name),
+                    None => println!("  {symbol} {}", check.name),
+                }
+            }
+            if !sub.overall_ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 

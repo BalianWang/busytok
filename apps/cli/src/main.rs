@@ -106,6 +106,11 @@ enum Command {
         #[command(subcommand)]
         subcommand: SubagentCommand,
     },
+
+    /// Run doctor health checks (spec §855, §1068: `busytok doctor`).
+    /// Calls the existing `settings.diagnostics` RPC and pretty-prints
+    /// the subagent section. No new RPC method.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -429,6 +434,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Cli { .. } => "cli",
         Command::Delegate { .. } => "delegate",
         Command::Subagent { .. } => "subagent",
+        Command::Doctor => "doctor",
     }
 }
 
@@ -607,5 +613,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 yes,
             } => commands_subagent::handle_delete(name, id, cwd, hard, yes).await,
         },
+
+        Command::Doctor => commands::handle_doctor().await,
     }
 }

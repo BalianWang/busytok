@@ -144,7 +144,21 @@ aggregate_lag_ms: number,
  * Recent runtime diagnostic events (e.g. subscription lifecycle,
  * writer thresholds, drift events).
  */
-recent_diagnostics: Array<SettingsDiagnosticEventDto>, };
+recent_diagnostics: Array<SettingsDiagnosticEventDto>, 
+/**
+ * Subagent doctor checks (spec §7.1). `None` when the subagent feature
+ * is disabled or not yet checked. Reuses the existing
+ * `settings.diagnostics` RPC path — no separate `subagent.doctor` RPC.
+ */
+subagent: SubagentDoctorResultDto | null, };
+
+export type SubagentDoctorResultDto = { checks: Array<DoctorCheckDto>, 
+/**
+ * True iff no check has `status == "error"`. Warnings don't fail.
+ */
+overall_ok: boolean, };
+
+export type DoctorCheckDto = { name: string, status: string, detail: string | null, };
 
 export type SettingsDiagnosticEventDto = { code: string, severity: string, message: string, happened_at_ms: number, };
 

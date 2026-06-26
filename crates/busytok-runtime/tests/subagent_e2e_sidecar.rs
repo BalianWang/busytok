@@ -641,3 +641,141 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     supervisor.shutdown_sidecar().await;
     supervisor.shutdown_writer().await.unwrap();
 }
+
+// --- doctor via settings.diagnostics (Plan 5 Task 3, spec §7.1 + §7.3) ---
+//
+// Verifies that the EXISTING settings.diagnostics RPC path now includes
+// an optional `subagent` section with 11 §7.1 checks. No new RPC method —
+// the doctor reuses the existing diagnostics infrastructure.
+
+#[tokio::test]
+async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    // Disable sidecar so doctor's `sidecar_launchable` check is "ok"
+    // (no bundle to launch in unit tests).
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(
+        db,
+        paths,
+        vec![], // no adapters needed for this test
+        settings,
+    );
+
+    // Call the EXISTING settings_diagnostics handler — no new RPC.
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let dto = envelope.data;
+
+    // Subagent section is present.
+    let sub = dto
+        .subagent
+        .as_ref()
+        .expect("settings.diagnostics must include subagent section");
+
+    // 11 checks total per spec §7.1.
+    assert_eq!(sub.checks.len(), 11, "must have all 11 §7.1 checks");
+
+    // Verify the 6 stubbed checks return "warning" (NOT "ok") —
+    // unimplemented checks must not claim green.
+    for name in [
+        "bundled_node_arch",
+        "bundle_manifest_readable",
+        "protocol_version",
+        "default_model_config",
+        "pi_runtime_installed",
+        "artifact_store_writable",
+    ] {
+        let check = sub
+            .checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("missing check: {name}"));
+        assert_eq!(
+            check.status, "warning",
+            "stubbed check {name} must return 'warning' not 'ok' (unverified = warning)"
+        );
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("not yet implemented"),
+            "stubbed check {name} detail should explain it's not yet implemented"
+        );
+    }
+
+    // Verify the real checks return "ok" (sidecar disabled => launchable ok).
+    let launchable = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "sidecar_launchable")
+        .expect("missing sidecar_launchable check");
+    assert_eq!(launchable.status, "ok", "sidecar disabled => launchable ok");
+
+    // overall_ok is true (warnings don't fail, no errors).
+    assert!(sub.overall_ok, "warnings don't break overall_ok");
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(
+        db,
+        paths,
+        vec![], // no adapters needed for this test
+        settings,
+    );
+
+    // Insert a stale subagent (last_active 31 days ago).
+    {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let stale_ms = busytok_domain::now_ms() - (31 * 24 * 60 * 60 * 1000);
+        db_guard
+            .conn()
+            .execute(
+                "INSERT INTO subagent_logical_subagents \
+                 (id, name, project_id, repo_path, repo_hash, intent, default_profile, \
+                  status, created_at_ms, updated_at_ms, last_active_at_ms) \
+                 VALUES ('stale_sub', 'stale-test', 'proj', '/repo', 'hash', 'test', \
+                         'pi/search-cheap', 'warm', ?1, ?1, ?1)",
+                rusqlite::params![stale_ms],
+            )
+            .unwrap();
+    }
+
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let stale_check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "subagents_unused_30d")
+        .expect("must have subagents_unused_30d check");
+    assert_eq!(stale_check.status, "warning", "stale subagent => warning");
+    assert!(
+        stale_check
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("stale_sub"),
+        "detail should mention the stale subagent"
+    );
+    assert!(sub.overall_ok, "warnings don't break overall_ok");
+
+    supervisor.shutdown_writer().await.unwrap();
+}

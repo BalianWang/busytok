@@ -755,6 +755,34 @@ pub struct SettingsDiagnosticsDto {
     /// Recent runtime diagnostic events (e.g. subscription lifecycle,
     /// writer thresholds, drift events).
     pub recent_diagnostics: Vec<SettingsDiagnosticEventDto>,
+    /// Subagent doctor checks (spec §7.1). `None` when the subagent feature
+    /// is disabled or not yet checked. Reuses the existing
+    /// `settings.diagnostics` RPC path — no separate `subagent.doctor` RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentDoctorResultDto>,
+}
+
+/// Result of running subagent doctor checks (spec §7.1). Returned as the
+/// optional `subagent` field of `SettingsDiagnosticsDto` — no separate RPC
+/// method, reuses the existing `settings.diagnostics` path.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct SubagentDoctorResultDto {
+    pub checks: Vec<DoctorCheckDto>,
+    /// True iff no check has `status == "error"`. Warnings don't fail.
+    pub overall_ok: bool,
+}
+
+/// One doctor check result. `status` is one of: `"ok"`, `"warning"`, `"error"`.
+/// - `"ok"`: check passed.
+/// - `"warning"`: check surfaced a non-blocking issue (e.g. stale subagents,
+///   or a stubbed check not yet implemented — stubs return "warning" so
+///   `overall_ok` doesn't claim a green check on unverified ground).
+/// - `"error"`: check failed and `overall_ok` will be false.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct DoctorCheckDto {
+    pub name: String,
+    pub status: String,
+    pub detail: Option<String>,
 }
 
 /// A lightweight diagnostic event suitable for display in Settings/Diagnostics.
@@ -1563,5 +1591,69 @@ mod tests {
         assert!(json.contains("cache_hit_rate"));
         // Raw audit field still present (not collapsed away):
         assert!(json.contains("cached_input_tokens"));
+    }
+
+    #[test]
+    fn subagent_doctor_result_dto_serializes_round_trip() {
+        let dto = SubagentDoctorResultDto {
+            checks: vec![DoctorCheckDto {
+                name: "resource_policy_valid".to_string(),
+                status: "ok".to_string(),
+                detail: None,
+            }],
+            overall_ok: true,
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        let back: SubagentDoctorResultDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.checks.len(), 1);
+        assert_eq!(back.checks[0].name, "resource_policy_valid");
+        assert!(back.overall_ok);
+    }
+
+    #[test]
+    fn settings_diagnostics_dto_serializes_with_optional_subagent_none() {
+        // Backwards-compat: existing clients don't send `subagent` field.
+        // Deserialization must still work.
+        let json = r#"{
+            "db_healthy": true,
+            "db_size_bytes": 4096,
+            "migration_version": 3,
+            "usage_event_count": 0,
+            "last_log_checkpoint_ms": null,
+            "writer_queue_depth": 0,
+            "aggregate_lag_ms": 0,
+            "recent_diagnostics": []
+        }"#;
+        let dto: SettingsDiagnosticsDto = serde_json::from_str(json).unwrap();
+        assert!(
+            dto.subagent.is_none(),
+            "missing field => None (backwards-compat)"
+        );
+    }
+
+    #[test]
+    fn settings_diagnostics_dto_serializes_with_subagent_present() {
+        let dto = SettingsDiagnosticsDto {
+            db_healthy: true,
+            db_size_bytes: 4096,
+            migration_version: 3,
+            usage_event_count: 0,
+            last_log_checkpoint_ms: None,
+            writer_queue_depth: 0,
+            aggregate_lag_ms: 0,
+            recent_diagnostics: vec![],
+            subagent: Some(SubagentDoctorResultDto {
+                checks: vec![DoctorCheckDto {
+                    name: "service_running".to_string(),
+                    status: "ok".to_string(),
+                    detail: None,
+                }],
+                overall_ok: true,
+            }),
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        let back: SettingsDiagnosticsDto = serde_json::from_str(&json).unwrap();
+        assert!(back.subagent.is_some());
+        assert_eq!(back.subagent.unwrap().checks.len(), 1);
     }
 }

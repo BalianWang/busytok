@@ -841,6 +841,7 @@ impl RuntimeControl for TestRuntimeControl {
                 writer_queue_depth: 0,
                 aggregate_lag_ms: 0,
                 recent_diagnostics: vec![],
+                subagent: None,
             },
             recovery_actions: vec![],
         }))
@@ -876,6 +877,7 @@ impl RuntimeControl for TestRuntimeControl {
                 writer_queue_depth: 0,
                 aggregate_lag_ms: 0,
                 recent_diagnostics: vec![],
+                subagent: None,
             },
             recovery_actions: vec![],
         }))
@@ -891,6 +893,7 @@ impl RuntimeControl for TestRuntimeControl {
             writer_queue_depth: 0,
             aggregate_lag_ms: 0,
             recent_diagnostics: vec![],
+            subagent: None,
         }))
     }
 

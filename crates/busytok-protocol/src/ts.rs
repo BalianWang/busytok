@@ -105,6 +105,8 @@ mod tests {
             dto::SettingsDiscoveryDto::decl(),
             dto::SettingsPrivacyDto::decl(),
             dto::SettingsDiagnosticsDto::decl(),
+            dto::SubagentDoctorResultDto::decl(),
+            dto::DoctorCheckDto::decl(),
             dto::SettingsDiagnosticEventDto::decl(),
             dto::SettingsRecoveryActionDto::decl(),
             dto::SettingsRecoveryActionRequestDto::decl(),
