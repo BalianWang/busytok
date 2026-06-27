@@ -1059,31 +1059,47 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
         .await
         .unwrap();
 
-    // Use a fresh System instance to count all processes. Reusing the RSS
-    // measurement instance (refreshed with ProcessesToUpdate::Some) does not
-    // reliably pick up newly-spawned processes on macOS when later switching
-    // to ProcessesToUpdate::All — a fresh System::new_all() does.
+    // Spec §12.2: "exactly 1 process when active." Count mock-sidecar
+    // processes that are children of THIS test process.
     //
-    // Spec §12.2: "exactly 1 process when active." This relies on every
-    // sidecar-spawning test in this file being marked `#[serial]` so that no
-    // sibling test's sidecar is running concurrently — the mock-sidecar.sh
-    // scan is global and all tests in the binary share one PID, so neither
-    // a parent-PID filter nor an unserialized run can isolate this test's
-    // sidecar from siblings. `#[serial]` guarantees mutual exclusion.
-    let mut sys_all = sysinfo::System::new_all();
-    sys_all.refresh_processes(ProcessesToUpdate::All, true);
-    let sidecar_count = sys_all
-        .processes()
-        .values()
-        .filter(|p| {
-            p.cmd()
-                .iter()
-                .any(|arg| arg.to_string_lossy().contains("mock-sidecar.sh"))
-        })
-        .count();
+    // Filter by parent PID because `#[serial]` does NOT isolate across
+    // test binaries — `cargo test` compiles each `tests/*.rs` as a separate
+    // binary and runs binaries in parallel by default. Other binaries
+    // (supervisor_shutdown, sidecar_supervisor, sidecar_executor) spawn
+    // their own mock-sidecar.sh processes that a global scan would
+    // incorrectly count as this test's sidecar. `#[serial]` only
+    // serializes tests within the same binary, so the parent-PID filter
+    // is the reliable isolation boundary.
+    //
+    // A short retry loop tolerates sysinfo's eventual-consistency process
+    // table refresh on macOS — a freshly spawned child may not appear in
+    // System::new_all() for a few hundred ms.
+    let test_pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut sidecar_count = 0;
+    for attempt in 0..5 {
+        let mut sys_all = sysinfo::System::new_all();
+        sys_all.refresh_processes(ProcessesToUpdate::All, true);
+        sidecar_count = sys_all
+            .processes()
+            .values()
+            .filter(|p| {
+                p.parent() == Some(test_pid)
+                    && p.cmd()
+                        .iter()
+                        .any(|arg| arg.to_string_lossy().contains("mock-sidecar.sh"))
+            })
+            .count();
+        if sidecar_count == 1 {
+            break;
+        }
+        if attempt < 4 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     assert_eq!(
         sidecar_count, 1,
-        "exactly 1 sidecar process must exist when active (got {sidecar_count})"
+        "exactly 1 sidecar process parented to this test must exist when \
+         active (got {sidecar_count}); this test's pid={test_pid}"
     );
 
     supervisor.shutdown_sidecar().await;

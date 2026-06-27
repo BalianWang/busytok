@@ -51,6 +51,13 @@ const MAX_CRASHES_PER_WINDOW: usize = 3;
 pub struct PiSidecarSupervisor {
     config: SidecarConfig,
     state: Mutex<SupervisorState>,
+    /// Dedicated spawn lock — held for the entire `spawn_internal` duration
+    /// (spawn + adapter.initialize handshake) to prevent two concurrent
+    /// `ensure_started` callers from each spawning a sidecar process.
+    /// The state lock alone is insufficient because it is released between
+    /// the double-check and the actual `cmd.spawn()` + handshake, leaving a
+    /// window where a second caller sees `client.is_none()` and proceeds.
+    spawn_lock: Mutex<()>,
     db: Option<SharedDb>,
     /// Resource monitor — None in unit tests that don't pass a policy.
     /// Mutex because `sample(&mut self)` mutates the internal `sysinfo::System`.
@@ -103,6 +110,7 @@ impl PiSidecarSupervisor {
                 resource_pressure_state: ResourcePressureState::Normal,
                 restart_history: VecDeque::new(),
             }),
+            spawn_lock: Mutex::new(()),
             db,
             resource_monitor: Some(std::sync::Mutex::new(monitor)),
         })
@@ -131,6 +139,7 @@ impl PiSidecarSupervisor {
                 resource_pressure_state: ResourcePressureState::Normal,
                 restart_history: VecDeque::new(),
             }),
+            spawn_lock: Mutex::new(()),
             db,
             resource_monitor: Some(std::sync::Mutex::new(monitor)),
         })
@@ -166,17 +175,21 @@ impl PiSidecarSupervisor {
     }
 
     async fn spawn_internal(self: &Arc<Self>) -> Result<(), SidecarError> {
+        // Acquire the dedicated spawn lock for the entire spawn+handshake
+        // duration. This prevents two concurrent `ensure_started` callers
+        // from each spawning a sidecar process — the state lock alone is
+        // insufficient because it is released between the double-check and
+        // the actual `cmd.spawn()` + `adapter.initialize` handshake.
+        let _spawn_guard = self.spawn_lock.lock().await;
+
         // Exponential backoff if this is a restart after a crash.
         let backoff = {
             let mut state = self.state.lock().await;
-            // Double-checked locking: `ensure_started` checks `needs_spawn`
-            // without holding the lock, so two concurrent callers can both see
-            // `needs_spawn=true` and both call `spawn_internal`. Re-check here
-            // (under the lock) so only the first caller actually spawns — the
-            // second sees the child/client the first installed and returns
-            // early. `child.id().is_some()` guards against the case where a
-            // child was set but has since exited (id() returns None after
-            // wait()/kill()).
+            // Re-check under the state lock: a previous `spawn_internal`
+            // (which held the spawn_lock) may have already installed a
+            // client+child. `child.id().is_some()` guards against the case
+            // where a child was set but has since exited (id() returns None
+            // after wait()/kill()).
             if state.client.is_some()
                 && state
                     .child

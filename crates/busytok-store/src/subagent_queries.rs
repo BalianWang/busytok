@@ -695,12 +695,11 @@ pub fn find_hot_binding_by_session(
 
 /// Write just the `hot_summary` field of a subagent's memory row.
 /// Used by the eviction flow to persist the memory delta returned by
-/// `session.prepare_hibernate`. Mirrors `SubagentManager::write_hot_summary`
-/// but lives in the store layer so the executor can call it directly.
+/// `session.prepare_hibernate`. Lives in the store layer so the executor
+/// can call it directly without going through SubagentManager.
 pub fn write_hot_summary(conn: &Connection, subagent_id: &str, hot_summary: &str) -> Result<()> {
     // UPSERT memory row with just hot_summary (other fields unchanged).
-    // Mirrors the manager's write_hot_summary pattern: get-or-create, update
-    // hot_summary, upsert.
+    // Pattern: get-or-create the memory row, update hot_summary, upsert.
     let existing: Option<SubagentMemoryRow> = conn
         .query_row(
             "SELECT id, subagent_id, hot_summary, long_summary, key_files_json, \

@@ -96,8 +96,10 @@ pub fn resolve_sidecar_config(
         // Spec §5.4: health ping every 30s. Fixed in MVP (no config knob).
         health_interval: Duration::from_secs(30),
         task_timeout: Duration::from_secs(settings.task_timeout_seconds),
-        // Spec §5.4: max 3 attempts. The sliding 5-min window is NOT
-        // implemented in MVP — restart_attempts resets on successful spawn.
+        // Spec §5.4: max 3 backoff attempts. The rolling 5-min crash window
+        // (restart_history + MAX_CRASHES_PER_WINDOW=3) is implemented in
+        // supervisor.rs and is independent of this backoff-only counter.
+        // restart_attempts resets on successful spawn; restart_history does not.
         max_restart_attempts: 3,
         restart_backoff_base: Duration::from_secs(1),
         harness_name: "pi".to_string(),

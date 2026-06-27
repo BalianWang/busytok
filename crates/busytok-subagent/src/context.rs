@@ -55,7 +55,12 @@ impl ContextBuilder {
         } else {
             profile_budget_tokens
         };
-        let budget = effective_budget.clamp(1, self.config.max_budget_tokens);
+        // Guard against max_budget_tokens=0 misconfiguration — clamp(1, 0)
+        // would panic (min > max). Treat 0 as 1 so the clamp stays valid;
+        // a 0 config is a misconfiguration that produces a degraded 1-token
+        // cap rather than a crash.
+        let max_budget = self.config.max_budget_tokens.max(1);
+        let budget = effective_budget.clamp(1, max_budget);
 
         let snapshot = MemorySnapshot {
             hot_summary: memory.hot_summary.clone(),
