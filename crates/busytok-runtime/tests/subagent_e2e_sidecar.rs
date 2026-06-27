@@ -785,6 +785,102 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
+// --- doctor SQLite failure paths (spec §7.1: readable/writable/schema) ---
+//
+// Verifies the 3-probe SQLite check reports "error" when (a) the schema
+// version doesn't match SCHEMA_VERSION, and (b) the DB is read-only (write
+// probe fails). The all-good case is covered by
+// settings_diagnostics_includes_subagent_doctor_with_11_checks above.
+
+#[tokio::test]
+#[serial]
+async fn doctor_sqlite_check_errors_on_schema_version_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // Corrupt the schema version to trigger the mismatch branch.
+    // DELETE + INSERT (not UPDATE) because _schema_version.version has a
+    // UNIQUE constraint — UPDATE would fail if the target value exists.
+    db.conn()
+        .execute_batch("DELETE FROM _schema_version; INSERT INTO _schema_version (version, applied_at_ms) VALUES (999, 0);")
+        .unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope
+        .data
+        .subagent
+        .expect("subagent section must be present");
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "sqlite_readable")
+        .expect("must have sqlite_readable check");
+    assert_eq!(check.status, "error", "schema mismatch must report error");
+    assert!(
+        check
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("schema version mismatch"),
+        "detail should explain the mismatch: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_sqlite_check_errors_on_readonly_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("readonly_test.db");
+    // Open normally to run migrations, then drop to close the connection.
+    {
+        let _db = busytok_store::Database::open(&db_path).unwrap();
+    }
+    // Reopen as read-only — BEGIN IMMEDIATE will fail (SQLITE_READONLY).
+    let db = busytok_store::Database::open_readonly(&db_path).unwrap();
+
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope
+        .data
+        .subagent
+        .expect("subagent section must be present");
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "sqlite_readable")
+        .expect("must have sqlite_readable check");
+    assert_eq!(check.status, "error", "read-only DB must report error");
+    assert!(
+        check
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("write probe failed"),
+        "detail should explain the write probe failure: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
 // --- crash recovery e2e (Plan 5 Task 5, spec §12.1 Case 4) ---
 //
 // Verifies the EXISTING crash recovery logic in PiSidecarSupervisor
@@ -940,7 +1036,165 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
-// --- stress test: 100 idle logical subagents (Plan 5 Task 6, spec §12.2) ---
+// --- double-crash regression test (P1 fix: supervision_started must reset) ---
+//
+// Verifies that the supervision loop is revived after a crash, so a SECOND
+// crash is still detected. Without the fix (supervision_started never reset),
+// the loop exits after the first crash and is never re-spawned — the second
+// crash would go undetected (no sidecar_crash event, no DB reconciliation).
+//
+// Flow: crash #1 → restart → crash #2 → restart → success. Asserts 2 crash
+// events + 2 restart events, proving the loop ran for both lifecycles.
+
+#[tokio::test]
+#[serial]
+async fn sidecar_e2e_double_crash_second_crash_still_detected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.idle_exit_seconds = 300;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let mut cfg = make_sidecar_config();
+    cfg.env
+        .insert("BUSYTOK_MOCK_CRASH_AFTER".into(), "2".into());
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, cfg);
+
+    // 1. First delegate — completes, then mock crashes.
+    let resp1 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "double-crash".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "crash 1".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect("first delegate must complete");
+    assert_eq!(resp1.status, "completed");
+    let sub_id = resp1.subagent_id.clone();
+
+    // Wait for crash #1 to be detected by the supervision loop.
+    let mut crash1_detected = false;
+    for _ in 0..160 {
+        let crashes = {
+            let db_guard = supervisor.db_handle().lock().unwrap();
+            let events = db_guard.subagent_list_resource_events(None, 200).unwrap();
+            events
+                .iter()
+                .filter(|e| e.event_type == "sidecar_crash")
+                .count()
+        };
+        if crashes >= 1 {
+            crash1_detected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        crash1_detected,
+        "first crash must be detected by the supervision loop"
+    );
+
+    // 2. Second delegate — triggers auto-restart, completes, then mock
+    //    crashes AGAIN. This is the key: if supervision_started was not
+    //    reset, no loop would be running to detect this second crash.
+    let resp2 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "double-crash".to_string(),
+            subagent_id: Some(sub_id.clone()),
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "crash 2".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect("second delegate must complete after restart");
+    assert_eq!(resp2.status, "completed");
+
+    // Wait for crash #2 to be detected. WITHOUT the fix, this would time
+    // out because the supervision loop was never revived.
+    let mut crash2_detected = false;
+    for _ in 0..160 {
+        let crashes = {
+            let db_guard = supervisor.db_handle().lock().unwrap();
+            let events = db_guard.subagent_list_resource_events(None, 200).unwrap();
+            events
+                .iter()
+                .filter(|e| e.event_type == "sidecar_crash")
+                .count()
+        };
+        if crashes >= 2 {
+            crash2_detected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        crash2_detected,
+        "second crash must be detected — if this times out, the supervision \
+         loop was not revived after the first crash (supervision_started \
+         was not reset)"
+    );
+
+    // 3. Third delegate — triggers second restart, completes.
+    let resp3 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "double-crash".to_string(),
+            subagent_id: Some(sub_id.clone()),
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "final".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect("third delegate must complete after second restart");
+    assert_eq!(resp3.status, "completed");
+
+    // 4. Verify event counts: at least 2 crashes + exactly 2 restarts.
+    //    crash_count uses `>= 2` (not `== 2`) because the mock also crashes
+    //    after delegate #3's 2nd message, and the supervision loop may
+    //    detect that 3rd crash before this assertion runs — a legitimate
+    //    race. restart_count is exactly 2 because restarts only happen on
+    //    ensure_started (delegate), and there is no delegate #4.
+    let (crash_count, restart_count) = {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        let events = db_guard.subagent_list_resource_events(None, 200).unwrap();
+        let c = events
+            .iter()
+            .filter(|e| e.event_type == "sidecar_crash")
+            .count();
+        let r = events
+            .iter()
+            .filter(|e| e.event_type == "sidecar_restart")
+            .count();
+        (c, r)
+    };
+    assert!(
+        crash_count >= 2,
+        "expected at least 2 crash events, got {crash_count} (3rd crash may have been detected before assertion)"
+    );
+    assert_eq!(restart_count, 2, "exactly 2 restart events expected");
+
+    supervisor.shutdown_sidecar().await;
+    supervisor.shutdown_writer().await.unwrap();
+}
 //
 // Spec §12.2 acceptance: "100 idle logical subagents: RSS does not grow
 // linearly." Logical subagents are SQLite rows, not processes — RSS should
@@ -1103,5 +1357,108 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
     );
 
     supervisor.shutdown_sidecar().await;
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+// --- idle RSS regression test (spec §12.2: "Idle busytok-service RSS < 50MB") ---
+//
+// Spec §12.2 requires idle busytok-service RSS < 50MB when the Pi sidecar is
+// not running. The 50MB budget targets the production service process; a test
+// process carries extra overhead (test harness, tokio runtime, sysinfo, all
+// crate deps). This test provides regression protection by:
+// 1. Measuring RSS with no sidecar started (idle baseline).
+// 2. Delegating + shutting down (exercising spawn → shutdown → resource
+//    cleanup).
+// 3. Measuring RSS after shutdown.
+// 4. Asserting the delta is small (< 15MB) — catches resource monitor leaks,
+//    un-dropped state, or retained caches that would grow RSS over time.
+// 5. Asserting the absolute RSS stays below a test-process upper bound.
+//
+// The delta assertion is the primary regression signal; the absolute bound
+// is a generous ceiling that catches catastrophic leaks without being
+// environment-sensitive.
+
+#[tokio::test]
+#[serial]
+async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let settings = make_sidecar_settings();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
+
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+
+    // Baseline: measure RSS before any sidecar activity.
+    let measure_rss = || {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::everything(),
+        );
+        sys.process(pid)
+            .map(|p| (p.memory() as f64) / (1024.0 * 1024.0))
+            .unwrap_or(0.0)
+    };
+
+    let rss_baseline = measure_rss();
+    assert!(
+        rss_baseline > 0.0,
+        "failed to measure baseline RSS for pid={pid}"
+    );
+
+    // Exercise the full lifecycle: delegate → sidecar spawns → shutdown.
+    let _resp = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "idle-rss-test".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "noop".to_string(),
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Shutdown the sidecar and wait for cleanup.
+    supervisor.shutdown_sidecar().await;
+
+    // Give the OS a moment to reclaim the sidecar process's memory.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let rss_after = measure_rss();
+    let delta = rss_after - rss_baseline;
+
+    // Delta assertion (primary regression signal): RSS should not grow
+    // significantly from a single delegate+shutdown cycle. A growth > 15MB
+    // indicates a resource leak (monitor, cache, or un-dropped state).
+    assert!(
+        delta < 15.0,
+        "RSS grew by {delta:.1}MB after one delegate+shutdown cycle \
+         (baseline={rss_baseline:.1}MB, after={rss_after:.1}MB); \
+         this indicates a resource leak — spec §12.2 requires idle service \
+         RSS to stay bounded"
+    );
+
+    // Absolute assertion (spec §12.2 budget is 50MB for production; test
+    // process overhead warrants a generous ceiling). Catches catastrophic
+    // leaks. Adjust if test-process deps grow.
+    assert!(
+        rss_after < 200.0,
+        "RSS after shutdown = {rss_after:.1}MB, exceeding 200MB test-process \
+         ceiling (baseline={rss_baseline:.1}MB); spec §12.2 production budget \
+         is 50MB — investigate the leak"
+    );
+
     supervisor.shutdown_writer().await.unwrap();
 }

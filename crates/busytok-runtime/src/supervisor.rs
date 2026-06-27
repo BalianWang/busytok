@@ -422,23 +422,58 @@ impl BusytokSupervisor {
             detail: None,
         });
 
-        // 2. SQLite readable/writable + schema version.
+        // 2. SQLite readable/writable + schema version (spec §7.1).
+        //    Three probes: SELECT 1 (readable), BEGIN IMMEDIATE; ROLLBACK
+        //    (writable — fails on read-only DBs or locked state), and
+        //    schema_version == SCHEMA_VERSION (correct migration applied).
         {
             let db = self.db.lock().unwrap();
-            let schema_ok = db
+            let readable = db
                 .conn()
                 .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
                 .is_ok();
-            let schema_version = db
+            let db_version: i64 = db
                 .conn()
-                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM _schema_version",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
                 .unwrap_or(0);
+            let schema_version_ok = db_version == busytok_store::schema::SCHEMA_VERSION as i64;
+            // Write probe: BEGIN IMMEDIATE + a no-op DELETE + ROLLBACK. The
+            // DELETE matches no rows (version=-999 never exists) but forces
+            // SQLite to acquire a write lock and attempt I/O, which fails on
+            // read-only connections (SQLITE_READONLY). A bare
+            // `BEGIN IMMEDIATE; ROLLBACK;` is insufficient because in WAL
+            // mode some SQLite builds allow acquiring a RESERVED lock on a
+            // read-only connection without actually writing.
+            let writable = db
+                .conn()
+                .execute_batch(
+                    "BEGIN IMMEDIATE; \
+                     DELETE FROM _schema_version WHERE version = -999; \
+                     ROLLBACK;",
+                )
+                .is_ok();
+            let ok = readable && writable && schema_version_ok;
+            let mut detail = format!(
+                "schema_version={db_version} (expected {}), readable={readable}, writable={writable}",
+                busytok_store::schema::SCHEMA_VERSION
+            );
+            if !ok {
+                if !readable {
+                    detail.push_str(" — SELECT 1 failed");
+                } else if !writable {
+                    detail.push_str(" — write probe failed (read-only or locked)");
+                } else if !schema_version_ok {
+                    detail.push_str(" — schema version mismatch");
+                }
+            }
             checks.push(DoctorCheckDto {
                 name: "sqlite_readable".into(),
-                status: if schema_ok { "ok" } else { "error" }.into(),
-                detail: Some(format!("schema_version={schema_version}")),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
             });
         }
 

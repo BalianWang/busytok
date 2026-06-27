@@ -75,6 +75,11 @@ pub struct SupervisorState {
     /// Set true when the supervision loop is running; prevents double-spawn
     /// of the loop across concurrent `ensure_started` calls.
     supervision_started: bool,
+    /// Generation counter to prevent double-loop races. Each `spawn_internal`
+    /// that starts a new loop increments this. The loop captures the value
+    /// at start and checks it each iteration — if it changed, a newer loop
+    /// was spawned (after a shutdown+restart cycle) and this one is stale.
+    generation: u64,
     /// Edge-trigger latch for resource pressure (spec §6.5: lifecycle
     /// boundaries only). Updated on EVERY transition (escalation OR recovery)
     /// so re-pressurization after recovery writes a fresh `memory_pressure`
@@ -107,6 +112,7 @@ impl PiSidecarSupervisor {
                 last_activity: tokio::time::Instant::now(),
                 restart_attempts: 0,
                 supervision_started: false,
+                generation: 0,
                 resource_pressure_state: ResourcePressureState::Normal,
                 restart_history: VecDeque::new(),
             }),
@@ -136,6 +142,7 @@ impl PiSidecarSupervisor {
                 last_activity: tokio::time::Instant::now(),
                 restart_attempts: 0,
                 supervision_started: false,
+                generation: 0,
                 resource_pressure_state: ResourcePressureState::Normal,
                 restart_history: VecDeque::new(),
             }),
@@ -314,9 +321,16 @@ impl PiSidecarSupervisor {
             state.restart_attempts = 0; // reset on successful spawn
             if !state.supervision_started {
                 state.supervision_started = true;
+                // Bump generation so any stale loop from a prior lifecycle
+                // detects the change and exits (prevents double-loop when
+                // shutdown_internal + quick ensure_started races the old
+                // loop's sleep). The new loop captures this value and
+                // checks it each iteration.
+                state.generation = state.generation.wrapping_add(1);
+                let generation = state.generation;
                 let self_clone = Arc::clone(self);
                 tokio::spawn(async move {
-                    self_clone.supervision_loop().await;
+                    self_clone.supervision_loop(generation).await;
                 });
             }
             is_restart
@@ -342,7 +356,12 @@ impl PiSidecarSupervisor {
     /// resource sampling. Exits when the child is taken (shutdown) or
     /// crashes (handled, then exits — next `ensure_started` respawns and
     /// re-spawns the loop).
-    async fn supervision_loop(self: Arc<Self>) {
+    ///
+    /// `my_generation` is the generation captured at spawn time. Each
+    /// iteration checks `state.generation` — if it changed, a newer loop
+    /// was spawned (after a shutdown+restart cycle raced this loop's
+    /// sleep) and this one is stale; exit to avoid double-loop.
+    async fn supervision_loop(self: Arc<Self>, my_generation: u64) {
         let mut last_health = tokio::time::Instant::now();
         let mut last_resource_sample = tokio::time::Instant::now();
         // Read the monitor interval from the resource_monitor's policy (not
@@ -356,8 +375,17 @@ impl PiSidecarSupervisor {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             let mut state = self.state.lock().await;
+            // Stale-loop guard: a newer spawn_internal bumped the generation
+            // (after shutdown_internal reset supervision_started and a quick
+            // ensure_started re-spawned). Exit instead of double-running.
+            if state.generation != my_generation {
+                return;
+            }
             if state.child.is_none() {
-                return; // shut down — loop exits
+                // Shutdown took the child while we slept. Reset the flag so
+                // the next spawn_internal re-spawns this loop.
+                state.supervision_started = false;
+                return;
             }
             // --- crash detection (non-blocking try_wait) ---
             let crash_status = match state.child.as_mut() {
@@ -373,6 +401,8 @@ impl PiSidecarSupervisor {
                 state.child = None;
                 state.restart_attempts += 1;
                 state.restart_history.push_back(tokio::time::Instant::now());
+                // Reset so the next spawn_internal re-spawns this loop.
+                state.supervision_started = false;
                 warn!(
                     event_code = "subagent.sidecar.crash",
                     exit = ?status,
@@ -398,6 +428,8 @@ impl PiSidecarSupervisor {
             let idle_threshold = Duration::from_secs(self.config.idle_exit_seconds);
             let idle = last_activity.elapsed();
             if idle > idle_threshold {
+                // Reset so the next spawn_internal re-spawns this loop.
+                state.supervision_started = false;
                 drop(state);
                 info!(
                     event_code = "subagent.sidecar.idle_exit",
@@ -680,7 +712,15 @@ impl PiSidecarSupervisor {
         }
         // Kill child with 10s grace (spec §5.4). The sidecar should have
         // exited on adapter.shutdown; this is the fallback.
-        let child = { self.state.lock().await.child.take() };
+        // Reset supervision_started so the next spawn_internal re-spawns
+        // the supervision loop — without this, an external shutdown()
+        // followed by a quick ensure_started() would skip loop revival
+        // because the old loop hasn't yet observed child.is_none().
+        let child = {
+            let mut state = self.state.lock().await;
+            state.supervision_started = false;
+            state.child.take()
+        };
         if let Some(mut child) = child {
             match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
                 Ok(Ok(_status)) => {}
