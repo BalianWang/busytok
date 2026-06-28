@@ -52,7 +52,13 @@
 
   position: relative;
   width: 420px;
-  padding: 40px 36px 44px;
+  /* min-height (not fixed height) so 6-item papers can grow slightly beyond
+     560px instead of clipping the TOTAL row. Common cases (≤5 items) render
+     at exactly 560px (3:4); the 6-item edge case is ~595px (3:4.05). */
+  min-height: 560px;
+  display: flex;
+  flex-direction: column;
+  padding: 36px 36px 40px;
   border-radius: 14px 14px 0 0; /* rounded top; bottom carries the SVG scallop */
   background:
     radial-gradient(circle at 18% 8%, rgba(0, 0, 0, 0.03), transparent 22%),
@@ -62,6 +68,16 @@
   box-shadow:
     0 12px 30px rgba(35, 25, 15, 0.16),
     inset 0 0 0 1px rgba(60, 40, 20, 0.08);
+}
+
+/* Body region between meta and footer — flex:1 absorbs surplus vertical
+   space so the footer stays pinned to the bottom and the min-height target
+   is always filled. No overflow:hidden — clipping the TOTAL row silently
+   is worse than letting the paper grow a few pixels taller. */
+.receipt__body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
 }
 
 /* Capture-safe scalloped bottom edge: an inline <svg> (rendered in
@@ -119,7 +135,7 @@
 .receipt__divider {
   height: 0;
   border-top: 1px dashed var(--r-divider);
-  margin: 18px 0;
+  margin: 14px 0;
 }
 
 .receipt__meta {
@@ -158,8 +174,8 @@
   grid-template-columns: 1fr 80px 64px;
   align-items: baseline;
   gap: 0 10px;
-  font-size: 13px;
-  padding: 6px 0;
+  font-size: 12.5px;
+  padding: 5px 0;
   border-bottom: 1px dotted var(--r-divider);
 }
 /* Last item row before TOTAL has no dotted border — the TOTAL's double
@@ -228,7 +244,7 @@
    the visual focus on ITEMS + TOTAL above. */
 .receipt__footer {
   position: relative;
-  margin-top: 26px;
+  margin-top: 16px;
   text-align: center;
   font-size: 10px;
   letter-spacing: 0.18em;
@@ -249,20 +265,45 @@
 .receipt__footer-brand {
   /* inherits .receipt__footer text styling */
 }
-.receipt__barcode {
-  margin: 14px auto 0;
-  height: 34px;
-  width: 70%;
-  background: repeating-linear-gradient(
-    90deg,
-    var(--r-ink) 0 1px,
-    transparent 1px 3px,
-    var(--r-ink) 3px 4px,
-    transparent 4px 6px,
-    var(--r-ink) 6px 9px,
-    transparent 9px 12px
-  );
-  opacity: 0.78;
+
+/* QR call-to-action row: QR image + CTA text, horizontally aligned. */
+.receipt__qr-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 12px 0 6px;
+}
+.receipt__qr {
+  width: 56px;
+  height: 56px;
+  /* White background ensures scannability against the cream paper. */
+  background: #ffffff;
+  border: 1px solid var(--r-divider);
+  border-radius: 4px;
+  /* Prevent layout shift while the SVG loads. */
+  flex-shrink: 0;
+}
+.receipt__qr-cta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+}
+.receipt__qr-cta-primary {
+  font-family: "BusytokSans", system-ui, sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  color: var(--r-ink);
+  line-height: 1.2;
+}
+.receipt__qr-cta-secondary {
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--r-ink-muted);
+  line-height: 1.2;
 }
 
 /* The hidden, off-screen export target: rendered at exactly 420px, captured
@@ -276,8 +317,11 @@
 }
 
 .receipt-paper__empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   text-align: center;
-  padding: 48px 0;
   color: var(--r-ink-muted);
   font-size: 13px;
 }
