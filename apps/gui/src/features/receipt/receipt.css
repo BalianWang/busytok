@@ -329,14 +329,20 @@
 
 /* ── ReceiptPreviewDialog chrome ──────────────────────────────────────
    The dialog hosts a live preview of ReceiptPaper. The chrome consumes
-   semantic --color-* tokens so it follows the active app theme. */
+   semantic --color-* tokens so it follows the active app theme.
+   z-index:140 matches .prompt-dialog__overlay so the modal sits above
+   chart canvases and other in-page content (LightweightCharts creates
+   its own stacking context that can paint over position:fixed elements
+   without an explicit z-index). */
 .receipt-preview__overlay {
   position: fixed; inset: 0;
+  z-index: 140;
   background: var(--material-overlay-scrim);
   backdrop-filter: blur(var(--material-glass-blur-subtle));
 }
 .receipt-preview {
   position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 140;
   width: min(560px, 92vw); max-height: 88vh; display: flex; flex-direction: column;
   background: var(--color-surface);
   color: var(--color-text);
