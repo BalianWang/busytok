@@ -41,3 +41,10 @@ fn force_kill_sets_paused() {
     gate.set_action(PressureAction::ForceKill);
     assert!(gate.is_paused());
 }
+
+#[test]
+fn graceful_restart_sets_paused() {
+    let gate = PressureGate::new();
+    gate.set_action(PressureAction::GracefulRestart);
+    assert!(gate.is_paused());
+}
