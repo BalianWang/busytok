@@ -95,7 +95,7 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         timeout: Option<u64>,
-        #[arg(long, default_value = "text")]
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
         output: String,
         /// The task prompt (positional)
         prompt: String,

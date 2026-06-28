@@ -13,6 +13,7 @@ pub mod pressure;
 pub mod resolver;
 pub mod resource;
 pub mod sidecar;
+pub mod util;
 
 pub use error::{Result, SubagentError};
 pub use manager::SubagentManager;

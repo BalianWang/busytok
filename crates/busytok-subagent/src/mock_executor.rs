@@ -15,6 +15,9 @@ pub struct ExecutorInput {
     pub profile: String,
     pub model: Option<String>,
     pub prompt: String,
+    /// Spec §4.3: when set, the sidecar resolves this artifact path instead of
+    /// the inline `prompt`. Mutually exclusive with `prompt`.
+    pub prompt_artifact_ref: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub tools: Vec<String>,
     pub memory: MemorySnapshot,

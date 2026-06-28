@@ -2072,6 +2072,7 @@ fn delegate_request_from_dto(
         profile: d.profile,
         intent: d.intent,
         prompt: d.prompt,
+        prompt_artifact_ref: d.prompt_artifact_ref,
         timeout_seconds: d.timeout_seconds,
         model_override: d.model_override,
         source_harness: d.source_harness,

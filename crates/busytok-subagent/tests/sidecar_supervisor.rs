@@ -178,6 +178,7 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         profile: "pi/search-cheap".to_string(),
         intent: None,
         prompt: prompt.to_string(),
+        prompt_artifact_ref: None,
         timeout_seconds: None,
         model_override: None,
         source_harness: None,

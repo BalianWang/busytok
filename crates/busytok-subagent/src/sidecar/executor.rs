@@ -104,7 +104,7 @@ impl TaskExecutor for SidecarTaskExecutor {
             "model": input.model,
             "tools": input.tools,
             "prompt": input.prompt,
-            "prompt_artifact_ref": null,
+            "prompt_artifact_ref": input.prompt_artifact_ref,
             "memory": memory_json,
             "context": {
                 "compact_context": input.context.compact_context,
@@ -300,9 +300,20 @@ impl SidecarTaskExecutor {
                 flipped.is_hot = 0;
                 flipped.status = "closed".into();
                 flipped.closed_at_ms = Some(now);
-                db_guard
+                let new_status = db_guard
                     .subagent_commit_eviction(&flipped, &subagent_id, hot_summary)
                     .map_err(|e| anyhow::anyhow!("commit eviction failed: {e}"))?;
+                // Explicit status transition log (§3.3): hot binding closed,
+                // logical status flips to warm (hot_summary present) or cold.
+                // `new_status` is the authoritative value computed by
+                // `commit_eviction` from the post-write memory row state.
+                info!(
+                    event_code = "subagent.status.hot_to_warm",
+                    subagent_id = %subagent_id,
+                    adapter_session_id = %adapter_session_id,
+                    new_status = %new_status,
+                    "hot session evicted — logical status transitioned"
+                );
                 // Write `session_hibernate` resource event for observability.
                 // Best-effort: this is pure observability. If it fails we must
                 // NOT propagate — doing so would skip `session.close`, leaving

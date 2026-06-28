@@ -292,7 +292,13 @@ export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string
 
 export type SubagentResolveRequestDto = { name: string | null, id: string | null, cwd: string | null, };
 
-export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: string | null, cwd: string, profile: string, intent: string | null, prompt: string, timeout_seconds: number | null, model_override: string | null, source_harness: string | null, source_session_id: string | null, };
+export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: string | null, cwd: string, profile: string, intent: string | null, prompt: string, 
+/**
+ * Spec §4.3: when set, references a stored artifact (relative path within
+ * the artifact store root) instead of the inline `prompt`. Mutually
+ * exclusive with `prompt` — exactly one must be non-empty/Some.
+ */
+prompt_artifact_ref: string | null, timeout_seconds: number | null, model_override: string | null, source_harness: string | null, source_session_id: string | null, };
 
 export type SubagentListRequestDto = { 
 /**

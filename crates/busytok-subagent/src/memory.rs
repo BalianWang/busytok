@@ -6,7 +6,7 @@
 
 use busytok_config::SubagentContextConfig;
 use busytok_store::{SubagentMemoryRow, SubagentTaskRow};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 const MAX_LONG_SUMMARY_CHARS: usize = 3000;
 const MAX_DECISIONS: usize = 20;
@@ -91,7 +91,7 @@ impl MemoryUpdater {
         }
 
         // Merge key_files (normalize + dedupe + max score + latest last_seen).
-        let mut files = parse_json_vec::<KeyFile>(&current.key_files_json);
+        let mut files = crate::util::parse_json_vec::<KeyFile>(&current.key_files_json);
         for f in update.key_files {
             let normalized = normalize_path(&f.path, repo_path);
             if let Some(existing) = files
@@ -113,7 +113,8 @@ impl MemoryUpdater {
         current.key_files_json = Some(serde_json::to_string(&files).unwrap_or_default());
 
         // Merge open_questions (trim + dedupe by lowercase exact match, preserve casing).
-        let mut questions = parse_json_vec::<OpenQuestion>(&current.open_questions_json);
+        let mut questions =
+            crate::util::parse_json_vec::<OpenQuestion>(&current.open_questions_json);
         for q in update.open_questions {
             let trimmed = q.question.trim().to_string();
             let lower = trimmed.to_lowercase();
@@ -137,7 +138,7 @@ impl MemoryUpdater {
         current.open_questions_json = Some(serde_json::to_string(&questions).unwrap_or_default());
 
         // Merge decisions (dedupe by exact match).
-        let mut decisions = parse_json_vec::<String>(&current.decisions_json);
+        let mut decisions = crate::util::parse_json_vec::<String>(&current.decisions_json);
         for d in update.decisions {
             if !decisions.iter().any(|e: &String| e == &d) {
                 decisions.push(d);
@@ -147,7 +148,7 @@ impl MemoryUpdater {
 
         // Attempts: append a one-line summary from the MOST RECENT task.
         // recent_tasks is DESC-ordered, so .first() is the most recent.
-        let mut attempts = parse_json_vec::<String>(&current.attempts_json);
+        let mut attempts = crate::util::parse_json_vec::<String>(&current.attempts_json);
         if let Some(summary) = recent_tasks
             .first()
             .and_then(|t| t.result_summary.as_deref())
@@ -174,12 +175,12 @@ impl MemoryUpdater {
         if should_compact {
             self.compact(&mut current, recent_tasks);
             // Per-category caps apply DURING compaction (§6.2.4).
-            let mut decisions = parse_json_vec::<String>(&current.decisions_json);
+            let mut decisions = crate::util::parse_json_vec::<String>(&current.decisions_json);
             let start = decisions.len().saturating_sub(MAX_DECISIONS);
             decisions = decisions[start..].to_vec();
             current.decisions_json = Some(serde_json::to_string(&decisions).unwrap_or_default());
 
-            let mut files = parse_json_vec::<KeyFile>(&current.key_files_json);
+            let mut files = crate::util::parse_json_vec::<KeyFile>(&current.key_files_json);
             files.sort_by(|a, b| {
                 b.score
                     .cmp(&a.score)
@@ -188,7 +189,8 @@ impl MemoryUpdater {
             files.truncate(MAX_KEY_FILES);
             current.key_files_json = Some(serde_json::to_string(&files).unwrap_or_default());
 
-            let mut questions = parse_json_vec::<OpenQuestion>(&current.open_questions_json);
+            let mut questions =
+                crate::util::parse_json_vec::<OpenQuestion>(&current.open_questions_json);
             questions.truncate(MAX_OPEN_QUESTIONS);
             current.open_questions_json =
                 Some(serde_json::to_string(&questions).unwrap_or_default());
@@ -267,17 +269,10 @@ impl MemoryUpdater {
         };
 
         // Drop resolved open questions during compaction (§6.2.4 cap: unresolved only).
-        let mut questions = parse_json_vec::<OpenQuestion>(&mem.open_questions_json);
+        let mut questions = crate::util::parse_json_vec::<OpenQuestion>(&mem.open_questions_json);
         questions.retain(|q| q.status != "resolved");
         mem.open_questions_json = Some(serde_json::to_string(&questions).unwrap_or_default());
     }
-}
-
-/// Generic JSON vec parser — replaces 4 near-identical helpers.
-fn parse_json_vec<T: DeserializeOwned>(json: &Option<String>) -> Vec<T> {
-    json.as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default()
 }
 
 /// Normalize a file path (spec §6.3): repo-relative, forward slashes, strip

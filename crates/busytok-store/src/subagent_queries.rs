@@ -455,6 +455,19 @@ pub fn count_tasks_since(conn: &Connection, subagent_id: &str, since_ms: i64) ->
     Ok(count as u32)
 }
 
+/// Whether the given subagent has a task currently in `'running'` status.
+/// Used by `delegate()` to enforce per-subagent serialization (spec §6.4
+/// line 737): if a running task exists, the new task is inserted as
+/// `'queued'` instead of `'running'`.
+pub fn has_running_task(conn: &Connection, subagent_id: &str) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM subagent_tasks WHERE subagent_id = ? AND status = 'running'",
+        rusqlite::params![subagent_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Count subagent tasks by status. Returns (queued, running).
 pub fn task_counts_by_status(conn: &Connection) -> Result<(u32, u32)> {
     let queued: i64 = conn.query_row(
@@ -706,7 +719,7 @@ pub fn commit_eviction(
     binding: &SubagentHarnessBindingRow,
     subagent_id: &str,
     hot_summary: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let tx = conn.unchecked_transaction()?;
     if let Some(summary) = hot_summary {
         write_hot_summary(&tx, subagent_id, summary)?;
@@ -734,7 +747,7 @@ pub fn commit_eviction(
     )
     .with_context(|| format!("set logical status {new_status} for {subagent_id}"))?;
     tx.commit().context("commit eviction transaction")?;
-    Ok(())
+    Ok(new_status.to_string())
 }
 
 pub fn hot_binding(

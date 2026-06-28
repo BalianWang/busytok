@@ -37,6 +37,7 @@ pub async fn handle_delegate(
         profile,
         intent,
         prompt,
+        prompt_artifact_ref: None,
         timeout_seconds: timeout,
         model_override: model,
         source_harness: Some("cli".to_string()),
@@ -184,95 +185,89 @@ fn unwrap_ok(resp: ControlResponse) -> Result<serde_json::Value> {
 
 /// Print the `subagent.delegate` result (task_id / subagent_name / status / summary).
 fn print_delegate(value: &serde_json::Value, output: &str) -> Result<()> {
-    match output {
-        "json" => println!("{}", serde_json::to_string_pretty(value)?),
-        _ => {
-            let summary = value
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(no summary)");
-            println!(
-                "task:     {}",
-                value.get("task_id").and_then(|v| v.as_str()).unwrap_or("?")
-            );
-            println!(
-                "subagent: {}",
-                value
-                    .get("subagent_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-            );
-            println!(
-                "status:   {}",
-                value.get("status").and_then(|v| v.as_str()).unwrap_or("?")
-            );
-            println!("\n{summary}");
-        }
-    }
-    Ok(())
+    print_json_or(value, output, |v| {
+        let summary = v
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or("(no summary)");
+        println!(
+            "task:     {}",
+            v.get("task_id").and_then(|s| s.as_str()).unwrap_or("?")
+        );
+        println!(
+            "subagent: {}",
+            v.get("subagent_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?")
+        );
+        println!(
+            "status:   {}",
+            v.get("status").and_then(|s| s.as_str()).unwrap_or("?")
+        );
+        println!("\n{summary}");
+    })
 }
 
 /// Print an array envelope `{ "<key>": [ ... ] }` (used by list / tasks).
 fn print_array(value: &serde_json::Value, key: &str, output: &str) -> Result<()> {
-    match output {
-        "json" => println!("{}", serde_json::to_string_pretty(value)?),
-        _ => {
-            let arr = value.get(key).and_then(|v| v.as_array());
-            match arr {
-                Some(items) if items.is_empty() => {
-                    println!("(no {key})");
-                }
-                Some(items) => {
-                    for item in items {
-                        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let name = item
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| item.get("subagent_name").and_then(|v| v.as_str()))
-                            .unwrap_or("?");
-                        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                        println!("{id:<36} {name:<20} {status}");
-                    }
-                }
-                None => {
-                    // Unexpected shape — fall back to pretty JSON.
-                    println!("{}", serde_json::to_string_pretty(value)?);
+    print_json_or(value, output, |v| {
+        let arr = v.get(key).and_then(|a| a.as_array());
+        match arr {
+            Some(items) if items.is_empty() => println!("(no {key})"),
+            Some(items) => {
+                for item in items {
+                    let id = item.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+                    let name = item
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .or_else(|| item.get("subagent_name").and_then(|s| s.as_str()))
+                        .unwrap_or("?");
+                    let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                    println!("{id:<36} {name:<20} {status}");
                 }
             }
+            None => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
         }
-    }
-    Ok(())
+    })
 }
 
 /// Print a single subagent detail object.
 fn print_detail(value: &serde_json::Value, output: &str) -> Result<()> {
-    match output {
-        "json" => println!("{}", serde_json::to_string_pretty(value)?),
-        _ => {
-            let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            let name = value
-                .get("name")
-                .and_then(|v| v.as_str())
-                .or_else(|| value.get("subagent_name").and_then(|v| v.as_str()))
-                .unwrap_or("?");
-            let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            println!("id:     {id}");
-            println!("name:   {name}");
-            println!("status: {status}");
-        }
-    }
-    Ok(())
+    print_json_or(value, output, |v| {
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let name = v
+            .get("name")
+            .and_then(|s| s.as_str())
+            .or_else(|| v.get("subagent_name").and_then(|s| s.as_str()))
+            .unwrap_or("?");
+        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+        println!("id:     {id}");
+        println!("name:   {name}");
+        println!("status: {status}");
+    })
 }
 
 /// Print a simple ack envelope (`{ id, status }`).
 fn print_ack(value: &serde_json::Value, output: &str) -> Result<()> {
-    match output {
-        "json" => println!("{}", serde_json::to_string_pretty(value)?),
-        _ => {
-            let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            println!("{id}: {status}");
-        }
+    print_json_or(value, output, |v| {
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+        println!("{id}: {status}");
+    })
+}
+
+/// Shared helper: `json` output prints pretty JSON; any other value runs the
+/// supplied text-mode closure. Centralizes the `match output { "json" => …, _ => … }`
+/// pattern previously repeated across `print_delegate`/`print_array`/`print_detail`/`print_ack`.
+fn print_json_or(
+    value: &serde_json::Value,
+    output: &str,
+    text_fn: impl FnOnce(&serde_json::Value),
+) -> Result<()> {
+    if output == "json" {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        text_fn(value);
     }
     Ok(())
 }

@@ -132,6 +132,9 @@ pub struct DelegateRequest {
     pub profile: String,
     pub intent: Option<String>,
     pub prompt: String,
+    /// Spec §4.3: when set, references a stored artifact instead of the inline
+    /// `prompt`. Mutually exclusive with `prompt`.
+    pub prompt_artifact_ref: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub model_override: Option<String>,
     pub source_harness: Option<String>,

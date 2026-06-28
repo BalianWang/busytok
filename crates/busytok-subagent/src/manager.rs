@@ -88,6 +88,30 @@ impl SubagentManager {
             );
             return Err(SubagentError::ProfileNotFound(req.profile));
         }
+        // Spec §4.3: `prompt` and `prompt_artifact_ref` are mutually exclusive.
+        // Exactly one must be set (non-empty prompt OR Some artifact ref).
+        let has_artifact = req
+            .prompt_artifact_ref
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
+        if has_artifact && !req.prompt.is_empty() {
+            warn!(
+                event_code = "subagent.delegate.rejected",
+                reason = "prompt_and_artifact_ref_both_set"
+            );
+            return Err(SubagentError::InvalidArgument(
+                "prompt and prompt_artifact_ref are mutually exclusive".to_string(),
+            ));
+        }
+        if !has_artifact && req.prompt.is_empty() {
+            warn!(
+                event_code = "subagent.delegate.rejected",
+                reason = "prompt_and_artifact_ref_both_empty"
+            );
+            return Err(SubagentError::InvalidArgument(
+                "either prompt or prompt_artifact_ref must be set".to_string(),
+            ));
+        }
         let profile_model = self.profile_model(&req.profile);
 
         // 1. resolve subagent (create if needed). `resolve_by_name` canonicalizes
@@ -121,18 +145,17 @@ impl SubagentManager {
         };
 
         // 2. insert task row. §8.3 step 2 "queue only" (Round 4 race-free
-        //    design): check the gate BEFORE insert and set the row status
-        //    directly.
-        //    - Gate paused → insert as `"queued"`, return `Queued` early.
-        //      The background `TaskDispatcher` (Task 7) picks it up when the
-        //      gate clears.
-        //    - Gate not paused → insert as `"running"` (with `started_at_ms =
-        //      now`). The dispatcher only picks `'queued'` tasks, so it never
-        //      sees this task — no race where the dispatcher could pick a
-        //      just-inserted queued task before `delegate()` flips it.
-        //    `insert_task` already takes `row.status` from the
-        //    `SubagentTaskRow` (verified at subagent_queries.rs:331), so no
-        //    store change is needed.
+        //    design) + spec §6.4 per-subagent serialization: check the gate
+        //    AND whether this subagent already has a running task BEFORE insert.
+        //    - Gate paused OR subagent busy → insert as `"queued"`, return
+        //      `Queued` early. The background `TaskDispatcher` (Task 7) picks
+        //      it up when the gate clears AND the subagent is free.
+        //    - Gate not paused AND subagent free → insert as `"running"`
+        //      (with `started_at_ms = now`). The dispatcher only picks
+        //      `'queued'` tasks, so it never sees this task.
+        //    The `has_running_task` check + insert happen inside the same DB
+        //    lock, so the TOCTOU window is closed (single-process, Rust mutex
+        //    serializes all DB access).
         let paused = self
             .pressure_gate
             .as_ref()
@@ -140,8 +163,10 @@ impl SubagentManager {
             .unwrap_or(false);
         let now = busytok_domain::now_ms();
         let task_id = format!("task_{}", uuid::Uuid::new_v4());
-        {
+        let should_queue = {
             let db = self.db.lock().expect("subagent db lock poisoned");
+            let has_running = db.subagent_has_running_task(&subagent.id).unwrap_or(false);
+            let should_queue = paused || has_running;
             db.subagent_insert_task(&SubagentTaskRow {
                 id: task_id.clone(),
                 subagent_id: subagent.id.clone(),
@@ -150,10 +175,10 @@ impl SubagentManager {
                 intent: req.intent.clone(),
                 profile: req.profile.clone(),
                 prompt: Some(req.prompt.clone()),
-                prompt_artifact_ref: None,
+                prompt_artifact_ref: req.prompt_artifact_ref.clone(),
                 output_schema_name: None,
                 output_schema_version: 1,
-                status: if paused {
+                status: if should_queue {
                     "queued".to_string()
                 } else {
                     "running".to_string()
@@ -162,7 +187,7 @@ impl SubagentManager {
                 result_json: None,
                 error: None,
                 created_at_ms: now,
-                started_at_ms: if paused { None } else { Some(now) },
+                started_at_ms: if should_queue { None } else { Some(now) },
                 completed_at_ms: None,
                 // Task 7 Round 3 Finding 1 fix: persist execution params so the
                 // dispatcher reads them from the row (single source of truth).
@@ -170,7 +195,8 @@ impl SubagentManager {
                 model_override: req.model_override.clone(),
             })
             .map_err(SubagentError::Store)?;
-        }
+            should_queue
+        };
 
         info!(
             event_code = "subagent.delegate.start",
@@ -180,16 +206,18 @@ impl SubagentManager {
             "delegating task"
         );
 
-        // If paused, return Queued — the dispatcher handles it when the gate
-        // clears. We return immediately without building context or invoking
-        // the executor.
-        if paused {
+        // If should_queue (gate paused OR subagent busy), return Queued — the
+        // dispatcher handles it when the gate clears AND the subagent is free.
+        // We return immediately without building context or invoking the
+        // executor.
+        if should_queue {
             info!(
                 event_code = "subagent.delegate.queued",
                 subagent_id = %subagent.id,
                 task_id = %task_id,
                 action = ?self.pressure_gate.as_ref().and_then(|g| g.last_action()),
-                "pressure gate paused — task queued, not executed"
+                paused,
+                "task queued — gate paused or subagent busy"
             );
             return Ok(DelegateResult {
                 task_id,
@@ -225,7 +253,7 @@ impl SubagentManager {
             intent: req.intent.clone(),
             profile: req.profile.clone(),
             prompt: Some(req.prompt.clone()),
-            prompt_artifact_ref: None,
+            prompt_artifact_ref: req.prompt_artifact_ref.clone(),
             output_schema_name: None,
             output_schema_version: 1,
             status: "running".to_string(),
@@ -343,6 +371,7 @@ impl SubagentManager {
                 profile: task.profile.clone(),
                 model: model.clone(),
                 prompt,
+                prompt_artifact_ref: task.prompt_artifact_ref.clone(),
                 timeout_seconds: task.timeout_seconds.map(|t| t as u64),
                 tools,
                 memory: snapshot,
@@ -419,6 +448,7 @@ impl SubagentManager {
                 .as_ref()
                 .map(|p| p.context_budget_tokens)
                 .unwrap_or(self.settings.context.default_budget_tokens);
+            let prev_compacted_at = memory_row.last_compacted_at_ms;
             let updated_mem = self.memory_updater.update(
                 memory_row,
                 out.memory_update.clone(),
@@ -428,11 +458,20 @@ impl SubagentManager {
                 profile_budget,
                 &subagent.repo_path,
             );
+            let compacted = updated_mem.last_compacted_at_ms != prev_compacted_at;
+            if compacted {
+                info!(
+                    event_code = "subagent.memory.compacted",
+                    subagent_id = %subagent.id,
+                    tasks_since_last_compaction,
+                    "memory compacted (trigger fired)"
+                );
+            }
             info!(
                 event_code = "subagent.memory.updated",
                 subagent_id = %subagent.id,
                 has_hot_summary = updated_mem.hot_summary.is_some(),
-                compacted = updated_mem.last_compacted_at_ms.is_some(),
+                compacted,
                 "memory updated after task"
             );
             db.subagent_upsert_memory(&updated_mem)

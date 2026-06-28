@@ -97,6 +97,7 @@ async fn failing_executor_always_errors() {
         profile: "pi/search-cheap".into(),
         model: None,
         prompt: "do".into(),
+        prompt_artifact_ref: None,
         timeout_seconds: None,
         tools: vec![],
         memory: busytok_subagent::context::MemorySnapshot {

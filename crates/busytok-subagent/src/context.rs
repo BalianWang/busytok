@@ -65,9 +65,9 @@ impl ContextBuilder {
         let snapshot = MemorySnapshot {
             hot_summary: memory.hot_summary.clone(),
             long_summary: memory.long_summary.clone(),
-            key_files: parse_json_vec(&memory.key_files_json),
-            decisions: parse_json_vec(&memory.decisions_json),
-            open_questions: parse_json_vec(&memory.open_questions_json),
+            key_files: crate::util::parse_json_vec(&memory.key_files_json),
+            decisions: crate::util::parse_json_vec(&memory.decisions_json),
+            open_questions: crate::util::parse_json_vec(&memory.open_questions_json),
         };
 
         // Recent task summaries: most recent first. Sort by created_at_ms DESC
@@ -92,7 +92,7 @@ impl ContextBuilder {
         let parts = ContextParts {
             header,
             recent_summaries,
-            attempts: parse_json_vec::<String>(&memory.attempts_json),
+            attempts: crate::util::parse_json_vec::<String>(&memory.attempts_json),
             key_files: snapshot.key_files.clone(),
             open_questions: snapshot.open_questions.clone(),
             decisions: snapshot.decisions.clone(),
@@ -381,10 +381,4 @@ fn assemble_with_budget(parts: ContextParts, budget_chars: usize) -> String {
 
 fn finalize(s: String) -> String {
     s.trim_end_matches('\n').to_string() + "\n"
-}
-
-fn parse_json_vec<T: serde::de::DeserializeOwned>(json: &Option<String>) -> Vec<T> {
-    json.as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default()
 }

@@ -45,6 +45,7 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         profile: "pi/search-cheap".to_string(),
         intent: None,
         prompt: prompt.to_string(),
+        prompt_artifact_ref: None,
         timeout_seconds: Some(5),
         model_override: None,
         source_harness: None,
@@ -320,5 +321,201 @@ fn pick_oldest_queued_task_flips_status_to_running() {
     assert!(
         picked_again.is_none(),
         "task already flipped to running must NOT be picked again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1-1 fix (spec §6.4): per-subagent serialization in `delegate()`.
+// ---------------------------------------------------------------------------
+
+/// Executor that sleeps for a fixed duration to keep the task in "running"
+/// state while a second `delegate()` is called concurrently.
+struct DelayingExecutor(std::time::Duration, Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl TaskExecutor for DelayingExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(self.0).await;
+        Ok(ExecutorOutput {
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: "done".into(),
+            usage: Default::default(),
+            memory_update: Default::default(),
+        })
+    }
+}
+
+/// Spec §6.4 line 737: "Same logical subagent: tasks are serialized (FIFO
+/// queue per subagent)." When a subagent already has a running task, a
+/// second `delegate()` must insert as `'queued'` (not run concurrently).
+#[tokio::test]
+async fn delegate_queues_when_subagent_already_running() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let db = Arc::new(Mutex::new(
+        busytok_store::Database::open_in_memory().unwrap(),
+    ));
+    let settings = SubagentSettings::default();
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(DelayingExecutor(
+        std::time::Duration::from_millis(500),
+        Arc::clone(&call_count),
+    )) as Arc<dyn TaskExecutor>;
+    let manager =
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+
+    // Run two delegates concurrently for the SAME subagent.
+    // r1 inserts as "running" + starts executing (sleeps 500ms).
+    // r2 sees the running task → inserts as "queued" → returns Queued.
+    let (r1, r2) = tokio::join!(
+        manager.delegate(req("busy-sub", "first")),
+        manager.delegate(req("busy-sub", "second")),
+    );
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+
+    assert_eq!(r1.status, TaskStatus::Completed, "first task completes");
+    assert_eq!(
+        r2.status,
+        TaskStatus::Queued,
+        "second task must be queued — subagent was busy (spec §6.4)"
+    );
+    assert_eq!(
+        r1.subagent_id, r2.subagent_id,
+        "both tasks target the same subagent"
+    );
+
+    // Executor called exactly once — second task was queued, not executed.
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "executor called once — second task was queued"
+    );
+
+    // DB state: one completed, one queued.
+    {
+        let db = db.lock().unwrap();
+        let tasks = db.subagent_list_tasks(&r1.subagent_id, 10).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks.iter().any(|t| t.status == "completed"),
+            "first task is completed"
+        );
+        let queued = tasks
+            .iter()
+            .find(|t| t.status == "queued")
+            .expect("second task is queued");
+        assert!(
+            queued.started_at_ms.is_none(),
+            "queued task has no started_at_ms"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1-2 fix (spec §4.3): `prompt_artifact_ref` end-to-end + validation.
+// ---------------------------------------------------------------------------
+
+/// `prompt` and `prompt_artifact_ref` are mutually exclusive (spec §4.3).
+/// Setting both is rejected with `InvalidArgument`.
+#[tokio::test]
+async fn delegate_rejects_both_prompt_and_artifact_ref() {
+    let db = Arc::new(Mutex::new(
+        busytok_store::Database::open_in_memory().unwrap(),
+    ));
+    let settings = SubagentSettings::default();
+    let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
+    let manager =
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+    let mut r = req("test", "inline prompt");
+    r.prompt_artifact_ref = Some("sub/task/prompt.txt".to_string());
+    let err = manager.delegate(r).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "subagent.invalid_argument",
+        "both prompt and prompt_artifact_ref set → InvalidArgument"
+    );
+}
+
+/// Setting neither `prompt` nor `prompt_artifact_ref` is rejected.
+#[tokio::test]
+async fn delegate_rejects_neither_prompt_nor_artifact_ref() {
+    let db = Arc::new(Mutex::new(
+        busytok_store::Database::open_in_memory().unwrap(),
+    ));
+    let settings = SubagentSettings::default();
+    let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
+    let manager =
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+    let r = req("test", "");
+    let err = manager.delegate(r).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "subagent.invalid_argument",
+        "neither prompt nor prompt_artifact_ref set → InvalidArgument"
+    );
+}
+
+/// `prompt_artifact_ref` is preserved end-to-end: DelegateRequest → task row
+/// → ExecutorInput → (sidecar RPC). Verifies spec §4.3 contract.
+#[tokio::test]
+async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
+    use std::sync::Mutex as StdMutex;
+
+    struct CapturingExecutor(Arc<StdMutex<Option<ExecutorInput>>>);
+    #[async_trait]
+    impl TaskExecutor for CapturingExecutor {
+        async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+            *self.0.lock().unwrap() = Some(input.clone());
+            Ok(ExecutorOutput {
+                adapter_session_id: None,
+                session_reused: false,
+                status: TaskStatus::Completed,
+                summary: "done".into(),
+                usage: Default::default(),
+                memory_update: Default::default(),
+            })
+        }
+    }
+
+    let db = Arc::new(Mutex::new(
+        busytok_store::Database::open_in_memory().unwrap(),
+    ));
+    let settings = SubagentSettings::default();
+    let captured = Arc::new(StdMutex::new(None));
+    let executor = Arc::new(CapturingExecutor(Arc::clone(&captured))) as Arc<dyn TaskExecutor>;
+    let manager =
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+
+    let mut r = req("artifact-sub", "");
+    r.prompt_artifact_ref = Some("sub123/task456/prompt.txt".to_string());
+    let result = manager.delegate(r).await.unwrap();
+    assert_eq!(result.status, TaskStatus::Completed);
+
+    // Verify task row in DB has the artifact ref.
+    {
+        let db = db.lock().unwrap();
+        let tasks = db.subagent_list_tasks(&result.subagent_id, 10).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].prompt_artifact_ref.as_deref(),
+            Some("sub123/task456/prompt.txt"),
+            "task row must preserve prompt_artifact_ref"
+        );
+    }
+
+    // Verify ExecutorInput received the artifact ref.
+    let captured_input = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("executor was called");
+    assert_eq!(
+        captured_input.prompt_artifact_ref.as_deref(),
+        Some("sub123/task456/prompt.txt"),
+        "ExecutorInput must preserve prompt_artifact_ref"
     );
 }

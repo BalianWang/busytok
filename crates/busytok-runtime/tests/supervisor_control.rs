@@ -3341,6 +3341,7 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
             profile: "pi/search-cheap".to_string(),
             intent: None,
             prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
             timeout_seconds: None,
             model_override: None,
             source_harness: None,

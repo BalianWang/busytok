@@ -1269,6 +1269,10 @@ pub struct SubagentDelegateRequestDto {
     pub profile: String,
     pub intent: Option<String>,
     pub prompt: String,
+    /// Spec §4.3: when set, references a stored artifact (relative path within
+    /// the artifact store root) instead of the inline `prompt`. Mutually
+    /// exclusive with `prompt` — exactly one must be non-empty/Some.
+    pub prompt_artifact_ref: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub model_override: Option<String>,
     pub source_harness: Option<String>,

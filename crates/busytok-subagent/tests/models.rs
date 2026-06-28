@@ -54,6 +54,7 @@ fn delegate_request_requires_subagent_and_prompt() {
         profile: "pi/search-cheap".to_string(),
         intent: None,
         prompt: "find it".to_string(),
+        prompt_artifact_ref: None,
         timeout_seconds: None,
         model_override: None,
         source_harness: None,

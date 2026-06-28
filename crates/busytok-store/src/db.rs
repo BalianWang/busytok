@@ -1956,6 +1956,11 @@ impl Database {
     pub fn subagent_pick_oldest_queued_task(&self) -> rusqlite::Result<Option<SubagentTaskRow>> {
         subagent_queries::pick_oldest_queued_task(self.conn())
     }
+    /// Whether the subagent has a task currently in `'running'` status.
+    /// Used by `delegate()` for per-subagent serialization (spec §6.4).
+    pub fn subagent_has_running_task(&self, subagent_id: &str) -> rusqlite::Result<bool> {
+        subagent_queries::has_running_task(self.conn(), subagent_id)
+    }
     /// Count subagent tasks by status. Returns (queued, running).
     pub fn subagent_task_counts_by_status(&self) -> Result<(u32, u32)> {
         crate::subagent_queries::task_counts_by_status(&self.conn)
@@ -2031,7 +2036,7 @@ impl Database {
         binding: &SubagentHarnessBindingRow,
         subagent_id: &str,
         hot_summary: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let conn = self.conn();
         subagent_queries::commit_eviction(conn, binding, subagent_id, hot_summary)
     }
