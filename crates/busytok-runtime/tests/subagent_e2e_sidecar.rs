@@ -1570,7 +1570,16 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
 
-    let _supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // Smoke-test intent: with `pi_sidecar.enabled = false` the supervisor
+    // must NOT construct a pressure gate (gate construction is the sidecar
+    // path's responsibility). The queue-only behavior below is exercised
+    // through a standalone SubagentManager with an explicit gate.
+    assert!(
+        supervisor.pressure_gate().is_none(),
+        "sidecar disabled → no pressure gate constructed"
+    );
 
     // When sidecar is disabled, no pressure gate is constructed. Use a
     // direct SubagentManager test instead by constructing the manager
@@ -1588,7 +1597,7 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     let exec = Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
     let manager = busytok_subagent::SubagentManager::with_pressure_gate(
-        db2,
+        db2.clone(),
         settings2,
         "pi",
         exec,
@@ -1619,6 +1628,28 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
         busytok_subagent::TaskStatus::Queued,
         "delegate must return Queued status when gate is paused, not execute or error"
     );
+
+    // Verify the race-free insert claim: the task row must exist in the DB
+    // with `status = "queued"` and `started_at_ms = NULL` (not started).
+    // Without this query, the Queued return value could in principle come
+    // from a path that skipped DB insertion entirely.
+    let row = db2
+        .lock()
+        .unwrap()
+        .subagent_get_task(&result.task_id)
+        .expect("DB get_task must not error")
+        .expect("queued task row must exist in the DB after delegate returns Queued");
+    assert_eq!(
+        row.status, "queued",
+        "DB row status must be 'queued' (got {:?})",
+        row.status
+    );
+    assert!(
+        row.started_at_ms.is_none(),
+        "queued task must not have started_at_ms set (got {:?})",
+        row.started_at_ms
+    );
+
     // Sanity: the gate is still paused (delegate must not have cleared it).
     assert!(gate.is_paused(), "delegate must not clear the pause flag");
 }
