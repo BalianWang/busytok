@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useRef } from "react";
+import { Calendar as CalendarIcon, Clipboard, Download as DownloadIcon } from "lucide-react";
 import { useDailyReceipt } from "../../api/useBusytokData";
 import { ReceiptPaper } from "./ReceiptPaper";
 import { toReceiptViewModel } from "./viewModel";
@@ -16,82 +17,105 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
   const envelope = useDailyReceipt(date);
   const dto = envelope.data?.data ?? null;
   const vm = dto ? toReceiptViewModel(dto) : null;
-  const exportRootRef = useRef<HTMLDivElement>(null);
-  const exportApi = useReceiptExport(exportRootRef, vm ?? EMPTY_VM, date);
+  // Capture the .receipt-paper element (NOT the .receipt-stage wrapper) so the
+  // exported PNG is filled edge-to-edge by the receipt body, with no stage
+  // backdrop. The ref is read inside useReceiptExport's captureBytes at click
+  // time, so it always points at the latest-mounted paper.
+  const paperRef = useRef<HTMLDivElement>(null);
+  const dateInputRef = useRef<HTMLInputElement>(null);
+  const exportApi = useReceiptExport(paperRef, date);
 
   return (
     <>
-    <Dialog.Root
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) onClose();
-      }}
-    >
-      <Dialog.Portal>
-        <Dialog.Overlay className="receipt-preview__overlay" />
-        <Dialog.Content className="receipt-preview">
-          <Dialog.Title className="receipt-preview__title">Daily receipt</Dialog.Title>
-          <Dialog.Description className="receipt-preview__desc">
-            Preview your day as a shareable receipt.
-          </Dialog.Description>
+      <Dialog.Root
+        open={open}
+        onOpenChange={(next) => {
+          if (!next) onClose();
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="receipt-preview__overlay" />
+          <Dialog.Content className="receipt-preview">
+            {/* Visually-hidden Title/Description satisfy Radix Dialog a11y
+                (Dialog.Content requires a Title or aria-describedby). They
+                occupy no visible space. */}
+            <Dialog.Title className="receipt-preview__sr-only">
+              Daily receipt
+            </Dialog.Title>
+            <Dialog.Description className="receipt-preview__sr-only">
+              Preview your day as a shareable receipt.
+            </Dialog.Description>
 
-          <label className="receipt-preview__date">
-            <span>Receipt date</span>
-            <input
-              type="date"
-              aria-label="Receipt date"
-              value={date}
-              onChange={(e) => onDateChange(e.target.value)}
-            />
-          </label>
+            <div className="receipt-preview__scroll">
+              {vm ? (
+                <div className="receipt-preview__paper">
+                  {/* Scaled live preview. The export root below renders an
+                      unscaled twin for capture. */}
+                  <ReceiptPaper vm={vm} key="preview" />
+                </div>
+              ) : (
+                <div className="receipt-preview__loading">Loading…</div>
+              )}
+            </div>
 
-          <div className="receipt-preview__scroll">
-            {vm ? (
-              <div className="receipt-preview__paper">
-                {/* Scaled live preview */}
-                <ReceiptPaper vm={vm} key="preview" />
-              </div>
-            ) : (
-              <div className="receipt-preview__loading">Loading…</div>
-            )}
-          </div>
-
-          <footer className="receipt-preview__actions">
-            <button type="button" className="btn btn--secondary" onClick={exportApi.copySummary}>
-              Copy summary
-            </button>
-            <button type="button" className="btn btn--secondary" onClick={exportApi.savePng} disabled={exportApi.busy || !vm}>
-              Save PNG
-            </button>
-            <button type="button" className="btn btn--primary" onClick={exportApi.copyImage} disabled={exportApi.busy || !vm}>
-              Copy image
-            </button>
-            <Dialog.Close asChild>
-              <button type="button" className="btn btn--ghost">Close</button>
-            </Dialog.Close>
-          </footer>
-
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+            <footer className="receipt-preview__toolbar">
+              {/* Hidden native date input — opened via showPicker() on icon
+                  click. showPicker() is supported on Chromium ≥99 and
+                  WebKit ≥17, matching Tauri's webview floor. */}
+              <input
+                ref={dateInputRef}
+                type="date"
+                aria-label="Receipt date"
+                className="receipt-preview__date-input"
+                value={date}
+                onChange={(e) => onDateChange(e.target.value)}
+              />
+              <button
+                type="button"
+                className="receipt-action-button"
+                aria-label="Pick receipt date"
+                title="Pick receipt date"
+                onClick={() => dateInputRef.current?.showPicker()}
+              >
+                <CalendarIcon size={16} strokeWidth={1.75} />
+              </button>
+              <button
+                type="button"
+                className="receipt-action-button"
+                aria-label="Save PNG"
+                title="Save PNG"
+                disabled={exportApi.busy || !vm}
+                onClick={exportApi.savePng}
+              >
+                <DownloadIcon size={16} strokeWidth={1.75} />
+              </button>
+              <button
+                type="button"
+                className="receipt-action-button"
+                aria-label="Copy image"
+                title="Copy image"
+                disabled={exportApi.busy || !vm}
+                onClick={exportApi.copyImage}
+              >
+                <Clipboard size={16} strokeWidth={1.75} />
+              </button>
+            </footer>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
       {/* Off-screen export root — OUTSIDE the dialog content so it is not
-          focus-trapped or announced; only the capture reads it. */}
+          focus-trapped or announced. Captures the .receipt-paper twin (no
+          stage wrapper) for an edge-to-edge receipt image. */}
       <div className="receipt-export-root" aria-hidden="true">
-        <div ref={exportRootRef}>{vm && <ReceiptPaper vm={vm} key="export" />}</div>
+        {vm && (
+          <ReceiptPaper
+            vm={vm}
+            key="export"
+            // Forward paperRef so captureBytes targets the paper element.
+            paperRef={paperRef}
+          />
+        )}
       </div>
     </>
   );
 }
-
-const EMPTY_VM = toReceiptViewModel({
-  date: "1970-01-01",
-  date_label: "",
-  timezone: "UTC",
-  metrics: {
-    total_tokens: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0,
-    cache_creation_tokens: 0, cache_hit_rate: null, cost_usd: null,
-    cost_status: "unavailable", event_count: 0, session_count: 0, peak_hour: null,
-  },
-  top_models: [],
-  brand: { name: "BUSYTOK", tagline: "", github: "", generated_at_ms: 0 },
-});

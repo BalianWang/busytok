@@ -1,19 +1,22 @@
-import { useId } from "react";
+import { useId, type Ref } from "react";
 import type { ReceiptViewModel } from "./viewModel";
 import "./receipt.css";
 
 interface ReceiptPaperProps {
   vm: ReceiptViewModel;
+  /** Optional ref forwarded to the .receipt-paper element so callers
+   * (e.g. the export pipeline) can capture it directly. */
+  paperRef?: Ref<HTMLDivElement>;
 }
 
-export function ReceiptPaper({ vm }: ReceiptPaperProps) {
+export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
   const empty = vm.hero.totalTokensRaw === 0 && vm.items.length === 0;
   // Unique per-instance ID so preview + export root (both render <ReceiptPaper>)
   // don't collide on the same SVG pattern id in the DOM.
   const scallopId = `receipt-scallop-${useId()}`;
   return (
     <div className="receipt-stage">
-      <div className="receipt-paper">
+      <div className="receipt-paper" ref={paperRef}>
         <header className="receipt__header">
           <div className="receipt__brand">BUSYTOK</div>
           <div className="receipt__subtitle">AI CODING · TOKEN RECEIPT</div>

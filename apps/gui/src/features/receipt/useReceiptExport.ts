@@ -4,13 +4,11 @@ import { writeImage } from "@tauri-apps/plugin-clipboard-manager";
 import { domToBlob } from "modern-screenshot";
 import { useState, type RefObject } from "react";
 import { reportFrontendEventSafely } from "../../logging/safeReporter";
-import type { ReceiptViewModel } from "./viewModel";
 
 export interface ReceiptExportApi {
   busy: boolean;
   copyImage: () => Promise<void>;
   savePng: () => Promise<void>;
-  copySummary: () => Promise<void>;
 }
 
 const log = (event_code: string, message: string, details: Record<string, unknown>, level: "INFO" | "ERROR" = "INFO") =>
@@ -18,7 +16,6 @@ const log = (event_code: string, message: string, details: Record<string, unknow
 
 export function useReceiptExport(
   target: RefObject<HTMLElement | null>,
-  vm: ReceiptViewModel,
   date: string,
 ): ReceiptExportApi {
   const [busy, setBusy] = useState(false);
@@ -40,11 +37,12 @@ export function useReceiptExport(
       await fonts.ready.catch(() => {});
     }
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    // Solid backgroundColor (the stage color) — null/transparent can render
-    // black in some WebKit foreignObject paths.
+    // backgroundColor: null → transparent PNG. The .receipt-paper element
+    // carries its own gradient + shadow; capturing paper (not the stage
+    // wrapper) yields an image filled edge-to-edge by the receipt body.
     const blob = await domToBlob(node, {
       scale: 3,
-      backgroundColor: "#E9E4DA",
+      backgroundColor: null,
       font: { preferredFormat: "woff2" },
     });
     return new Uint8Array(await blob.arrayBuffer());
@@ -79,21 +77,12 @@ export function useReceiptExport(
         });
         if (!path) return; // user cancelled
         const bytes = await captureBytes();
-        await invoke("save_receipt_png", { path, bytes });
+        // Tauri v2 IPC serialises invoke args via JSON. A bare Uint8Array is
+        // stringified as {"0":1,"1":2,...} and fails to deserialize as
+        // Vec<u8> on the Rust side → save silently rejects. Convert to a
+        // plain JS array so serde decodes the bytes correctly.
+        await invoke("save_receipt_png", { path, bytes: Array.from(bytes) });
         log("gui.receipt.exported", "receipt saved to file", { date, path });
-      });
-    },
-    async copySummary() {
-      await run("summary_copied", async () => {
-        const text = [
-          "Busytok — daily token receipt",
-          vm.dateLabel,
-          `Total tokens: ${vm.hero.totalTokens}`,
-          vm.secondary.cost,
-          `Top: ${vm.items.slice(0, 3).map((i) => i.name).join(", ")}`,
-        ].join("\n");
-        await navigator.clipboard.writeText(text);
-        log("gui.receipt.summary_copied", "receipt summary copied", { date });
       });
     },
   };

@@ -93,7 +93,10 @@ describe("useReceiptToolbar", () => {
     await act(async () => {
       share.click();
     });
-    expect(await screen.findByText("Daily receipt")).toBeDefined();
+    // The dialog is open: its icon toolbar (calendar + save + copy) is
+    // present. The Radix Dialog.Title is in the DOM but visually hidden
+    // (.receipt-preview__sr-only), so we assert on the action buttons instead.
+    expect(await screen.findByRole("button", { name: /save png/i })).toBeDefined();
   });
 
   it("renders a Refresh button that invokes onRefresh on click", async () => {

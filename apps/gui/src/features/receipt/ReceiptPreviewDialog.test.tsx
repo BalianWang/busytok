@@ -32,7 +32,7 @@ function wrap(ui: React.ReactNode) {
 }
 
 describe("ReceiptPreviewDialog", () => {
-  it("renders the receipt + action buttons when open", () => {
+  it("renders the receipt preview and three icon action buttons when open", () => {
     wrap(
       <ReceiptPreviewDialog open date="2026-06-26" onDateChange={vi.fn()} onClose={vi.fn()} />,
     );
@@ -40,9 +40,25 @@ describe("ReceiptPreviewDialog", () => {
     // capture root render <ReceiptPaper /> with the same vm — the I9 fix
     // mandates the export root as a fragment sibling. Expect both.
     expect(screen.getAllByText("BUSYTOK").length).toBe(2);
-    expect(screen.getByRole("button", { name: /copy image/i })).toBeDefined();
+    // The toolbar carries three icon buttons: calendar, save, copy.
+    expect(screen.getByRole("button", { name: /pick receipt date/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /save png/i })).toBeDefined();
-    expect(screen.getByLabelText(/receipt date/i)).toBeDefined();
+    expect(screen.getByRole("button", { name: /copy image/i })).toBeDefined();
+    // Hidden date input is in the DOM and labelled for a11y.
+    expect(screen.getByLabelText(/^receipt date$/i)).toBeDefined();
+  });
+
+  it("does NOT render the visible title, description, or Copy summary button", () => {
+    wrap(
+      <ReceiptPreviewDialog open date="2026-06-26" onDateChange={vi.fn()} onClose={vi.fn()} />,
+    );
+    // The Radix Dialog.Title is present in the DOM (a11y requirement) but
+    // visually hidden via .receipt-preview__sr-only.
+    const title = screen.getByText("Daily receipt");
+    expect(title).toBeDefined();
+    expect(title.className).toContain("receipt-preview__sr-only");
+    // No visible "Copy summary" button anywhere.
+    expect(screen.queryByRole("button", { name: /copy summary/i })).toBeNull();
   });
 
   it("renders the off-screen export root as a fragment sibling of the dialog", () => {
