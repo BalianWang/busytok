@@ -9,9 +9,11 @@ pub mod manager;
 pub mod memory;
 pub mod mock_executor;
 pub mod models;
+pub mod pressure;
 pub mod resolver;
 pub mod resource;
 pub mod sidecar;
 
 pub use error::{Result, SubagentError};
 pub use manager::SubagentManager;
+pub use pressure::{PressureAction, PressureGate};
