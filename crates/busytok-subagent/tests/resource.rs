@@ -223,7 +223,8 @@ fn transition_event_returns_rss_limit_on_pressure_to_limit_exceeded() {
 #[test]
 fn transition_event_returns_none_on_pressure_to_normal_recovery() {
     // Recovery: no DB event (resource_recovered not in spec §3.2 enum).
-    // The supervisor logs recovery to tracing only; DB event deferred to Plan 6.
+    // The supervisor logs recovery to tracing only; DB event omitted by
+    // design (spec §3.2 has no `resource_recovered` type).
     let event = ResourcePressureState::transition_event(
         ResourcePressureState::Pressure,
         ResourcePressureState::Normal,

@@ -1672,6 +1672,15 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
 //    ~10MB mock sidecar). `under_pressure` → `new_state = Pressure` →
 //    `PauseNewTasks` action (§8.3 steps 1-2: pause queue + hibernate LRU).
 //    The gate is set to paused; the responder also calls `evict_lru`.
+//
+// 3. `pressure_response_graceful_restarts_on_soft_limit_exceeded`: soft limit
+//    = 1MB (mock sidecar ~5-10MB exceeds → `exceeds_soft`), hard limit =
+//    1200MB (NOT exceeded → no ForceKill), `memory_pressure_free_mb = 0`
+//    (system_available_mb is always >= 0, so `is_under_pressure` is false).
+//    `exceeds_soft` → `GracefulRestart` action (§8.3 steps 3-4):
+//    `prepare_hibernate_all` + `shutdown_internal` writes a `sidecar_stop`
+//    resource event, then the responder clears the gate to `Resume` so the
+//    next delegate() can lazy-restart the sidecar.
 
 #[tokio::test]
 #[serial]
@@ -1817,6 +1826,86 @@ async fn pressure_response_pauses_on_memory_pressure() {
     assert!(
         events.iter().any(|e| e.event_type == "memory_pressure"),
         "memory_pressure event must be written on Normal→Pressure transition"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    settings.subagent.resource_policy.monitor_interval_seconds = 1;
+    // Ensure is_under_pressure is false: system_available_mb is always >= 0,
+    // so a 0 threshold means pressure is never triggered by available memory.
+    settings.subagent.resource_policy.memory_pressure_free_mb = 0;
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    // soft limit = 1MB (mock sidecar ~5-10MB exceeds → GracefulRestart),
+    // hard limit = 1200MB (mock sidecar does NOT exceed → no ForceKill).
+    let mut config = make_sidecar_config();
+    config.memory_soft_limit_mb = 1;
+    config.memory_hard_limit_mb = 1200;
+
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, config);
+
+    // Delegate once to start the sidecar + supervision loop.
+    let _ = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "graceful-restart-test".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "trigger sidecar".to_string(),
+            timeout_seconds: Some(5),
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await;
+
+    // Wait for the supervision loop to sample + detect soft limit exceeded +
+    // trigger GracefulRestart → shutdown_internal writes `sidecar_stop` event.
+    // Poll for up to 15s (GracefulRestart involves prepare_hibernate_all RPC
+    // + shutdown grace period, which takes longer than a simple force-kill).
+    let mut stopped = false;
+    for _ in 0..150 {
+        let stopped_now = {
+            let db_guard = supervisor.db_handle().lock().unwrap();
+            let events = db_guard.subagent_list_resource_events(None, 200).unwrap();
+            events.iter().any(|e| e.event_type == "sidecar_stop")
+        };
+        if stopped_now {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        stopped,
+        "sidecar_stop event must be written after GracefulRestart triggers shutdown_internal"
+    );
+
+    // After graceful shutdown, the responder clears the gate to Resume so the
+    // next delegate() can lazy-restart the sidecar.
+    let gate = supervisor.pressure_gate().expect("gate must be present");
+    let mut gate_cleared = false;
+    for _ in 0..50 {
+        if !gate.is_paused() {
+            gate_cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        gate_cleared,
+        "gate must be cleared (Resume) after GracefulRestart completes"
     );
 
     supervisor.shutdown_writer().await.unwrap();

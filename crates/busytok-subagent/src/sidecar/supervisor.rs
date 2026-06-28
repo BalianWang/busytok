@@ -681,8 +681,11 @@ impl PiSidecarSupervisor {
     ///   Normal → Pressure        : write `memory_pressure` DB event (warn log)
     ///   Normal → LimitExceeded   : write `rss_limit_exceeded` DB event (error log)
     ///   Pressure → LimitExceeded : write `rss_limit_exceeded` DB event (error log)
-    ///   Pressure → Normal        : info log ONLY (no DB event — `resource_recovered`
-    ///                              not in spec §3.2 enum, deferred to Plan 6)
+    ///   Pressure → Normal        : info log ONLY (no DB event — tracing-only
+    ///                              by design: spec §3.2 enum has no
+    ///                              `resource_recovered` event type; the latch
+    ///                              still updates on recovery so re-pressurization
+    ///                              writes a fresh `memory_pressure` event)
     ///   LimitExceeded → Normal   : info log ONLY (no DB event — same as above)
     ///   LimitExceeded → Pressure : no event (still in warning tier)
     ///   same → same              : no event (debounced)
