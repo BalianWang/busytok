@@ -6,6 +6,9 @@
 //! task creation (§8.3 step 2).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+
+use crate::sidecar::{PiSidecarSupervisor, SidecarTaskExecutor};
 
 /// Actions the pressure responder can take (spec §8.3 escalation chain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,5 +74,53 @@ impl PressureGate {
 impl Default for PressureGate {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drives the §8.3 5-step escalation chain. Strong-owned by
+/// `BusytokSupervisor.pressure_responder`. Holds `Weak` refs to supervisor
+/// + executor to break the reference cycle (supervisor → responder →
+///   `executor → supervisor` would be a cycle if any were `Arc`).
+///
+/// **NOTE — Task 3 stub:** this struct is wired into `BusytokSupervisor` and
+/// `PiSidecarSupervisor` in Task 3 so the gate + accessors can be threaded
+/// through. The `respond()` method (the actual §8.3 escalation logic) is
+/// added in Task 4. Until then, `new()` is the only API exercised — Task 3
+/// constructs the responder, stores it, and sets the weak ref on the
+/// supervisor, but nothing calls `respond()`.
+pub struct PressureResponder {
+    supervisor: Weak<PiSidecarSupervisor>,
+    executor: Weak<SidecarTaskExecutor>,
+    gate: Arc<PressureGate>,
+}
+
+impl PressureResponder {
+    pub fn new(
+        supervisor: Weak<PiSidecarSupervisor>,
+        executor: Weak<SidecarTaskExecutor>,
+        gate: Arc<PressureGate>,
+    ) -> Self {
+        Self {
+            supervisor,
+            executor,
+            gate,
+        }
+    }
+
+    /// Access the underlying gate (used by Task 4 wiring + tests).
+    pub fn gate(&self) -> &Arc<PressureGate> {
+        &self.gate
+    }
+
+    /// Best-effort upgrade of the supervisor weak ref (used by Task 4 wiring
+    /// + tests). Returns `None` if the supervisor was dropped.
+    pub fn supervisor(&self) -> Option<Arc<PiSidecarSupervisor>> {
+        self.supervisor.upgrade()
+    }
+
+    /// Best-effort upgrade of the executor weak ref (used by Task 4 wiring
+    /// + tests). Returns `None` if the executor was dropped.
+    pub fn executor(&self) -> Option<Arc<SidecarTaskExecutor>> {
+        self.executor.upgrade()
     }
 }

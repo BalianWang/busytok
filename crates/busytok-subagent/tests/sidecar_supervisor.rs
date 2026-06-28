@@ -791,7 +791,7 @@ async fn with_resource_policy_constructs_working_supervisor() {
         memory_pressure_free_mb: 1024,
         monitor_interval_seconds: 5,
     };
-    let sup = PiSidecarSupervisor::with_resource_policy(mock_config(), None, policy);
+    let sup = PiSidecarSupervisor::with_resource_policy(mock_config(), None, policy, None);
     let handle = sup.ensure_started().await.unwrap();
     let health = handle.health().await.unwrap();
     assert_eq!(health["status"], "healthy");
@@ -810,8 +810,12 @@ async fn with_resource_policy_threads_limits_into_monitor() {
 
     let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let policy = SubagentResourcePolicyConfig::default();
-    let sup =
-        PiSidecarSupervisor::with_resource_policy(mock_config(), Some(Arc::clone(&db)), policy);
+    let sup = PiSidecarSupervisor::with_resource_policy(
+        mock_config(),
+        Some(Arc::clone(&db)),
+        policy,
+        None,
+    );
     let handle = sup.ensure_started().await.unwrap();
     let _ = handle.health().await.unwrap();
     sup.shutdown().await.unwrap();

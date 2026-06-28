@@ -53,6 +53,15 @@ pub enum SubagentError {
 
     #[error("hot session limit reached, candidate: {candidate}")]
     HotSessionLimit { candidate: String },
+
+    /// §8.3 step 2: subagent system paused due to resource pressure. Under
+    /// the queue-only design `delegate()` returns `Ok(DelegateResult {
+    /// status: Queued })` instead of this error; the variant is retained for
+    /// the background `TaskDispatcher` (Task 7) — if the gate re-pauses
+    /// between picking a queued task and executing it, the dispatcher returns
+    /// `Err(Paused)` to signal re-queue.
+    #[error("subagent system paused due to resource pressure")]
+    Paused,
 }
 
 impl SubagentError {
@@ -73,6 +82,7 @@ impl SubagentError {
             SubagentError::SidecarTimeout(_) => "subagent.sidecar_timeout",
             SubagentError::SidecarCrashed(_) => "subagent.sidecar_crashed",
             SubagentError::HotSessionLimit { .. } => "subagent.hot_session_limit",
+            SubagentError::Paused => "subagent.paused",
         }
     }
 }

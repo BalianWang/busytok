@@ -14,8 +14,9 @@ use crate::memory::MemoryUpdater;
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
     DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
-    SubagentTaskSummary, TaskStatus,
+    SubagentTaskSummary, TaskStatus, TaskUsage,
 };
+use crate::pressure::PressureGate;
 use crate::resolver::{resolve_by_id, resolve_by_name, row_to_model, Resolved};
 
 type SharedDb = Arc<Mutex<busytok_store::Database>>;
@@ -27,6 +28,11 @@ pub struct SubagentManager {
     executor: Arc<dyn TaskExecutor>,
     context_builder: ContextBuilder,
     memory_updater: MemoryUpdater,
+    /// §8.3 step 2: when `Some` and `is_paused()`, `delegate()` inserts the
+    /// task row as `'queued'` and returns `DelegateResult { status: Queued }`
+    /// instead of executing synchronously. The background `TaskDispatcher`
+    /// (Task 7) picks up queued tasks when the gate clears.
+    pressure_gate: Option<Arc<PressureGate>>,
 }
 
 impl SubagentManager {
@@ -35,6 +41,19 @@ impl SubagentManager {
         settings: SubagentSettings,
         adapter: &str,
         executor: Arc<dyn TaskExecutor>,
+    ) -> Self {
+        Self::with_pressure_gate(db, settings, adapter, executor, None)
+    }
+
+    /// Construct with an explicit `PressureGate`. When the gate is `Some`
+    /// and paused, `delegate()` queues the task instead of executing it
+    /// (spec §8.3 step 2 "queue only").
+    pub fn with_pressure_gate(
+        db: SharedDb,
+        settings: SubagentSettings,
+        adapter: &str,
+        executor: Arc<dyn TaskExecutor>,
+        pressure_gate: Option<Arc<PressureGate>>,
     ) -> Self {
         let context_builder = ContextBuilder::new(settings.context.clone());
         let memory_updater = MemoryUpdater::new(settings.context.clone());
@@ -45,6 +64,7 @@ impl SubagentManager {
             executor,
             context_builder,
             memory_updater,
+            pressure_gate,
         }
     }
 
@@ -99,7 +119,25 @@ impl SubagentManager {
             }
         };
 
-        // 2. insert task row (queued)
+        // 2. insert task row. §8.3 step 2 "queue only" (Round 4 race-free
+        //    design): check the gate BEFORE insert and set the row status
+        //    directly.
+        //    - Gate paused → insert as `"queued"`, return `Queued` early.
+        //      The background `TaskDispatcher` (Task 7) picks it up when the
+        //      gate clears.
+        //    - Gate not paused → insert as `"running"` (with `started_at_ms =
+        //      now`). The dispatcher only picks `'queued'` tasks, so it never
+        //      sees this task — no race where the dispatcher could pick a
+        //      just-inserted queued task before `delegate()` flips it.
+        //    `insert_task` already takes `row.status` from the
+        //    `SubagentTaskRow` (verified at subagent_queries.rs:331), so no
+        //    store change is needed.
+        let paused = self
+            .pressure_gate
+            .as_ref()
+            .map(|g| g.is_paused())
+            .unwrap_or(false);
+        let now = busytok_domain::now_ms();
         let task_id = format!("task_{}", uuid::Uuid::new_v4());
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -114,12 +152,16 @@ impl SubagentManager {
                 prompt_artifact_ref: None,
                 output_schema_name: None,
                 output_schema_version: 1,
-                status: "queued".to_string(),
+                status: if paused {
+                    "queued".to_string()
+                } else {
+                    "running".to_string()
+                },
                 result_summary: None,
                 result_json: None,
                 error: None,
-                created_at_ms: busytok_domain::now_ms(),
-                started_at_ms: None,
+                created_at_ms: now,
+                started_at_ms: if paused { None } else { Some(now) },
                 completed_at_ms: None,
             })
             .map_err(SubagentError::Store)?;
@@ -132,6 +174,32 @@ impl SubagentManager {
             profile = %req.profile,
             "delegating task"
         );
+
+        // If paused, return Queued — the dispatcher handles it when the gate
+        // clears. We return immediately without building context or invoking
+        // the executor.
+        if paused {
+            info!(
+                event_code = "subagent.delegate.queued",
+                subagent_id = %subagent.id,
+                task_id = %task_id,
+                action = ?self.pressure_gate.as_ref().and_then(|g| g.last_action()),
+                "pressure gate paused — task queued, not executed"
+            );
+            return Ok(DelegateResult {
+                task_id,
+                subagent_id: subagent.id.clone(),
+                subagent_name: subagent.name.clone(),
+                adapter: self.adapter.clone(),
+                adapter_session_id: None,
+                session_reused: false,
+                status: TaskStatus::Queued,
+                profile: req.profile.clone(),
+                model: req.model_override.clone().or(profile_model),
+                summary: None,
+                usage: TaskUsage::default(),
+            });
+        }
 
         // 3. Build context + memory snapshot from the store, then execute.
         //    No lock held during execution.
@@ -348,6 +416,17 @@ impl SubagentManager {
             summary: Some(out.summary),
             usage: out.usage.clone(),
         })
+    }
+
+    /// Count subagent tasks by status. Returns `(queued, running)`. Used by
+    /// `ResourceMonitor` (via `PiSidecarSupervisor`) to populate the
+    /// `queued_task_count` / `running_task_count` fields of `ResourceSample`
+    /// (spec §8.1). Errors are logged at the caller; this method returns
+    /// `(0, 0)` on DB failure so a transient lock error doesn't crash the
+    /// supervision loop.
+    pub fn task_counts(&self) -> (u32, u32) {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        db.subagent_task_counts_by_status().unwrap_or((0, 0))
     }
 
     /// List subagents, optionally filtered by status / project / include-deleted.

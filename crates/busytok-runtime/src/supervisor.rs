@@ -68,6 +68,22 @@ pub struct BusytokSupervisor {
     /// Pi sidecar supervisor (present when `subagent.pi_sidecar.enabled`).
     /// Task 6 uses this for graceful shutdown.
     sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+    /// §8.3 step 2: pressure gate shared between `PiSidecarSupervisor`
+    /// (writer, via `PressureResponder`) and `SubagentManager` (reader, via
+    /// `delegate()`). `Some` when the sidecar is enabled, `None` otherwise.
+    pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
+    /// Concrete `SidecarTaskExecutor` Arc — strong owner (keeps executor
+    /// alive). The `PressureResponder` (Task 4) holds a `Weak` ref to it
+    /// so it can call `evict_lru` without creating an Arc cycle. `None`
+    /// when the sidecar is disabled.
+    sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+    /// §8.3 escalation chain driver. Strong-owned here so it lives as long
+    /// as the supervisor; `PiSidecarSupervisor` holds a `Weak` ref (set via
+    /// `set_pressure_responder`) so the supervision loop can upgrade + invoke
+    /// `respond()` on pressure transitions. `None` when the sidecar is
+    /// disabled. Task 4 implements `respond()`; Task 3 wires the field +
+    /// constructs the (stub) responder.
+    pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
     /// Error message captured when the sidecar config could not be resolved
     /// despite `pi_sidecar.enabled = true`. `None` when the sidecar was
     /// initialized successfully OR when `pi_sidecar.enabled = false` (the
@@ -193,7 +209,7 @@ impl BusytokSupervisor {
         // `pi_sidecar.enabled = true` must ensure the bundle is installed; a
         // missing bundle surfaces as an `error!` log + queryable init error
         // and degraded (mock) execution rather than a panic.
-        let (executor, sidecar_supervisor, sidecar_init_error) =
+        let (executor, sidecar_supervisor, sidecar_init_error, pressure_gate, sidecar_executor) =
             Self::construct_sidecar(&settings, &paths, &db, None);
         Self::assemble_with_sidecar(
             db,
@@ -204,6 +220,8 @@ impl BusytokSupervisor {
             executor,
             sidecar_supervisor,
             sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
         )
     }
 
@@ -221,7 +239,7 @@ impl BusytokSupervisor {
     ) -> Self {
         let event_bus = AppEventBus::new(64);
         let db = Arc::new(Mutex::new(db));
-        let (executor, sidecar_supervisor, sidecar_init_error) =
+        let (executor, sidecar_supervisor, sidecar_init_error, pressure_gate, sidecar_executor) =
             Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
         Self::assemble_with_sidecar(
             db,
@@ -232,6 +250,8 @@ impl BusytokSupervisor {
             executor,
             sidecar_supervisor,
             sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
         )
     }
 
@@ -239,6 +259,12 @@ impl BusytokSupervisor {
     /// When `sidecar_config_override` is `Some`, skip `resolve_sidecar_config`
     /// and use the provided config directly (test injection path). When
     /// `None`, resolve from settings + paths (production path).
+    ///
+    /// Returns a 5-tuple: `(executor, sidecar_supervisor, sidecar_init_error,
+    /// pressure_gate, sidecar_executor)`. The last two are `Some` only when
+    /// the sidecar is enabled AND its config resolved successfully — they're
+    /// consumed by `assemble_with_sidecar` to construct the `PressureResponder`
+    /// and wire the manager's `PressureGate`.
     fn construct_sidecar(
         settings: &BusytokSettings,
         paths: &BusytokPaths,
@@ -248,11 +274,15 @@ impl BusytokSupervisor {
         Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
         Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
         Option<String>,
+        Option<Arc<busytok_subagent::PressureGate>>,
+        Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
     ) {
         if !settings.subagent.pi_sidecar.enabled {
             return (
                 Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
                     as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                None,
+                None,
                 None,
                 None,
             );
@@ -274,17 +304,28 @@ impl BusytokSupervisor {
                 // `PiSidecarSupervisor::new` remains for unit tests that
                 // don't have a policy (it uses the spec-default policy).
                 let policy = settings.subagent.resource_policy.clone();
+                let gate = Arc::new(busytok_subagent::PressureGate::new());
                 let sup = busytok_subagent::sidecar::PiSidecarSupervisor::with_resource_policy(
                     sidecar_config,
                     Some(Arc::clone(db)),
                     policy,
+                    Some(Arc::clone(&gate)),
                 );
-                let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
+                // Construct the concrete `Arc<SidecarTaskExecutor>` FIRST,
+                // then clone + coerce one copy to `Arc<dyn TaskExecutor>`
+                // for the manager. The concrete copy is kept by
+                // `BusytokSupervisor` so `PressureResponder` (Task 4) can
+                // downgrade it to `Weak<SidecarTaskExecutor>` without an
+                // Arc cycle (responder → executor → supervisor → responder).
+                let exec_concrete =
                     Arc::new(busytok_subagent::sidecar::SidecarTaskExecutor::with_db(
                         Arc::clone(&sup),
                         Arc::clone(db),
                     ));
-                (exec, Some(sup), None)
+                let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
+                    Arc::clone(&exec_concrete)
+                        as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
+                (exec, Some(sup), None, Some(gate), Some(exec_concrete))
             }
             Err(e) => {
                 // `build_with_settings` returns `Self`, not `Result<Self>`,
@@ -308,13 +349,15 @@ impl BusytokSupervisor {
                         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
                     None,
                     Some(msg),
+                    None,
+                    None,
                 )
             }
         }
     }
 
     /// Assemble the final `BusytokSupervisor` from the shared constructor
-    /// inputs plus the already-constructed sidecar triple. Both
+    /// inputs plus the already-constructed sidecar 5-tuple. Both
     /// `build_with_settings` and `build_with_sidecar_config` funnel through
     /// this to avoid duplicating the ~60 lines of manager/read-service/
     /// writer/event-bus wiring.
@@ -327,12 +370,15 @@ impl BusytokSupervisor {
         executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
         sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
         sidecar_init_error: Option<String>,
+        pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
+        sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
     ) -> Self {
-        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::new(
+        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
             Arc::clone(&db),
             settings.subagent.clone(),
             "pi",
             executor,
+            pressure_gate.clone(),
         ));
         let read_service = {
             let db_guard = db.lock().unwrap();
@@ -368,6 +414,29 @@ impl BusytokSupervisor {
 
         let catalog_reload_join = try_spawn_catalog_reloader(paths.price_catalog_path().clone());
 
+        // §8.3 escalation chain driver: construct the `PressureResponder`
+        // (Task 4 implements `respond()`; Task 3 wires the field + sets the
+        // weak ref on the supervisor). The responder holds `Weak` refs to
+        // the supervisor + executor so it can drive the 5-step chain
+        // (hibernate LRU, pause new tasks, graceful restart, force kill)
+        // without creating an Arc cycle. The strong owner is
+        // `BusytokSupervisor.pressure_responder`. Constructed only when all
+        // three are `Some` (sidecar enabled + config resolved).
+        let pressure_responder = match (&sidecar_supervisor, &sidecar_executor, &pressure_gate) {
+            (Some(sup), Some(exec), Some(gate)) => {
+                let responder = Arc::new(busytok_subagent::PressureResponder::new(
+                    Arc::downgrade(sup),
+                    Arc::downgrade(exec),
+                    Arc::clone(gate),
+                ));
+                // Set the weak ref on the supervisor so the supervision loop
+                // can upgrade + invoke `respond()` on pressure transitions.
+                sup.set_pressure_responder(Arc::clone(&responder));
+                Some(responder)
+            }
+            _ => None,
+        };
+
         Self {
             db,
             event_bus,
@@ -383,6 +452,9 @@ impl BusytokSupervisor {
             subagent_manager,
             sidecar_supervisor,
             sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
+            pressure_responder,
             _writer_join: Mutex::new(writer_join),
             _catalog_reload_join: Mutex::new(catalog_reload_join),
         }
@@ -404,6 +476,20 @@ impl BusytokSupervisor {
     /// loud signal that the configured sidecar is NOT backing delegate calls.
     pub fn sidecar_init_error(&self) -> Option<&str> {
         self.sidecar_init_error.as_deref()
+    }
+
+    /// §8.3 step 2: pressure gate shared with `SubagentManager`. `None` when
+    /// the sidecar is disabled (no pressure response chain). Task 6 / status
+    /// reporting can read this to expose the current pressure action via
+    /// `gate.last_action()`.
+    pub fn pressure_gate(&self) -> Option<&Arc<busytok_subagent::PressureGate>> {
+        self.pressure_gate.as_ref()
+    }
+
+    /// §8.3 escalation chain driver. `None` when the sidecar is disabled.
+    /// Task 6 / status reporting can read this to surface responder state.
+    pub fn pressure_responder(&self) -> Option<&Arc<busytok_subagent::PressureResponder>> {
+        self.pressure_responder.as_ref()
     }
 
     /// Run the 11 spec §7.1 doctor checks. The subagent-specific checks

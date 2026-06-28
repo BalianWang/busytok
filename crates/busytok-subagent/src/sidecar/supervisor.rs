@@ -29,6 +29,7 @@ use tracing::{error, info, instrument, warn};
 use busytok_config::SubagentResourcePolicyConfig;
 use busytok_store::{Database, SubagentResourceEventRow};
 
+use crate::pressure::{PressureGate, PressureResponder};
 use crate::resource::{ResourceMonitor, ResourcePressureState};
 use crate::sidecar::client::SidecarRpcClient;
 use crate::sidecar::config::SidecarConfig;
@@ -62,6 +63,16 @@ pub struct PiSidecarSupervisor {
     /// Resource monitor — None in unit tests that don't pass a policy.
     /// Mutex because `sample(&mut self)` mutates the internal `sysinfo::System`.
     resource_monitor: Option<std::sync::Mutex<ResourceMonitor>>,
+    /// §8.3 step 2: pressure gate shared with `SubagentManager`. When the
+    /// `PressureResponder` (Task 4) escalates, it sets the gate; the manager
+    /// checks `is_paused()` at the top of `delegate()` to queue new tasks.
+    #[allow(dead_code)] // Read via pressure_gate() accessor; Task 4 consumes it.
+    pressure_gate: Option<Arc<PressureGate>>,
+    /// Weak ref to the pressure responder — set AFTER construction via
+    /// `set_pressure_responder`. Weak (not Arc) to break the reference
+    /// cycle: supervisor → responder → executor → supervisor.
+    /// The strong owner is `BusytokSupervisor.pressure_responder`.
+    pressure_responder: std::sync::Mutex<Option<std::sync::Weak<PressureResponder>>>,
 }
 
 pub struct SupervisorState {
@@ -98,6 +109,10 @@ impl PiSidecarSupervisor {
         // `with_resource_policy` (added below) when they have a
         // SubagentResourcePolicyConfig. For the default-constructed path
         // (tests), we use the spec-default policy so the monitor still works.
+        // `new` does NOT accept a pressure gate — the runtime constructs the
+        // gate in `construct_sidecar` and threads it through
+        // `with_resource_policy`. Tests that need a gate construct one
+        // explicitly and pass it to `with_resource_policy`.
         let policy = SubagentResourcePolicyConfig::default();
         let monitor = ResourceMonitor::new(
             policy,
@@ -119,15 +134,22 @@ impl PiSidecarSupervisor {
             spawn_lock: Mutex::new(()),
             db,
             resource_monitor: Some(std::sync::Mutex::new(monitor)),
+            pressure_gate: None,
+            pressure_responder: std::sync::Mutex::new(None),
         })
     }
 
     /// Construct with an explicit resource policy (used by the runtime
     /// supervisor which has the deserialized SubagentResourcePolicyConfig).
+    /// The `pressure_gate` is the new 4th param — `Some` when constructed by
+    /// `construct_sidecar` (production path), `None` in tests that don't
+    /// exercise the gate. The gate is shared (`Arc`) with `SubagentManager`
+    /// so the manager's `delegate()` sees `is_paused()` flips immediately.
     pub fn with_resource_policy(
         config: SidecarConfig,
         db: Option<SharedDb>,
         policy: SubagentResourcePolicyConfig,
+        pressure_gate: Option<Arc<PressureGate>>,
     ) -> Arc<Self> {
         let monitor = ResourceMonitor::new(
             policy,
@@ -149,6 +171,8 @@ impl PiSidecarSupervisor {
             spawn_lock: Mutex::new(()),
             db,
             resource_monitor: Some(std::sync::Mutex::new(monitor)),
+            pressure_gate,
+            pressure_responder: std::sync::Mutex::new(None),
         })
     }
 
@@ -157,6 +181,172 @@ impl PiSidecarSupervisor {
     /// eviction flow.
     pub fn config(&self) -> &SidecarConfig {
         &self.config
+    }
+
+    /// Non-blocking check of whether the sidecar child is currently running.
+    /// `pub(crate)` so `crate::pressure::PressureResponder` (Task 4) can
+    /// inspect the child without acquiring the async state lock (which would
+    /// require an `.await` and isn't safe from a sync context).
+    #[allow(dead_code)] // Task 4 (PressureResponder::respond) consumes this.
+    pub(crate) fn try_is_running(&self) -> bool {
+        self.state
+            .try_lock()
+            .map(|s| s.child.as_ref().map(|c| c.id().is_some()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// §8.3 step 5: force-kill the sidecar child (SIGKILL, no graceful
+    /// shutdown). Used by `PressureResponder` (Task 4) when graceful restart
+    /// fails or when RSS exceeds the hard limit. After kill, reconciles DB
+    /// state as if the sidecar crashed (so the next `ensure_started` sees a
+    /// clean store). `pub(crate)` so the responder can call it without going
+    /// through the public `shutdown()` (which would attempt graceful
+    /// shutdown first).
+    #[allow(dead_code)] // Task 4 (PressureResponder::respond) consumes this.
+    pub(crate) async fn force_kill(&self) {
+        let mut child = {
+            let mut state = self.state.lock().await;
+            state.child.take()
+        };
+        if let Some(child) = child.as_mut() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        // Reconcile as if it crashed.
+        self.reconcile_crash();
+        self.write_resource_event("sidecar_crash");
+    }
+
+    /// Graceful shutdown without re-acquiring the public `shutdown()` wrapper
+    /// — used by `PressureResponder` (Task 4) and the supervision loop's idle
+    /// exit path. `pub(crate)` so the responder can call it during
+    /// `GracefulRestart` (§8.3 step 3).
+    pub(crate) async fn shutdown_internal(&self) -> Result<(), SidecarError> {
+        // ... existing body, just change visibility to pub(crate) ...
+        let client = { self.state.lock().await.client.take() };
+        if let Some(client) = &client {
+            // Best-effort: ask the sidecar to prepare all hot sessions for
+            // hibernate (Plan 3 tracks per-session state; Plan 2 uses `all`).
+            // Plan 3: consume memory_delta from the response.
+            let _ = client
+                .lock()
+                .await
+                .call_with_timeout(
+                    "session.prepare_hibernate",
+                    serde_json::json!({"all": true}),
+                    Duration::from_secs(5),
+                )
+                .await;
+            // adapter.shutdown — sidecar should exit 0 after responding.
+            let _ = client
+                .lock()
+                .await
+                .call_with_timeout(
+                    "adapter.shutdown",
+                    serde_json::json!({}),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+        // Kill child with 10s grace (spec §5.4). The sidecar should have
+        // exited on adapter.shutdown; this is the fallback.
+        // Reset supervision_started so the next spawn_internal re-spawns
+        // the supervision loop — without this, an external shutdown()
+        // followed by a quick ensure_started() would skip loop revival
+        // because the old loop hasn't yet observed child.is_none().
+        let child = {
+            let mut state = self.state.lock().await;
+            state.supervision_started = false;
+            state.child.take()
+        };
+        if let Some(mut child) = child {
+            match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
+                Ok(Ok(_status)) => {}
+                Ok(Err(_)) | Err(_) => {
+                    warn!(
+                        event_code = "subagent.sidecar.shutdown_kill",
+                        "grace period expired or wait failed, SIGKILL"
+                    );
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        // Spec §3.3 end-to-end: after the worker process is dead, release hot
+        // bindings (status='closed') and roll back logical status to warm/cold
+        // so the store never says "hot" with no worker running. This mirrors
+        // `reconcile_crash` but uses 'closed' (graceful) instead of 'crashed'.
+        // Synchronous — no `.await` held across the DB lock.
+        self.reconcile_shutdown();
+        info!(event_code = "subagent.sidecar.stop", "sidecar shut down");
+        self.write_resource_event("sidecar_stop");
+        Ok(())
+    }
+
+    /// Converge DB state after a sidecar crash (spec §3.3 + §5.4). Calls
+    /// `subagent_reconcile_sidecar_crash` with the harness name from config.
+    /// Synchronous (no `.await` held across the DB lock).
+    /// `pub(crate)` so `PressureResponder::force_kill` (Task 4) can call it
+    /// after killing the child.
+    pub(crate) fn reconcile_crash(&self) {
+        if let Some(db) = &self.db {
+            let db = db.lock().expect("subagent db lock poisoned");
+            match db.subagent_reconcile_sidecar_crash(&self.config.harness_name) {
+                Ok(counts) => {
+                    warn!(
+                        event_code = "subagent.sidecar.crash_reconciled",
+                        tasks_failed = counts.tasks_failed,
+                        bindings_released = counts.bindings_released,
+                        status_rolled_back = counts.status_rolled_back,
+                        "sidecar crash reconciled"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        event_code = "subagent.sidecar.crash_reconcile_failed",
+                        error = %e,
+                        "crash reconciliation failed; store may be half-converged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Write a row to `subagent_resource_events` if a DB handle is attached.
+    /// `pub(crate)` so `PressureResponder::force_kill` (Task 4) can write a
+    /// `sidecar_crash` event after killing the child.
+    pub(crate) fn write_resource_event(&self, event_type: &str) {
+        self.write_resource_event_with_sample(event_type, None);
+    }
+
+    /// Access the pressure gate. `pub(crate)` so `PressureResponder` (Task 4)
+    /// can call `set_action()` on it. Returns `None` when no gate is attached
+    /// (default-constructed supervisors in unit tests).
+    #[allow(dead_code)] // Task 4 (PressureResponder::respond) consumes this.
+    pub(crate) fn pressure_gate(&self) -> Option<&Arc<PressureGate>> {
+        self.pressure_gate.as_ref()
+    }
+
+    /// Set the pressure responder — called by `BusytokSupervisor` (in the
+    /// runtime crate) after both supervisor + responder are constructed.
+    /// Stores a `Weak` so the supervision loop can upgrade it without
+    /// creating a reference cycle (supervisor → responder → executor →
+    /// supervisor). Public so the runtime crate can call it across crate
+    /// boundaries; the field itself remains private.
+    pub fn set_pressure_responder(&self, responder: Arc<PressureResponder>) {
+        *self.pressure_responder.lock().unwrap() = Some(Arc::downgrade(&responder));
+    }
+
+    /// Upgrade the weak responder ref — returns `None` if the responder was
+    /// dropped (BusytokSupervisor gone). Called by the supervision loop
+    /// (Task 4) when pressure transitions occur.
+    #[allow(dead_code)] // Task 4 (PressureResponder::respond) consumes this.
+    pub(crate) fn pressure_responder(&self) -> Option<Arc<PressureResponder>> {
+        self.pressure_responder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.upgrade())
     }
 
     /// Lazy-spawn the sidecar if not running, then return a handle.
@@ -607,33 +797,6 @@ impl PiSidecarSupervisor {
         self.write_resource_event_with_sample(event_type, Some(&sample));
     }
 
-    /// Converge DB state after a sidecar crash (spec §3.3 + §5.4). Calls
-    /// `subagent_reconcile_sidecar_crash` with the harness name from config.
-    /// Synchronous (no `.await` held across the DB lock).
-    fn reconcile_crash(&self) {
-        if let Some(db) = &self.db {
-            let db = db.lock().expect("subagent db lock poisoned");
-            match db.subagent_reconcile_sidecar_crash(&self.config.harness_name) {
-                Ok(counts) => {
-                    warn!(
-                        event_code = "subagent.sidecar.crash_reconciled",
-                        tasks_failed = counts.tasks_failed,
-                        bindings_released = counts.bindings_released,
-                        status_rolled_back = counts.status_rolled_back,
-                        "sidecar crash reconciled"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        event_code = "subagent.sidecar.crash_reconcile_failed",
-                        error = %e,
-                        "crash reconciliation failed; store may be half-converged"
-                    );
-                }
-            }
-        }
-    }
-
     /// Converge DB state after a graceful sidecar shutdown (spec §3.3).
     /// Releases hot bindings (`status='closed'`, NOT `'crashed'`) and rolls
     /// back logical subagent status to `warm`/`cold` for the affected set.
@@ -692,75 +855,6 @@ impl PiSidecarSupervisor {
     #[instrument(skip(self))]
     pub async fn shutdown(&self) -> Result<(), SidecarError> {
         self.shutdown_internal().await
-    }
-
-    async fn shutdown_internal(&self) -> Result<(), SidecarError> {
-        let client = { self.state.lock().await.client.take() };
-        if let Some(client) = &client {
-            // Best-effort: ask the sidecar to prepare all hot sessions for
-            // hibernate (Plan 3 tracks per-session state; Plan 2 uses `all`).
-            // Plan 3: consume memory_delta from the response.
-            let _ = client
-                .lock()
-                .await
-                .call_with_timeout(
-                    "session.prepare_hibernate",
-                    serde_json::json!({"all": true}),
-                    Duration::from_secs(5),
-                )
-                .await;
-            // adapter.shutdown — sidecar should exit 0 after responding.
-            let _ = client
-                .lock()
-                .await
-                .call_with_timeout(
-                    "adapter.shutdown",
-                    serde_json::json!({}),
-                    Duration::from_secs(5),
-                )
-                .await;
-        }
-        // Kill child with 10s grace (spec §5.4). The sidecar should have
-        // exited on adapter.shutdown; this is the fallback.
-        // Reset supervision_started so the next spawn_internal re-spawns
-        // the supervision loop — without this, an external shutdown()
-        // followed by a quick ensure_started() would skip loop revival
-        // because the old loop hasn't yet observed child.is_none().
-        let child = {
-            let mut state = self.state.lock().await;
-            state.supervision_started = false;
-            state.child.take()
-        };
-        if let Some(mut child) = child {
-            match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
-                Ok(Ok(_status)) => {}
-                Ok(Err(_)) | Err(_) => {
-                    warn!(
-                        event_code = "subagent.sidecar.shutdown_kill",
-                        "grace period expired or wait failed, SIGKILL"
-                    );
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-            }
-        }
-        // Spec §3.3 end-to-end: after the worker process is dead, release hot
-        // bindings (status='closed') and roll back logical status to warm/cold
-        // so the store never says "hot" with no worker running. This mirrors
-        // `reconcile_crash` but uses 'closed' (graceful) instead of 'crashed'.
-        // Synchronous — no `.await` held across the DB lock.
-        self.reconcile_shutdown();
-        info!(event_code = "subagent.sidecar.stop", "sidecar shut down");
-        self.write_resource_event("sidecar_stop");
-        Ok(())
-    }
-
-    /// Write a row to `subagent_resource_events` if a DB handle is attached.
-    /// No-op (but still logged at debug) in unit tests where `db` is `None`.
-    /// When `sample` is `Some`, populates `rss_mb`, `cpu_percent`, and
-    /// `detail_json` with the full sample (spec §3.2 columns).
-    fn write_resource_event(&self, event_type: &str) {
-        self.write_resource_event_with_sample(event_type, None);
     }
 
     /// Extended resource event writer that attaches a `ResourceSample`.

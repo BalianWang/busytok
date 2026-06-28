@@ -1543,3 +1543,82 @@ async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
 
     supervisor.shutdown_writer().await.unwrap();
 }
+
+// --- pressure gate wiring (Plan 6 Task 3, spec §8.3 step 2 "queue only") ---
+//
+// Verifies that `SubagentManager::delegate()` honors a paused `PressureGate`
+// by inserting the task row as `'queued'` and returning
+// `DelegateResult { status: Queued }` — NOT an error, NOT executing the task.
+// The background `TaskDispatcher` (Task 7) picks it up when the gate clears.
+// This test constructs a standalone `SubagentManager` with an explicit gate
+// because the supervisor path skips gate construction when `pi_sidecar.enabled
+// = false` (the unit-test default). The wiring (gate threaded into the
+// manager via `with_pressure_gate`) is what's being verified.
+
+#[tokio::test]
+#[serial]
+async fn delegate_returns_queued_when_pressure_gate_is_paused() {
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false; // mock executor
+    settings.subagent.enabled = true;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let _supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // When sidecar is disabled, no pressure gate is constructed. Use a
+    // direct SubagentManager test instead by constructing the manager
+    // with an explicit gate. This test verifies the wiring path.
+    let gate = Arc::new(busytok_subagent::PressureGate::new());
+    gate.set_action(busytok_subagent::PressureAction::PauseNewTasks);
+
+    let db2 = Arc::new(std::sync::Mutex::new(
+        busytok_store::Database::open_in_memory().unwrap(),
+    ));
+    let settings2 = busytok_config::SubagentSettings {
+        enabled: true,
+        ..Default::default()
+    };
+    let exec = Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+        as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
+    let manager = busytok_subagent::SubagentManager::with_pressure_gate(
+        db2,
+        settings2,
+        "pi",
+        exec,
+        Some(gate.clone()),
+    );
+
+    let req = busytok_subagent::DelegateRequest {
+        subagent_name: "paused-test".to_string(),
+        subagent_id: None,
+        cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+        profile: "pi/search-cheap".to_string(),
+        intent: None,
+        prompt: "should be queued".to_string(),
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+    };
+    // §8.3 step 2 "queue only": delegate() accepts the task and returns
+    // DelegateResult { status: Queued } — NOT an error. The background
+    // TaskDispatcher (Task 7) picks it up when the gate clears.
+    let result = manager
+        .delegate(req)
+        .await
+        .expect("delegate must succeed (queue-only)");
+    assert_eq!(
+        result.status,
+        busytok_subagent::TaskStatus::Queued,
+        "delegate must return Queued status when gate is paused, not execute or error"
+    );
+    // Sanity: the gate is still paused (delegate must not have cleared it).
+    assert!(gate.is_paused(), "delegate must not clear the pause flag");
+}
