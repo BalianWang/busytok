@@ -1,5 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
-use busytok_subagent::pressure::{PressureAction, PressureGate};
+use busytok_store::Database;
+use busytok_subagent::pressure::{PressureAction, PressureGate, PressureResponder};
+use busytok_subagent::sidecar::{PiSidecarSupervisor, SidecarConfig, SidecarTaskExecutor};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[test]
 fn gate_starts_unpaused_with_resume_action() {
@@ -60,14 +65,8 @@ fn graceful_restart_sets_paused() {
 #[tokio::test]
 async fn evict_lru_hibernates_oldest_hot_binding() {
     use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
-    use busytok_store::Database;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Duration;
 
-    use busytok_subagent::sidecar::{PiSidecarSupervisor, SidecarConfig, SidecarTaskExecutor};
-
-    let db = Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let config = SidecarConfig {
         node_binary: std::path::PathBuf::from("/usr/bin/true"),
         bundle_path: std::path::PathBuf::from("/dev/null"),
@@ -163,4 +162,158 @@ async fn evict_lru_hibernates_oldest_hot_binding() {
         lru.id, "bind-old",
         "LRU must be the oldest binding (last_used_at_ms=1000)"
     );
+}
+
+// --- PressureResponder::respond() branch coverage (spec §8.3) ---
+//
+// These tests construct a real `PressureResponder` with a mock `SidecarConfig`
+// (`/usr/bin/true` as node_binary) and exercise each `respond()` branch.
+// `ensure_started` fails fast (child exits → stdout EOF → Crashed error);
+// `shutdown_internal` and `force_kill` are no-ops when no child is running.
+
+/// Build a mock config + in-memory DB (shared setup for responder tests).
+fn mock_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let config = SidecarConfig {
+        node_binary: std::path::PathBuf::from("/usr/bin/true"),
+        bundle_path: std::path::PathBuf::from("/dev/null"),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(300),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    };
+    (config, db)
+}
+
+/// Build a responder + gate + strong Arcs (supervisor, executor) for tests
+/// that keep both alive. Returns the strong Arcs so the caller can drop them
+/// (for the "dropped" branch tests).
+fn mock_responder() -> (
+    Arc<PressureGate>,
+    PressureResponder,
+    Arc<PiSidecarSupervisor>,
+    Arc<SidecarTaskExecutor>,
+) {
+    let (config, db) = mock_config_and_db();
+    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let exec = Arc::new(SidecarTaskExecutor::with_db(
+        Arc::clone(&sup),
+        Arc::clone(&db),
+    ));
+    let gate = Arc::new(PressureGate::new());
+    let responder = PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&exec),
+        Arc::clone(&gate),
+    );
+    (gate, responder, sup, exec)
+}
+
+#[tokio::test]
+async fn respond_resume_clears_pause() {
+    let (gate, responder, _sup, _exec) = mock_responder();
+    gate.set_action(PressureAction::PauseNewTasks);
+    assert!(gate.is_paused());
+    responder.respond(PressureAction::Resume).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn respond_hibernate_lru_does_not_pause() {
+    let (gate, responder, _sup, _exec) = mock_responder();
+    // evict_lru is a no-op on an empty DB.
+    responder.respond(PressureAction::HibernateLru).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(
+        gate.last_action(),
+        Some(PressureAction::HibernateLru)
+    ));
+}
+
+#[tokio::test]
+async fn respond_pause_new_tasks_sets_pause() {
+    let (gate, responder, _sup, _exec) = mock_responder();
+    responder.respond(PressureAction::PauseNewTasks).await;
+    assert!(gate.is_paused());
+    assert!(matches!(
+        gate.last_action(),
+        Some(PressureAction::PauseNewTasks)
+    ));
+}
+
+#[tokio::test]
+async fn respond_force_kill_clears_gate() {
+    let (gate, responder, _sup, _exec) = mock_responder();
+    // force_kill is a no-op when no child is running (reconcile_crash +
+    // write_resource_event only). Gate is cleared to Resume afterward.
+    responder.respond(PressureAction::ForceKill).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn respond_graceful_restart_clears_gate() {
+    let (gate, responder, _sup, _exec) = mock_responder();
+    // ensure_started fails (mock binary exits → protocol init fails), logs
+    // warning but does NOT return early. shutdown_internal is a no-op (no
+    // child stored). Gate is cleared to Resume.
+    responder.respond(PressureAction::GracefulRestart).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn respond_both_dropped_is_noop() {
+    let (gate, responder, sup, exec) = mock_responder();
+    // Drop both strong Arcs — both weak refs fail to upgrade. The supervisor
+    // check fires first (returns early). Gate must be unchanged (Resume).
+    drop(sup);
+    drop(exec);
+    assert!(!gate.is_paused());
+    responder.respond(PressureAction::ForceKill).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn respond_executor_dropped_is_noop() {
+    // Supervisor alive, executor dropped: the executor weak fails to upgrade
+    // while the supervisor weak still succeeds. respond(HibernateLru) returns
+    // early at the executor check, leaving the gate unchanged (Resume).
+    let (config, db) = mock_config_and_db();
+    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let exec = Arc::new(SidecarTaskExecutor::with_db(
+        Arc::clone(&sup),
+        Arc::clone(&db),
+    ));
+    let gate = Arc::new(PressureGate::new());
+    let sup_weak = Arc::downgrade(&sup);
+    let exec_weak = Arc::downgrade(&exec);
+    drop(exec);
+    let responder = PressureResponder::new(sup_weak, exec_weak, Arc::clone(&gate));
+    responder.respond(PressureAction::HibernateLru).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn responder_accessors_return_alive_refs() {
+    let (gate, responder, sup, exec) = mock_responder();
+    // gate() returns the same Arc.
+    assert!(Arc::ptr_eq(responder.gate(), &gate));
+    // supervisor() / executor() upgrade successfully while strong Arcs alive.
+    assert!(responder.supervisor().is_some());
+    assert!(responder.executor().is_some());
+    assert!(Arc::ptr_eq(&responder.supervisor().unwrap(), &sup));
+    assert!(Arc::ptr_eq(&responder.executor().unwrap(), &exec));
+    // Default impl == new().
+    let default_gate = PressureGate::default();
+    assert!(!default_gate.is_paused());
 }
