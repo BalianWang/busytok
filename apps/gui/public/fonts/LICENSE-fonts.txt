@@ -9,10 +9,6 @@ This directory bundles font files under the SIL Open Font License, Version 1.1
     Copyright 2023 Vercel.
     Source: https://github.com/vercel/geist-font
 
-  Special Elite (Regular)
-    Copyright 2011 Brian J.S. Kent.
-    Source: https://fonts.google.com/specimen/Special+Elite
-
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:
 https://openfontlicense.org

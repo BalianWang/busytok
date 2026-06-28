@@ -55,7 +55,7 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
 
             <div className="receipt__total">
               <span className="receipt__total-label">TOTAL</span>
-              <span className="receipt__total-tokens">{vm.total.tokens} tok</span>
+              <span className="receipt__total-tokens">{vm.total.tokens}</span>
               <span className="receipt__total-cost">{vm.total.cost}</span>
             </div>
           </>

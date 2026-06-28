@@ -5,8 +5,7 @@
 
    Font vocabulary:
    - BusytokSans (Geist)     → brand wordmark, total cost numeral
-   - BusytokMono (IBM Plex)   → receipt body (meta / items / total)
-   - BusytokType (Special Elite) → footer brand line (typewriter feel) */
+   - BusytokMono (IBM Plex)  → receipt body (meta / items / total) */
 
 @font-face {
   font-family: "BusytokMono";
@@ -40,13 +39,6 @@
   font-family: "BusytokSans";
   src: url("/fonts/Geist-Bold.woff2") format("woff2");
   font-weight: 700;
-  font-style: normal;
-  font-display: block;
-}
-@font-face {
-  font-family: "BusytokType";
-  src: url("/fonts/SpecialElite-Regular.woff2") format("woff2");
-  font-weight: 400;
   font-style: normal;
   font-display: block;
 }
@@ -293,10 +285,10 @@
   border: 1px solid var(--r-divider);
   border-radius: 4px;
 }
-/* Brand line in Special Elite typewriter face — the "old printer" note at
-   the bottom of a clean modern receipt. */
+/* Footer brand line — the "old printer" note at the bottom of a clean
+   modern receipt. */
 .receipt__footer-brand {
-  font-family: "BusytokType", "BusytokMono", ui-monospace, monospace;
+  font-family: "BusytokMono", ui-monospace, monospace;
   font-size: 10px;
   letter-spacing: 0.14em;
   line-height: 1.3;
