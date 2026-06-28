@@ -446,6 +446,21 @@ pub fn count_tasks_since(conn: &Connection, subagent_id: &str, since_ms: i64) ->
     Ok(count as u32)
 }
 
+/// Count subagent tasks by status. Returns (queued, running).
+pub fn task_counts_by_status(conn: &Connection) -> Result<(u32, u32)> {
+    let queued: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM subagent_tasks WHERE status = 'queued'",
+        [],
+        |row| row.get(0),
+    )?;
+    let running: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM subagent_tasks WHERE status = 'running'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((queued as u32, running as u32))
+}
+
 // --- harness bindings ------------------------------------------------------
 
 pub fn upsert_binding(conn: &Connection, row: &SubagentHarnessBindingRow) -> Result<()> {

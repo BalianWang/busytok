@@ -33,6 +33,11 @@ pub struct ResourceSample {
     pub hot_session_count: u32,
     /// System available memory in MB (macOS). Best-effort.
     pub system_available_mb: f64,
+    /// Number of queued tasks (spec §8.1). Provided by the caller from the
+    /// subagent_tasks table.
+    pub queued_task_count: u32,
+    /// Number of running tasks (spec §8.1). Provided by the caller.
+    pub running_task_count: u32,
 }
 
 /// Edge-trigger latch for resource pressure state (spec §6.5: "lifecycle
@@ -121,11 +126,19 @@ impl ResourceMonitor {
     /// Take a sample. `sidecar_pid` is the sidecar child PID (None when the
     /// sidecar is not running). `hot_session_count` is provided by the caller
     /// (the supervisor reads it from the sidecar's `adapter.health` response
-    /// or tracks it via the executor).
+    /// or tracks it via the executor). `queued_task_count` and
+    /// `running_task_count` are provided by the caller from the
+    /// `subagent_tasks` table (spec §8.1).
     ///
     /// First call after construction returns `sidecar_cpu_percent = Some(0.0)`
     /// (spike note) — sysinfo needs two refreshes to compute a delta.
-    pub fn sample(&mut self, sidecar_pid: Option<u32>, hot_session_count: u32) -> ResourceSample {
+    pub fn sample(
+        &mut self,
+        sidecar_pid: Option<u32>,
+        hot_session_count: u32,
+        queued_task_count: u32,
+        running_task_count: u32,
+    ) -> ResourceSample {
         // sysinfo 0.32 API: refresh_specifics takes a RefreshKind. We refresh
         // processes (with cpu+memory) and system memory in one call.
         self.system.refresh_specifics(
@@ -157,6 +170,8 @@ impl ResourceMonitor {
             sidecar_cpu_percent,
             hot_session_count,
             system_available_mb,
+            queued_task_count,
+            running_task_count,
         }
     }
 

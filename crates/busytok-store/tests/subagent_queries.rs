@@ -460,3 +460,58 @@ fn count_tasks_since_returns_authoritative_count() {
     let count_all = db.subagent_count_tasks_since(sub_id, 0).unwrap();
     assert_eq!(count_all, 8);
 }
+
+#[test]
+fn task_counts_by_status_returns_queued_and_running_counts() {
+    let db = db();
+    let sub_id = "sub-status-count";
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(
+        sub_id,
+        "status-count",
+    ))
+    .unwrap();
+    // Insert 3 queued, 2 running, 4 completed tasks.
+    for (i, status) in [
+        ("q1", "queued"),
+        ("q2", "queued"),
+        ("q3", "queued"),
+        ("r1", "running"),
+        ("r2", "running"),
+        ("c1", "completed"),
+        ("c2", "completed"),
+        ("c3", "completed"),
+        ("c4", "completed"),
+    ] {
+        let task = SubagentTaskRow {
+            id: i.into(),
+            subagent_id: sub_id.into(),
+            source_harness: None,
+            source_session_id: None,
+            intent: None,
+            profile: "pi/review-cheap".into(),
+            prompt: Some("do".into()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: status.into(),
+            result_summary: None,
+            result_json: None,
+            error: None,
+            created_at_ms: 1000,
+            started_at_ms: None,
+            completed_at_ms: None,
+        };
+        db.subagent_insert_task(&task).unwrap();
+    }
+    let (queued, running) = db.subagent_task_counts_by_status().unwrap();
+    assert_eq!(queued, 3);
+    assert_eq!(running, 2);
+}
+
+#[test]
+fn task_counts_by_status_returns_zeros_when_no_tasks() {
+    let db = db();
+    let (queued, running) = db.subagent_task_counts_by_status().unwrap();
+    assert_eq!(queued, 0);
+    assert_eq!(running, 0);
+}

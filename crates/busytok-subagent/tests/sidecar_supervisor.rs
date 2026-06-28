@@ -647,6 +647,8 @@ fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
         sidecar_cpu_percent: Some(3.5),
         hot_session_count: 2,
         system_available_mb: 4096.0,
+        queued_task_count: 0,
+        running_task_count: 0,
     };
     sup.write_resource_event_with_sample("sidecar_start", Some(&sample));
 

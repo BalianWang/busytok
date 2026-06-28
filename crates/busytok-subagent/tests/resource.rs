@@ -17,6 +17,8 @@ fn sample(
         sidecar_cpu_percent,
         hot_session_count,
         system_available_mb,
+        queued_task_count: 0,
+        running_task_count: 0,
     }
 }
 
@@ -119,7 +121,7 @@ fn sample_returns_positive_service_rss_for_current_process() {
     // (the current process always has RSS).
     let policy = SubagentResourcePolicyConfig::default();
     let mut mon = ResourceMonitor::new(policy, 800, 1200);
-    let s = mon.sample(None, 0);
+    let s = mon.sample(None, 0, 0, 0);
     assert!(
         s.service_rss_mb > 0.0,
         "current process RSS must be > 0; got {}",
@@ -145,7 +147,7 @@ fn sample_with_known_pid_returns_sidecar_rss_and_zero_first_cpu() {
     let mut mon = ResourceMonitor::new(policy, 800, 1200);
     let pid = sysinfo::Pid::from_u32(std::process::id());
     let _ = pid;
-    let s = mon.sample(Some(std::process::id()), 0);
+    let s = mon.sample(Some(std::process::id()), 0, 0, 0);
     assert!(
         s.sidecar_rss_mb.map(|v| v > 0.0).unwrap_or(false),
         "sidecar_rss_mb must be > 0 for self PID; got {:?}",
@@ -167,14 +169,14 @@ fn second_sample_returns_meaningful_cpu() {
     let policy = SubagentResourcePolicyConfig::default();
     let mut mon = ResourceMonitor::new(policy, 800, 1200);
     let pid = std::process::id();
-    let _ = mon.sample(Some(pid), 0); // prime
-                                      // Burn a tiny bit of CPU so sysinfo has something to measure.
+    let _ = mon.sample(Some(pid), 0, 0, 0); // prime
+                                            // Burn a tiny bit of CPU so sysinfo has something to measure.
     let mut acc: u64 = 0;
     for i in 0..100_000 {
         acc = acc.wrapping_add(i);
     }
     std::hint::black_box(acc);
-    let s2 = mon.sample(Some(pid), 0);
+    let s2 = mon.sample(Some(pid), 0, 0, 0);
     let cpu = s2.sidecar_cpu_percent.unwrap_or(0.0);
     assert!(
         cpu.is_finite(),
@@ -284,4 +286,15 @@ fn transition_event_returns_none_on_same_state() {
         None,
         "LimitExceeded → LimitExceeded must be debounced"
     );
+}
+
+// --- Task 1: queued/running task count fields (spec §8.1) ---
+
+#[test]
+fn sample_includes_queued_and_running_task_counts() {
+    let policy = busytok_config::SubagentResourcePolicyConfig::default();
+    let mut monitor = ResourceMonitor::new(policy, 800, 1200);
+    let sample = monitor.sample(None, 0, 5, 2);
+    assert_eq!(sample.queued_task_count, 5);
+    assert_eq!(sample.running_task_count, 2);
 }

@@ -504,12 +504,20 @@ impl PiSidecarSupervisor {
             Some(m) => m,
             None => return,
         };
+        let (queued, running) = match &self.db {
+            Some(db) => db
+                .lock()
+                .unwrap()
+                .subagent_task_counts_by_status()
+                .unwrap_or((0, 0)),
+            None => (0, 0),
+        };
         let sample = {
             let mut guard = match monitor.lock() {
                 Ok(g) => g,
                 Err(_) => return, // poisoned — skip this tick
             };
-            guard.sample(sidecar_pid, hot_sessions)
+            guard.sample(sidecar_pid, hot_sessions, queued, running)
         };
         // Time-series signal — logged EVERY tick (level-triggered).
         info!(
@@ -518,6 +526,8 @@ impl PiSidecarSupervisor {
             sidecar_rss_mb = ?sample.sidecar_rss_mb,
             sidecar_cpu_percent = ?sample.sidecar_cpu_percent,
             hot_session_count = sample.hot_session_count,
+            queued_task_count = sample.queued_task_count,
+            running_task_count = sample.running_task_count,
             system_available_mb = sample.system_available_mb,
             "resource sample"
         );

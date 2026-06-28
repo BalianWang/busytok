@@ -1949,6 +1949,10 @@ impl Database {
     pub fn subagent_count_tasks_since(&self, subagent_id: &str, since_ms: i64) -> Result<u32> {
         subagent_queries::count_tasks_since(self.conn(), subagent_id, since_ms)
     }
+    /// Count subagent tasks by status. Returns (queued, running).
+    pub fn subagent_task_counts_by_status(&self) -> Result<(u32, u32)> {
+        crate::subagent_queries::task_counts_by_status(&self.conn)
+    }
     pub fn subagent_set_task_status(
         &self,
         id: &str,
