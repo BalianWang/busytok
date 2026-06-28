@@ -1,4 +1,17 @@
-Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+This directory bundles font files under the SIL Open Font License, Version 1.1
+(copied in full below). Each font's copyright holders are:
+
+  IBM Plex Mono (Regular, SemiBold, Bold)
+    Copyright 2017 IBM Corp.
+    Source: https://github.com/IBM/plex
+
+  Geist (Regular, Bold)
+    Copyright 2023 Vercel.
+    Source: https://github.com/vercel/geist-font
+
+  Special Elite (Regular)
+    Copyright 2011 Brian J.S. Kent.
+    Source: https://fonts.google.com/specimen/Special+Elite
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

@@ -210,7 +210,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 700;
+  font-weight: 600;
 }
 .receipt__item-tokens {
   text-align: right;
@@ -299,6 +299,7 @@
   font-family: "BusytokType", "BusytokMono", ui-monospace, monospace;
   font-size: 10px;
   letter-spacing: 0.14em;
+  line-height: 1.3;
 }
 
 /* The hidden, off-screen export target: rendered at exactly 420px, captured

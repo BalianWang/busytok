@@ -33,7 +33,17 @@ export function useReceiptExport(
         fonts.load('400 1em "BusytokSans"'),
         fonts.load('700 1em "BusytokSans"'),
         fonts.load('400 1em "BusytokType"'),
-      ]).catch(() => {});
+      ]).catch((error) => {
+        // A failed font load produces a silently degraded export (fallback
+        // face with wrong metrics). Surface it so the operator can correlate
+        // "why does my exported PNG look wrong" reports with a real event.
+        log(
+          "gui.receipt.font_load_failed",
+          "receipt font preload failed",
+          { date, error: error instanceof Error ? error.message : String(error) },
+          "ERROR",
+        );
+      });
       await fonts.ready.catch(() => {});
     }
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
