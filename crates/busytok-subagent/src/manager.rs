@@ -1,6 +1,7 @@
 //! The public logical-subagent manager.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use busytok_config::SubagentSettings;
 use busytok_store::{
@@ -163,6 +164,10 @@ impl SubagentManager {
                 created_at_ms: now,
                 started_at_ms: if paused { None } else { Some(now) },
                 completed_at_ms: None,
+                // Task 7 Round 3 Finding 1 fix: persist execution params so the
+                // dispatcher reads them from the row (single source of truth).
+                timeout_seconds: req.timeout_seconds.map(|t| t as i64),
+                model_override: req.model_override.clone(),
             })
             .map_err(SubagentError::Store)?;
         }
@@ -202,8 +207,75 @@ impl SubagentManager {
         }
 
         // 3. Build context + memory snapshot from the store, then execute.
-        //    No lock held during execution.
+        //    No lock held during execution. Task 7 Step 3: the post-insert
+        //    execute logic is delegated to `execute_task()` so the background
+        //    dispatcher can reuse it for queued tasks.
         let model = req.model_override.clone().or(profile_model);
+        // The task row is already inserted as 'running' (Round 4 race-free
+        // design). Reconstruct a `SubagentTaskRow` view to pass to
+        // `execute_task` — the row is the single source of truth for execution
+        // params (Round 3 Finding 1 fix). For the synchronous delegate path
+        // we read directly from `req` since the row was just inserted from
+        // the same values; the dispatcher path reads the row from the DB.
+        let task_row = SubagentTaskRow {
+            id: task_id.clone(),
+            subagent_id: subagent.id.clone(),
+            source_harness: req.source_harness.clone(),
+            source_session_id: req.source_session_id.clone(),
+            intent: req.intent.clone(),
+            profile: req.profile.clone(),
+            prompt: Some(req.prompt.clone()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: "running".to_string(),
+            result_summary: None,
+            result_json: None,
+            error: None,
+            created_at_ms: now,
+            started_at_ms: Some(now),
+            completed_at_ms: None,
+            timeout_seconds: req.timeout_seconds.map(|t| t as i64),
+            model_override: req.model_override.clone(),
+        };
+        let mut result = self.execute_task(&task_row, &subagent).await?;
+        // `execute_task` returns the model it actually used (which may differ
+        // from `model` when the task row's `model_override` is None and the
+        // subagent's `default_model` overrides the profile default). Preserve
+        // the model the caller expected when possible (synchronous path uses
+        // `req.model_override.or(profile_model)`); fall back to the
+        // `execute_task` value otherwise.
+        if result.model.is_none() {
+            result.model = model;
+        }
+        Ok(result)
+    }
+
+    /// Execute a task that is ALREADY "running" (status + started_at_ms set
+    /// by the caller). Builds context → executes → persists results.
+    /// Called by `delegate()` (synchronous, after inserting as 'running')
+    /// and the background dispatcher (after `pick_oldest_queued_task` which
+    /// does the atomic CAS flip).
+    ///
+    /// **Round 3 Finding 2 fix:** this method does NOT call
+    /// `subagent_set_task_status("running")` — the caller sets the status
+    /// before calling (via insert-as-running or pick's atomic flip).
+    ///
+    /// Reads ALL execution params from the task row (Finding 1 fix):
+    ///   - task.prompt / task.prompt_artifact_ref
+    ///   - task.profile
+    ///   - task.timeout_seconds (new column)
+    ///   - task.model_override (new column)
+    async fn execute_task(
+        &self,
+        task: &SubagentTaskRow,
+        subagent: &LogicalSubagent,
+    ) -> Result<DelegateResult> {
+        let model = task
+            .model_override
+            .clone()
+            .or_else(|| subagent.default_model.clone())
+            .or_else(|| self.profile_model(&task.profile));
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -225,7 +297,7 @@ impl SubagentManager {
                     memory_row.last_compacted_at_ms.unwrap_or(0),
                 )
                 .map_err(SubagentError::Store)?;
-            let profile_cfg = self.settings.profiles.get(&req.profile);
+            let profile_cfg = self.settings.profiles.get(&task.profile);
             let profile_budget = profile_cfg
                 .map(|p| p.context_budget_tokens)
                 .unwrap_or(self.settings.context.default_budget_tokens);
@@ -235,11 +307,16 @@ impl SubagentManager {
                 .subagent_get_logical(&subagent.id)
                 .map_err(SubagentError::Store)?
                 .ok_or_else(|| SubagentError::NotFound(subagent.id.clone()))?;
+            // The task row is the single source of truth for the prompt
+            // (Finding 1 fix). `prompt` is set when the caller supplied inline
+            // text; `prompt_artifact_ref` is set when the caller referenced a
+            // stored artifact. The context builder takes the inline prompt.
+            let prompt = task.prompt.clone().unwrap_or_default();
             let (compact, snapshot) = self.context_builder.build(
                 &sub_row,
                 &memory_row,
                 &recent_tasks,
-                &req.prompt,
+                &prompt,
                 profile_budget,
             );
             info!(
@@ -249,16 +326,24 @@ impl SubagentManager {
                 context_chars = compact.compact_context.len(),
                 recent_tasks_count = recent_tasks.len(),
                 tasks_since_last_compaction,
-                "built context for delegate"
+                "built context for task"
             );
             let input = ExecutorInput {
                 subagent_id: subagent.id.clone(),
                 subagent_name: subagent.name.clone(),
-                cwd: req.cwd.clone(),
-                profile: req.profile.clone(),
+                // Task 7 brief: `cwd` for `ExecutorInput` is the subagent's
+                // canonical `repo_path`. The task was queued FOR this
+                // subagent, so the subagent's repo is the right working
+                // directory. (The original `delegate()` used `req.cwd`, but
+                // `execute_task` takes a `&SubagentTaskRow` which has no
+                // `cwd` field — `subagent.repo_path` is the correct
+                // substitute and is what `req.cwd` would have been
+                // canonicalized to during `resolve_by_name`.)
+                cwd: subagent.repo_path.clone(),
+                profile: task.profile.clone(),
                 model: model.clone(),
-                prompt: req.prompt.clone(),
-                timeout_seconds: req.timeout_seconds,
+                prompt,
+                timeout_seconds: task.timeout_seconds.map(|t| t as u64),
                 tools,
                 memory: snapshot,
                 context: compact,
@@ -290,7 +375,7 @@ impl SubagentManager {
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
             db.subagent_set_task_status(
-                &task_id,
+                &task.id,
                 out.status.as_str(),
                 Some(out.summary.clone()),
                 None,
@@ -309,8 +394,8 @@ impl SubagentManager {
                 )
                 .map_err(SubagentError::Store)?;
             db.subagent_insert_usage_record(&SubagentUsageRecordRow {
-                id: format!("usage_{task_id}"),
-                task_id: task_id.clone(),
+                id: format!("usage_{}", task.id),
+                task_id: task.id.clone(),
                 subagent_id: subagent.id.clone(),
                 source_usage_event_id: None,
                 harness: self.adapter.clone(),
@@ -339,7 +424,7 @@ impl SubagentManager {
                 out.memory_update.clone(),
                 &recent_tasks,
                 tasks_since_last_compaction,
-                &task_id,
+                &task.id,
                 profile_budget,
                 &subagent.repo_path,
             );
@@ -348,20 +433,20 @@ impl SubagentManager {
                 subagent_id = %subagent.id,
                 has_hot_summary = updated_mem.hot_summary.is_some(),
                 compacted = updated_mem.last_compacted_at_ms.is_some(),
-                "memory updated after delegate"
+                "memory updated after task"
             );
             db.subagent_upsert_memory(&updated_mem)
                 .map_err(SubagentError::Store)?;
 
             // Spec §3.3 invariant: status='hot' iff is_hot=1 binding exists.
             // Hot path: commit binding + status atomically; failure fails the
-            // delegate to preserve the status invariant (no `hot` without a
+            // task to preserve the status invariant (no `hot` without a
             // backing binding). Warm path (mock executor, no adapter_session_id):
             // just flip status — no real session to bind.
             //
             // An empty `adapter_session_id` is treated as warm/cold — there is
             // no real backing session, so committing a hot binding would
-            // violate spec §3.3 semantically. The delegate is the authority
+            // violate spec §3.3 semantically. The task is the authority
             // that decides hot vs warm/cold (the executor only extracts the
             // raw value).
             let hot_sid = out.adapter_session_id.as_deref().filter(|s| !s.is_empty());
@@ -385,7 +470,7 @@ impl SubagentManager {
                         error!(
                             event_code = "subagent.delegate.binding_commit_failed",
                             error = %e,
-                            "hot binding commit failed; delegate fails to preserve status invariant"
+                            "hot binding commit failed; task fails to preserve status invariant"
                         );
                         SubagentError::Store(e)
                     })?;
@@ -404,17 +489,115 @@ impl SubagentManager {
         }
 
         Ok(DelegateResult {
-            task_id,
+            task_id: task.id.clone(),
             subagent_id: subagent.id.clone(),
             subagent_name: subagent.name.clone(),
             adapter: self.adapter.clone(),
             adapter_session_id: out.adapter_session_id.clone(),
             session_reused: out.session_reused,
             status: out.status,
-            profile: req.profile,
+            profile: task.profile.clone(),
             model,
             summary: Some(out.summary),
             usage: out.usage.clone(),
+        })
+    }
+
+    /// Spawn the background task dispatcher (§8.3 step 2 "queue only").
+    /// Polls for queued tasks every 200ms; when the gate is not paused,
+    /// picks the oldest queued task and executes it. Terminates when
+    /// `shutdown` receiver sees `true` (sent by `BusytokSupervisor` on
+    /// drop/shutdown).
+    ///
+    /// **Finding 3 fix:** `JoinHandle` drop = detach (NOT abort), so we use
+    /// `tokio::sync::watch` for explicit shutdown signaling. The caller
+    /// MUST keep the `Sender` alive and send `true` to stop the dispatcher.
+    pub fn spawn_task_dispatcher(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {},
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            info!(
+                                event_code = "subagent.dispatcher.shutdown",
+                                "task dispatcher shutting down"
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                // Check gate — if paused, skip this tick.
+                if let Some(gate) = &manager.pressure_gate {
+                    if gate.is_paused() {
+                        continue;
+                    }
+                }
+
+                // Pick oldest queued task (per-subagent FIFO, atomic pick + flip).
+                // `pick_oldest_queued_task` returns `None` when no queued task
+                // is eligible (no queued rows OR the only queued rows belong to
+                // subagents that already have a running task — per-subagent FIFO).
+                let task = {
+                    let db = manager.db.lock().expect("subagent db lock poisoned");
+                    db.subagent_pick_oldest_queued_task().ok().flatten()
+                };
+
+                if let Some(task) = task {
+                    // Resolve the subagent from the DB so we have the
+                    // canonical `repo_path`, `default_model`, etc.
+                    let subagent = {
+                        let db = manager.db.lock().expect("subagent db lock poisoned");
+                        db.subagent_get_logical(&task.subagent_id)
+                            .ok()
+                            .flatten()
+                            .map(|row| row_to_model(&row))
+                    };
+                    let Some(subagent) = subagent else {
+                        warn!(
+                            event_code = "subagent.queue.subagent_missing",
+                            task_id = %task.id,
+                            subagent_id = %task.subagent_id,
+                            "dispatcher could not resolve subagent for queued task; marking failed"
+                        );
+                        let db = manager.db.lock().expect("subagent db lock poisoned");
+                        let _ = db.subagent_set_task_status(
+                            &task.id,
+                            "failed",
+                            None,
+                            Some("subagent not found".to_string()),
+                        );
+                        continue;
+                    };
+                    info!(
+                        event_code = "subagent.queue.execute",
+                        task_id = %task.id,
+                        subagent_id = %subagent.id,
+                        "dispatcher executing queued task"
+                    );
+                    if let Err(e) = manager.execute_task(&task, &subagent).await {
+                        warn!(
+                            event_code = "subagent.queue.execute_failed",
+                            task_id = %task.id,
+                            error = %e,
+                            "dispatcher execute_task failed; marking task failed"
+                        );
+                        let db = manager.db.lock().expect("subagent db lock poisoned");
+                        let _ = db.subagent_set_task_status(
+                            &task.id,
+                            "failed",
+                            None,
+                            Some(e.to_string()),
+                        );
+                    }
+                }
+            }
         })
     }
 

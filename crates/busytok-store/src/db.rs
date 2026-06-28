@@ -1949,6 +1949,13 @@ impl Database {
     pub fn subagent_count_tasks_since(&self, subagent_id: &str, since_ms: i64) -> Result<u32> {
         subagent_queries::count_tasks_since(self.conn(), subagent_id, since_ms)
     }
+    /// Atomically pick the oldest queued task and flip it to "running"
+    /// (Task 7 §8.3 step 2 dispatcher). `None` when no queued task is
+    /// eligible (no queued rows OR the only queued rows belong to
+    /// subagents that already have a running task — per-subagent FIFO).
+    pub fn subagent_pick_oldest_queued_task(&self) -> rusqlite::Result<Option<SubagentTaskRow>> {
+        subagent_queries::pick_oldest_queued_task(self.conn())
+    }
     /// Count subagent tasks by status. Returns (queued, running).
     pub fn subagent_task_counts_by_status(&self) -> Result<(u32, u32)> {
         crate::subagent_queries::task_counts_by_status(&self.conn)

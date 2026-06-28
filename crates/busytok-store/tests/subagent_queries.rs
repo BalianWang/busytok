@@ -450,6 +450,8 @@ fn count_tasks_since_returns_authoritative_count() {
             created_at_ms: 1000 * (i as i64 + 1),
             started_at_ms: None,
             completed_at_ms: None,
+            timeout_seconds: None,
+            model_override: None,
         };
         db.subagent_insert_task(&task).unwrap();
     }
@@ -500,6 +502,8 @@ fn task_counts_by_status_returns_queued_and_running_counts() {
             created_at_ms: 1000,
             started_at_ms: None,
             completed_at_ms: None,
+            timeout_seconds: None,
+            model_override: None,
         };
         db.subagent_insert_task(&task).unwrap();
     }

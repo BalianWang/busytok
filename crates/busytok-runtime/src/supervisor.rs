@@ -97,6 +97,18 @@ pub struct BusytokSupervisor {
     /// JoinHandle for the catalog reload background task (None when no
     /// Tokio runtime was active at construction time).
     _catalog_reload_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// §8.3 step 2 "queue only" background task dispatcher (Task 7).
+    /// Polls `subagent_tasks` for queued rows and executes them when the
+    /// pressure gate is not paused. `None` when no Tokio runtime was
+    /// active at construction time. Wrapped in `Mutex<Option<...>>` so
+    /// `shutdown_writer(&self)` (which takes `&self`, not `&mut self`)
+    /// can `.take()` the handle.
+    task_dispatcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shutdown sender for `task_dispatcher` (Task 7 Finding 3 fix).
+    /// `JoinHandle` drop = detach (NOT abort), so explicit shutdown
+    /// signaling via `tokio::sync::watch` is required. `None` when no
+    /// Tokio runtime was active at construction time.
+    dispatcher_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 enum DatabaseHandle<'a> {
@@ -437,6 +449,27 @@ impl BusytokSupervisor {
             _ => None,
         };
 
+        // §8.3 step 2 "queue only" background dispatcher (Task 7 Finding 3
+        // fix): spawn the dispatcher that polls `subagent_tasks` for queued
+        // rows and executes them when the pressure gate is not paused. Uses
+        // the sync-safe spawn pattern (mirrors `try_spawn_writer`): when no
+        // Tokio runtime is active (e.g. sync unit tests that construct a
+        // supervisor via `BusytokSupervisor::new()`), the handle + sender
+        // are `None` and the dispatcher is not started. `shutdown_writer()`
+        // and `Drop` both treat `None` as a no-op.
+        //
+        // `spawn_task_dispatcher` is a sync fn that calls `tokio::spawn`
+        // internally; we guard the call with `Handle::try_current()` so the
+        // sync-context path skips the spawn instead of panicking.
+        let (dispatcher_handle, dispatcher_shutdown) =
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let handle = subagent_manager.spawn_task_dispatcher(shutdown_rx);
+                (Some(handle), Some(shutdown_tx))
+            } else {
+                (None, None)
+            };
+
         Self {
             db,
             event_bus,
@@ -457,6 +490,8 @@ impl BusytokSupervisor {
             pressure_responder,
             _writer_join: Mutex::new(writer_join),
             _catalog_reload_join: Mutex::new(catalog_reload_join),
+            task_dispatcher: Mutex::new(dispatcher_handle),
+            dispatcher_shutdown: Mutex::new(dispatcher_shutdown),
         }
     }
 
@@ -1338,7 +1373,24 @@ impl BusytokSupervisor {
     ///
     /// Service shutdown calls this after scan/tail tasks have stopped so the
     /// final metrics checkpoint is persisted before process exit.
+    ///
+    /// Task 7 Finding 3 fix: the §8.3 "queue only" background dispatcher is
+    /// drained FIRST (send `true` on the watch + await the JoinHandle). The
+    /// dispatcher writes directly to `db` (NOT through the writer actor), so
+    /// it must finish before the writer actor's final flush + WAL checkpoint
+    /// to avoid a race where the dispatcher commits a row after the writer
+    /// has stopped accepting commands. No-op when no Tokio runtime was active
+    /// at construction time (both fields are `None`).
     pub async fn shutdown_writer(&self) -> Result<()> {
+        // 1. Drain the §8.3 task dispatcher (if running).
+        if let Some(tx) = self.dispatcher_shutdown.lock().unwrap().take() {
+            let _ = tx.send(true); // signal dispatcher to exit
+        }
+        if let Some(handle) = self.task_dispatcher.lock().unwrap().take() {
+            let _ = handle.await; // wait for dispatcher to actually exit
+        }
+
+        // 2. Drain the writer actor.
         if self._writer_join.lock().unwrap().is_none() {
             return Ok(());
         }
@@ -1973,6 +2025,30 @@ impl BusytokSupervisor {
         }
 
         samples
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drop — best-effort shutdown of the §8.3 task dispatcher (Task 7 Finding 3
+// fix). `Drop` cannot `.await`, so we can only send the shutdown signal; the
+// dispatcher will exit on its next `select!` iteration (within ~200ms). Tests
+// that need deterministic shutdown call `shutdown_writer()` (which awaits the
+// JoinHandle) before letting the supervisor drop.
+// ---------------------------------------------------------------------------
+
+impl Drop for BusytokSupervisor {
+    fn drop(&mut self) {
+        // Send the shutdown signal if the sender is still owned (i.e. not
+        // already taken by `shutdown_writer()`). Best-effort: ignore errors
+        // (receiver already dropped).
+        if let Some(tx) = self.dispatcher_shutdown.lock().unwrap().take() {
+            let _ = tx.send(true);
+        }
+        // The JoinHandle is detached on drop (tokio semantics) — it does NOT
+        // abort the task. The shutdown signal above guarantees the dispatcher
+        // will exit within one poll cycle (200ms). We do NOT `take()` the
+        // handle here so any subsequent `shutdown_writer()` call (rare, only
+        // possible if drop is somehow re-entered) is a no-op.
     }
 }
 

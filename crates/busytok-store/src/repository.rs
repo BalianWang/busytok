@@ -534,6 +534,14 @@ pub struct SubagentTaskRow {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
+    /// Task 7 Round 3 Finding 1 fix: persisted execution param so the
+    /// dispatcher reads it from the row (single source of truth). `None`
+    /// when not specified by the caller (use profile/adapter default).
+    pub timeout_seconds: Option<i64>,
+    /// Task 7 Round 3 Finding 1 fix: persisted model override so the
+    /// dispatcher reads it from the row. `None` → fall back to
+    /// `subagent.default_model` then `profile_model`.
+    pub model_override: Option<String>,
 }
 
 impl SubagentTaskRow {
@@ -556,6 +564,8 @@ impl SubagentTaskRow {
             created_at_ms: busytok_domain::now_ms(),
             started_at_ms: None,
             completed_at_ms: None,
+            timeout_seconds: None,
+            model_override: None,
         }
     }
 }

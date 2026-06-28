@@ -315,8 +315,9 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
         "INSERT INTO subagent_tasks \
              (id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
               prompt_artifact_ref, output_schema_name, output_schema_version, status, \
-              result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
+              timeout_seconds, model_override) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             row.id,
             row.subagent_id,
@@ -335,6 +336,8 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
             row.created_at_ms,
             row.started_at_ms,
             row.completed_at_ms,
+            row.timeout_seconds,
+            row.model_override,
         ],
     )
     .map(|_| ())
@@ -345,7 +348,8 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
     let mut stmt = conn.prepare(
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
-                result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms \
+                result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
+                timeout_seconds, model_override \
          FROM subagent_tasks WHERE id = ?1",
     )?;
     let row_opt = stmt
@@ -368,6 +372,8 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
                 created_at_ms: row.get(14)?,
                 started_at_ms: row.get(15)?,
                 completed_at_ms: row.get(16)?,
+                timeout_seconds: row.get(17)?,
+                model_override: row.get(18)?,
             })
         })
         .ok();
@@ -382,7 +388,8 @@ pub fn list_tasks(
     let mut stmt = conn.prepare(
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
-                result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms \
+                result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
+                timeout_seconds, model_override \
          FROM subagent_tasks WHERE subagent_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
     )?;
     let rows = stmt
@@ -405,6 +412,8 @@ pub fn list_tasks(
                 created_at_ms: row.get(14)?,
                 started_at_ms: row.get(15)?,
                 completed_at_ms: row.get(16)?,
+                timeout_seconds: row.get(17)?,
+                model_override: row.get(18)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -459,6 +468,89 @@ pub fn task_counts_by_status(conn: &Connection) -> Result<(u32, u32)> {
         |row| row.get(0),
     )?;
     Ok((queued as u32, running as u32))
+}
+
+/// Atomically pick the oldest "queued" task and flip it to "running".
+/// Enforces per-subagent FIFO (spec §6.4 line 737): only picks from
+/// subagents that have NO running task. This ensures same-subagent tasks
+/// are serialized.
+///
+/// **Atomicity (Round 3 Finding 1 fix):** pick + flip happen inside a
+/// single `BEGIN IMMEDIATE` transaction with a CAS guard
+/// (`WHERE id = ? AND status = 'queued'`). If two dispatchers race on
+/// the same task, only one UPDATE affects 1 row; the other gets 0 rows
+/// and returns `None`. The RAII `Transaction` auto-rolls-back on drop.
+pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<SubagentTaskRow>> {
+    // `Transaction::new_unchecked` (vs `conn.transaction_with_behavior`)
+    // avoids requiring `&mut Connection` — `Database::conn()` returns `&Connection`.
+    // Mirrors the pattern in `run_subagent_doctor` (supervisor.rs).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // 1. Pick candidate id (still 'queued', per-subagent FIFO).
+    let id_opt: Option<String> = tx
+        .query_row(
+            "SELECT id FROM subagent_tasks \
+             WHERE status = 'queued' \
+               AND subagent_id NOT IN ( \
+                   SELECT subagent_id FROM subagent_tasks WHERE status = 'running' \
+               ) \
+             ORDER BY created_at_ms ASC \
+             LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(id) = id_opt else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    // 2. CAS flip: only updates if still 'queued'. rows_affected == 1 means we won.
+    let now = busytok_domain::now_ms();
+    let rows = tx.execute(
+        "UPDATE subagent_tasks SET status = 'running', started_at_ms = ?1 \
+         WHERE id = ?2 AND status = 'queued'",
+        rusqlite::params![now, id],
+    )?;
+    if rows == 0 {
+        // Lost the race — another dispatcher flipped it first.
+        tx.commit()?;
+        return Ok(None);
+    }
+    // 3. Fetch the full row (status is now 'running', started_at_ms = now).
+    let task = tx
+        .query_row(
+            "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
+                    prompt_artifact_ref, output_schema_name, output_schema_version, status, \
+                    result_summary, result_json, error, created_at_ms, started_at_ms, \
+                    completed_at_ms, timeout_seconds, model_override \
+             FROM subagent_tasks WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok(SubagentTaskRow {
+                    id: r.get(0)?,
+                    subagent_id: r.get(1)?,
+                    source_harness: r.get(2)?,
+                    source_session_id: r.get(3)?,
+                    intent: r.get(4)?,
+                    profile: r.get(5)?,
+                    prompt: r.get(6)?,
+                    prompt_artifact_ref: r.get(7)?,
+                    output_schema_name: r.get(8)?,
+                    output_schema_version: r.get(9)?,
+                    status: r.get(10)?,
+                    result_summary: r.get(11)?,
+                    result_json: r.get(12)?,
+                    error: r.get(13)?,
+                    created_at_ms: r.get(14)?,
+                    started_at_ms: r.get(15)?,
+                    completed_at_ms: r.get(16)?,
+                    timeout_seconds: r.get(17)?,
+                    model_override: r.get(18)?,
+                })
+            },
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(task)
 }
 
 // --- harness bindings ------------------------------------------------------
