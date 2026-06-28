@@ -147,109 +147,110 @@
   color: var(--r-ink-muted);
 }
 
-.receipt__hero {
-  text-align: center;
-  padding: 8px 0 4px;
-}
-.receipt__hero-value {
-  font-family: "BusytokMono";
-  font-weight: 700;
-  font-size: 52px;
-  line-height: 1.02;
-  letter-spacing: -0.02em;
-}
-.receipt__hero-label {
-  margin-top: 6px;
-  font-size: 11px;
-  letter-spacing: 0.22em;
-  color: var(--r-ink-muted);
-}
-.receipt__hero-secondary {
-  margin-top: 12px;
-  font-size: 11.5px;
-  color: var(--r-ink-muted);
+/* ── Compact summary line ─────────────────────────────────────────────
+   Replaces the old oversized hero block. Two short muted lines, no large
+   numerals — keeps the visual focus on ITEMS + TOTAL below, matching a
+   real-world receipt where the line items and grand total dominate. */
+.receipt__summary {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  padding: 4px 0 2px;
+  font-size: 11.5px;
+  color: var(--r-ink-muted);
+  text-align: center;
+  line-height: 1.4;
 }
 
+/* ── ITEMS section — the primary content ────────────────────────────
+   Three-column grid (ITEM | TOKENS | COST) with a small header row,
+   matching real receipts where each line item lists quantity + unit
+   price. The name column carries leader dots to the value columns. */
+.receipt__items {
+  margin-top: 4px;
+}
 .receipt__items-header {
-  font-size: 11px;
-  letter-spacing: 0.2em;
+  display: grid;
+  grid-template-columns: 1fr 80px 64px;
+  gap: 0 10px;
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--r-divider);
+  font-size: 10px;
+  letter-spacing: 0.22em;
   color: var(--r-ink-muted);
-  margin-bottom: 10px;
+}
+.receipt__items-header span:nth-child(2),
+.receipt__items-header span:nth-child(3) {
+  text-align: right;
 }
 .receipt__item {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr 80px 64px;
   align-items: baseline;
   gap: 0 10px;
   font-size: 13px;
-  margin-bottom: 9px;
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--r-divider);
+}
+/* Last item row before TOTAL has no dotted border — the TOTAL's double
+   border takes over. */
+.receipt__item:last-child {
+  border-bottom: 0;
+  padding-bottom: 8px;
 }
 .receipt__item-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-/* Leader dots between name and the value column. */
-.receipt__item-name::after {
-  content: " . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .";
-  letter-spacing: 2px;
-  color: var(--r-divider);
-}
-.receipt__item-value {
-  display: flex;
-  gap: 12px;
-  align-items: baseline;
-}
-.receipt__item-tokens {
   font-weight: 700;
 }
-.receipt__item-cost {
-  color: var(--r-ink-muted);
-  min-width: 64px;
+.receipt__item-tokens {
   text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--r-ink);
+}
+.receipt__item-cost {
+  text-align: right;
+  color: var(--r-ink-muted);
+  font-variant-numeric: tabular-nums;
 }
 .receipt__item--others .receipt__item-name {
   color: var(--r-ink-muted);
   font-style: italic;
+  font-weight: 400;
+}
+.receipt__item--others .receipt__item-tokens {
+  color: var(--r-ink-muted);
+  font-weight: 400;
 }
 
+/* ── TOTAL — the grand total row ───────────────────────────────────
+   Double rule above (classic receipt convention), larger weight,
+   accent cost. Three columns mirror ITEMS so values align. */
 .receipt__total {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr 80px 64px;
   align-items: baseline;
   gap: 0 10px;
-  margin-top: 4px;
-  padding-top: 14px;
+  margin-top: 10px;
+  padding-top: 12px;
   border-top: 3px double var(--r-ink);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
 }
-.receipt__total-value {
-  display: flex;
-  gap: 14px;
-  align-items: baseline;
+.receipt__total-label {
+  letter-spacing: 0.18em;
+}
+.receipt__total-tokens {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .receipt__total-cost {
+  text-align: right;
   color: var(--r-accent);
-}
-
-.receipt__stamp {
-  position: absolute;
-  right: 28px;
-  bottom: 96px;
-  transform: rotate(-12deg);
-  border: 2px solid var(--r-accent);
-  color: var(--r-accent);
-  border-radius: 999px;
-  padding: 6px 14px;
   font-family: "BusytokSans", system-ui, sans-serif;
-  font-weight: 700;
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  opacity: 0.72;
+  font-size: 17px;
 }
 
 .receipt__footer {

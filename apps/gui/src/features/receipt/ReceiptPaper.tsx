@@ -10,7 +10,7 @@ interface ReceiptPaperProps {
 }
 
 export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
-  const empty = vm.hero.totalTokensRaw === 0 && vm.items.length === 0;
+  const empty = vm.totalTokensRaw === 0 && vm.items.length === 0;
   // Unique per-instance ID so preview + export root (both render <ReceiptPaper>)
   // don't collide on the same SVG pattern id in the DOM.
   const scallopId = `receipt-scallop-${useId()}`;
@@ -35,42 +35,42 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
           <div className="receipt-paper__empty">No usage recorded for this day.</div>
         ) : (
           <>
-            <div className="receipt__divider" />
-            <section className="receipt__hero">
-              <div className="receipt__hero-value">{vm.hero.totalTokens}</div>
-              <div className="receipt__hero-label">TOTAL TOKENS</div>
-              <div className="receipt__hero-secondary">
-                <span>{vm.secondary.split}</span>
-                <span>{vm.secondary.cost} · cache hit {vm.secondary.cacheHitRate}</span>
-              </div>
-            </section>
+            {/* Compact summary line — replaces the old oversized hero block.
+                The visual weight now belongs to ITEMS + TOTAL below, matching
+                a real-world receipt where line items and the grand total are
+                the primary content. */}
+            <div className="receipt__summary">
+              <span className="receipt__summary-line">{vm.summary}</span>
+              <span className="receipt__summary-line">
+                cache hit {vm.cacheHitRate}
+              </span>
+            </div>
 
             <div className="receipt__divider" />
-            <section>
-              <div className="receipt__items-header">ITEMS</div>
+
+            <section className="receipt__items">
+              <div className="receipt__items-header">
+                <span>ITEM</span>
+                <span>TOKENS</span>
+                <span>COST</span>
+              </div>
               {vm.items.map((item) => (
                 <div
                   key={item.name}
                   className={`receipt__item${item.others ? " receipt__item--others" : ""}`}
                 >
                   <span className="receipt__item-name">{item.name}</span>
-                  <span className="receipt__item-value">
-                    <span className="receipt__item-tokens">{item.tokens}</span>
-                    <span className="receipt__item-cost">{item.cost}</span>
-                  </span>
+                  <span className="receipt__item-tokens">{item.tokens}</span>
+                  <span className="receipt__item-cost">{item.cost}</span>
                 </div>
               ))}
             </section>
 
             <div className="receipt__total">
-              <span>TOTAL</span>
-              <span className="receipt__total-value">
-                <span>{vm.total.tokens} tok</span>
-                <span className="receipt__total-cost">{vm.total.cost}</span>
-              </span>
+              <span className="receipt__total-label">TOTAL</span>
+              <span className="receipt__total-tokens">{vm.total.tokens} tok</span>
+              <span className="receipt__total-cost">{vm.total.cost}</span>
             </div>
-
-            <div className="receipt__stamp">LOCAL AUDIT</div>
           </>
         )}
 

@@ -10,6 +10,7 @@ import {
   OTHERS_ALL_UNAVAILABLE,
   OTHERS_MIXED_COST,
   PARTIAL_COST,
+  ZERO_COST,
 } from "./fixtures";
 
 afterEach(() => cleanup());
@@ -19,17 +20,30 @@ function renderVm(dto = NORMAL_DAY) {
 }
 
 describe("ReceiptPaper", () => {
-  it("renders brand, hero, and a TOTAL block", () => {
+  it("renders brand, summary, ITEMS, and a TOTAL block", () => {
     renderVm();
     expect(screen.getByText("BUSYTOK")).toBeDefined();
-    expect(screen.getByText("TOTAL TOKENS")).toBeDefined();
-    expect(screen.getByText("ITEMS")).toBeDefined();
+    expect(screen.getByText("ITEM")).toBeDefined();
     expect(screen.getByText("TOTAL")).toBeDefined();
+    // The hero block was removed; summary line carries the split.
+    expect(screen.getByText(/cache hit/)).toBeDefined();
+    // Serial follows the #MMDD-XXXX receipt convention.
+    expect(screen.getByText(/RECEIPT #0626-[0-9A-F]{4}/)).toBeDefined();
+  });
+
+  it("does NOT render the old oversized TOTAL TOKENS hero block", () => {
+    const { container } = renderVm();
+    expect(screen.queryByText("TOTAL TOKENS")).toBeNull();
+    // The hero block's CSS hook must also be gone from the DOM.
+    expect(container.querySelector(".receipt__hero")).toBeNull();
   });
 
   it("renders an OTHERS row when more than 5 models", () => {
     renderVm(MANY_MODELS);
     expect(screen.getByText(/OTHERS \(3\)/)).toBeDefined();
+    // All 3 overflow models are exact → OTHERS cost is a plain $X.XX (no ≈).
+    // Symmetric with OTHERS_MIXED_COST which renders ≈$X.XX.
+    expect(screen.getByText("$1.60")).toBeDefined();
   });
 
   it("renders OTHERS as — (not ≈$0.00) when all overflow models are unavailable", () => {
@@ -53,11 +67,47 @@ describe("ReceiptPaper", () => {
   it("shows the empty state when there are no models and no tokens", () => {
     const { container } = renderVm(NO_DATA);
     expect(container.querySelector(".receipt-paper__empty")).not.toBeNull();
+    // The meta row still renders above the empty block; peak_hour null → "PEAK —".
+    expect(screen.getByText("PEAK —")).toBeDefined();
+  });
+
+  it("renders 'cache hit --' when cache_hit_rate is null but tokens exist", () => {
+    // ZERO_COST: total_tokens > 0 (inherited), cache_hit_rate null, cost unavailable.
+    // Non-empty path → summary block renders with the null-rate fallback "--".
+    renderVm(ZERO_COST);
+    expect(screen.getByText(/cache hit --/)).toBeDefined();
+    // TOTAL cost is unavailable → "—".
+    expect(screen.getByText("TOTAL")).toBeDefined();
   });
 
   it("truncates long model names", () => {
     renderVm(LONG_NAMES);
     const name = screen.getByText(/claude-sonnet-4-5-thinking-very-long/);
     expect(name).toBeDefined();
+  });
+
+  it("aligns ITEMS and TOTAL on the same three-column structure", () => {
+    // jsdom does not resolve grid-template-columns from external CSS, so we
+    // assert the DOM contract instead: every item row and the TOTAL row must
+    // carry exactly three children in the (name, tokens, cost) order, so the
+    // CSS grid (declared in receipt.css) lines them up column-for-column.
+    const { container } = renderVm();
+    const itemRows = container.querySelectorAll(".receipt__item");
+    const totalRow = container.querySelector(".receipt__total");
+    expect(itemRows.length).toBeGreaterThan(0);
+    expect(totalRow).not.toBeNull();
+    const itemChildren = Array.from(itemRows[0].children);
+    const totalChildren = Array.from(totalRow!.children);
+    expect(itemChildren.length).toBe(3);
+    expect(totalChildren.length).toBe(3);
+    // Class-name order encodes the column role so CSS can target each track.
+    const itemRoles = itemChildren.map((c) => c.className);
+    const totalRoles = totalChildren.map((c) => c.className);
+    expect(itemRoles[0]).toBe("receipt__item-name");
+    expect(itemRoles[1]).toBe("receipt__item-tokens");
+    expect(itemRoles[2]).toBe("receipt__item-cost");
+    expect(totalRoles[0]).toBe("receipt__total-label");
+    expect(totalRoles[1]).toBe("receipt__total-tokens");
+    expect(totalRoles[2]).toBe("receipt__total-cost");
   });
 });

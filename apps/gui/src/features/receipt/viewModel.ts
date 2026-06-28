@@ -21,12 +21,12 @@ export interface ReceiptItem {
 export interface ReceiptViewModel {
   dateLabel: string;
   timezone: string;
-  hero: { totalTokens: string; totalTokensRaw: number };
-  secondary: {
-    split: string; // "in 2.1M · out 0.9M · cache 1.8M"
-    cost: string; // "est. $47.21" | "est. —"
-    cacheHitRate: string;
-  };
+  /** Raw total token count, used for empty-state detection only. */
+  totalTokensRaw: number;
+  /** One-line compact summary of the input/output/cache split. */
+  summary: string;
+  /** Cache hit rate as "46.15%" / "--". */
+  cacheHitRate: string;
   items: ReceiptItem[];
   total: { tokens: string; cost: string };
   peakHour: string | null;
@@ -85,25 +85,18 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
     });
   }
 
-  const estCost = `est. ${formatReceiptCost(m.cost_usd, m.cost_status)}`;
-
   return {
     dateLabel: dto.date_label,
     timezone: dto.timezone,
-    hero: {
-      totalTokens: formatCompactNumber(m.total_tokens),
-      totalTokensRaw: m.total_tokens,
-    },
-    secondary: {
-      split: `in ${formatCompactNumber(m.input_tokens)} · out ${formatCompactNumber(
-        m.output_tokens,
-      )} · cache ${formatCompactNumber(m.cache_read_tokens)}`,
-      cost: estCost,
-      cacheHitRate: formatCacheHitRate(m.cache_hit_rate),
-    },
+    totalTokensRaw: m.total_tokens,
+    summary: `in ${formatCompactNumber(m.input_tokens)} · out ${formatCompactNumber(
+      m.output_tokens,
+    )} · cache ${formatCompactNumber(m.cache_read_tokens)}`,
+    cacheHitRate: formatCacheHitRate(m.cache_hit_rate),
     items,
     total: {
       tokens: formatCompactNumber(m.total_tokens),
+      // Partial status is carried by the ≈ marker; no "est." prefix.
       cost: formatReceiptCost(m.cost_usd, m.cost_status),
     },
     peakHour: m.peak_hour?.label ?? null,
