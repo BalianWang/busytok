@@ -1001,13 +1001,15 @@ async fn doctor_protocol_version_check_is_warning_when_pi_sidecar_disabled() {
 
 #[tokio::test]
 #[serial]
-async fn doctor_protocol_version_check_probes_via_short_lived_sidecar_when_enabled() {
+async fn doctor_protocol_version_check_errors_when_enabled_but_bundle_missing() {
     // When pi_sidecar.enabled = true but the bundle is missing,
     // resolve_sidecar_config fails at construction → sidecar_supervisor is
     // None AND sidecar_init_error is Some. The check returns "error" (NOT
     // "warning") because the user enabled the sidecar but it's broken.
-    // This is the key difference from the old stub which returned "warning"
-    // unconditionally.
+    // This exercises the `None` arm with `sidecar_init_error = Some`, NOT
+    // the real probe arm (see
+    // `doctor_protocol_version_check_probes_sidecar_when_not_running` for
+    // the `Some(sup) => ensure_started()` probe path).
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
@@ -1035,6 +1037,52 @@ async fn doctor_protocol_version_check_probes_via_short_lived_sidecar_when_enabl
     assert!(
         check.detail.as_deref().unwrap_or("").contains("probe"),
         "detail should mention probe failure: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_protocol_version_check_probes_sidecar_when_not_running() {
+    // Exercises the real `Some(sup) => match sup.ensure_started().await` arm
+    // of the protocol_version doctor check — the path where the sidecar is
+    // enabled, constructed successfully (via `new_with_sidecar_config`), but
+    // NOT already running. The check spawns the mock sidecar via
+    // `ensure_started` (verifies protocol via `adapter.initialize`), then
+    // shuts it down via `shutdown_internal`. This is the arm that
+    // `doctor_protocol_version_check_errors_when_enabled_but_bundle_missing`
+    // does NOT cover — that test hits the `None` arm because
+    // `resolve_sidecar_config` fails before the supervisor is constructed.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = true;
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    // Bypass resolve_sidecar_config → constructs a real PiSidecarSupervisor
+    // (self.sidecar_supervisor is Some). Do NOT delegate first — the sidecar
+    // must not be running when settings_diagnostics() is called.
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
+
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "protocol_version")
+        .unwrap();
+    assert_eq!(
+        check.status, "ok",
+        "mock sidecar starts + verifies protocol → ok"
+    );
+    assert!(
+        check.detail.as_deref().unwrap_or("").contains("probe"),
+        "detail should mention short-lived probe: {:?}",
         check.detail
     );
 
