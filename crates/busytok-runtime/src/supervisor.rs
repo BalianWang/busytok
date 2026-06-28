@@ -494,11 +494,13 @@ impl BusytokSupervisor {
 
     /// Run the 11 spec §7.1 doctor checks. The subagent-specific checks
     /// (SQLite, sidecar launchable, resource policy, stale subagents) are
-    /// real; the 6 bundle-inspection checks return `status: "warning"` with
-    /// a "not yet implemented" detail — they must NOT return "ok" because
-    /// unverified checks claiming green would mislead users. `overall_ok`
-    /// is true iff no check has `status == "error"` (warnings don't fail).
-    fn run_subagent_doctor(&self) -> SubagentDoctorResultDto {
+    /// real; the 6 bundle-inspection checks probe the filesystem + sidecar
+    /// supervisor. `overall_ok` is true iff no check has `status == "error"`
+    /// (warnings don't fail). Async because the `protocol_version` check
+    /// does a short-lived probe (`ensure_started().await` +
+    /// `shutdown_internal().await`) when the sidecar is enabled but not
+    /// running.
+    async fn run_subagent_doctor(&self) -> SubagentDoctorResultDto {
         let mut checks: Vec<DoctorCheckDto> = Vec::new();
 
         // 1. busytok-service running — always ok (we're running this code).
@@ -594,21 +596,216 @@ impl BusytokSupervisor {
         });
 
         // 4-9. Bundled node arch, manifest, protocol version, model config,
-        //      Pi runtime, artifact store — NOT YET IMPLEMENTED. Return
-        //      "warning" (not "ok") so overall_ok doesn't claim green on
-        //      unverified ground. Plan 6+ will implement bundle inspection.
-        for name in [
-            "bundled_node_arch",
-            "bundle_manifest_readable",
-            "protocol_version",
-            "default_model_config",
-            "pi_runtime_installed",
-            "artifact_store_writable",
-        ] {
+        //      Pi runtime, artifact store — real probes (spec §7.1 lines
+        //      865-870). Extract all settings-derived values BEFORE any
+        //      `.await` — `self.settings` is a `std::sync::Mutex` and holding
+        //      its guard across `.await` (protocol_version probe below) is
+        //      forbidden. `runtime_dir` and `models` are cloned out as owned
+        //      values so the lock is released before the protocol probe.
+        let (runtime_dir, models) = {
+            let settings = self.settings.lock().unwrap();
+            (
+                settings.subagent.pi_sidecar.runtime_dir.clone(),
+                settings.subagent.models.clone(),
+            )
+        };
+        let runtime_dir_ref = runtime_dir.as_deref();
+
+        // 4. Bundled Node architecture matches (spec §7.1 line 865).
+        {
+            let node_path = self.paths.sidecar_bundled_node_path(runtime_dir_ref);
+            let expected_arch = std::env::consts::ARCH;
+            let arch_ok = node_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n == expected_arch)
+                .unwrap_or(false);
+            let node_exists = node_path.exists();
+            let ok = arch_ok && node_exists;
+            let detail = if !node_exists {
+                format!("bundled node not found at {}", node_path.display())
+            } else if !arch_ok {
+                format!("arch mismatch: expected {expected_arch}")
+            } else {
+                format!("ok ({expected_arch})")
+            };
             checks.push(DoctorCheckDto {
-                name: name.into(),
-                status: "warning".into(),
-                detail: Some("not yet implemented (Plan 6+ bundle inspection)".into()),
+                name: "bundled_node_arch".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 5. Bundle manifest readable (spec §7.1 line 866, §5.1 line 549).
+        //    Verifies manifest.json EXISTS, is READABLE (open succeeds), and
+        //    is PARSEABLE as JSON. A missing or malformed manifest is an
+        //    "error" — the sidecar cannot be launched without a valid
+        //    manifest.
+        {
+            let manifest_path = self.paths.sidecar_manifest_path(runtime_dir_ref);
+            let (status, detail) = match std::fs::read_to_string(&manifest_path) {
+                Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+                    Ok(_v) => (
+                        "ok",
+                        format!("manifest readable ({})", manifest_path.display()),
+                    ),
+                    Err(e) => (
+                        "error",
+                        format!(
+                            "manifest at {} is not valid JSON: {}",
+                            manifest_path.display(),
+                            e
+                        ),
+                    ),
+                },
+                Err(e) => (
+                    "error",
+                    format!(
+                        "manifest not readable at {}: {}",
+                        manifest_path.display(),
+                        e
+                    ),
+                ),
+            };
+            checks.push(DoctorCheckDto {
+                name: "bundle_manifest_readable".into(),
+                status: status.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 6. Protocol version matches (spec §7.1 line 867).
+        //    If sidecar is already running, protocol was verified during
+        //    `adapter.initialize` in `ensure_started` → "ok". If not running,
+        //    do a SHORT-LIVED PROBE: `ensure_started()` (spawns + verifies
+        //    protocol via adapter.initialize), then `shutdown_internal()`.
+        //    When `sidecar_supervisor` is None, distinguish "pi_sidecar
+        //    disabled" (warning) from "enabled but config resolve failed"
+        //    (error via `sidecar_init_error`).
+        {
+            let expected_pv = busytok_subagent::sidecar::protocol::PROTOCOL_VERSION;
+            let (status, detail) = match &self.sidecar_supervisor {
+                Some(sup) if sup.try_is_running() => (
+                    "ok",
+                    format!(
+                        "protocol_version={expected_pv}, sidecar running (verified during init)"
+                    ),
+                ),
+                Some(sup) => match sup.ensure_started().await {
+                    Ok(_handle) => {
+                        if let Err(e) = sup.shutdown_internal().await {
+                            warn!(
+                                event_code = "subagent.doctor.protocol_probe_shutdown_failed",
+                                error = %e,
+                                "short-lived probe shutdown failed"
+                            );
+                        }
+                        (
+                            "ok",
+                            format!(
+                                "protocol_version={expected_pv}, verified via short-lived probe"
+                            ),
+                        )
+                    }
+                    Err(e) => (
+                        "error",
+                        format!("protocol probe failed (ensure_started): {e}"),
+                    ),
+                },
+                None => {
+                    if let Some(err) = self.sidecar_init_error() {
+                        (
+                            "error",
+                            format!("protocol probe failed — sidecar not constructed: {err}"),
+                        )
+                    } else {
+                        (
+                            "warning",
+                            "pi_sidecar disabled — cannot probe protocol version".into(),
+                        )
+                    }
+                }
+            };
+            checks.push(DoctorCheckDto {
+                name: "protocol_version".into(),
+                status: status.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 7. Default model config valid (spec §7.1 line 868).
+        {
+            let empty_fields: Vec<&str> = [
+                ("default_cheap_model", &models.default_cheap_model),
+                ("default_review_model", &models.default_review_model),
+                ("default_reasoning_model", &models.default_reasoning_model),
+                ("default_coder_model", &models.default_coder_model),
+            ]
+            .iter()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
+            let ok = empty_fields.is_empty();
+            let detail = if ok {
+                "all 4 default models configured".to_string()
+            } else {
+                format!("empty model fields: {}", empty_fields.join(", "))
+            };
+            checks.push(DoctorCheckDto {
+                name: "default_model_config".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 8. Pi runtime installed (spec §7.1 line 869).
+        {
+            let node_path = self.paths.sidecar_bundled_node_path(runtime_dir_ref);
+            let bundle_path = self.paths.sidecar_bundle_path(runtime_dir_ref);
+            let ok = node_path.exists() && bundle_path.exists();
+            let detail = if ok {
+                "node + bundle present".to_string()
+            } else {
+                format!(
+                    "missing: node={} bundle={}",
+                    node_path.exists(),
+                    bundle_path.exists()
+                )
+            };
+            checks.push(DoctorCheckDto {
+                name: "pi_runtime_installed".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 9. Artifact store writable (spec §7.1 line 870).
+        //    Self-heal: create the artifacts dir if missing so the probe
+        //    tests actual writability rather than reporting a stale "missing"
+        //    state. A missing dir that can't be created is reported as
+        //    "not writable" — what the user cares about is whether artifacts
+        //    can be written, not whether the dir pre-existed.
+        {
+            let artifacts_dir = self.paths.artifacts_dir();
+            let dir_created =
+                artifacts_dir.exists() || std::fs::create_dir_all(&artifacts_dir).is_ok();
+            let probe_ok = if dir_created {
+                let probe_path = artifacts_dir.join(".busytok_doctor_probe");
+                std::fs::write(&probe_path, b"probe").is_ok()
+                    && std::fs::remove_file(&probe_path).is_ok()
+            } else {
+                false
+            };
+            let detail = if probe_ok {
+                format!("writable ({})", artifacts_dir.display())
+            } else {
+                format!("not writable: {}", artifacts_dir.display())
+            };
+            checks.push(DoctorCheckDto {
+                name: "artifact_store_writable".into(),
+                status: if probe_ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
             });
         }
 
@@ -3810,7 +4007,7 @@ impl RuntimeControl for BusytokSupervisor {
         // reflects the current configuration rather than gating the whole
         // section. The DTO field is still `Option<...>` for wire-level
         // backwards-compat with older clients.
-        let subagent = Some(self.run_subagent_doctor());
+        let subagent = Some(self.run_subagent_doctor().await);
 
         let now_ms = busytok_domain::now_ms();
         self.build_read_envelope(

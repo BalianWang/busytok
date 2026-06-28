@@ -173,6 +173,13 @@ impl BusytokPaths {
             .join("pi-sidecar.bundle.js")
     }
 
+    /// Path to the sidecar bundle manifest (spec §5.1 line 549).
+    /// `manifest.json` sits alongside `pi-sidecar.bundle.js` in the runtime dir.
+    /// Doctor check verifies this file is readable + valid JSON.
+    pub fn sidecar_manifest_path(&self, runtime_dir: Option<&str>) -> std::path::PathBuf {
+        self.sidecar_runtime_dir(runtime_dir).join("manifest.json")
+    }
+
     /// Path to the bundled Node binary for the current arch. Returns the path
     /// even if it doesn't exist — the caller (`resolve_sidecar_config`) decides
     /// whether to use it (mode `bundled`) or fall back to system `node` (mode

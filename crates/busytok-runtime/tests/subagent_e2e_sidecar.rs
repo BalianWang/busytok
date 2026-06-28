@@ -686,15 +686,13 @@ async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
     // 11 checks total per spec §7.1.
     assert_eq!(sub.checks.len(), 11, "must have all 11 §7.1 checks");
 
-    // Verify the 6 stubbed checks return "warning" (NOT "ok") —
-    // unimplemented checks must not claim green.
+    // 3 bundle-inspection checks return "error" in the default test setup
+    // (pi_sidecar.enabled=false, no runtime_dir → dev fallback path
+    // apps/pi-sidecar/dist has no node/manifest/bundle files).
     for name in [
         "bundled_node_arch",
         "bundle_manifest_readable",
-        "protocol_version",
-        "default_model_config",
         "pi_runtime_installed",
-        "artifact_store_writable",
     ] {
         let check = sub
             .checks
@@ -702,18 +700,47 @@ async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("missing check: {name}"));
         assert_eq!(
-            check.status, "warning",
-            "stubbed check {name} must return 'warning' not 'ok' (unverified = warning)"
-        );
-        assert!(
-            check
-                .detail
-                .as_deref()
-                .unwrap_or("")
-                .contains("not yet implemented"),
-            "stubbed check {name} detail should explain it's not yet implemented"
+            check.status, "error",
+            "check {name} should be 'error' (bundle missing in default test setup)"
         );
     }
+
+    // default_model_config is "ok" — default SubagentModelsConfig has all 4
+    // models non-empty (deepseek-chat, qwen-coder, deepseek-reasoner, qwen-coder).
+    let model_check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "default_model_config")
+        .expect("missing default_model_config check");
+    assert_eq!(model_check.status, "ok", "default models non-empty => ok");
+
+    // artifact_store_writable is "ok" — doctor check self-heals the dir.
+    let artifact_check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "artifact_store_writable")
+        .expect("missing artifact_store_writable check");
+    assert_eq!(artifact_check.status, "ok", "artifacts dir writable => ok");
+
+    // protocol_version is "warning" — pi_sidecar disabled, no init_error.
+    let proto_check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "protocol_version")
+        .expect("missing protocol_version check");
+    assert_eq!(
+        proto_check.status, "warning",
+        "pi_sidecar disabled => warning (no supervisor to probe)"
+    );
+    assert!(
+        proto_check
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("disabled"),
+        "protocol_version detail should mention disabled: {:?}",
+        proto_check.detail
+    );
 
     // Verify the real checks return "ok" (sidecar disabled => launchable ok).
     let launchable = sub
@@ -723,8 +750,293 @@ async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
         .expect("missing sidecar_launchable check");
     assert_eq!(launchable.status, "ok", "sidecar disabled => launchable ok");
 
-    // overall_ok is true (warnings don't fail, no errors).
-    assert!(sub.overall_ok, "warnings don't break overall_ok");
+    // overall_ok is false — 3 "error" checks (bundle missing) make it false.
+    assert!(!sub.overall_ok, "error checks make overall_ok false");
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+// --- 6 real doctor checks (Task 5, spec §7.1 lines 865-870) ---
+//
+// Each test exercises one of the 6 previously-stubbed checks against real
+// fixture dirs. Together with the updated 11-check test above, these verify
+// the doctor returns concrete statuses (ok/error/warning) based on the
+// filesystem + sidecar state, not the "not yet implemented" warning stub.
+
+#[tokio::test]
+#[serial]
+async fn doctor_bundled_node_arch_check_validates_arch_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("rt");
+    let arch_dir = runtime_dir.join("node").join(std::env::consts::ARCH);
+    std::fs::create_dir_all(&arch_dir).unwrap();
+    std::fs::write(arch_dir.join("node"), b"#!/bin/sh\n").unwrap();
+
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "bundled_node_arch")
+        .unwrap();
+    assert_eq!(
+        check.status, "ok",
+        "arch matches + node exists → ok: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_bundled_node_arch_check_errors_on_missing_node() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("rt");
+    // Don't create the node binary — should error.
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "bundled_node_arch")
+        .unwrap();
+    assert_eq!(check.status, "error", "missing node → error");
+    assert!(
+        check.detail.as_deref().unwrap_or("").contains("not found"),
+        "detail should say not found: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_bundle_manifest_readable_check_validates_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("rt");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    // Write a valid manifest.json (spec §5.1 line 549).
+    std::fs::write(
+        runtime_dir.join("manifest.json"),
+        br#"{"name":"pi-sidecar","version":"0.1.0"}"#,
+    )
+    .unwrap();
+
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "bundle_manifest_readable")
+        .unwrap();
+    assert_eq!(check.status, "ok", "valid manifest.json → ok");
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_bundle_manifest_readable_check_fails_on_malformed_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime_dir = tmp.path().join("rt");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    // Write a malformed manifest.json (not valid JSON).
+    std::fs::write(runtime_dir.join("manifest.json"), b"not json {{{").unwrap();
+
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "bundle_manifest_readable")
+        .unwrap();
+    assert_eq!(check.status, "error", "malformed manifest.json → error");
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_default_model_config_check_validates_models() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings.subagent.models.default_cheap_model = "".to_string(); // empty → error
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "default_model_config")
+        .unwrap();
+    assert_eq!(check.status, "error", "empty model field → error");
+    assert!(
+        check
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("default_cheap_model"),
+        "detail should name the empty field: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_artifact_store_writable_check_writes_probe_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "artifact_store_writable")
+        .unwrap();
+    // artifacts dir is created (self-healed) by the doctor check → writable.
+    assert_eq!(
+        check.status, "ok",
+        "artifacts dir writable → ok: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_protocol_version_check_is_warning_when_pi_sidecar_disabled() {
+    // When pi_sidecar.enabled = false, there is no sidecar supervisor at
+    // all (sidecar_supervisor = None) and no sidecar_init_error. The check
+    // returns "warning" because there is nothing to probe — this is NOT
+    // the "sidecar not running" case.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "protocol_version")
+        .unwrap();
+    assert_eq!(
+        check.status, "warning",
+        "pi_sidecar disabled → warning (no supervisor to probe)"
+    );
+    assert!(
+        check.detail.as_deref().unwrap_or("").contains("disabled"),
+        "detail should mention disabled: {:?}",
+        check.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn doctor_protocol_version_check_probes_via_short_lived_sidecar_when_enabled() {
+    // When pi_sidecar.enabled = true but the bundle is missing,
+    // resolve_sidecar_config fails at construction → sidecar_supervisor is
+    // None AND sidecar_init_error is Some. The check returns "error" (NOT
+    // "warning") because the user enabled the sidecar but it's broken.
+    // This is the key difference from the old stub which returned "warning"
+    // unconditionally.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = true;
+    // No bundle installed → resolve_sidecar_config fails → init_error set.
+    settings.subagent.pi_sidecar.runtime_dir =
+        Some(tmp.path().join("rt").to_string_lossy().to_string());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "protocol_version")
+        .unwrap();
+    assert_eq!(
+        check.status, "error",
+        "enabled but probe fails → error (not warning)"
+    );
+    assert!(
+        check.detail.as_deref().unwrap_or("").contains("probe"),
+        "detail should mention probe failure: {:?}",
+        check.detail
+    );
 
     supervisor.shutdown_writer().await.unwrap();
 }
@@ -780,7 +1092,16 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
             .contains("stale_sub"),
         "detail should mention the stale subagent"
     );
-    assert!(sub.overall_ok, "warnings don't break overall_ok");
+    // overall_ok is false because the 3 bundle-inspection checks error in
+    // this default test setup (no runtime_dir → dev fallback path has no
+    // bundle files). The stale-subagent check is a WARNING (verified above),
+    // not an error — warnings alone would not break overall_ok. This
+    // assertion confirms the bundle errors (not the stale warning) are what
+    // flips overall_ok.
+    assert!(
+        !sub.overall_ok,
+        "bundle-missing errors make overall_ok false"
+    );
 
     supervisor.shutdown_writer().await.unwrap();
 }

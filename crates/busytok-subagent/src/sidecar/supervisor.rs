@@ -184,11 +184,11 @@ impl PiSidecarSupervisor {
     }
 
     /// Non-blocking check of whether the sidecar child is currently running.
-    /// `pub(crate)` so `crate::pressure::PressureResponder` (Task 4) can
+    /// Public so the runtime crate's doctor check (`run_subagent_doctor`) can
     /// inspect the child without acquiring the async state lock (which would
-    /// require an `.await` and isn't safe from a sync context).
-    #[allow(dead_code)] // Task 4 (PressureResponder::respond) consumes this.
-    pub(crate) fn try_is_running(&self) -> bool {
+    /// require an `.await` and isn't safe from a sync context). Also used by
+    /// `crate::pressure::PressureResponder` (Task 4).
+    pub fn try_is_running(&self) -> bool {
         self.state
             .try_lock()
             .map(|s| s.child.as_ref().map(|c| c.id().is_some()).unwrap_or(false))
@@ -218,11 +218,11 @@ impl PiSidecarSupervisor {
     }
 
     /// Graceful shutdown without re-acquiring the public `shutdown()` wrapper
-    /// — used by `PressureResponder` (Task 4) and the supervision loop's idle
-    /// exit path. `pub(crate)` so the responder can call it during
-    /// `GracefulRestart` (§8.3 step 3).
-    pub(crate) async fn shutdown_internal(&self) -> Result<(), SidecarError> {
-        // ... existing body, just change visibility to pub(crate) ...
+    /// — used by `PressureResponder` (Task 4), the supervision loop's idle
+    /// exit path, and the runtime crate's doctor check
+    /// (`run_subagent_doctor` protocol_version probe). Public so the runtime
+    /// crate can call it after a short-lived probe.
+    pub async fn shutdown_internal(&self) -> Result<(), SidecarError> {
         let client = { self.state.lock().await.client.take() };
         if let Some(client) = &client {
             // Best-effort: ask the sidecar to prepare all hot sessions for
