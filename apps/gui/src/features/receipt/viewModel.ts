@@ -20,16 +20,16 @@ export interface ReceiptItem {
 
 export interface ReceiptViewModel {
   dateLabel: string;
-  timezone: string;
   /** Raw total token count, used for empty-state detection only. */
   totalTokensRaw: number;
   /** One-line compact summary of the input/output/cache split. */
   summary: string;
   /** Cache hit rate as "46.15%" / "--". */
   cacheHitRate: string;
+  /** Receipt issuance time (HH:MM local) derived from brand.generated_at_ms. */
+  generatedAtLabel: string;
   items: ReceiptItem[];
   total: { tokens: string; cost: string };
-  peakHour: string | null;
   serial: string; // "#0626-A3F2"
 }
 
@@ -67,6 +67,16 @@ function receiptSerial(date: string): string {
   return `#${digits}-${suffix}`;
 }
 
+function formatGeneratedTime(ms: number): string {
+  // brand.generated_at_ms is the server-side issuance timestamp. Render as
+  // HH:MM in the viewer's local time — matches a real receipt's "ISSUED 22:34".
+  if (!ms) return "—";
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
 export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
   const m = dto.metrics;
   const ranked = [...dto.top_models].sort((a, b) => b.tokens - a.tokens);
@@ -87,19 +97,18 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
 
   return {
     dateLabel: dto.date_label,
-    timezone: dto.timezone,
     totalTokensRaw: m.total_tokens,
     summary: `in ${formatCompactNumber(m.input_tokens)} · out ${formatCompactNumber(
       m.output_tokens,
     )} · cache ${formatCompactNumber(m.cache_read_tokens)}`,
     cacheHitRate: formatCacheHitRate(m.cache_hit_rate),
+    generatedAtLabel: formatGeneratedTime(dto.brand?.generated_at_ms ?? 0),
     items,
     total: {
       tokens: formatCompactNumber(m.total_tokens),
       // Partial status is carried by the ≈ marker; no "est." prefix.
       cost: formatReceiptCost(m.cost_usd, m.cost_status),
     },
-    peakHour: m.peak_hour?.label ?? null,
     serial: receiptSerial(dto.date),
   };
 }

@@ -1,13 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { writeImage } from "@tauri-apps/plugin-clipboard-manager";
 import { domToBlob } from "modern-screenshot";
 import { useState, type RefObject } from "react";
 import { reportFrontendEventSafely } from "../../logging/safeReporter";
 
 export interface ReceiptExportApi {
   busy: boolean;
-  copyImage: () => Promise<void>;
   savePng: () => Promise<void>;
 }
 
@@ -62,18 +60,6 @@ export function useReceiptExport(
 
   return {
     busy,
-    async copyImage() {
-      await run("copied", async () => {
-        const bytes = await captureBytes();
-        // writeImage is the Tauri clipboard-manager plugin's own API — it
-        // serialises the image internally (base64 path), so the Uint8Array
-        // form is fine here. Do NOT wrap with Array.from (that is only
-        // needed for the bespoke save_receipt_png invoke, where Tauri's
-        // generic JSON IPC would stringify a Uint8Array as {"0":1,...}).
-        await writeImage(bytes);
-        log("gui.receipt.copied", "receipt copied to clipboard", { date });
-      });
-    },
     async savePng() {
       await run("exported", async () => {
         const path = await save({

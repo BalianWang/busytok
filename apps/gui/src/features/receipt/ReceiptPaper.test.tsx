@@ -20,15 +20,17 @@ function renderVm(dto = NORMAL_DAY) {
 }
 
 describe("ReceiptPaper", () => {
-  it("renders brand, summary, ITEMS, and a TOTAL block", () => {
+  it("renders brand, ITEMS, TOTAL, and footer with summary stats", () => {
     renderVm();
     expect(screen.getByText("BUSYTOK")).toBeDefined();
     expect(screen.getByText("ITEM")).toBeDefined();
     expect(screen.getByText("TOTAL")).toBeDefined();
-    // The hero block was removed; summary line carries the split.
+    // The in/out/cache summary moved to the footer.
     expect(screen.getByText(/cache hit/)).toBeDefined();
     // Serial follows the #MMDD-XXXX receipt convention.
     expect(screen.getByText(/RECEIPT #0626-[0-9A-F]{4}/)).toBeDefined();
+    // ISSUED time label rendered from brand.generated_at_ms.
+    expect(screen.getByText(/ISSUED \d{2}:\d{2}/)).toBeDefined();
   });
 
   it("does NOT render the old oversized TOTAL TOKENS hero block", () => {
@@ -36,6 +38,17 @@ describe("ReceiptPaper", () => {
     expect(screen.queryByText("TOTAL TOKENS")).toBeNull();
     // The hero block's CSS hook must also be gone from the DOM.
     expect(container.querySelector(".receipt__hero")).toBeNull();
+  });
+
+  it("does NOT render the old NO PROMPTS UPLOADED / LOCAL AUDIT ONLY footer copy", () => {
+    renderVm();
+    expect(screen.queryByText("NO PROMPTS UPLOADED")).toBeNull();
+    expect(screen.queryByText("LOCAL AUDIT ONLY")).toBeNull();
+  });
+
+  it("does NOT render a separate mid-paper summary block (moved to footer)", () => {
+    const { container } = renderVm();
+    expect(container.querySelector(".receipt__summary")).toBeNull();
   });
 
   it("renders an OTHERS row when more than 5 models", () => {
@@ -67,13 +80,21 @@ describe("ReceiptPaper", () => {
   it("shows the empty state when there are no models and no tokens", () => {
     const { container } = renderVm(NO_DATA);
     expect(container.querySelector(".receipt-paper__empty")).not.toBeNull();
-    // The meta row still renders above the empty block; peak_hour null → "PEAK —".
-    expect(screen.getByText("PEAK —")).toBeDefined();
+  });
+
+  it("does not render the footer stats block on empty state", () => {
+    const { container } = renderVm(NO_DATA);
+    expect(container.querySelector(".receipt__footer-stats")).toBeNull();
+    // But the brand line + barcode still render.
+    expect(container.querySelector(".receipt__footer-brand")).not.toBeNull();
+    expect(container.querySelector(".receipt__barcode")).not.toBeNull();
+    // NO_DATA has generated_at_ms: 0 → formatGeneratedTime returns "—".
+    expect(screen.getByText(/ISSUED —/)).toBeDefined();
   });
 
   it("renders 'cache hit --' when cache_hit_rate is null but tokens exist", () => {
     // ZERO_COST: total_tokens > 0 (inherited), cache_hit_rate null, cost unavailable.
-    // Non-empty path → summary block renders with the null-rate fallback "--".
+    // Non-empty path → footer stats render with the null-rate fallback "--".
     renderVm(ZERO_COST);
     expect(screen.getByText(/cache hit --/)).toBeDefined();
     // TOTAL cost is unavailable → "—".
@@ -109,5 +130,11 @@ describe("ReceiptPaper", () => {
     expect(totalRoles[0]).toBe("receipt__total-label");
     expect(totalRoles[1]).toBe("receipt__total-tokens");
     expect(totalRoles[2]).toBe("receipt__total-cost");
+  });
+
+  it("does not render timezone or PEAK labels (removed per spec)", () => {
+    renderVm();
+    expect(screen.queryByText(/PEAK/)).toBeNull();
+    expect(screen.queryByText(/TZ/)).toBeNull();
   });
 });

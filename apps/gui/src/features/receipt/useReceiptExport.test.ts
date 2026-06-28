@@ -3,13 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useReceiptExport } from "./useReceiptExport";
 
 const domToBlob = vi.fn();
-const writeImage = vi.fn();
 const save = vi.fn();
 const invoke = vi.fn();
 const reportEvent = vi.fn();
 
 vi.mock("modern-screenshot", () => ({ domToBlob: (...a: unknown[]) => domToBlob(...a) }));
-vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeImage: (...a: unknown[]) => writeImage(...a) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: (...a: unknown[]) => save(...a) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 vi.mock("../../logging/safeReporter", () => ({
@@ -19,7 +17,6 @@ vi.mock("../../logging/safeReporter", () => ({
 afterEach(() => {
   cleanup();
   domToBlob.mockReset();
-  writeImage.mockReset();
   save.mockReset();
   invoke.mockReset();
   reportEvent.mockReset();
@@ -30,23 +27,6 @@ function blob(bytes: number[]) {
 }
 
 describe("useReceiptExport", () => {
-  it("copyImage: fonts.ready → domToBlob → writeImage, logs gui.receipt.copied", async () => {
-    domToBlob.mockResolvedValue(blob([1, 2, 3]));
-    const el = document.createElement("div");
-    const { result } = renderHook(() => useReceiptExport({ current: el }, "2026-06-26"));
-    await result.current.copyImage();
-    expect(domToBlob).toHaveBeenCalledWith(
-      el,
-      expect.objectContaining({
-        scale: 3,
-        backgroundColor: null,
-        font: { preferredFormat: "woff2" },
-      }),
-    );
-    expect(writeImage).toHaveBeenCalledWith(expect.any(Uint8Array));
-    expect(reportEvent).toHaveBeenCalledWith(expect.objectContaining({ event_code: "gui.receipt.copied" }));
-  });
-
   it("savePng: save() → invoke save_receipt_png, logs gui.receipt.exported", async () => {
     domToBlob.mockResolvedValue(blob([9, 9]));
     save.mockResolvedValue("/tmp/x.png");
@@ -78,33 +58,6 @@ describe("useReceiptExport", () => {
     const { result } = renderHook(() => useReceiptExport({ current: el }, "2026-06-26"));
     await result.current.savePng();
     expect(invoke).not.toHaveBeenCalled();
-  });
-
-  it("copyImage logs gui.receipt.copied_failed when domToBlob rejects (no throw)", async () => {
-    domToBlob.mockRejectedValueOnce(new Error("capture failed"));
-    const el = document.createElement("div");
-    const { result } = renderHook(() => useReceiptExport({ current: el }, "2026-06-26"));
-    await expect(result.current.copyImage()).resolves.toBeUndefined();
-    expect(reportEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        level: "ERROR",
-        event_code: "gui.receipt.copied_failed",
-      }),
-    );
-  });
-
-  it("copyImage logs gui.receipt.copied_failed when writeImage rejects (no throw)", async () => {
-    domToBlob.mockResolvedValueOnce(blob([1, 2, 3]));
-    writeImage.mockRejectedValueOnce(new Error("write failed"));
-    const el = document.createElement("div");
-    const { result } = renderHook(() => useReceiptExport({ current: el }, "2026-06-26"));
-    await expect(result.current.copyImage()).resolves.toBeUndefined();
-    expect(reportEvent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        level: "ERROR",
-        event_code: "gui.receipt.copied_failed",
-      }),
-    );
   });
 
   it("savePng logs gui.receipt.exported_failed when invoke rejects (no throw)", async () => {

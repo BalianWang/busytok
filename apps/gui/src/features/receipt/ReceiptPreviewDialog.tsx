@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useRef } from "react";
-import { Calendar as CalendarIcon, Clipboard, Download as DownloadIcon } from "lucide-react";
+import { Calendar as CalendarIcon, Download as DownloadIcon } from "lucide-react";
 import { useDailyReceipt } from "../../api/useBusytokData";
 import { ReceiptPaper } from "./ReceiptPaper";
 import { toReceiptViewModel } from "./viewModel";
@@ -17,10 +17,10 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
   const envelope = useDailyReceipt(date);
   const dto = envelope.data?.data ?? null;
   const vm = dto ? toReceiptViewModel(dto) : null;
-  // Capture the .receipt-paper element (NOT the .receipt-stage wrapper) so the
-  // exported PNG is filled edge-to-edge by the receipt body, with no stage
-  // backdrop. The ref is read inside useReceiptExport's captureBytes at click
-  // time, so it always points at the latest-mounted paper.
+  // Capture the .receipt-paper element (the paper itself — no stage wrapper)
+  // so the exported PNG is filled edge-to-edge by the receipt body. The ref
+  // is read inside useReceiptExport's captureBytes at click time, so it
+  // always points at the latest-mounted paper.
   const paperRef = useRef<HTMLDivElement>(null);
   const dateInputRef = useRef<HTMLInputElement>(null);
   const exportApi = useReceiptExport(paperRef, date);
@@ -48,11 +48,7 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
 
             <div className="receipt-preview__scroll">
               {vm ? (
-                <div className="receipt-preview__paper">
-                  {/* Scaled live preview. The export root below renders an
-                      unscaled twin for capture. */}
-                  <ReceiptPaper vm={vm} key="preview" />
-                </div>
+                <ReceiptPaper vm={vm} key="preview" />
               ) : (
                 <div className="receipt-preview__loading">Loading…</div>
               )}
@@ -88,16 +84,6 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
                 onClick={exportApi.savePng}
               >
                 <DownloadIcon size={16} strokeWidth={1.75} aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                className="receipt-action-button"
-                aria-label="Copy image"
-                title="Copy image"
-                disabled={exportApi.busy || !vm}
-                onClick={exportApi.copyImage}
-              >
-                <Clipboard size={16} strokeWidth={1.75} aria-hidden="true" />
               </button>
             </footer>
           </Dialog.Content>
