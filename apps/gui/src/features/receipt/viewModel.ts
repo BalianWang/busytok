@@ -15,7 +15,6 @@ export interface ReceiptItem {
   name: string;
   tokens: string;
   cost: string; // "$24.10" | "≈$24.10" | "—"
-  others: boolean;
 }
 
 export interface ReceiptViewModel {
@@ -28,7 +27,10 @@ export interface ReceiptViewModel {
   cacheHitRate: string;
   /** Receipt issuance time (HH:MM local) derived from brand.generated_at_ms. */
   generatedAtLabel: string;
+  /** Top-N model rows (truncated to TOP_N). `truncated` indicates overflow. */
   items: ReceiptItem[];
+  /** True when top_models had more than TOP_N entries (overflow indicator). */
+  truncated: boolean;
   total: { tokens: string; cost: string };
   serial: string; // "#0626-A3F2"
 }
@@ -41,19 +43,11 @@ function formatReceiptCost(costUsd: number | null, status: CostStatusDto): strin
   return status === "partial" ? `≈${value}` : value;
 }
 
-function worstStatus(rows: ReceiptModelSliceDto[]): CostStatusDto {
-  if (rows.length === 0) return "unavailable";
-  if (rows.every((r) => r.cost_status === "exact")) return "exact";
-  if (rows.every((r) => r.cost_status === "unavailable")) return "unavailable";
-  return "partial"; // mixed exact + partial/unavailable
-}
-
 function toItem(m: ReceiptModelSliceDto): ReceiptItem {
   return {
     name: m.name,
     tokens: formatCompactNumber(m.tokens),
     cost: formatReceiptCost(m.cost_usd, m.cost_status),
-    others: false,
   };
 }
 
@@ -81,19 +75,6 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
   const m = dto.metrics;
   const ranked = [...dto.top_models].sort((a, b) => b.tokens - a.tokens);
   const top = ranked.slice(0, TOP_N);
-  const rest = ranked.slice(TOP_N);
-
-  const items: ReceiptItem[] = top.map(toItem);
-  if (rest.length > 0) {
-    const othersTokens = rest.reduce((s, r) => s + r.tokens, 0);
-    const othersCostUsd = rest.reduce<number>((s, r) => s + (r.cost_usd ?? 0), 0);
-    items.push({
-      name: `OTHERS (${rest.length})`,
-      tokens: formatCompactNumber(othersTokens),
-      cost: formatReceiptCost(othersCostUsd, worstStatus(rest)),
-      others: true,
-    });
-  }
 
   return {
     dateLabel: dto.date_label,
@@ -103,7 +84,10 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
     )} · cache ${formatCompactNumber(m.cache_read_tokens)}`,
     cacheHitRate: formatCacheHitRate(m.cache_hit_rate),
     generatedAtLabel: formatGeneratedTime(dto.brand?.generated_at_ms ?? 0),
-    items,
+    items: top.map(toItem),
+    // Truncated when more than TOP_N models — TOTAL still reflects the full
+    // aggregate; items are just visually capped to keep the 3:4 layout stable.
+    truncated: ranked.length > TOP_N,
     total: {
       tokens: formatCompactNumber(m.total_tokens),
       // Partial status is carried by the ≈ marker; no "est." prefix.

@@ -25,11 +25,8 @@ describe("ReceiptPaper", () => {
     expect(screen.getByText("BUSYTOK")).toBeDefined();
     expect(screen.getByText("ITEM")).toBeDefined();
     expect(screen.getByText("TOTAL")).toBeDefined();
-    // The in/out/cache summary moved to the footer.
     expect(screen.getByText(/cache hit/)).toBeDefined();
-    // Serial follows the #MMDD-XXXX receipt convention.
     expect(screen.getByText(/RECEIPT #0626-[0-9A-F]{4}/)).toBeDefined();
-    // ISSUED time label rendered from brand.generated_at_ms.
     expect(screen.getByText(/ISSUED \d{2}:\d{2}/)).toBeDefined();
   });
 
@@ -52,53 +49,66 @@ describe("ReceiptPaper", () => {
 
   it("renders a QR code with SCAN TO STAR CTA (replaces the old barcode)", () => {
     const { container } = renderVm();
-    // QR image is present.
     const qr = container.querySelector(".receipt__qr");
     expect(qr).not.toBeNull();
     expect(qr?.tagName).toBe("IMG");
     expect(qr?.getAttribute("src")).toBe("/busytok-gh-qr.svg");
-    // CTA text.
     expect(screen.getByText("SCAN TO STAR")).toBeDefined();
     expect(screen.getByText("github.com/BalianWang/busytok")).toBeDefined();
-    // Old barcode element is gone.
     expect(container.querySelector(".receipt__barcode")).toBeNull();
   });
 
-  it("renders an OTHERS row when more than 5 models", () => {
-    renderVm(MANY_MODELS);
-    expect(screen.getByText(/OTHERS \(3\)/)).toBeDefined();
-    // All 3 overflow models are exact → OTHERS cost is a plain $X.XX (no ≈).
-    expect(screen.getByText("$1.60")).toBeDefined();
+  it("caps ITEMS at 5 rows and shows a truncation indicator when there are >5 models", () => {
+    // MANY_MODELS has 8 models → top 5 shown, overflow 3 elided.
+    const { container } = renderVm(MANY_MODELS);
+    const itemRows = container.querySelectorAll(".receipt__item");
+    expect(itemRows.length).toBe(5);
+    // Old OTHERS aggregate row is gone.
+    expect(screen.queryByText(/OTHERS/)).toBeNull();
+    // Truncation indicator renders.
+    const indicator = container.querySelector(".receipt__items-truncated");
+    expect(indicator).not.toBeNull();
+    expect(indicator?.textContent?.trim()).toBe("· · ·");
   });
 
-  it("renders OTHERS as — (not ≈$0.00) when all overflow models are unavailable", () => {
-    renderVm(OTHERS_ALL_UNAVAILABLE);
-    expect(screen.getAllByText("—").length).toBe(1);
+  it("does NOT show the truncation indicator when ≤5 models", () => {
+    const { container } = renderVm(); // NORMAL_DAY has 1 model
+    expect(container.querySelector(".receipt__items-truncated")).toBeNull();
   });
 
-  it("renders OTHERS as ≈$X.XX when overflow mixes exact + unavailable", () => {
-    renderVm(OTHERS_MIXED_COST);
-    expect(screen.getByText("≈$1.50")).toBeDefined();
+  it("truncates and shows the indicator when overflow models are all unavailable", () => {
+    // OTHERS_ALL_UNAVAILABLE: top 5 exact; overflow (2 unavailable) elided.
+    // The truncation indicator is the only signal that overflow existed.
+    const { container } = renderVm(OTHERS_ALL_UNAVAILABLE);
+    expect(container.querySelector(".receipt__items-truncated")).not.toBeNull();
+    // Top-5 item rows all render (no OTHERS row).
+    expect(container.querySelectorAll(".receipt__item").length).toBe(5);
+  });
+
+  it("truncates and shows the indicator when overflow models are mixed", () => {
+    // OTHERS_MIXED_COST: overflow mixed (1 exact + 1 unavailable), elided.
+    // The TOTAL block still carries the aggregate cost from the full set.
+    const { container } = renderVm(OTHERS_MIXED_COST);
+    expect(container.querySelector(".receipt__items-truncated")).not.toBeNull();
+    expect(screen.getByText("TOTAL")).toBeDefined();
   });
 
   it("marks partial aggregate cost with ≈ and keeps exact item cost plain", () => {
     renderVm(PARTIAL_COST);
-    expect(screen.getByText("≈$47.21")).toBeDefined();
-    expect(screen.getByText("$24.10")).toBeDefined();
-    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+    expect(screen.getByText("≈$47.21")).toBeDefined(); // TOTAL block
+    expect(screen.getByText("$24.10")).toBeDefined(); // exact-status item row
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0); // unavailable item
   });
 
   it("shows the empty state when there are no models and no tokens", () => {
     const { container } = renderVm(NO_DATA);
     expect(container.querySelector(".receipt-paper__empty")).not.toBeNull();
-    // NO_DATA has generated_at_ms: 0 → formatGeneratedTime returns "—".
     expect(screen.getByText(/ISSUED —/)).toBeDefined();
   });
 
   it("does not render the footer stats block on empty state", () => {
     const { container } = renderVm(NO_DATA);
     expect(container.querySelector(".receipt__footer-stats")).toBeNull();
-    // But the brand line + QR still render.
     expect(container.querySelector(".receipt__footer-brand")).not.toBeNull();
     expect(container.querySelector(".receipt__qr")).not.toBeNull();
   });
@@ -141,15 +151,14 @@ describe("ReceiptPaper", () => {
     expect(screen.queryByText(/TZ/)).toBeNull();
   });
 
-  it("renders the paper with a flex body wrapper (min-height 560, grows if needed)", () => {
+  it("renders the paper with a flex body wrapper (fixed 3:4, 420 × 560)", () => {
     const { container } = renderVm();
     const paper = container.querySelector(".receipt-paper") as HTMLElement;
     expect(paper).not.toBeNull();
     // jsdom does not resolve external CSS, so we assert the DOM contract:
     // the body region exists as the flex:1 absorber that keeps the footer
-    // pinned to the bottom. The CSS rule (receipt.css) sets min-height:560px
-    // so common cases render at 3:4 (420×560) while 6-item papers grow slightly
-    // rather than clipping the TOTAL row.
+    // pinned to the bottom. The CSS rule (receipt.css) sets height:560px
+    // (fixed 3:4) — safe now because items are capped at TOP_N=5 rows.
     const body = container.querySelector(".receipt__body");
     expect(body).not.toBeNull();
   });

@@ -41,15 +41,17 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
                 <span>COST</span>
               </div>
               {vm.items.map((item) => (
-                <div
-                  key={item.name}
-                  className={`receipt__item${item.others ? " receipt__item--others" : ""}`}
-                >
+                <div key={item.name} className="receipt__item">
                   <span className="receipt__item-name">{item.name}</span>
                   <span className="receipt__item-tokens">{item.tokens}</span>
                   <span className="receipt__item-cost">{item.cost}</span>
                 </div>
               ))}
+              {vm.truncated && (
+                <div className="receipt__items-truncated" aria-hidden="true">
+                  · · ·
+                </div>
+              )}
             </section>
 
             <div className="receipt__total">

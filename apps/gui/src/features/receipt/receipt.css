@@ -52,10 +52,9 @@
 
   position: relative;
   width: 420px;
-  /* min-height (not fixed height) so 6-item papers can grow slightly beyond
-     560px instead of clipping the TOTAL row. Common cases (≤5 items) render
-     at exactly 560px (3:4); the 6-item edge case is ~595px (3:4.05). */
-  min-height: 560px;
+  /* Fixed 3:4 aspect ratio (420 × 560). Safe because items are capped at
+     TOP_N=5 rows — no content overflow risk. */
+  height: 560px;
   display: flex;
   flex-direction: column;
   padding: 36px 36px 40px;
@@ -200,14 +199,16 @@
   color: var(--r-ink-muted);
   font-variant-numeric: tabular-nums;
 }
-.receipt__item--others .receipt__item-name {
+/* Truncation indicator: rendered after the last visible item row when there
+   are more than TOP_N models. Centered dotted divider — matches the visual
+   language of a receipt where extra entries are elided. */
+.receipt__items-truncated {
+  text-align: center;
+  font-size: 13px;
+  letter-spacing: 0.4em;
   color: var(--r-ink-muted);
-  font-style: italic;
-  font-weight: 400;
-}
-.receipt__item--others .receipt__item-tokens {
-  color: var(--r-ink-muted);
-  font-weight: 400;
+  padding: 6px 0 2px;
+  line-height: 1;
 }
 
 /* ── TOTAL — the grand total row ───────────────────────────────────
