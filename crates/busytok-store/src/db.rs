@@ -2006,6 +2006,13 @@ impl Database {
         let conn = self.conn();
         subagent_queries::find_hot_binding_by_session(conn, adapter_session_id, harness)
     }
+    pub fn subagent_find_lru_hot_binding(
+        &self,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        let conn = self.conn();
+        subagent_queries::find_lru_hot_binding(conn, harness)
+    }
     pub fn subagent_write_hot_summary(&self, subagent_id: &str, hot_summary: &str) -> Result<()> {
         let conn = self.conn();
         subagent_queries::write_hot_summary(conn, subagent_id, hot_summary)

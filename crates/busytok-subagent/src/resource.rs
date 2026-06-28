@@ -52,7 +52,7 @@ pub enum ResourcePressureState {
     Normal,
     /// System memory pressure OR sidecar RSS > soft limit (warning tier).
     Pressure,
-    /// Sidecar RSS > hard limit (error tier — Plan 6 will force-kill).
+    /// Sidecar RSS > hard limit (error tier — `PressureResponder` force-kills).
     LimitExceeded,
 }
 
@@ -65,8 +65,9 @@ impl ResourcePressureState {
     /// (escalations). Recovery transitions (Pressure→Normal,
     /// LimitExceeded→Normal) return `None` — the supervisor logs them to
     /// `tracing` (info level) but does NOT write a DB event, because
-    /// `resource_recovered` is not in spec §3.2's event enum. The spec enum
-    /// update + DB event for recovery are deferred to Plan 6.
+    /// `resource_recovered` is not in spec §3.2's event enum. The
+    /// `PressureResponder` still clears the gate on recovery so the queue
+    /// unpauses (§8.3).
     ///
     /// The latch state still updates on recovery (handled by the caller) so
     /// a re-pressurization later writes a fresh `memory_pressure` event.
@@ -77,7 +78,8 @@ impl ResourcePressureState {
                 Some("rss_limit_exceeded")
             }
             // Recovery transitions: no DB event (resource_recovered not in
-            // spec §3.2 enum — deferred to Plan 6). Caller logs to tracing.
+            // spec §3.2 enum). Caller logs to tracing; the PressureResponder
+            // clears the gate so the queue unpauses.
             (Self::Pressure, Self::Normal) | (Self::LimitExceeded, Self::Normal) => None,
             (Self::LimitExceeded, Self::Pressure) => None,
             _ => None, // same state — debounced
@@ -182,16 +184,18 @@ impl ResourceMonitor {
     }
 
     /// True when system available memory is below the pressure threshold
-    /// (spec §8.3 step 1 threshold). Plan 5 only emits the
-    /// `memory_pressure` event; the backpressure action is deferred to
-    /// Plan 6. Reads `self.policy.memory_pressure_free_mb`.
+    /// (spec §8.3 step 1 threshold). When this fires (and soft/hard limits
+    /// are NOT exceeded), the supervision loop drives `PauseNewTasks` via
+    /// `PressureResponder` — pausing the queue + hibernating the LRU hot
+    /// session. Reads `self.policy.memory_pressure_free_mb`.
     pub fn is_under_pressure(&self, sample: &ResourceSample) -> bool {
         sample.system_available_mb < self.policy.memory_pressure_free_mb as f64
     }
 
     /// True when sidecar RSS exceeds the soft limit (spec §8.3 step 3
-    /// threshold). Plan 5 only emits a warning log; the graceful-restart
-    /// action is deferred to Plan 6. Reads `self.soft_limit_mb`.
+    /// threshold). Drives `GracefulRestart` via `PressureResponder`:
+    /// prepare_hibernate_all → graceful shutdown → next delegate respawns.
+    /// Reads `self.soft_limit_mb`.
     pub fn exceeds_soft_limit(&self, sample: &ResourceSample) -> bool {
         sample
             .sidecar_rss_mb
@@ -200,8 +204,8 @@ impl ResourceMonitor {
     }
 
     /// True when sidecar RSS exceeds the hard limit (spec §8.3 step 5
-    /// threshold). Plan 5 only emits the `rss_limit_exceeded` event;
-    /// the force-kill action is deferred to Plan 6.
+    /// threshold). Drives `ForceKill` via `PressureResponder` — the sidecar
+    /// is SIGKILLed; the next delegate lazy-restarts it.
     /// Reads `self.hard_limit_mb`.
     pub fn exceeds_hard_limit(&self, sample: &ResourceSample) -> bool {
         sample

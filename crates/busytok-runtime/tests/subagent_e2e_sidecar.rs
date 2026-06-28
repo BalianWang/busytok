@@ -1653,3 +1653,171 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     // Sanity: the gate is still paused (delegate must not have cleared it).
     assert!(gate.is_paused(), "delegate must not clear the pause flag");
 }
+
+// --- pressure response e2e (Plan 6 Task 4, spec §8.3 escalation chain) ---
+//
+// Verifies the full §8.3 escalation chain end-to-end through the real
+// supervisor + mock sidecar subprocess. The mock sidecar's RSS (a bash
+// process, ~5-10MB) is compared against artificially low limits set in
+// SidecarConfig to trigger each escalation tier:
+//
+// 1. `pressure_response_force_kills_on_rss_limit_exceeded`: hard/soft limit
+//    = 1MB. The sidecar's RSS always exceeds this → `exceeds_hard` →
+//    `ForceKill` action. The responder SIGKILLs the sidecar, writes a
+//    `sidecar_crash` resource event, and clears the gate to `Resume`
+//    (Finding 2 fix — prevents deadlock in paused state).
+//
+// 2. `pressure_response_pauses_on_memory_pressure`: `memory_pressure_free_mb
+//    = 999999` (always pressured), soft limit = 800MB (not exceeded by the
+//    ~10MB mock sidecar). `under_pressure` → `new_state = Pressure` →
+//    `PauseNewTasks` action (§8.3 steps 1-2: pause queue + hibernate LRU).
+//    The gate is set to paused; the responder also calls `evict_lru`.
+
+#[tokio::test]
+#[serial]
+async fn pressure_response_force_kills_on_rss_limit_exceeded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    settings.subagent.resource_policy.monitor_interval_seconds = 1;
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    // Use mock sidecar with hard/soft limit = 1MB (sidecar RSS always exceeds this).
+    let mut config = make_sidecar_config();
+    config.memory_hard_limit_mb = 1;
+    config.memory_soft_limit_mb = 1;
+
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, config);
+
+    // Delegate once to start the sidecar + supervision loop.
+    let _ = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "pressure-test".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "trigger sidecar".to_string(),
+            timeout_seconds: Some(5),
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await;
+
+    // Wait for the supervision loop to sample + detect hard limit + force-kill.
+    // Poll for up to 10s for a sidecar_crash event.
+    let mut crashed = false;
+    for _ in 0..100 {
+        let crashed_now = {
+            let db_guard = supervisor.db_handle().lock().unwrap();
+            let events = db_guard.subagent_list_resource_events(None, 200).unwrap();
+            events.iter().any(|e| e.event_type == "sidecar_crash")
+        };
+        if crashed_now {
+            crashed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        crashed,
+        "sidecar_crash event must be written after hard-limit force-kill"
+    );
+
+    // Finding 2 fix: after force-kill, the PressureResponder clears the
+    // gate to Resume so the next delegate() can lazy-restart the sidecar.
+    // If the gate stayed paused, the system would deadlock with no path
+    // to restart.
+    let gate = supervisor.pressure_gate().expect("gate must be present");
+    // Give the responder a brief moment to clear the gate after the kill.
+    // The `sidecar_crash` event is written by `force_kill` BEFORE the gate
+    // is cleared, so we may observe the event before the gate clear.
+    let mut gate_cleared = false;
+    for _ in 0..50 {
+        if !gate.is_paused() {
+            gate_cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        gate_cleared,
+        "gate must be cleared (Resume) after force-kill to allow lazy restart"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn pressure_response_pauses_on_memory_pressure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    settings.subagent.resource_policy.monitor_interval_seconds = 1;
+    // Always pressured: 999999MB free threshold exceeds any real machine's
+    // available memory, so `is_under_pressure` returns true on every sample.
+    settings.subagent.resource_policy.memory_pressure_free_mb = 999_999;
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    // soft/hard limits high enough that the mock sidecar (~10MB RSS) does
+    // NOT exceed them — so only `PauseNewTasks` fires, not GracefulRestart
+    // or ForceKill.
+    let mut config = make_sidecar_config();
+    config.memory_soft_limit_mb = 800;
+    config.memory_hard_limit_mb = 1200;
+
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, config);
+
+    // Delegate once to start the sidecar + supervision loop.
+    let _ = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "pressure-pause-test".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "trigger sidecar".to_string(),
+            timeout_seconds: Some(5),
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await;
+
+    // Wait for the supervision loop to sample + detect memory pressure +
+    // trigger PauseNewTasks. Poll for up to 10s for the gate to be paused.
+    let gate = supervisor.pressure_gate().expect("gate must be present");
+    let mut paused = false;
+    for _ in 0..100 {
+        if gate.is_paused() {
+            paused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        paused,
+        "gate must be paused after memory pressure triggers PauseNewTasks"
+    );
+
+    // Verify a `memory_pressure` resource event was written (the escalation
+    // DB event fires before the responder action).
+    let events = {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        db_guard.subagent_list_resource_events(None, 200).unwrap()
+    };
+    assert!(
+        events.iter().any(|e| e.event_type == "memory_pressure"),
+        "memory_pressure event must be written on Normal→Pressure transition"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}

@@ -183,6 +183,37 @@ fn extract_candidate_from_data(data: Option<&serde_json::Value>) -> anyhow::Resu
 }
 
 impl SidecarTaskExecutor {
+    /// Proactively hibernate the LRU hot session (spec §8.3 step 1).
+    /// Unlike `evict_session` (reactive, sidecar-named candidate), this picks
+    /// the LRU from the DB and calls `evict_session` with its adapter_session_id.
+    /// Used by `PressureResponder` (§8.3 step 1) when system memory pressure
+    /// is detected — proactively sheds one hot session to free RSS.
+    pub async fn evict_lru(&self) -> anyhow::Result<()> {
+        let adapter_session_id = {
+            let Some(db) = &self.db else {
+                return Err(anyhow::anyhow!(
+                    "evict_lru requires a DB connection; no-DB executor cannot pick LRU"
+                ));
+            };
+            let db = db.lock().expect("db lock poisoned");
+            let binding = db
+                .subagent_find_lru_hot_binding(&self.supervisor.config().harness_name)
+                .map_err(|e| anyhow::anyhow!("find_lru_hot_binding failed: {e}"))?;
+            let Some(binding) = binding else {
+                info!(
+                    event_code = "subagent.pressure.no_lru",
+                    "no hot binding to hibernate"
+                );
+                return Ok(());
+            };
+            binding
+                .adapter_session_id
+                .ok_or_else(|| anyhow::anyhow!("LRU hot binding has no adapter_session_id"))?
+        };
+        // Delegate to the existing eviction flow (prepare_hibernate → commit → close).
+        self.evict_session(&adapter_session_id).await
+    }
+
     /// Drive the eviction flow for a single session (spec §4.4):
     /// 1. RPC: `session.prepare_hibernate(adapter_session_id)` → `{memory_delta, stats}`
     /// 2. Persist: write memory delta (optional) + flip binding atomically

@@ -29,7 +29,7 @@ use tracing::{error, info, instrument, warn};
 use busytok_config::SubagentResourcePolicyConfig;
 use busytok_store::{Database, SubagentResourceEventRow};
 
-use crate::pressure::{PressureGate, PressureResponder};
+use crate::pressure::{PressureAction, PressureGate, PressureResponder};
 use crate::resource::{ResourceMonitor, ResourcePressureState};
 use crate::sidecar::client::SidecarRpcClient;
 use crate::sidecar::config::SidecarConfig;
@@ -742,9 +742,9 @@ impl PiSidecarSupervisor {
         };
         // Lifecycle signal — write DB event ONLY on escalation transitions
         // (edge-triggered). Recovery transitions log to tracing only (no DB
-        // event — `resource_recovered` is not in spec §3.2's enum; deferred
-        // to Plan 6). The latch state updates on every transition so
-        // re-pressurization after recovery writes a fresh event.
+        // event — `resource_recovered` is not in spec §3.2's enum). The latch
+        // state updates on every transition so re-pressurization after
+        // recovery writes a fresh event.
         let (db_event, is_recovery, old_state) = {
             let mut state = match self.state.try_lock() {
                 Ok(g) => g,
@@ -767,8 +767,12 @@ impl PiSidecarSupervisor {
                 new_state = ?new_state,
                 sidecar_rss_mb = ?sample.sidecar_rss_mb,
                 system_available_mb = sample.system_available_mb,
-                "resource pressure recovered to normal (DB event deferred to Plan 6)"
+                "resource pressure recovered to normal"
             );
+            // §8.3 pressure response: clear the gate on recovery so the
+            // queue unpauses. Run AFTER the tracing log so the observability
+            // signal is recorded before the action.
+            self.invoke_pressure_responder(PressureAction::Resume);
             return;
         }
         // Escalation: log + write DB event.
@@ -781,7 +785,7 @@ impl PiSidecarSupervisor {
                     event_code = "subagent.resource.memory_pressure",
                     system_available_mb = sample.system_available_mb,
                     sidecar_rss_mb = ?sample.sidecar_rss_mb,
-                    "entered memory pressure (Plan 6 will pause queue + hibernate LRU)"
+                    "entered memory pressure (pausing queue + hibernating LRU)"
                 );
             }
             "rss_limit_exceeded" => {
@@ -789,12 +793,59 @@ impl PiSidecarSupervisor {
                     event_code = "subagent.resource.rss_limit_exceeded",
                     sidecar_rss_mb = ?sample.sidecar_rss_mb,
                     hard_limit_mb = self.config.memory_hard_limit_mb,
-                    "sidecar RSS exceeded hard limit (Plan 6 will force-kill)"
+                    "sidecar RSS exceeded hard limit (force-killing)"
                 );
             }
             _ => unreachable!("transition_event only returns known escalation event types"),
         }
         self.write_resource_event_with_sample(event_type, Some(&sample));
+
+        // §8.3 pressure response actions. Run AFTER the DB event write so the
+        // observability signal is recorded before the action.
+        //
+        // Action mapping (verified against `resource.rs` predicates):
+        // - `exceeds_hard` → ForceKill (§8.3 step 5). Checked first because
+        //   hard limit is the most severe — even if old_state was already
+        //   LimitExceeded, re-kill (the sidecar may have grown beyond the
+        //   limit without restarting).
+        // - `exceeds_soft` (but NOT hard) → GracefulRestart (§8.3 steps 3-4).
+        //   Checked as a SEPARATE predicate, NOT via state transition —
+        //   `under_pressure || exceeds_soft` both fold to `Pressure` state,
+        //   but only `exceeds_soft` warrants graceful restart.
+        // - `new_state == Pressure && old_state == Normal` → PauseNewTasks
+        //   (§8.3 steps 1-2). The `PauseNewTasks` arm also calls `evict_lru`,
+        //   folding step 1 into step 2 (spec intent: steps 1+2 happen
+        //   together on pressure entry). Only fires on the Normal→Pressure
+        //   transition (edge-triggered) — sustained Pressure without
+        //   soft/hard exceeded does NOT re-pause.
+        // - Recovery → Resume (handled above in the `is_recovery` branch).
+        let action = if exceeds_hard {
+            Some(PressureAction::ForceKill)
+        } else if exceeds_soft {
+            Some(PressureAction::GracefulRestart)
+        } else if new_state == ResourcePressureState::Pressure
+            && old_state == ResourcePressureState::Normal
+        {
+            Some(PressureAction::PauseNewTasks)
+        } else {
+            None
+        };
+        if let Some(action) = action {
+            self.invoke_pressure_responder(action);
+        }
+    }
+
+    /// Upgrade the weak responder ref (if set) and spawn `respond(action)`
+    /// on a detached task. Spawning avoids blocking the supervision loop on
+    /// the (potentially slow) escalation chain (e.g. `force_kill` waits for
+    /// the child to exit, `prepare_hibernate_all` is an RPC). The
+    /// responder's `in_flight` Mutex deduplicates concurrent escalations.
+    fn invoke_pressure_responder(&self, action: PressureAction) {
+        if let Some(responder) = self.pressure_responder() {
+            tokio::spawn(async move {
+                responder.respond(action).await;
+            });
+        }
     }
 
     /// Converge DB state after a graceful sidecar shutdown (spec §3.3).
@@ -960,6 +1011,18 @@ impl SidecarHandle {
             .call_rpc(
                 "session.close",
                 serde_json::json!({ "adapter_session_id": adapter_session_id }),
+            )
+            .await
+    }
+
+    /// §8.3 step 4: prepare ALL hot sessions for hibernate before graceful
+    /// restart. Calls `session.prepare_hibernate` with `{"all": true}`.
+    /// Returns the sidecar's response (a map of session_id → {memory_delta, stats}).
+    pub async fn prepare_hibernate_all(&self) -> Result<serde_json::Value, SidecarError> {
+        self.supervisor
+            .call_rpc(
+                "session.prepare_hibernate",
+                serde_json::json!({"all": true}),
             )
             .await
     }

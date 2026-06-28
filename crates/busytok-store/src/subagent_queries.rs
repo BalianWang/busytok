@@ -675,6 +675,42 @@ pub fn hot_binding(
     Ok(row_opt)
 }
 
+/// Find the least-recently-used hot binding for a harness (spec §8.3 step 1).
+/// Returns None if no hot bindings exist.
+pub fn find_lru_hot_binding(
+    conn: &Connection,
+    harness: &str,
+) -> Result<Option<SubagentHarnessBindingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, subagent_id, harness, adapter_session_id, adapter_process_id, \
+                is_hot, status, created_at_ms, last_used_at_ms, closed_at_ms, detail_json \
+         FROM subagent_harness_bindings \
+         WHERE harness = ?1 AND is_hot = 1 \
+         ORDER BY last_used_at_ms ASC \
+         LIMIT 1",
+    )?;
+    let row = stmt.query_row(params![harness], |row| {
+        Ok(SubagentHarnessBindingRow {
+            id: row.get(0)?,
+            subagent_id: row.get(1)?,
+            harness: row.get(2)?,
+            adapter_session_id: row.get(3)?,
+            adapter_process_id: row.get(4)?,
+            is_hot: row.get(5)?,
+            status: row.get(6)?,
+            created_at_ms: row.get(7)?,
+            last_used_at_ms: row.get(8)?,
+            closed_at_ms: row.get(9)?,
+            detail_json: row.get(10)?,
+        })
+    });
+    match row {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Find a hot binding by adapter_session_id and harness.
 /// Used by the eviction flow to locate the binding for a specific session.
 pub fn find_hot_binding_by_session(
