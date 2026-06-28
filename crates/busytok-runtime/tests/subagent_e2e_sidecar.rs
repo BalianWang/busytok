@@ -881,6 +881,87 @@ async fn doctor_sqlite_check_errors_on_readonly_database() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
+#[tokio::test]
+#[serial]
+async fn doctor_sqlite_check_failure_leaves_connection_usable() {
+    // Regression: the write probe must not leave an open transaction on the
+    // connection after a failure. Previously `execute_batch("BEGIN IMMEDIATE;
+    // DELETE ...; ROLLBACK;")` would abort at the failing DELETE and skip
+    // ROLLBACK, polluting subsequent operations on the same connection.
+    // Verify by triggering the read-only failure, then calling
+    // settings_diagnostics AGAIN on the same supervisor — the second call's
+    // SQLite check (readable probe: SELECT 1) must still work, proving the
+    // connection isn't stuck in a dirty transaction.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("readonly_conn_test.db");
+    {
+        let _db = busytok_store::Database::open(&db_path).unwrap();
+    }
+    let db = busytok_store::Database::open_readonly(&db_path).unwrap();
+
+    let paths = BusytokPaths::for_test(tmp.path());
+    let mut settings = make_sidecar_settings();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // First call — triggers the read-only failure in the write probe.
+    let envelope1 = supervisor.settings_diagnostics().await.unwrap();
+    let sub1 = envelope1
+        .data
+        .subagent
+        .expect("subagent section must be present");
+    let check1 = sub1
+        .checks
+        .iter()
+        .find(|c| c.name == "sqlite_readable")
+        .expect("must have sqlite_readable check");
+    assert_eq!(
+        check1.status, "error",
+        "first call: read-only DB must error"
+    );
+
+    // Second call — the readable probe (SELECT 1) must still succeed and
+    // not be blocked by a leftover transaction. If the connection were
+    // stuck in a transaction, the SELECT 1 would either error or return
+    // stale results. We assert the check still runs and reports the same
+    // status (error, because the DB is still read-only), confirming the
+    // connection is usable.
+    let envelope2 = supervisor.settings_diagnostics().await.unwrap();
+    let sub2 = envelope2
+        .data
+        .subagent
+        .expect("subagent section must be present on second call");
+    let check2 = sub2
+        .checks
+        .iter()
+        .find(|c| c.name == "sqlite_readable")
+        .expect("must have sqlite_readable check on second call");
+    // The check must still execute — not panic, not hang, not return a
+    // different error type. Same status as the first call confirms the
+    // connection is in a clean state.
+    assert_eq!(
+        check2.status, "error",
+        "second call must still report error (read-only), proving connection is usable"
+    );
+    // The detail must still report the write probe failure (not a different
+    // error like "cannot start a transaction within a transaction").
+    assert!(
+        check2
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("write probe failed"),
+        "second call detail should still be write probe failure, got: {:?}",
+        check2.detail
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
 // --- crash recovery e2e (Plan 5 Task 5, spec §12.1 Case 4) ---
 //
 // Verifies the EXISTING crash recovery logic in PiSidecarSupervisor

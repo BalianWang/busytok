@@ -441,21 +441,38 @@ impl BusytokSupervisor {
                 )
                 .unwrap_or(0);
             let schema_version_ok = db_version == busytok_store::schema::SCHEMA_VERSION as i64;
-            // Write probe: BEGIN IMMEDIATE + a no-op DELETE + ROLLBACK. The
-            // DELETE matches no rows (version=-999 never exists) but forces
-            // SQLite to acquire a write lock and attempt I/O, which fails on
-            // read-only connections (SQLITE_READONLY). A bare
+            // Write probe: BEGIN IMMEDIATE + a no-op DELETE, then rollback.
+            // The DELETE matches no rows (version=-999 never exists) but
+            // forces SQLite to acquire a write lock and attempt I/O, which
+            // fails on read-only connections (SQLITE_READONLY). A bare
             // `BEGIN IMMEDIATE; ROLLBACK;` is insufficient because in WAL
             // mode some SQLite builds allow acquiring a RESERVED lock on a
             // read-only connection without actually writing.
-            let writable = db
-                .conn()
-                .execute_batch(
-                    "BEGIN IMMEDIATE; \
-                     DELETE FROM _schema_version WHERE version = -999; \
-                     ROLLBACK;",
-                )
-                .is_ok();
+            //
+            // Uses an RAII `Transaction` instead of `execute_batch` so the
+            // transaction is rolled back on BOTH the success and failure
+            // paths of the DELETE. With `execute_batch("BEGIN; DELETE;
+            // ROLLBACK;")`, if DELETE fails (e.g. mid-transaction I/O
+            // error), the batch aborts at the failing statement and the
+            // trailing ROLLBACK never runs — leaving the connection in an
+            // open transaction that pollutes subsequent operations. The
+            // RAII `Transaction` guarantees cleanup via Drop regardless of
+            // how the block exits.
+            let writable = match rusqlite::Transaction::new_unchecked(
+                db.conn(),
+                rusqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => {
+                    let delete_ok = tx
+                        .execute("DELETE FROM _schema_version WHERE version = -999", [])
+                        .is_ok();
+                    // Explicit rollback — Drop would also do it, but be
+                    // explicit so the cleanup guarantee is visible.
+                    let _ = tx.rollback();
+                    delete_ok
+                }
+                Err(_) => false, // BEGIN IMMEDIATE failed (read-only or locked)
+            };
             let ok = readable && writable && schema_version_ok;
             let mut detail = format!(
                 "schema_version={db_version} (expected {}), readable={readable}, writable={writable}",
