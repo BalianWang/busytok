@@ -191,7 +191,8 @@ fn second_sample_returns_meaningful_cpu() {
 // `ResourcePressureState` enum. These tests verify the edge-trigger
 // semantics without spinning up the supervisor: escalation transitions
 // return a DB event type, recovery transitions return None (DB event
-// deferred to Plan 6), and same-state transitions are debounced.
+// omitted by design — spec §3.2 has no `resource_recovered` type),
+// and same-state transitions are debounced.
 
 #[test]
 fn transition_event_returns_memory_pressure_on_normal_to_pressure() {
