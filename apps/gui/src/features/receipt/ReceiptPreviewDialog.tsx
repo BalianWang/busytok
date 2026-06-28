@@ -77,7 +77,7 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
                 title="Pick receipt date"
                 onClick={() => dateInputRef.current?.showPicker()}
               >
-                <CalendarIcon size={16} strokeWidth={1.75} />
+                <CalendarIcon size={16} strokeWidth={1.75} aria-hidden="true" />
               </button>
               <button
                 type="button"
@@ -87,7 +87,7 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
                 disabled={exportApi.busy || !vm}
                 onClick={exportApi.savePng}
               >
-                <DownloadIcon size={16} strokeWidth={1.75} />
+                <DownloadIcon size={16} strokeWidth={1.75} aria-hidden="true" />
               </button>
               <button
                 type="button"
@@ -97,7 +97,7 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
                 disabled={exportApi.busy || !vm}
                 onClick={exportApi.copyImage}
               >
-                <Clipboard size={16} strokeWidth={1.75} />
+                <Clipboard size={16} strokeWidth={1.75} aria-hidden="true" />
               </button>
             </footer>
           </Dialog.Content>
