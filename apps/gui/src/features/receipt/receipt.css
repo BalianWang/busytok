@@ -1,18 +1,30 @@
 /* ── Receipt share image — standalone design language ───────────────────
    NOT subject to DESIGN-SYSTEM.md. Excluded from check-busytok-gui-surfaces.sh
    via --glob '!**/receipt.css'. Bundled fonts scoped to .receipt-paper so app
-   chrome (system fonts) is untouched. */
+   chrome (system fonts) is untouched.
+
+   Font vocabulary:
+   - BusytokSans (Geist)     → brand wordmark, total cost numeral
+   - BusytokMono (IBM Plex)   → receipt body (meta / items / total)
+   - BusytokType (Special Elite) → footer brand line (typewriter feel) */
 
 @font-face {
   font-family: "BusytokMono";
-  src: url("/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+  src: url("/fonts/IBMPlexMono-Regular.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "BusytokMono";
-  src: url("/fonts/JetBrainsMono-Bold.woff2") format("woff2");
+  src: url("/fonts/IBMPlexMono-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "BusytokMono";
+  src: url("/fonts/IBMPlexMono-Bold.woff2") format("woff2");
   font-weight: 700;
   font-style: normal;
   font-display: block;
@@ -31,13 +43,19 @@
   font-style: normal;
   font-display: block;
 }
+@font-face {
+  font-family: "BusytokType";
+  src: url("/fonts/SpecialElite-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
 
-/* The paper: fixed export width, height auto. Carries its own design tokens
-   (no .receipt-stage wrapper — that was removed to eliminate the 64px top
-   padding / vignette that produced the large blank area above the receipt
-   in the preview dialog and the export root). */
+/* The paper: fixed export width + 3:4 height. Carries its own design tokens
+   (no .receipt-stage wrapper — that was removed to eliminate the large blank
+   area above the receipt in the preview dialog and the export root). */
 .receipt-paper {
-  --r-ink: #211b14;
+  --r-ink: #1e1914;
   --r-ink-muted: #6b5e4a;
   --r-paper-top: #fffdf6;
   --r-paper-bottom: #f6efe2;
@@ -47,8 +65,14 @@
   font-family: "BusytokMono", ui-monospace, monospace;
   color: var(--r-ink);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.005em;
   -webkit-font-smoothing: antialiased;
+  /* Thermal-printer texture: two faint 0.25px shadows simulate ink bleed —
+     gives the body text a slightly uneven, "printed" quality without the
+     capture risk of SVG feDisplacementMap (which foreignObject drops). */
+  text-shadow:
+    0.25px 0 rgba(30, 25, 20, 0.16),
+    -0.25px 0 rgba(255, 255, 255, 0.10);
 
   position: relative;
   width: 420px;
@@ -70,9 +94,8 @@
 }
 
 /* Body region between meta and footer — flex:1 absorbs surplus vertical
-   space so the footer stays pinned to the bottom and the min-height target
-   is always filled. No overflow:hidden — clipping the TOTAL row silently
-   is worse than letting the paper grow a few pixels taller. */
+   space so the footer stays pinned to the bottom and the 3:4 ratio is
+   always filled. */
 .receipt__body {
   flex: 1;
   display: flex;
@@ -111,8 +134,8 @@
   font-family: "BusytokSans", system-ui, sans-serif;
   font-weight: 700;
   font-size: 30px;
-  letter-spacing: 0.34em;
-  text-indent: 0.34em; /* visually center despite tracking */
+  letter-spacing: 0.22em;
+  text-indent: 0.22em; /* visually center despite tracking */
   line-height: 1;
 }
 .receipt__brand::after {
@@ -239,16 +262,12 @@
   font-size: 17px;
 }
 
-/* ── Footer: input/output/cache split + cache hit rate, then brand ──
-   Replaces the old "NO PROMPTS UPLOADED / LOCAL AUDIT ONLY" copy. The
-   in/out/cache summary moved here from the old mid-paper block, keeping
-   the visual focus on ITEMS + TOTAL above. */
+/* ── Footer: in/out/cache split + cache hit rate, then centered QR,
+   then the brand line in typewriter face. */
 .receipt__footer {
   position: relative;
   margin-top: 16px;
   text-align: center;
-  font-size: 10px;
-  letter-spacing: 0.18em;
   color: var(--r-ink-muted);
   line-height: 1.9;
 }
@@ -263,48 +282,23 @@
   letter-spacing: 0;
   line-height: 1.4;
 }
-.receipt__footer-brand {
-  /* inherits .receipt__footer text styling */
-}
-
-/* QR call-to-action row: QR image + CTA text, horizontally aligned. */
-.receipt__qr-row {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  margin: 12px 0 6px;
-}
+/* QR centered below the stats block. White background ensures scannability
+   against the cream paper. */
 .receipt__qr {
+  display: block;
+  margin: 0 auto 10px;
   width: 56px;
   height: 56px;
-  /* White background ensures scannability against the cream paper. */
   background: #ffffff;
   border: 1px solid var(--r-divider);
   border-radius: 4px;
-  /* Prevent layout shift while the SVG loads. */
-  flex-shrink: 0;
 }
-.receipt__qr-cta {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  text-align: left;
-}
-.receipt__qr-cta-primary {
-  font-family: "BusytokSans", system-ui, sans-serif;
-  font-weight: 700;
-  font-size: 13px;
+/* Brand line in Special Elite typewriter face — the "old printer" note at
+   the bottom of a clean modern receipt. */
+.receipt__footer-brand {
+  font-family: "BusytokType", "BusytokMono", ui-monospace, monospace;
+  font-size: 10px;
   letter-spacing: 0.14em;
-  color: var(--r-ink);
-  line-height: 1.2;
-}
-.receipt__qr-cta-secondary {
-  font-size: 9.5px;
-  letter-spacing: 0.04em;
-  color: var(--r-ink-muted);
-  line-height: 1.2;
 }
 
 /* The hidden, off-screen export target: rendered at exactly 420px, captured

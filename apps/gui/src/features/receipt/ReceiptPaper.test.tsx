@@ -26,8 +26,9 @@ describe("ReceiptPaper", () => {
     expect(screen.getByText("ITEM")).toBeDefined();
     expect(screen.getByText("TOTAL")).toBeDefined();
     expect(screen.getByText(/cache hit/)).toBeDefined();
-    expect(screen.getByText(/RECEIPT #0626-[0-9A-F]{4}/)).toBeDefined();
+    // Meta row carries date + ISSUED time only (no RECEIPT #serial).
     expect(screen.getByText(/ISSUED \d{2}:\d{2}/)).toBeDefined();
+    expect(screen.queryByText(/RECEIPT #/)).toBeNull();
   });
 
   it("does NOT render the old oversized TOTAL TOKENS hero block", () => {
@@ -47,14 +48,18 @@ describe("ReceiptPaper", () => {
     expect(container.querySelector(".receipt__summary")).toBeNull();
   });
 
-  it("renders a QR code with SCAN TO STAR CTA (replaces the old barcode)", () => {
+  it("renders a centered QR code without CTA text (replaces the old barcode + CTA row)", () => {
     const { container } = renderVm();
     const qr = container.querySelector(".receipt__qr");
     expect(qr).not.toBeNull();
     expect(qr?.tagName).toBe("IMG");
     expect(qr?.getAttribute("src")).toBe("/busytok-gh-qr.svg");
-    expect(screen.getByText("SCAN TO STAR")).toBeDefined();
-    expect(screen.getByText("github.com/BalianWang/busytok")).toBeDefined();
+    // CTA text removed — QR stands alone, centered.
+    expect(screen.queryByText("SCAN TO STAR")).toBeNull();
+    expect(screen.queryByText("github.com/BalianWang/busytok")).toBeNull();
+    // Old qr-row / qr-cta wrappers gone.
+    expect(container.querySelector(".receipt__qr-row")).toBeNull();
+    expect(container.querySelector(".receipt__qr-cta")).toBeNull();
     expect(container.querySelector(".receipt__barcode")).toBeNull();
   });
 

@@ -32,7 +32,6 @@ export interface ReceiptViewModel {
   /** True when top_models had more than TOP_N entries (overflow indicator). */
   truncated: boolean;
   total: { tokens: string; cost: string };
-  serial: string; // "#0626-A3F2"
 }
 
 function formatReceiptCost(costUsd: number | null, status: CostStatusDto): string {
@@ -49,16 +48,6 @@ function toItem(m: ReceiptModelSliceDto): ReceiptItem {
     tokens: formatCompactNumber(m.tokens),
     cost: formatReceiptCost(m.cost_usd, m.cost_status),
   };
-}
-
-function receiptSerial(date: string): string {
-  // Deterministic, date-derived pseudo-serial for receipt authenticity.
-  const digits = date.replace(/-/g, "").slice(4); // MMDD
-  const hash = (date + "busytok")
-    .split("")
-    .reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 7);
-  const suffix = hash.toString(16).toUpperCase().slice(0, 4).padStart(4, "0");
-  return `#${digits}-${suffix}`;
 }
 
 function formatGeneratedTime(ms: number): string {
@@ -93,6 +82,5 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
       // Partial status is carried by the ≈ marker; no "est." prefix.
       cost: formatReceiptCost(m.cost_usd, m.cost_status),
     },
-    serial: receiptSerial(dto.date),
   };
 }
