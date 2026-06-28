@@ -18,6 +18,7 @@
     "dialog:default",
     "dialog:allow-save",
     "allow-invoke-busytok",
+    "allow-save-receipt-png",
     "allow-log-frontend-event",
     "allow-flush-frontend-logs",
     "allow-prompt-palette-paste-active-app",

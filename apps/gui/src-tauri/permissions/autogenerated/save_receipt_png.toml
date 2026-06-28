@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-receipt-png"
+description = "Enables the save_receipt_png command without any pre-configured scope."
+commands.allow = ["save_receipt_png"]
+
+[[permission]]
+identifier = "deny-save-receipt-png"
+description = "Denies the save_receipt_png command without any pre-configured scope."
+commands.deny = ["save_receipt_png"]
