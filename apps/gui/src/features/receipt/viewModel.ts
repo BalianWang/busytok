@@ -68,9 +68,11 @@ export function toReceiptViewModel(dto: ReceiptDailyDto): ReceiptViewModel {
   return {
     dateLabel: dto.date_label,
     totalTokensRaw: m.total_tokens,
-    summary: `in ${formatCompactNumber(m.input_tokens)} · out ${formatCompactNumber(
+    // Uppercase keys match the receipt's monospace label vocabulary
+    // (ITEM / TOKENS / COST / TOTAL / TOKEN BREAKDOWN).
+    summary: `INPUT ${formatCompactNumber(m.input_tokens)} · OUTPUT ${formatCompactNumber(
       m.output_tokens,
-    )} · cache ${formatCompactNumber(m.cache_read_tokens)}`,
+    )} · CACHE ${formatCompactNumber(m.cache_read_tokens)}`,
     cacheHitRate: formatCacheHitRate(m.cache_hit_rate),
     generatedAtLabel: formatGeneratedTime(dto.brand?.generated_at_ms ?? 0),
     items: top.map(toItem),
