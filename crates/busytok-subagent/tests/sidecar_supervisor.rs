@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/mod.rs"]
+mod support;
+
 use busytok_config::SubagentSettings;
 use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
 use busytok_store::Database;
@@ -16,16 +19,10 @@ use busytok_subagent::sidecar::{
 };
 use busytok_subagent::{PressureAction, PressureGate, PressureResponder};
 
-fn mock_sidecar_script() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/mock-sidecar.sh");
-    p
-}
-
 fn mock_config() -> SidecarConfig {
     SidecarConfig {
-        node_binary: PathBuf::from("bash"),
-        bundle_path: mock_sidecar_script(),
+        node_binary: support::sidecar_shell_path(),
+        bundle_path: support::mock_sidecar_bundle_path(),
         env: HashMap::new(),
         idle_exit_seconds: 300,
         health_interval: Duration::from_secs(3600), // disable in basic tests
@@ -806,8 +803,8 @@ async fn spawn_allows_restart_after_5_min_window_expires() {
     let shared_db: std::sync::Arc<std::sync::Mutex<busytok_store::Database>> =
         std::sync::Arc::new(std::sync::Mutex::new(db));
     let config = busytok_subagent::sidecar::SidecarConfig {
-        node_binary: std::path::PathBuf::from("bash"),
-        bundle_path: mock_sidecar_script(),
+        node_binary: support::sidecar_shell_path(),
+        bundle_path: support::mock_sidecar_bundle_path(),
         env: std::collections::HashMap::new(),
         idle_exit_seconds: 300,
         health_interval: std::time::Duration::from_secs(30),

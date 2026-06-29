@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/mod.rs"]
+mod support;
+
 #[test]
 fn gate_starts_unpaused_with_resume_action() {
     let gate = PressureGate::new();
@@ -191,17 +194,11 @@ fn mock_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
     (config, db)
 }
 
-fn mock_sidecar_script() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/mock-sidecar.sh");
-    p
-}
-
 fn live_sidecar_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
     let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let config = SidecarConfig {
-        node_binary: std::path::PathBuf::from("bash"),
-        bundle_path: mock_sidecar_script(),
+        node_binary: support::sidecar_shell_path(),
+        bundle_path: support::mock_sidecar_bundle_path(),
         env: HashMap::new(),
         idle_exit_seconds: 300,
         health_interval: Duration::from_secs(3600),

@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/mod.rs"]
+mod support;
+
 use busytok_config::SubagentSettings;
 use busytok_store::repository::{
     SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
@@ -38,16 +41,10 @@ fn empty_compact_context() -> CompactContext {
     }
 }
 
-fn mock_sidecar_script() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/mock-sidecar.sh");
-    p
-}
-
 fn mock_sidecar_config_with_env(env: HashMap<String, String>) -> SidecarConfig {
     SidecarConfig {
-        node_binary: PathBuf::from("bash"),
-        bundle_path: mock_sidecar_script(),
+        node_binary: support::sidecar_shell_path(),
+        bundle_path: support::mock_sidecar_bundle_path(),
         env,
         idle_exit_seconds: 300,
         health_interval: Duration::from_secs(3600),
