@@ -11,6 +11,8 @@ pub fn method_manifest() -> Vec<String> {
         "overview.trend".to_string(),
         "overview.heatmap".to_string(),
         "overview.rankings".to_string(),
+        // Receipt
+        "receipt.daily".to_string(),
         // Activity
         "activity.recent".to_string(),
         "activity.list".to_string(),

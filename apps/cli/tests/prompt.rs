@@ -328,6 +328,12 @@ impl RuntimeControl for AliasConflictRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<OverviewRankingsResponseDto>> {
         self.inner.overview_rankings(req).await
     }
+    async fn receipt_daily(
+        &self,
+        req: ReceiptDailyRequestDto,
+    ) -> anyhow::Result<ReadEnvelopeDto<ReceiptDailyDto>> {
+        self.inner.receipt_daily(req).await
+    }
     async fn activity_recent(
         &self,
         req: ActivityRecentRequestDto,

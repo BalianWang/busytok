@@ -86,6 +86,12 @@ pub trait RuntimeControl: Send + Sync {
         req: OverviewRankingsRequestDto,
     ) -> Result<ReadEnvelopeDto<OverviewRankingsResponseDto>>;
 
+    // Receipt
+    async fn receipt_daily(
+        &self,
+        req: ReceiptDailyRequestDto,
+    ) -> Result<ReadEnvelopeDto<ReceiptDailyDto>>;
+
     // Activity
     async fn activity_recent(
         &self,
@@ -266,6 +272,14 @@ impl ControlDispatcher {
                 let req: OverviewRankingsRequestDto = serde_json::from_value(request.params)
                     .map_err(|e| anyhow::anyhow!("invalid params for overview.rankings: {e}"))?;
                 let dto = self.runtime.overview_rankings(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Receipt
+            "receipt.daily" => {
+                let req: ReceiptDailyRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for receipt.daily: {e}"))?;
+                let dto = self.runtime.receipt_daily(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -588,6 +602,48 @@ impl RuntimeControl for TestRuntimeControl {
     ) -> Result<ReadEnvelopeDto<OverviewRankingsResponseDto>> {
         Ok(ReadEnvelopeDto {
             data: OverviewRankingsResponseDto { rankings: vec![] },
+            generated_at_ms: 0,
+            generation_id: None,
+            readiness: ReadinessStateDto::Starting,
+            is_exact: false,
+            is_stale: true,
+            watermark_ms: None,
+            progress: None,
+            degraded_reason: None,
+        })
+    }
+
+    // ── Receipt — modular stubs ────────────────────────────────────────
+
+    async fn receipt_daily(
+        &self,
+        req: ReceiptDailyRequestDto,
+    ) -> Result<ReadEnvelopeDto<ReceiptDailyDto>> {
+        Ok(ReadEnvelopeDto {
+            data: ReceiptDailyDto {
+                date: req.date.unwrap_or_else(|| "2026-06-26".to_string()),
+                date_label: "FRI · JUN 26, 2026".to_string(),
+                timezone: "UTC".to_string(),
+                metrics: ReceiptMetricsDto {
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_hit_rate: None,
+                    cost_usd: None,
+                    cost_status: CostStatusDto::Unavailable,
+                    event_count: 0,
+                    session_count: 0,
+                    peak_hour: None,
+                },
+                top_models: vec![],
+                brand: ReceiptBrandDto {
+                    name: "BUSYTOK".to_string(),
+                    tagline: "AI CODING · TOKEN USAGE".to_string(),
+                    github: "github.com/BalianWang/busytok".to_string(),
+                    generated_at_ms: 0,
+                },
+            },
             generated_at_ms: 0,
             generation_id: None,
             readiness: ReadinessStateDto::Starting,
@@ -976,6 +1032,12 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: OverviewRankingsRequestDto,
     ) -> Result<ReadEnvelopeDto<OverviewRankingsResponseDto>> {
         (**self).overview_rankings(req).await
+    }
+    async fn receipt_daily(
+        &self,
+        req: ReceiptDailyRequestDto,
+    ) -> Result<ReadEnvelopeDto<ReceiptDailyDto>> {
+        (**self).receipt_daily(req).await
     }
     async fn activity_recent(
         &self,

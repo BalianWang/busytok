@@ -268,3 +268,34 @@ watermark_ms: number | null,
 is_exact: boolean, };
 
 export type EventSubscriptionBatchDto = { events: Array<RuntimeEventDto>, };
+
+export type ReceiptPeakHourDto = { 
+/**
+ * Reporting-TZ wall-clock hour, e.g. "14:00".
+ */
+label: string, tokens: number, };
+
+export type ReceiptModelSliceDto = { name: string, tokens: number, cost_usd: number | null, cost_status: CostStatusDto, };
+
+export type ReceiptBrandDto = { name: string, tagline: string, github: string, generated_at_ms: number, };
+
+export type ReceiptMetricsDto = { total_tokens: number, input_tokens: number, output_tokens: number, cache_read_tokens: number, 
+/**
+ * `cache_read_tokens / (input_tokens + cache_read_tokens)`, else `null`.
+ */
+cache_hit_rate: number | null, cost_usd: number | null, cost_status: CostStatusDto, event_count: number, session_count: number, peak_hour: ReceiptPeakHourDto | null, };
+
+export type ReceiptDailyRequestDto = { 
+/**
+ * `YYYY-MM-DD` in the current reporting timezone. `None` = today
+ * (server-resolved). See `receipt.daily` spec.
+ */
+date: string | null, };
+
+export type ReceiptDailyDto = { date: string, 
+/**
+ * Server-produced label, e.g. "FRI · JUN 26, 2026". Format semantics
+ * intentionally match the GUI's `src/lib/formatters.ts`; produced
+ * server-side so the future Rust render path can share the ViewModel.
+ */
+date_label: string, timezone: string, metrics: ReceiptMetricsDto, top_models: Array<ReceiptModelSliceDto>, brand: ReceiptBrandDto, };

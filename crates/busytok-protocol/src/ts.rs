@@ -159,6 +159,13 @@ mod tests {
             // Event streaming types
             dto::RuntimeEventDto::decl(),
             dto::EventSubscriptionBatchDto::decl(),
+            // Receipt (daily share image)
+            dto::ReceiptPeakHourDto::decl(),
+            dto::ReceiptModelSliceDto::decl(),
+            dto::ReceiptBrandDto::decl(),
+            dto::ReceiptMetricsDto::decl(),
+            dto::ReceiptDailyRequestDto::decl(),
+            dto::ReceiptDailyDto::decl(),
         ]
         .into_iter()
         .collect();

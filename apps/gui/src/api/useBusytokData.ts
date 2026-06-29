@@ -41,6 +41,7 @@ import type {
   PromptUseRequestDto,
   PromptUseResultDto,
   PromptSuggestTagsResponseDto,
+  ReceiptDailyDto,
   SettingsSnapshotDto,
   SettingsDiagnosticsDto,
   SettingsRecoveryActionResponseDto,
@@ -172,6 +173,18 @@ export function useOverviewRankings(range: RangePresetDto) {
     envelopeQueryOptions({
       queryKey: queryKeys.overviewRankings(range),
       queryFn: () => client.overviewRankings({ range }),
+    }),
+  );
+}
+
+// ── Receipt — daily share-image data ─────────────────────────────────
+
+export function useDailyReceipt(date: string) {
+  const client = useBusytokClient();
+  return useQuery<ReadEnvelopeDto<ReceiptDailyDto>>(
+    envelopeQueryOptions({
+      queryKey: queryKeys.receiptDaily(date),
+      queryFn: () => client.receiptDaily({ date }),
     }),
   );
 }
