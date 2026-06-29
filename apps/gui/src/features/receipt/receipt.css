@@ -249,8 +249,8 @@
   font-size: 17px;
 }
 
-/* ── Footer: in/out/cache split + cache hit rate, then centered QR,
-   then the brand line in typewriter face. */
+/* ── Footer: in/out/cache split + cache hit rate, then the dashed QR
+   stamp with scan hint, then the brand line. */
 .receipt__footer {
   position: relative;
   margin-top: 16px;

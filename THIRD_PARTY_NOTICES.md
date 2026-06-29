@@ -8,7 +8,6 @@ License, Version 1.1 (OFL). The full OFL text is shipped alongside the fonts at
 
 - **IBM Plex Mono** (Regular + SemiBold + Bold) — © IBM Corp. Source: https://github.com/IBM/plex
 - **Geist** (Regular + Bold) — © Vercel. Source: https://github.com/vercel/geist-font
-- **Special Elite** (Regular) — © Brian J.S. Kent. Source: https://fonts.google.com/specimen/Special+Elite
 
 These fonts and any derivative works remain under the OFL; the OFL does not
 extend to Busytok application code (licensed separately under the Apache
