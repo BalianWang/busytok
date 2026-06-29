@@ -52,7 +52,7 @@ function toItem(m: ReceiptModelSliceDto): ReceiptItem {
 
 function formatGeneratedTime(ms: number): string {
   // brand.generated_at_ms is the server-side issuance timestamp. Render as
-  // HH:MM in the viewer's local time — matches a real receipt's "ISSUED 22:34".
+  // HH:MM in the viewer's local time — matches a real receipt's "PRINTED 22:34".
   if (!ms) return "—";
   const d = new Date(ms);
   const hh = String(d.getHours()).padStart(2, "0");

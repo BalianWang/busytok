@@ -133,18 +133,13 @@
 .receipt__brand::after {
   content: "";
   display: block;
-  width: 44px;
+  width: 60px;
   height: 3px;
   margin: 12px auto 0;
   background: var(--r-accent);
   border-radius: 2px;
 }
-.receipt__subtitle {
-  margin-top: 12px;
-  font-size: 10.5px;
-  letter-spacing: 0.22em;
-  color: var(--r-ink-muted);
-}
+/* .receipt__subtitle removed — the brand wordmark stands alone. */
 
 .receipt__divider {
   height: 0;
@@ -274,16 +269,32 @@
   letter-spacing: 0;
   line-height: 1.4;
 }
-/* QR centered below the stats block. White background ensures scannability
-   against the cream paper. */
+/* QR stamp: dashed border + small scan hint — reads like a rubber-stamp
+   block on a real receipt, not a modern UI card. White inner background
+   keeps the QR scannable against the cream paper. */
+.receipt__qr-stamp {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin: 0 auto 10px;
+  padding: 10px 14px 12px;
+  width: fit-content;
+  background: #ffffff;
+  border: 1px dashed var(--r-divider);
+  border-radius: 2px;
+}
+.receipt__qr-hint {
+  font-family: "BusytokMono", ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  color: var(--r-ink-muted);
+  text-transform: uppercase;
+}
 .receipt__qr {
   display: block;
-  margin: 0 auto 10px;
   width: 56px;
   height: 56px;
-  background: #ffffff;
-  border: 1px solid var(--r-divider);
-  border-radius: 4px;
 }
 /* Footer brand line — the "old printer" note at the bottom of a clean
    modern receipt. */

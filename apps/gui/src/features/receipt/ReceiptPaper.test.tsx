@@ -22,12 +22,12 @@ function renderVm(dto = NORMAL_DAY) {
 describe("ReceiptPaper", () => {
   it("renders brand, ITEMS, TOTAL, and footer with summary stats", () => {
     renderVm();
-    expect(screen.getByText("BUSYTOK")).toBeDefined();
+    expect(screen.getByText("AI CODING BILL")).toBeDefined();
     expect(screen.getByText("ITEM")).toBeDefined();
     expect(screen.getByText("TOTAL")).toBeDefined();
     expect(screen.getByText(/cache hit/)).toBeDefined();
-    // Meta row carries date + ISSUED time only (no RECEIPT #serial).
-    expect(screen.getByText(/ISSUED \d{2}:\d{2}/)).toBeDefined();
+    // Meta row carries date + PRINTED time only (no RECEIPT #serial).
+    expect(screen.getByText(/PRINTED \d{2}:\d{2}/)).toBeDefined();
     expect(screen.queryByText(/RECEIPT #/)).toBeNull();
   });
 
@@ -43,21 +43,25 @@ describe("ReceiptPaper", () => {
     expect(screen.queryByText("LOCAL AUDIT ONLY")).toBeNull();
   });
 
-  it("does NOT render a separate mid-paper summary block (moved to footer)", () => {
+  it("does NOT render the old subtitle 'AI CODING · TOKEN RECEIPT'", () => {
     const { container } = renderVm();
-    expect(container.querySelector(".receipt__summary")).toBeNull();
+    expect(screen.queryByText("AI CODING · TOKEN RECEIPT")).toBeNull();
+    expect(container.querySelector(".receipt__subtitle")).toBeNull();
   });
 
-  it("renders a centered QR code without CTA text (replaces the old barcode + CTA row)", () => {
+  it("renders the QR inside a dashed-border stamp with a SCAN TO GET YOUR BILL hint", () => {
     const { container } = renderVm();
-    const qr = container.querySelector(".receipt__qr");
+    const stamp = container.querySelector(".receipt__qr-stamp");
+    expect(stamp).not.toBeNull();
+    // QR image inside the stamp.
+    const qr = stamp?.querySelector(".receipt__qr");
     expect(qr).not.toBeNull();
     expect(qr?.tagName).toBe("IMG");
     expect(qr?.getAttribute("src")).toBe("/busytok-gh-qr.svg");
-    // CTA text removed — QR stands alone, centered.
-    expect(screen.queryByText("SCAN TO STAR")).toBeNull();
-    expect(screen.queryByText("github.com/BalianWang/busytok")).toBeNull();
-    // Old qr-row / qr-cta wrappers gone.
+    // Scan hint above the QR.
+    const hint = stamp?.querySelector(".receipt__qr-hint");
+    expect(hint?.textContent).toBe("SCAN TO GET YOUR BILL");
+    // Old solid-border / CTA wrappers are gone.
     expect(container.querySelector(".receipt__qr-row")).toBeNull();
     expect(container.querySelector(".receipt__qr-cta")).toBeNull();
     expect(container.querySelector(".receipt__barcode")).toBeNull();
@@ -108,7 +112,7 @@ describe("ReceiptPaper", () => {
   it("shows the empty state when there are no models and no tokens", () => {
     const { container } = renderVm(NO_DATA);
     expect(container.querySelector(".receipt-paper__empty")).not.toBeNull();
-    expect(screen.getByText(/ISSUED —/)).toBeDefined();
+    expect(screen.getByText(/PRINTED —/)).toBeDefined();
   });
 
   it("does not render the footer stats block on empty state", () => {
