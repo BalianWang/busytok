@@ -14,10 +14,13 @@ use std::time::Duration;
 use busytok_subagent::sidecar::{SidecarError, SidecarRpcClient};
 use tokio::process::Command;
 
+#[path = "support/mod.rs"]
+mod support;
+
 /// Spawn `script` under bash with piped stdio and return `(child, client)`.
 /// `kill_on_drop(true)` ensures the child is reaped when the test ends.
 async fn spawn_client(script: &str) -> (tokio::process::Child, SidecarRpcClient) {
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(support::sidecar_shell_path());
     cmd.arg("-c").arg(script);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());

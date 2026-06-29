@@ -755,7 +755,7 @@ async fn spawn_rejects_after_3_crashes_within_5_min_window() {
     let shared_db: std::sync::Arc<std::sync::Mutex<busytok_store::Database>> =
         std::sync::Arc::new(std::sync::Mutex::new(db));
     let config = busytok_subagent::sidecar::SidecarConfig {
-        node_binary: std::path::PathBuf::from("bash"),
+        node_binary: support::sidecar_shell_path(),
         bundle_path: std::path::PathBuf::from("/dev/null"),
         env: std::collections::HashMap::new(),
         idle_exit_seconds: 300,

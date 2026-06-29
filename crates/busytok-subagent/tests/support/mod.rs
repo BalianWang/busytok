@@ -2,6 +2,12 @@
 //!
 //! Provides Windows-compatible sidecar shell + bundle path resolution
 //! so tests that spawn the mock sidecar work across all CI platforms.
+//!
+//! `#![allow(dead_code)]`: each integration test file compiles as its own
+//! crate and only uses a subset of these helpers; unused helpers must not
+//! trip `-D warnings`.
+
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
