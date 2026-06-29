@@ -33,13 +33,49 @@ fn mock_sidecar_path() -> PathBuf {
     ))
 }
 
+fn sidecar_shell_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            return PathBuf::from(program_files)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+        }
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/bin/bash")
+    }
+}
+
+fn mock_sidecar_bundle_path() -> PathBuf {
+    let path = mock_sidecar_path();
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = raw.split_once(":/") {
+            let drive = drive.to_ascii_lowercase();
+            return PathBuf::from(format!("/{drive}/{rest}"));
+        }
+        PathBuf::from(raw)
+    }
+
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
 /// Settings with pi_sidecar enabled, using system bash as the "node"
 /// binary (mock-sidecar.sh is a bash script, not a Node bundle).
 fn make_sidecar_settings() -> BusytokSettings {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
     settings.subagent.pi_sidecar.node_runtime = "system".to_string();
-    settings.subagent.pi_sidecar.system_node_path = "/bin/bash".to_string();
+    settings.subagent.pi_sidecar.system_node_path = sidecar_shell_path().to_string_lossy().to_string();
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
     settings.subagent.pi_sidecar.task_timeout_seconds = 30;
     settings
@@ -50,8 +86,8 @@ fn make_sidecar_settings() -> BusytokSettings {
 /// but with `bundle_path` set to the mock fixture (no env var needed).
 fn make_sidecar_config() -> SidecarConfig {
     SidecarConfig {
-        node_binary: PathBuf::from("bash"),
-        bundle_path: mock_sidecar_path(),
+        node_binary: sidecar_shell_path(),
+        bundle_path: mock_sidecar_bundle_path(),
         env: HashMap::new(),
         idle_exit_seconds: 300,
         health_interval: Duration::from_secs(30),

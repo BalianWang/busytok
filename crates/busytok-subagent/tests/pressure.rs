@@ -191,6 +191,37 @@ fn mock_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
     (config, db)
 }
 
+fn mock_sidecar_script() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests/fixtures/mock-sidecar.sh");
+    p
+}
+
+fn live_sidecar_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let config = SidecarConfig {
+        node_binary: std::path::PathBuf::from("bash"),
+        bundle_path: mock_sidecar_script(),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(3600),
+        task_timeout: Duration::from_secs(5),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_millis(10),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    };
+    (config, db)
+}
+
+fn missing_node_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
+    let (mut config, db) = mock_config_and_db();
+    config.node_binary = std::path::PathBuf::from("/definitely/missing/binary");
+    (config, db)
+}
+
 /// Build a responder + gate + strong Arcs (supervisor, executor) for tests
 /// that keep both alive. Returns the strong Arcs so the caller can drop them
 /// (for the "dropped" branch tests).
@@ -238,6 +269,27 @@ async fn respond_hibernate_lru_does_not_pause() {
 }
 
 #[tokio::test]
+async fn respond_hibernate_lru_failure_still_sets_action() {
+    let (config, db) = mock_config_and_db();
+    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let exec = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let gate = Arc::new(PressureGate::new());
+    let responder = PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&exec),
+        Arc::clone(&gate),
+    );
+
+    responder.respond(PressureAction::HibernateLru).await;
+
+    assert!(!gate.is_paused());
+    assert!(matches!(
+        gate.last_action(),
+        Some(PressureAction::HibernateLru)
+    ));
+}
+
+#[tokio::test]
 async fn respond_pause_new_tasks_sets_pause() {
     let (gate, responder, _sup, _exec) = mock_responder();
     responder.respond(PressureAction::PauseNewTasks).await;
@@ -259,12 +311,100 @@ async fn respond_force_kill_clears_gate() {
 }
 
 #[tokio::test]
+async fn respond_force_kill_with_live_sidecar_writes_crash_event() {
+    let (config, db) = live_sidecar_config_and_db();
+    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let exec = Arc::new(SidecarTaskExecutor::with_db(
+        Arc::clone(&sup),
+        Arc::clone(&db),
+    ));
+    let gate = Arc::new(PressureGate::new());
+    let responder = PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&exec),
+        Arc::clone(&gate),
+    );
+
+    let _ = sup.ensure_started().await.unwrap();
+    assert!(sup.try_is_running(), "precondition: sidecar should be running");
+
+    responder.respond(PressureAction::ForceKill).await;
+
+    assert!(
+        !sup.try_is_running(),
+        "force kill should leave the sidecar stopped"
+    );
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "sidecar_crash"),
+        "force-kill path must persist a sidecar_crash resource event"
+    );
+}
+
+#[tokio::test]
 async fn respond_graceful_restart_clears_gate() {
     let (gate, responder, _sup, _exec) = mock_responder();
     // ensure_started fails (mock binary exits → protocol init fails), logs
     // warning but does NOT return early. shutdown_internal is a no-op (no
     // child stored). Gate is cleared to Resume.
     responder.respond(PressureAction::GracefulRestart).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn respond_graceful_restart_with_live_sidecar_restarts_cleanly() {
+    let (config, db) = live_sidecar_config_and_db();
+    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let exec = Arc::new(SidecarTaskExecutor::with_db(
+        Arc::clone(&sup),
+        Arc::clone(&db),
+    ));
+    let gate = Arc::new(PressureGate::new());
+    let responder = PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&exec),
+        Arc::clone(&gate),
+    );
+
+    let _ = sup.ensure_started().await.unwrap();
+    assert!(sup.try_is_running(), "precondition: sidecar should be running");
+
+    responder.respond(PressureAction::GracefulRestart).await;
+
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+    assert!(
+        !sup.try_is_running(),
+        "graceful restart path should stop the current sidecar before lazy restart"
+    );
+
+    let handle = sup.ensure_started().await.unwrap();
+    let health = handle.health().await.unwrap();
+    assert_eq!(health["status"], "healthy");
+}
+
+#[tokio::test]
+async fn respond_graceful_restart_when_spawn_fails_still_resumes() {
+    let (config, db) = missing_node_config_and_db();
+    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let exec = Arc::new(SidecarTaskExecutor::with_db(
+        Arc::clone(&sup),
+        Arc::clone(&db),
+    ));
+    let gate = Arc::new(PressureGate::new());
+    let responder = PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&exec),
+        Arc::clone(&gate),
+    );
+
+    responder.respond(PressureAction::GracefulRestart).await;
+
     assert!(!gate.is_paused());
     assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
 }
@@ -299,6 +439,29 @@ async fn respond_executor_dropped_is_noop() {
     drop(exec);
     let responder = PressureResponder::new(sup_weak, exec_weak, Arc::clone(&gate));
     responder.respond(PressureAction::HibernateLru).await;
+    assert!(!gate.is_paused());
+    assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
+}
+
+#[tokio::test]
+async fn respond_supervisor_dropped_is_noop() {
+    let (dead_config, dead_db) = mock_config_and_db();
+    let dead_sup = PiSidecarSupervisor::new(dead_config, Some(dead_db));
+    let dead_sup_weak = Arc::downgrade(&dead_sup);
+    drop(dead_sup);
+
+    let (live_config, live_db) = mock_config_and_db();
+    let live_sup = PiSidecarSupervisor::new(live_config, Some(Arc::clone(&live_db)));
+    let live_exec = Arc::new(SidecarTaskExecutor::with_db(
+        Arc::clone(&live_sup),
+        Arc::clone(&live_db),
+    ));
+
+    let gate = Arc::new(PressureGate::new());
+    let responder =
+        PressureResponder::new(dead_sup_weak, Arc::downgrade(&live_exec), Arc::clone(&gate));
+    responder.respond(PressureAction::ForceKill).await;
+
     assert!(!gate.is_paused());
     assert!(matches!(gate.last_action(), Some(PressureAction::Resume)));
 }

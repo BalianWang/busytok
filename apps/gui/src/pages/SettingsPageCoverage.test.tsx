@@ -104,6 +104,7 @@ function diagnostics(overrides: Partial<SettingsDiagnosticsDto> = {}): SettingsD
     writer_queue_depth: 0,
     aggregate_lag_ms: 0,
     recent_diagnostics: [],
+    subagent: null,
     ...overrides,
   };
 }

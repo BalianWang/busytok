@@ -56,6 +56,24 @@ async fn supervisor_spawns_and_initializes() {
 }
 
 #[tokio::test]
+async fn supervisor_try_is_running_tracks_lifecycle() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    assert!(
+        !sup.try_is_running(),
+        "fresh supervisor should report not running"
+    );
+
+    let _ = sup.ensure_started().await.unwrap();
+    assert!(sup.try_is_running(), "ensure_started should make child visible");
+
+    sup.shutdown().await.unwrap();
+    assert!(
+        !sup.try_is_running(),
+        "shutdown should clear the running child"
+    );
+}
+
+#[tokio::test]
 async fn supervisor_crash_recovery_restarts_sidecar() {
     let mut cfg = mock_config();
     cfg.env
@@ -617,6 +635,50 @@ async fn supervisor_turn_auto_reuses_session_for_same_subagent() {
     let sess2 = result2["adapter_session_id"].as_str().unwrap().to_string();
     assert_eq!(sess1, sess2, "same subagent must reuse the same session");
     assert_eq!(result2["session_reused"], true);
+
+    sup.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sidecar_handle_supports_prepare_hibernate_close_and_prepare_all() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let handle = sup.ensure_started().await.unwrap();
+
+    let turn = handle
+        .turn_auto(serde_json::json!({
+            "logical_subagent_id": "sub-a",
+            "logical_subagent_name": "a",
+            "cwd": "/tmp",
+            "profile": "pi/search-cheap",
+            "prompt": "do 1",
+        }))
+        .await
+        .unwrap();
+    let sess = turn["adapter_session_id"]
+        .as_str()
+        .expect("mock sidecar should return adapter_session_id");
+
+    let prepare_one = handle.prepare_hibernate(sess).await.unwrap();
+    assert_eq!(prepare_one["stats"]["adapter_session_id"], sess);
+    assert_eq!(prepare_one["memory_delta"]["hot_summary"], "hibernated");
+
+    let close = handle.close(sess).await.unwrap();
+    assert_eq!(close["ok"], true);
+
+    let _ = handle
+        .turn_auto(serde_json::json!({
+            "logical_subagent_id": "sub-b",
+            "logical_subagent_name": "b",
+            "cwd": "/tmp",
+            "profile": "pi/search-cheap",
+            "prompt": "do 2",
+        }))
+        .await
+        .unwrap();
+    let prepare_all = handle.prepare_hibernate_all().await.unwrap();
+    assert!(prepare_all.get("memory_delta").is_some());
 
     sup.shutdown().await.unwrap();
 }

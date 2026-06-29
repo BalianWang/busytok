@@ -2,6 +2,7 @@
 
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use busytok_config::SubagentSettings;
 use busytok_store::{Database, SubagentHarnessBindingRow};
 use busytok_subagent::manager::SubagentManager;
@@ -628,6 +629,82 @@ async fn hibernate_then_show_status_is_cold_when_no_memory() {
     // hibernate leaves the subagent cold (§3.3: warm iff hot_summary IS NOT NULL).
     assert_eq!(detail.status.as_str(), "cold");
 }
+
+struct WarmMemoryExecutor;
+
+#[async_trait]
+impl TaskExecutor for WarmMemoryExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        Ok(ExecutorOutput {
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: "done".into(),
+            usage: Default::default(),
+            memory_update: MemoryUpdate {
+                current_state_summary: Some("kept warm".into()),
+                key_files: Vec::<KeyFile>::new(),
+                decisions: Vec::<String>::new(),
+                open_questions: Vec::<OpenQuestion>::new(),
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let m = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(WarmMemoryExecutor),
+    );
+    let r = m.delegate(req("warm-reviewer", "do")).await.unwrap();
+    assert_eq!(r.status.as_str(), "completed");
+
+    m.hibernate(ResolveParams {
+        id: Some(r.subagent_id.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.status.as_str(),
+        "warm",
+        "hibernate without hot binding should keep warm when memory exists"
+    );
+}
+
+#[tokio::test]
+async fn task_counts_returns_zero_when_task_table_query_fails() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let m = SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+    {
+        let db = db.lock().unwrap();
+        db.conn().execute("DROP TABLE subagent_tasks", []).unwrap();
+    }
+
+    assert_eq!(
+        m.task_counts(),
+        (0, 0),
+        "task_counts should degrade to zeroes on DB query failure"
+    );
+}
+
 
 #[tokio::test]
 async fn hibernate_closes_existing_hot_binding() {
