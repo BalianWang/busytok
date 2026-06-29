@@ -195,7 +195,11 @@ describe("summarizeHeatmapForDiagnostics", () => {
     expect(diag.total_cells).toBeGreaterThan(0);
   });
 
-  it("reports legend [0,1] and sparse=true for a few active days (sparse binning path)", () => {
+  it("uses full 5-tier legend for a few active days (sparse does not collapse to [0,1])", () => {
+    // Two days with token counts that differ enough to land in different
+    // quartile bins — the sparse path must not force them to the same
+    // intensity (the original bug collapsed all sparse-active cells to
+    // intensity=1, making the heatmap color-flat).
     const model = buildOverviewHeatmapModel({
       today: "2025-06-15",
       week_starts_on: 0,
@@ -205,9 +209,20 @@ describe("summarizeHeatmapForDiagnostics", () => {
       ],
     });
     const diag = summarizeHeatmapForDiagnostics(model);
-    expect(diag.legend_levels).toEqual([0, 1]);
+    expect(diag.legend_levels).toEqual([0, 1, 2, 3, 4]);
     expect(diag.active_days).toBe(2);
     expect(diag.sparse).toBe(true);
+
+    // The two active days must map to different intensities so the
+    // heatmap shows color variation — the core of the bug fix.
+    const activeDays = model.columns
+      .flatMap((c) => c.days)
+      .filter((d) => d.isActive);
+    expect(activeDays).toHaveLength(2);
+    const intensities = activeDays.map((d) => d.intensity).sort((a, b) => a - b);
+    expect(intensities[0]).not.toBe(intensities[1]);
+    expect(intensities[0]).toBeGreaterThan(0);
+    expect(intensities[1]).toBeLessThanOrEqual(4);
   });
 
   it("reports the full 5-tier ramp and sparse=false for dense activity", () => {

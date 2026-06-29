@@ -20,6 +20,10 @@
   --color-text: #1A1D23;
   --color-text-muted: #6b7280;
   --color-text-faint: #9ca3af;
+  /* Navigation text: sits between text and muted — readable primary-nav
+     rest state (sidebar items, etc.) without dragging settings helpers
+     or form descriptions up with it. */
+  --color-nav-text: #4b5563;
   /* Explicit reverse/on-accent foreground — never literal #fff */
   --color-text-reverse: rgba(255, 255, 255, 0.96);
 
@@ -151,6 +155,7 @@
   --color-hover-strong: rgba(255, 255, 255, 0.08);
   --color-text: #e6edf3;
   --color-text-muted: #8b949e;
+  --color-nav-text: #afb7c0;
   --color-text-faint: #6e7681;
   --color-text-reverse: rgba(13, 17, 23, 0.92);
 

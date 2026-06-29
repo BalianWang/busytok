@@ -16,6 +16,5 @@
     "package:macos:dmg": "packaging/macos/scripts/package_dmg.sh",
     "release:macos:dmg": "packaging/macos/scripts/package_release_dmg.sh",
     "package:macos:dmg:release": "packaging/macos/scripts/package_release_dmg.sh"
-  },
-  "devDependencies": {}
+  }
 }

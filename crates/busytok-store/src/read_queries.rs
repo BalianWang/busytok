@@ -39,6 +39,31 @@ fn parse_sort_cursor(cursor: Option<&str>) -> Result<Option<SortCursor>> {
     Ok(Some(payload))
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ActivityCursor {
+    t: i64,
+    i: String,
+}
+
+fn encode_activity_cursor(timestamp_ms: i64, id: &str) -> Result<String> {
+    let payload = ActivityCursor {
+        t: timestamp_ms,
+        i: id.to_string(),
+    };
+    let bytes = serde_json::to_vec(&payload).context("failed to serialize activity cursor")?;
+    Ok(hex::encode(bytes))
+}
+
+fn parse_activity_cursor(cursor: Option<&str>) -> Result<Option<(i64, String)>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(cursor).context("invalid activity cursor encoding")?;
+    let payload: ActivityCursor =
+        serde_json::from_slice(&bytes).context("invalid activity cursor payload")?;
+    Ok(Some((payload.t, payload.i)))
+}
+
 fn append_source_health_status_filter(
     sql: &mut String,
     args: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -337,6 +362,10 @@ pub fn read_live_window_exact(
 
 /// Read a paginated activity list from usage_events.
 ///
+/// Uses the "peek one extra" cursor-pagination pattern: requests
+/// `page_size + 1` rows; if that many come back, there is a next page
+/// and the extra row is popped and used to derive `next_cursor`.
+///
 /// Returns events ordered by `timestamp_ms DESC, id DESC`.
 pub fn read_activity_list(
     conn: &Connection,
@@ -344,8 +373,11 @@ pub fn read_activity_list(
     start_ms: i64,
     end_ms: i64,
     limit: i64,
-    cursor: Option<(i64, String)>,
-) -> Result<Vec<ActivityListRow>> {
+    cursor: Option<&str>,
+) -> Result<CursorPage<ActivityListRow>> {
+    let page_size = limit.clamp(1, 500);
+    let query_limit = page_size + 1;
+    let parsed_cursor = parse_activity_cursor(cursor)?;
     let sql = if cursor.is_some() {
         "SELECT \
             id, \
@@ -426,26 +458,38 @@ pub fn read_activity_list(
         })
     };
 
-    let rows = match &cursor {
+    let rows = match &parsed_cursor {
         Some((cursor_ts, cursor_id)) => stmt.query_map(
             params![
                 generation_id,
                 start_ms,
                 end_ms,
-                limit,
+                query_limit,
                 cursor_ts,
                 cursor_id.as_str()
             ],
             map_row,
         )?,
-        None => stmt.query_map(params![generation_id, start_ms, end_ms, limit], map_row)?,
+        None => stmt.query_map(
+            params![generation_id, start_ms, end_ms, query_limit],
+            map_row,
+        )?,
     };
 
-    let mut results = Vec::new();
+    let mut items = Vec::new();
     for row in rows {
-        results.push(row?);
+        items.push(row?);
     }
-    Ok(results)
+
+    let next_cursor = if items.len() > page_size as usize {
+        items.pop().expect("extra cursor row exists");
+        let last = items.last().expect("visible cursor row exists");
+        Some(encode_activity_cursor(last.happened_at_ms, &last.id)?)
+    } else {
+        None
+    };
+
+    Ok(CursorPage { items, next_cursor })
 }
 
 /// Read bounded activity rows filtered by a breakdown detail dimension.
@@ -2007,7 +2051,8 @@ pub fn read_activity_recent(
     end_ms: i64,
     limit: u32,
 ) -> Result<Vec<ActivityListRow>> {
-    read_activity_list(conn, _generation_id, start_ms, end_ms, limit as i64, None)
+    let page = read_activity_list(conn, _generation_id, start_ms, end_ms, limit as i64, None)?;
+    Ok(page.items)
 }
 
 // ── Daily usage read queries (IANA timezone path) ───────────────────────────
@@ -2070,6 +2115,139 @@ pub fn read_overview_trend_from_daily_usage(
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Hero token/cost totals for one receipt day from `daily_usage`.
+/// (The row structs resolve via the file's existing `use crate::read_models::*;`
+/// glob import — do not re-import them.)
+pub fn read_daily_receipt_totals(
+    conn: &Connection,
+    timezone: &str,
+    date: &str,
+    generation_id: &str,
+) -> Result<ReceiptDailyTotalsRow> {
+    conn.query_row(
+        "SELECT
+            COALESCE(SUM(total_tokens), 0),
+            COALESCE(SUM(input_tokens), 0),
+            COALESCE(SUM(output_tokens), 0),
+            COALESCE(SUM(cache_read_tokens), 0),
+            SUM(cost_usd),
+            COALESCE(SUM(event_count), 0),
+            COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN event_count ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN event_count ELSE 0 END), 0)
+         FROM daily_usage
+         WHERE timezone = ?1 AND date = ?2 AND generation_id = ?3",
+        params![timezone, date, generation_id],
+        |row| {
+            let with_cost: i64 = row.get(6)?;
+            let without_cost: i64 = row.get(7)?;
+            Ok(ReceiptDailyTotalsRow {
+                total_tokens: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+                cache_read_tokens: row.get(3)?,
+                cost_usd: row.get(4)?,
+                event_count: row.get(5)?,
+                has_cost: with_cost > 0,
+                has_no_cost: without_cost > 0,
+            })
+        },
+    )
+    .context("failed to read daily receipt totals")
+}
+
+/// Per-model day slices for the receipt items section, ranked by tokens desc.
+pub fn read_daily_receipt_top_models(
+    conn: &Connection,
+    timezone: &str,
+    date: &str,
+    generation_id: &str,
+) -> Result<Vec<ReceiptModelSliceRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                model,
+                COALESCE(SUM(total_tokens), 0),
+                SUM(cost_usd),
+                COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN event_count ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN event_count ELSE 0 END), 0)
+             FROM daily_usage
+             WHERE timezone = ?1 AND date = ?2 AND generation_id = ?3
+             GROUP BY model
+             ORDER BY COALESCE(SUM(total_tokens), 0) DESC, model ASC",
+        )
+        .context("failed to prepare read_daily_receipt_top_models")?;
+    let rows = stmt.query_map(params![timezone, date, generation_id], |row| {
+        let with_cost: i64 = row.get(3)?;
+        let without_cost: i64 = row.get(4)?;
+        Ok(ReceiptModelSliceRow {
+            name: row.get(0)?,
+            tokens: row.get(1)?,
+            cost_usd: row.get(2)?,
+            has_cost: with_cost > 0,
+            has_no_cost: without_cost > 0,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Distinct session count within a reporting-TZ `[start_ms, end_ms)` window.
+///
+/// Deliberately queries `usage_events` by `timestamp_ms` — NOT
+/// `usage_by_session_day.date` (UTC-derived) nor `last_active_at_ms`, both of
+/// which miscount sessions that straddle the UTC/reporting-TZ day boundary.
+/// `idx_usage_events_time` makes the day-window scan efficient.
+pub fn read_session_count_for_window(
+    conn: &Connection,
+    generation_id: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT session_id)
+         FROM usage_events
+         WHERE generation_id = ?1
+           AND timestamp_ms >= ?2 AND timestamp_ms < ?3
+           AND session_id IS NOT NULL AND session_id <> ''",
+        params![generation_id, start_ms, end_ms],
+        |row| row.get(0),
+    )
+    .context("failed to read session count for receipt window")
+}
+
+/// The highest-token UTC hour bucket in `[start_ms, end_ms)`, or `None` if the
+/// day has no buckets. Caller converts `bucket_start_ms` to a reporting-TZ hour.
+///
+/// Known limitation: `bucket_start_ms` is UTC-aligned and the caller formats it
+/// to a reporting-TZ hour via `rem_euclid(24)`. On DST transition days (2/year
+/// per IANA zone) the offset shifts, so the label may be off by ±1h for those
+/// two days. This is acceptable for a "peak hour" summary stat.
+pub fn read_peak_hour_for_window(
+    conn: &Connection,
+    generation_id: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Option<PeakHourRow>> {
+    conn.query_row(
+        "SELECT bucket_start_ms, COALESCE(SUM(total_tokens), 0) AS t
+         FROM usage_buckets_hour
+         WHERE generation_id = ?1
+           AND bucket_start_ms >= ?2 AND bucket_start_ms < ?3
+         GROUP BY bucket_start_ms
+         ORDER BY t DESC, bucket_start_ms ASC
+         LIMIT 1",
+        params![generation_id, start_ms, end_ms],
+        |row| {
+            Ok(PeakHourRow {
+                bucket_start_ms: row.get(0)?,
+                tokens: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed to read peak hour for receipt window")
 }
 
 /// Read summary totals from the materialized `daily_usage` table.
@@ -2345,8 +2523,9 @@ mod tests {
     #[test]
     fn read_activity_list_returns_empty_for_no_data() {
         let db = Database::open_in_memory().unwrap();
-        let rows = read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
-        assert!(rows.is_empty());
+        let page = read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]
@@ -2380,8 +2559,10 @@ mod tests {
 
         insert_usage_events_batch_returning_inserted(conn, &[e], "gen1").unwrap();
 
-        let rows = read_activity_list(conn, "gen1", 0, now + 1, 10, None).unwrap();
+        let page = read_activity_list(conn, "gen1", 0, now + 1, 10, None).unwrap();
+        let rows = &page.items;
         assert_eq!(rows.len(), 1);
+        assert_eq!(page.next_cursor, None);
         assert_eq!(rows[0].prompt_input_total_tokens, 1000);
         assert_eq!(rows[0].prompt_input_non_cached_tokens, 10);
         assert_eq!(rows[0].cache_read_tokens, 990);
@@ -2888,5 +3069,167 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tokens, 400); // 100 + 300 grouped into one IANA day
         assert_eq!(rows[0].event_count, 2);
+    }
+
+    #[test]
+    fn read_daily_receipt_totals_aggregates_one_date() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        for model in ["claude-sonnet-4-5", "gpt-5.1"] {
+            conn.execute(
+                "INSERT INTO daily_usage (date, timezone, agent, project_hash, model, \
+                 input_tokens, output_tokens, total_tokens, cached_input_tokens, \
+                 cache_creation_tokens, cache_read_tokens, reasoning_tokens, \
+                 thoughts_tokens, tool_tokens, cost_usd, estimated_cost_usd, event_count, generation_id) \
+                 VALUES ('2026-06-26', 'Asia/Shanghai', 'claude_code', '', ?1, \
+                 100, 200, 300, 0, 10, 90, 0, 0, 0, 0.05, NULL, 1, 'gen-r')",
+                params![model],
+            )
+            .unwrap();
+        }
+        // A row with NULL cost on a different date — must be excluded.
+        conn.execute(
+            "INSERT INTO daily_usage (date, timezone, agent, project_hash, model, \
+             input_tokens, output_tokens, total_tokens, cached_input_tokens, \
+             cache_creation_tokens, cache_read_tokens, reasoning_tokens, \
+             thoughts_tokens, tool_tokens, cost_usd, estimated_cost_usd, event_count, generation_id) \
+             VALUES ('2026-06-27', 'Asia/Shanghai', 'claude_code', '', 'claude-sonnet-4-5', \
+             1, 1, 2, 0, 0, 0, 0, 0, 0, NULL, NULL, 1, 'gen-r')",
+            [],
+        )
+        .unwrap();
+
+        let t = read_daily_receipt_totals(conn, "Asia/Shanghai", "2026-06-26", "gen-r").unwrap();
+        assert_eq!(t.total_tokens, 600); // 300 + 300
+        assert_eq!(t.input_tokens, 200);
+        assert_eq!(t.output_tokens, 400);
+        assert_eq!(t.cache_read_tokens, 180);
+        assert_eq!(t.cost_usd, Some(0.10));
+        assert_eq!(t.event_count, 2);
+        assert!(t.has_cost);
+        assert!(!t.has_no_cost);
+    }
+
+    #[test]
+    fn read_daily_receipt_totals_empty_day_is_zero() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let t = read_daily_receipt_totals(conn, "Asia/Shanghai", "2026-06-26", "gen-r").unwrap();
+        assert_eq!(t.total_tokens, 0);
+        assert_eq!(t.event_count, 0);
+        assert!(t.cost_usd.is_none());
+        assert!(!t.has_cost);
+        assert!(!t.has_no_cost); // no rows → neither flag set
+    }
+
+    #[test]
+    fn read_daily_receipt_top_models_orders_by_tokens_and_flags_partial_cost() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        // model A: exact cost, 300 tokens. model B: NULL cost (partial), 500 tokens.
+        conn.execute(
+            "INSERT INTO daily_usage (date, timezone, agent, project_hash, model, \
+             input_tokens, output_tokens, total_tokens, cached_input_tokens, \
+             cache_creation_tokens, cache_read_tokens, reasoning_tokens, \
+             thoughts_tokens, tool_tokens, cost_usd, estimated_cost_usd, event_count, generation_id) \
+             VALUES ('2026-06-26', 'UTC', 'claude_code', '', 'model-a', \
+             100, 200, 300, 0, 0, 0, 0, 0, 0, 0.05, NULL, 1, 'gen-r')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO daily_usage (date, timezone, agent, project_hash, model, \
+             input_tokens, output_tokens, total_tokens, cached_input_tokens, \
+             cache_creation_tokens, cache_read_tokens, reasoning_tokens, \
+             thoughts_tokens, tool_tokens, cost_usd, estimated_cost_usd, event_count, generation_id) \
+             VALUES ('2026-06-26', 'UTC', 'claude_code', '', 'model-b', \
+             200, 300, 500, 0, 0, 0, 0, 0, 0, NULL, NULL, 1, 'gen-r')",
+            [],
+        )
+        .unwrap();
+
+        let models = read_daily_receipt_top_models(conn, "UTC", "2026-06-26", "gen-r").unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "model-b"); // 500 > 300
+        assert_eq!(models[0].tokens, 500);
+        assert!(models[0].has_no_cost);
+        assert!(!models[0].has_cost);
+        assert!(models[1].has_cost);
+        assert!(!models[1].has_no_cost);
+    }
+
+    #[test]
+    fn read_session_count_uses_ms_window_not_utc_date() {
+        // Regression: the +08:00 Jun-26 day window is [2026-06-25T16:00Z,
+        // 2026-06-26T16:00Z). sess-a fires at 2026-06-25T17:00Z — its UTC date is
+        // Jun 25 but it belongs to the reporting-TZ Jun 26 day, so a UTC-date-based
+        // count (usage_by_session_day.date) would miss it. The ms-window count on
+        // usage_events must include it. All NOT NULL no-default usage_events columns
+        // are populated (schema 0001_baseline.sql:33-77).
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let start_ms = 1_782_403_200_000i64; // 2026-06-25T16:00:00Z = +08:00 Jun 26 00:00
+        let end_ms = start_ms + 86_400_000;
+
+        let insert_event = |conn: &Connection, id: &str, session: &str, ts_ms: i64, dk: &str| {
+            conn.execute(
+                "INSERT INTO usage_events (id, agent, source_file_id, source_path, source_line, \
+                 source_offset_start, source_offset_end, session_id, timestamp_ms, model, \
+                 total_tokens, cost_usd, cost_source, raw_event_hash, is_error, generation_id, \
+                 dedupe_key, created_at_ms, updated_at_ms) \
+                 VALUES (?1, 'claude_code', 'f1', '/tmp/t.jsonl', 0, 0, 0, ?2, ?3, 'm', 10, NULL, \
+                 'unknown', '', 0, 'gen-r', ?4, 0, 0)",
+                params![id, session, ts_ms, dk],
+            )
+            .unwrap();
+        };
+
+        // sess-a: 2026-06-25T17:00Z — UTC date Jun 25, reporting-TZ date Jun 26 (boundary).
+        insert_event(conn, "e1", "sess-a", start_ms + 3_600_000, "dk1");
+        insert_event(conn, "e2", "sess-a", start_ms + 3_660_000, "dk2"); // same session
+                                                                         // sess-b: 2026-06-26T10:00Z — clearly inside the window.
+        insert_event(conn, "e3", "sess-b", start_ms + 64_800_000, "dk3");
+        // sess-c: outside the window — must be excluded.
+        insert_event(conn, "e4", "sess-c", end_ms + 1, "dk4");
+
+        let count = read_session_count_for_window(conn, "gen-r", start_ms, end_ms).unwrap();
+        assert_eq!(
+            count, 2,
+            "sess-a and sess-b are in the window; sess-c is not"
+        );
+    }
+
+    #[test]
+    fn read_peak_hour_for_window_picks_max_bucket() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO usage_buckets_hour (generation_id, bucket_start_ms, agent, model, \
+             total_tokens, cost_status, event_count, created_at_ms, updated_at_ms) \
+             VALUES ('gen-r', ?1, 'claude_code', 'm', 100, 'exact', 1, 0, 0)",
+            params![1_781_600_400_000i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_buckets_hour (generation_id, bucket_start_ms, agent, model, \
+             total_tokens, cost_status, event_count, created_at_ms, updated_at_ms) \
+             VALUES ('gen-r', ?1, 'claude_code', 'm', 500, 'exact', 1, 0, 0)",
+            params![1_781_600_400_000i64 + 3_600_000],
+        )
+        .unwrap();
+        let start_ms = 1_781_600_000_000i64;
+        let peak =
+            read_peak_hour_for_window(conn, "gen-r", start_ms, start_ms + 86_400_000).unwrap();
+        let peak = peak.expect("a peak bucket exists");
+        assert_eq!(peak.tokens, 500);
+        assert_eq!(peak.bucket_start_ms, 1_781_600_400_000i64 + 3_600_000);
+    }
+
+    #[test]
+    fn read_peak_hour_for_window_empty_is_none() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let peak = read_peak_hour_for_window(conn, "gen-r", 0, 86_400_000).unwrap();
+        assert!(peak.is_none());
     }
 }

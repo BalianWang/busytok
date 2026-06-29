@@ -1025,21 +1025,56 @@ fn read_activity_list_returns_events_in_desc_order() {
     let db = Database::open_in_memory().unwrap();
     seed_events_in_generation(&db, "gen-1");
 
-    let rows = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
-    assert_eq!(rows.len(), 3);
+    let page = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+    assert_eq!(page.items.len(), 3);
+    assert!(page.next_cursor.is_none());
     // Ordered by timestamp_ms DESC
-    assert_eq!(rows[0].happened_at_ms, 3000);
-    assert_eq!(rows[1].happened_at_ms, 2000);
-    assert_eq!(rows[2].happened_at_ms, 1000);
+    assert_eq!(page.items[0].happened_at_ms, 3000);
+    assert_eq!(page.items[1].happened_at_ms, 2000);
+    assert_eq!(page.items[2].happened_at_ms, 1000);
 }
 
 #[test]
-fn read_activity_list_respects_limit() {
+fn read_activity_list_respects_limit_and_signals_next_page() {
     let db = Database::open_in_memory().unwrap();
     seed_events_in_generation(&db, "gen-1");
 
-    let rows = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 2, None).unwrap();
-    assert_eq!(rows.len(), 2);
+    let page = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 2, None).unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert!(
+        page.next_cursor.is_some(),
+        "next_cursor should be set when there are more pages"
+    );
+}
+
+#[test]
+fn read_activity_list_cursor_pagination() {
+    let db = Database::open_in_memory().unwrap();
+    seed_events_in_generation(&db, "gen-1");
+
+    // Page 1: limit=2, should return 2 items with a next_cursor
+    let page1 = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 2, None).unwrap();
+    assert_eq!(page1.items.len(), 2);
+    assert!(page1.next_cursor.is_some());
+    assert_eq!(page1.items[0].happened_at_ms, 3000);
+    assert_eq!(page1.items[1].happened_at_ms, 2000);
+
+    // Page 2: use the cursor from page 1, should return last item with no next_cursor
+    let page2 = read_queries::read_activity_list(
+        db.conn(),
+        "gen-1",
+        0,
+        10000,
+        2,
+        page1.next_cursor.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(page2.items.len(), 1);
+    assert!(
+        page2.next_cursor.is_none(),
+        "last page should have no next_cursor"
+    );
+    assert_eq!(page2.items[0].happened_at_ms, 1000);
 }
 
 #[test]
@@ -1093,7 +1128,8 @@ fn read_activity_list_maps_input_and_cached_tokens() {
         )
         .unwrap();
 
-    let rows = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+    let page = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+    let rows = &page.items;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].total_tokens, 500);
     assert_eq!(rows[0].input_tokens, 400);
@@ -1118,7 +1154,8 @@ fn read_activity_list_maps_zero_tokens_correctly() {
         )
         .unwrap();
 
-    let rows = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+    let page = read_queries::read_activity_list(db.conn(), "gen-1", 0, 10000, 10, None).unwrap();
+    let rows = &page.items;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].input_tokens, 0);
     assert_eq!(rows[0].cached_input_tokens, 0);

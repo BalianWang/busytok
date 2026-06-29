@@ -36,6 +36,8 @@ import type {
   PromptUseResultDto,
   PromptSuggestTagsRequestDto,
   PromptSuggestTagsResponseDto,
+  ReceiptDailyDto,
+  ReceiptDailyRequestDto,
   ReadEnvelopeDto,
   SettingsDiagnosticsDto,
   SettingsRecoveryActionRequestDto,
@@ -103,6 +105,8 @@ export function createBusytokClient(deps: { invoke: InvokeFn }) {
     // Overview — modular envelope methods
     overviewSummary: (request: OverviewSummaryRequestDto) =>
       call<ReadEnvelopeDto<OverviewSummaryDto>>("overview.summary", { ...request }),
+    receiptDaily: (request: ReceiptDailyRequestDto) =>
+      call<ReadEnvelopeDto<ReceiptDailyDto>>("receipt.daily", { ...request }),
     overviewTrend: (request: OverviewTrendRequestDto) =>
       call<ReadEnvelopeDto<OverviewTrendResponseDto>>("overview.trend", { ...request }),
     overviewHeatmap: (request: OverviewHeatmapRequestDto) =>

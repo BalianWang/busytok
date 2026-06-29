@@ -16,6 +16,7 @@ pub mod queue;
 pub mod range;
 pub mod read_service;
 pub mod rebuild;
+pub mod receipt;
 pub mod sampler;
 pub mod scan;
 pub mod service_app;

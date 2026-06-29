@@ -10,7 +10,7 @@
  * - > $0      → 6 decimals  ($0.000001)
  * - = $0      → "$0.00"
  */
-function formatCostValue(cost_usd: number): string {
+export function formatCostValue(cost_usd: number): string {
   if (cost_usd === 0) return "$0.00";
   const abs = Math.abs(cost_usd);
   const decimals =

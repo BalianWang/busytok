@@ -116,12 +116,6 @@ enum DatabaseHandle<'a> {
     Detached(Database),
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct ActivitySortCursor {
-    t: i64,
-    i: String,
-}
-
 impl Deref for DatabaseHandle<'_> {
     type Target = Database;
 
@@ -1586,20 +1580,6 @@ fn to_store_exact_windows(
         .collect()
 }
 
-fn decode_activity_cursor(cursor: &str) -> Result<(i64, String)> {
-    let bytes = hex::decode(cursor).context("invalid cursor: not valid hex")?;
-    let payload: ActivitySortCursor =
-        serde_json::from_slice(&bytes).context("invalid cursor: JSON parse error")?;
-    Ok((payload.t, payload.i))
-}
-
-fn encode_activity_cursor(timestamp_ms: i64, id: &str) -> Result<String> {
-    Ok(hex::encode(serde_json::to_vec(&ActivitySortCursor {
-        t: timestamp_ms,
-        i: id.to_string(),
-    })?))
-}
-
 fn aggregate_trend_bucket(
     bucket: &range::TrendBucketWindow,
     granularity: &TrendBucketGranularityDto,
@@ -2388,6 +2368,81 @@ impl RuntimeControl for BusytokSupervisor {
         )
     }
 
+    // ── Receipt ──────────────────────────────────────────────────────
+
+    async fn receipt_daily(
+        &self,
+        req: ReceiptDailyRequestDto,
+    ) -> Result<ReadEnvelopeDto<ReceiptDailyDto>> {
+        let now_ms = busytok_domain::now_ms();
+        let (timezone, _week_starts_on) = self.timezone_and_weekday();
+        let rtz = range::parse_timezone(&timezone).unwrap_or_else(|_| {
+            warn!(event_code = "receipt.daily_tz_fallback", timezone = %timezone, "timezone parse failed, falling back to UTC");
+            ReportingTimezone::utc()
+        });
+        let date = match req.date {
+            Some(d) => d,
+            None => rtz.local_date_for_timestamp_ms(now_ms).unwrap_or_else(|_| {
+                warn!(
+                    event_code = "receipt.daily_date_fallback",
+                    "local date resolve failed, falling back to 1970-01-01 — receipt will be empty"
+                );
+                "1970-01-01".to_string()
+            }),
+        };
+        let start_ms = rtz.civil_date_to_utc_start_ms(&date)?;
+        let end_ms = rtz.civil_date_to_utc_start_ms(&rtz.next_civil_date(&date)?)?;
+        let generation_id = self.active_generation_id_from_snapshot().await?;
+
+        let tz_name = rtz.canonical_name().to_string();
+        let date_for_closure = date.clone();
+        let gen_for_closure = generation_id.clone();
+        let data = self
+            .run_read_with_mode("receipt.daily", "receipt_daily", true, move |conn| {
+                let totals = busytok_store::read_queries::read_daily_receipt_totals(
+                    conn,
+                    &tz_name,
+                    &date_for_closure,
+                    &gen_for_closure,
+                )?;
+                let models = busytok_store::read_queries::read_daily_receipt_top_models(
+                    conn,
+                    &tz_name,
+                    &date_for_closure,
+                    &gen_for_closure,
+                )?;
+                let session_count = busytok_store::read_queries::read_session_count_for_window(
+                    conn,
+                    &gen_for_closure,
+                    start_ms,
+                    end_ms,
+                )?;
+                let peak_hour = busytok_store::read_queries::read_peak_hour_for_window(
+                    conn,
+                    &gen_for_closure,
+                    start_ms,
+                    end_ms,
+                )?;
+                Ok(crate::receipt::ReceiptDailyData {
+                    totals,
+                    models,
+                    session_count,
+                    peak_hour,
+                })
+            })
+            .await?;
+
+        let dto = crate::receipt::assemble_receipt_daily(data, &rtz, &date, now_ms)?;
+        tracing::info!(
+            event_code = "receipt.daily_served",
+            date = %date,
+            model_count = dto.top_models.len(),
+            total_tokens = dto.metrics.total_tokens,
+            "served daily receipt"
+        );
+        self.build_read_envelope(dto, now_ms)
+    }
+
     async fn overview_trend(
         &self,
         req: OverviewTrendRequestDto,
@@ -2821,32 +2876,31 @@ impl RuntimeControl for BusytokSupervisor {
         let (year, month, day) = rtz.today_civil_ymd().unwrap_or((2026, 1, 1));
         let range = range::resolve_range(&rtz, year, month, day, req.range, week_starts_on);
         let generation_id = self.active_generation_id_from_snapshot().await?;
-        let cursor = req
-            .cursor
-            .as_deref()
-            .map(decode_activity_cursor)
-            .transpose()?;
+        let cursor = req.cursor.as_deref();
         let limit = req.limit.unwrap_or(100).clamp(1, 500) as i64;
         let list_generation_id = generation_id.clone();
-        let list_cursor = cursor.clone();
-        let list_rows: Vec<busytok_store::read_models::ActivityListRow> = self
+        let list_cursor = cursor.map(|s| s.to_string());
+        let list_page: busytok_store::read_models::CursorPage<
+            busytok_store::read_models::ActivityListRow,
+        > = self
             .run_read_with_mode("activity.list", "activity_list", false, move |conn| {
-                let rows = busytok_store::read_queries::read_activity_list(
+                let page = busytok_store::read_queries::read_activity_list(
                     conn,
                     &list_generation_id,
                     range.start_ms,
                     range.end_ms,
                     limit,
-                    list_cursor,
+                    list_cursor.as_deref(),
                 )?;
-                let row_count = rows.len();
+                let row_count = page.items.len();
                 Ok(crate::read_service::ReadOutcome::with_row_count(
-                    rows, row_count,
+                    page, row_count,
                 ))
             })
             .await?;
 
-        let items: Vec<ActivityListItemDto> = list_rows
+        let items: Vec<ActivityListItemDto> = list_page
+            .items
             .iter()
             .map(Self::activity_item_from_read_row)
             .collect();
@@ -2877,10 +2931,7 @@ impl RuntimeControl for BusytokSupervisor {
             ActivityListResponseDto {
                 generated_at_ms: now_ms,
                 items,
-                next_cursor: list_rows
-                    .last()
-                    .map(|last| encode_activity_cursor(last.happened_at_ms, &last.id))
-                    .transpose()?,
+                next_cursor: list_page.next_cursor,
                 summary,
             },
             now_ms,

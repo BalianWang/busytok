@@ -33,6 +33,9 @@ describe("tokens.css contract", () => {
     expect(css).toContain("--color-data-live-primary-soft:");
     expect(css).toContain("--material-shadow-card:");
     expect(css).toContain("--toggle-track-active:");
+    // Navigation token: dedicated semantic for primary-nav rest state,
+    // distinct from secondary/helper copy (--color-text-muted).
+    expect(css).toContain("--color-nav-text:");
 
     // The cyan secondary identity is removed rather than remapped
     expect(css).not.toContain("--app-secondary");
@@ -67,6 +70,10 @@ describe("tokens.css contract", () => {
 
   it("defines a dark theme block that overrides key tokens", () => {
     expect(tokensCss).toContain(':root[data-theme="dark"]');
+    const darkStart = tokensCss.indexOf(':root[data-theme="dark"]');
+    expect(darkStart).toBeGreaterThan(-1);
+    const dark = tokensCss.slice(darkStart);
+    expect(dark).toContain("--color-nav-text:");
   });
 
   it("defines dedicated live-curve tokens for both light and dark themes", () => {

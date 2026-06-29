@@ -174,6 +174,13 @@ mod tests {
             dto::SubagentTasksResponseDto::decl(),
             dto::SubagentDeleteRequestDto::decl(),
             dto::SubagentAckDto::decl(),
+            // Receipt (daily share image)
+            dto::ReceiptPeakHourDto::decl(),
+            dto::ReceiptModelSliceDto::decl(),
+            dto::ReceiptBrandDto::decl(),
+            dto::ReceiptMetricsDto::decl(),
+            dto::ReceiptDailyRequestDto::decl(),
+            dto::ReceiptDailyDto::decl(),
         ]
         .into_iter()
         .collect();

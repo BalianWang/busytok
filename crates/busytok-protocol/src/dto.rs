@@ -1391,6 +1391,73 @@ pub struct SubagentAckDto {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+
+// ─── Receipt DTOs (from main merge) ───
+pub struct ReceiptDailyRequestDto {
+    /// `YYYY-MM-DD` in the current reporting timezone. `None` = today
+    /// (server-resolved). See `receipt.daily` spec.
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ReceiptDailyDto {
+    pub date: String,
+    /// Server-produced label, e.g. "FRI · JUN 26, 2026". Format semantics
+    /// intentionally match the GUI's `src/lib/formatters.ts`; produced
+    /// server-side so the future Rust render path can share the ViewModel.
+    pub date_label: String,
+    pub timezone: String,
+    pub metrics: ReceiptMetricsDto,
+    pub top_models: Vec<ReceiptModelSliceDto>,
+    pub brand: ReceiptBrandDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ReceiptMetricsDto {
+    pub total_tokens: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// `cache_read_tokens / (input_tokens + cache_read_tokens)`, else `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub cost_status: CostStatusDto,
+    pub event_count: i64,
+    pub session_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_hour: Option<ReceiptPeakHourDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ReceiptPeakHourDto {
+    /// Reporting-TZ wall-clock hour, e.g. "14:00".
+    pub label: String,
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ReceiptModelSliceDto {
+    pub name: String,
+    pub tokens: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub cost_status: CostStatusDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ReceiptBrandDto {
+    pub name: String,
+    pub tagline: String,
+    pub github: String,
+    pub generated_at_ms: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 mod tests {
     use super::*;
     use serde_json;

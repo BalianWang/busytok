@@ -236,3 +236,47 @@ pub async fn desktop_background_service_repair(
         .await
         .map_err(|e| format!("service repair failed: {e}"))
 }
+
+// ── Receipt PNG save command ───────────────────────────────────────────
+
+/// Write the receipt PNG to a user-chosen path. The path comes from the
+/// `tauri-plugin-dialog` `save()` call on the JS side — that plugin only returns
+/// a path; this command performs the actual write (with tracing + typed errors).
+/// Uses `spawn_blocking` + `std::fs` because the workspace `tokio` dep does not
+/// enable the `fs` feature (see root Cargo.toml).
+#[tauri::command]
+pub async fn save_receipt_png(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    tracing::info!(
+        event_code = "tauri.save_receipt_png",
+        byte_count = bytes.len(),
+        "writing receipt PNG to user-chosen path"
+    );
+    tokio::task::spawn_blocking(move || std::fs::write(&path, &bytes))
+        .await
+        .map_err(|e| format!("receipt save task join failed: {e}"))?
+        .map_err(|e| format!("failed to write receipt PNG: {e}"))
+}
+
+#[cfg(test)]
+mod receipt_save_tests {
+    use super::save_receipt_png;
+
+    #[tokio::test]
+    async fn save_receipt_png_writes_bytes_to_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busytok-receipt-test-{}.png", uuid::Uuid::new_v4()));
+        let bytes = vec![1u8, 2, 3, 4];
+        save_receipt_png(path.to_string_lossy().to_string(), bytes.clone())
+            .await
+            .expect("write succeeds");
+        let on_disk = std::fs::read(&path).expect("file exists");
+        assert_eq!(on_disk, bytes);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn save_receipt_png_errors_on_invalid_path() {
+        let err = save_receipt_png("/no/such/dir/x.png".to_string(), vec![0u8]).await;
+        assert!(err.is_err());
+    }
+}

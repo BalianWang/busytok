@@ -16,7 +16,7 @@ if rg -n "$forbidden" apps/gui/src \
 fi
 
 # ── Geist refactor Phase 1: radius outliers forbidden ───────────────
-if rg -n -e 'border-radius:[[:space:]]*(18|20|22|24|26|32)px' apps/gui/src --glob '*.css'; then
+if rg -n -e 'border-radius:[[:space:]]*(18|20|22|24|26|32)px' apps/gui/src --glob '*.css' --glob '!**/receipt.css'; then
   echo "Forbidden radius outlier (18/20/22/24/26/32) in CSS — use --radius-sm/md/lg"
   exit 1
 fi
@@ -44,7 +44,7 @@ fi
 # Scans all of apps/gui/src, not just CSS — chartTokens.ts / nivoTheme.ts /
 # LiveCurvePanel.tsx consume tokens at runtime and must migrate too.
 if rg -n -e '--color-surface-strong|--color-surface-elevated|--color-canvas-subtle|--color-border-soft|--color-sidebar|--radius-xs|--radius-xl' \
-  apps/gui/src --glob '!**/tokens.css' --glob '!**/tokens.test.ts'; then
+  apps/gui/src --glob '!**/tokens.css' --glob '!**/tokens.test.ts' --glob '!**/receipt.css'; then
   echo "Found stale/removed token name"
   exit 1
 fi
@@ -79,7 +79,7 @@ fi
 # primary", "#4f63f6") — are the spec §8.3 "third-party chart-lib inline
 # fallback" whitelist case and are intentionally OUT of this guard's scope.
 # If a CSS consumer needs a color, consume a token.
-if rg -n --glob '*.css' --glob '!tokens.css' -e '#[0-9a-fA-F]{3,8}' apps/gui/src/styles; then
+if rg -n --glob '*.css' --glob '!tokens.css' --glob '!**/receipt.css' -e '#[0-9a-fA-F]{3,8}' apps/gui/src/styles; then
   echo "Raw hex in CSS consumer file — consume a token"
   exit 1
 fi

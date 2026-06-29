@@ -23,7 +23,7 @@ const mockUseOverviewTrend = vi.fn();
 const mockUseOverviewHeatmap = vi.fn();
 const mockUseOverviewRankings = vi.fn();
 const mockUseActivityRecent = vi.fn();
-const mockUseRefreshToolbar = vi.fn();
+const mockUseReceiptToolbar = vi.fn();
 
 vi.mock("../api/useBusytokData", () => ({
   DEFAULT_OVERVIEW_RANGE: "day" as const,
@@ -34,8 +34,8 @@ vi.mock("../api/useBusytokData", () => ({
   useActivityRecent: (...args: unknown[]) => mockUseActivityRecent(...args),
 }));
 
-vi.mock("../components/desktop/useRefreshToolbar", () => ({
-  useRefreshToolbar: (...args: unknown[]) => mockUseRefreshToolbar(...args),
+vi.mock("../features/receipt/useReceiptToolbar", () => ({
+  useReceiptToolbar: (...args: unknown[]) => mockUseReceiptToolbar(...args),
 }));
 
 vi.mock("../components/charts/NivoTimelineChart", () => ({
@@ -150,7 +150,7 @@ describe("OverviewPage", () => {
     ).toBeDefined();
 
     // Trend + heatmap are present as primary visual anchors.
-    expect(screen.getByRole("heading", { name: /usage trend/i })).toBeDefined();
+    expect(screen.getByRole("heading", { name: /trend/i })).toBeDefined();
     expect(screen.getByTestId("mock-trend-chart")).toBeDefined();
     expect(screen.getByTestId("mock-heatmap")).toBeDefined();
   });
