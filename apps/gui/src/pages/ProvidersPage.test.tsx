@@ -20,6 +20,7 @@ vi.mock("../logging/safeReporter", () => ({
 }));
 
 import { useProviders, useProviderMutations } from "../api/useBusytokData";
+import { reportFrontendEventSafely } from "../logging/safeReporter";
 import { ProvidersPage } from "./ProvidersPage";
 
 const mockUseProviders = vi.mocked(useProviders);
@@ -154,7 +155,9 @@ describe("ProvidersPage", () => {
   });
 
   it("submits the create form and calls createProvider.mutate", () => {
-    const createMutate = vi.fn();
+    const createMutate = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
     mockUseProviderMutations.mockReturnValue(
       mockMutations({ createMutate }),
     );
@@ -192,10 +195,15 @@ describe("ProvidersPage", () => {
       models: ["gpt-4", "gpt-3.5-turbo"],
       api_key: "sk-test",
     });
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "provider.added" }),
+    );
   });
 
   it("calls deleteProvider.mutate when Delete is clicked (after confirm)", () => {
-    const deleteMutate = vi.fn();
+    const deleteMutate = vi.fn((_id: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
     const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
     mockUseProviderMutations.mockReturnValue(
       mockMutations({ deleteMutate }),
@@ -211,6 +219,9 @@ describe("ProvidersPage", () => {
     expect(deleteMutate).toHaveBeenCalledWith(
       "deepseek-prod",
       expect.anything(),
+    );
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "provider.deleted" }),
     );
     confirmSpy.mockRestore();
   });
@@ -263,6 +274,9 @@ describe("ProvidersPage", () => {
     await waitFor(() => {
       expect(screen.getByText(/✓|connected|success/i)).toBeTruthy();
     });
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "provider.tested" }),
+    );
   });
 
   it("shows failure result when Test Connection returns ok=false", async () => {

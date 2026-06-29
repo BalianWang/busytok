@@ -4731,19 +4731,22 @@ impl RuntimeControl for BusytokSupervisor {
         if let Some(enabled) = req.enabled {
             provider.enabled = enabled;
         }
-        // api_key: None = no change; Some("") is ignored (MVP: empty string = no-op).
-        // Future: add clear_api_key: bool if clearing is needed.
-        if let Some(key) = &req.api_key {
-            if !key.is_empty() {
-                ProviderCredentialStore::set_key(&provider.id, key)
-                    .context("failed to update API key")?;
-            }
-        }
         let dto = provider_to_dto(provider);
         pending_settings.save(&self.paths)?;
         {
             let mut settings = self.settings.lock().unwrap();
             *settings = pending_settings;
+        }
+        // api_key: None = no change; Some("") is ignored (MVP: empty string = no-op).
+        // Future: add clear_api_key: bool if clearing is needed.
+        // Write keychain AFTER settings are persisted — mirrors provider_create's
+        // order so a keychain failure cannot leave the keychain and settings.toml
+        // out of sync (settings is the source of truth; orphaned key is harmless).
+        if let Some(key) = &req.api_key {
+            if !key.is_empty() {
+                ProviderCredentialStore::set_key(&req.id, key)
+                    .context("failed to update API key")?;
+            }
         }
         tracing::info!(event_code = "provider.updated", provider_id = %req.id, "provider updated");
         Ok(dto)
@@ -4774,9 +4777,17 @@ impl RuntimeControl for BusytokSupervisor {
             *settings = pending_settings;
         }
         // Delete key from keychain AFTER settings are persisted.
-        // If keychain delete fails, the orphaned key is harmless (no provider references it).
-        ProviderCredentialStore::delete_key(&req.id)
-            .context("failed to delete API key from keychain")?;
+        // If keychain delete fails, the orphaned key is harmless (no provider references it);
+        // downgrading to a warning keeps `provider_delete` resilient on platforms where the
+        // OS keychain/secret-service is unavailable (e.g. Ubuntu CI runners without D-Bus).
+        if let Err(e) = ProviderCredentialStore::delete_key(&req.id) {
+            tracing::warn!(
+                event_code = "provider.keychain_delete_failed",
+                provider_id = %req.id,
+                error = %e,
+                "failed to delete API key from keychain (orphaned key is harmless)"
+            );
+        }
         tracing::info!(event_code = "provider.deleted", provider_id = %req.id, "provider deleted");
         Ok(())
     }

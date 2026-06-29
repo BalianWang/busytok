@@ -10,7 +10,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import { useBusytokClient } from "./BusytokClientContext";
 import type { BusytokClient } from "./busytokClient";
-import { busytokClient } from "./busytokClient";
 import { queryKeys } from "./queryKeys";
 import type {
   ReadEnvelopeDto,
@@ -369,31 +368,33 @@ export function useSuggestTags(query: string | null) {
 // ── Providers ───────────────────────────────────────────────────────
 
 export function useProviders() {
+  const client = useBusytokClient();
   return useQuery({
     queryKey: queryKeys.providers(),
-    queryFn: () => busytokClient.providerList(),
+    queryFn: () => client.providerList(),
     staleTime: 30_000,
   });
 }
 
 export function useProviderMutations() {
+  const client = useBusytokClient();
   const queryClient = useQueryClient();
   const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.providers() });
 
   const createProvider = useMutation({
-    mutationFn: (req: ProviderCreateRequestDto) => busytokClient.providerCreate(req),
+    mutationFn: (req: ProviderCreateRequestDto) => client.providerCreate(req),
     onSuccess: invalidate,
   });
   const updateProvider = useMutation({
-    mutationFn: (req: ProviderUpdateRequestDto) => busytokClient.providerUpdate(req),
+    mutationFn: (req: ProviderUpdateRequestDto) => client.providerUpdate(req),
     onSuccess: invalidate,
   });
   const deleteProvider = useMutation({
-    mutationFn: (id: string) => busytokClient.providerDelete(id),
+    mutationFn: (id: string) => client.providerDelete(id),
     onSuccess: invalidate,
   });
   const testConnection = useMutation({
-    mutationFn: (id: string) => busytokClient.providerTestConnection(id),
+    mutationFn: (id: string) => client.providerTestConnection(id),
   });
 
   return { createProvider, updateProvider, deleteProvider, testConnection };
