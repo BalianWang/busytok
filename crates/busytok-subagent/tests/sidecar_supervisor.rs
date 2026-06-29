@@ -1137,9 +1137,7 @@ async fn idle_exit_with_db_writes_stop_event() {
             let db = db.lock().unwrap();
             let events = db.subagent_list_resource_events(None, 100).unwrap();
             let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-            panic!(
-                "idle exit should trigger shutdown which writes sidecar_stop: {types:?}"
-            );
+            panic!("idle exit should trigger shutdown which writes sidecar_stop: {types:?}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
