@@ -20,10 +20,50 @@ fn mock_sidecar_script() -> PathBuf {
     p
 }
 
+/// Resolve the shell binary used to launch the mock sidecar script.
+/// On Windows, bash is not on PATH by default; use Git Bash.
+fn sidecar_shell_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            return PathBuf::from(program_files)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+        }
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/bin/bash")
+    }
+}
+
+/// Convert the mock sidecar script path to a form bash can execute.
+/// On Windows, Git Bash expects MSYS-style paths (/c/users/...).
+fn mock_sidecar_bundle_path() -> PathBuf {
+    let path = mock_sidecar_script();
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = raw.split_once(":/") {
+            let drive = drive.to_ascii_lowercase();
+            return PathBuf::from(format!("/{drive}/{rest}"));
+        }
+        PathBuf::from(raw)
+    }
+
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
 fn mock_sidecar_config() -> SidecarConfig {
     SidecarConfig {
-        node_binary: PathBuf::from("bash"),
-        bundle_path: mock_sidecar_script(),
+        node_binary: sidecar_shell_path(),
+        bundle_path: mock_sidecar_bundle_path(),
         env: HashMap::new(),
         idle_exit_seconds: 300,
         health_interval: Duration::from_secs(3600),
