@@ -24,6 +24,7 @@ export type DesktopPage =
   | "overview"
   | "usage"
   | "prompt_palette"
+  | "providers"
   | "settings";
 
 interface AppShellProps {

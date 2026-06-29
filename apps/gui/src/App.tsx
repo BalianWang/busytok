@@ -7,6 +7,7 @@ import { AppShell, type DesktopPage } from "./components/AppShell";
 import { OverviewPage } from "./pages/OverviewPage";
 import { UsagePage } from "./pages/UsagePage";
 import { PromptPalettePage } from "./pages/PromptPalettePage";
+import { ProvidersPage } from "./pages/ProvidersPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { EventSubscriptionProvider } from "./api/EventSubscriptionProvider";
 import { UpdaterProvider } from "./api/UpdaterProvider";
@@ -25,6 +26,7 @@ const DESKTOP_PAGES: readonly DesktopPage[] = [
   "overview",
   "usage",
   "prompt_palette",
+  "providers",
   "settings",
 ];
 
@@ -96,6 +98,9 @@ export function App() {
       break;
     case "prompt_palette":
       pageContent = <PromptPalettePage />;
+      break;
+    case "providers":
+      pageContent = <ProvidersPage />;
       break;
     case "settings":
       pageContent = <SettingsPage />;

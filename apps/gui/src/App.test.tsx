@@ -438,10 +438,10 @@ describe("App", () => {
     });
   });
 
-  it("renders four sidebar navigation items", () => {
+  it("renders five sidebar navigation items", () => {
     renderApp(<App />);
     const sidebarItems = document.querySelectorAll(".desktop-sidebar__item");
-    expect(sidebarItems.length).toBe(4);
+    expect(sidebarItems.length).toBe(5);
   });
 
   it("renders all navigation labels", () => {
@@ -449,6 +449,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Overview" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Usage" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Prompt Palette" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Providers" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Settings" })).toBeDefined();
   });
 });
