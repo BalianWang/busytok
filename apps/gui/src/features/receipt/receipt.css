@@ -127,7 +127,8 @@
 
 /* ── Brand stamp — rectangular red-bordered "BUSYTOK" seal, tilted.
    Pill-shaped div with 2px stamp-red border + rotation, carrying only the
-   wordmark. Positioned over the items' tokens/cost columns.
+   wordmark. Positioned in the gap between TOTAL and the breakdown band
+   (created by .receipt__breakdown { margin-top: auto }).
 
    Ink-on-paper feel borrowed from the circular ReceiptStamp design:
    - Dedicated stamp red (#A94438) — deeper than --r-accent so the stamp
@@ -140,8 +141,8 @@
      clearly but reads as a residual mark, not a foreground badge. */
 .receipt-stamp {
   position: absolute;
-  top: 188px;
-  right: 28px;
+  top: 340px;
+  right: 36px;
   transform: rotate(-12deg);
   border: 2px solid #a94438;
   color: #a94438;
@@ -291,11 +292,12 @@
   font-size: 17px;
 }
 
-/* ── Breakdown — auxiliary stats band below TOTAL, centered. */
+/* ── Breakdown — auxiliary stats band, pinned to the bottom of the body.
+   margin-top:auto pushes it down so it hugs the divider above the QR block
+   (satisfying "breakdown close to the divider below"). The gap this creates
+   between TOTAL and breakdown is where the brand stamp lands. */
 .receipt__breakdown {
-  margin-top: 14px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--r-divider);
+  margin-top: auto;
   text-align: center;
 }
 .receipt__breakdown-stats {

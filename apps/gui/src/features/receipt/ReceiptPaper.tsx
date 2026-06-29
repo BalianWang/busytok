@@ -64,7 +64,10 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
               <span className="receipt__total-cost">{vm.total.cost}</span>
             </div>
 
-            {/* Breakdown — auxiliary stats band below TOTAL, centered. */}
+            {/* Breakdown — auxiliary stats band, pinned to the bottom of
+                the body (margin-top:auto) so it hugs the divider above the
+                QR block. The gap between TOTAL and breakdown is where the
+                brand stamp lands. */}
             <div className="receipt__breakdown">
               <div className="receipt__breakdown-stats">
                 <span>{vm.summary}</span>
@@ -74,6 +77,11 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
           </>
         )}
       </div>
+
+      {/* Divider moved from between TOTAL/breakdown to above the QR block —
+          separates the data region (TOTAL + breakdown) from the conversion
+          region (QR + trust line). */}
+      <div className="receipt__divider" />
 
       {/* Footer: frameless QR block (CTA above QR), then the single-line
           trust statement. No white box — the previous dashed border read

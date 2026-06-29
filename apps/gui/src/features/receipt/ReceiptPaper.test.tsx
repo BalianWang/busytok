@@ -184,4 +184,19 @@ describe("ReceiptPaper", () => {
     const { container } = renderVm(NO_DATA);
     expect(container.querySelector(".receipt-stamp")).not.toBeNull();
   });
+
+  it("places the divider above the QR block (not between TOTAL and breakdown)", () => {
+    // The divider was moved from .receipt__breakdown { border-top } to a
+    // standalone .receipt__divider element between the body and footer.
+    const { container } = renderVm();
+    const dividers = container.querySelectorAll(".receipt__divider");
+    // Two dividers: one after header, one before footer (above QR block).
+    expect(dividers.length).toBe(2);
+    // The second divider sits between .receipt__body and .receipt__footer.
+    const body = container.querySelector(".receipt__body");
+    const footer = container.querySelector(".receipt__footer");
+    const secondDivider = dividers[1];
+    expect(secondDivider.nextElementSibling).toBe(footer);
+    expect(secondDivider.previousElementSibling).toBe(body);
+  });
 });
