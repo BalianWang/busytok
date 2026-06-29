@@ -2172,7 +2172,6 @@ pub fn read_daily_receipt_top_models(
                 model,
                 COALESCE(SUM(total_tokens), 0),
                 SUM(cost_usd),
-                COALESCE(SUM(event_count), 0),
                 COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN event_count ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN event_count ELSE 0 END), 0)
              FROM daily_usage
@@ -2182,13 +2181,12 @@ pub fn read_daily_receipt_top_models(
         )
         .context("failed to prepare read_daily_receipt_top_models")?;
     let rows = stmt.query_map(params![timezone, date, generation_id], |row| {
-        let with_cost: i64 = row.get(4)?;
-        let without_cost: i64 = row.get(5)?;
+        let with_cost: i64 = row.get(3)?;
+        let without_cost: i64 = row.get(4)?;
         Ok(ReceiptModelSliceRow {
             name: row.get(0)?,
             tokens: row.get(1)?,
             cost_usd: row.get(2)?,
-            event_count: row.get(3)?,
             has_cost: with_cost > 0,
             has_no_cost: without_cost > 0,
         })
@@ -2223,6 +2221,11 @@ pub fn read_session_count_for_window(
 
 /// The highest-token UTC hour bucket in `[start_ms, end_ms)`, or `None` if the
 /// day has no buckets. Caller converts `bucket_start_ms` to a reporting-TZ hour.
+///
+/// Known limitation: `bucket_start_ms` is UTC-aligned and the caller formats it
+/// to a reporting-TZ hour via `rem_euclid(24)`. On DST transition days (2/year
+/// per IANA zone) the offset shifts, so the label may be off by ±1h for those
+/// two days. This is acceptable for a "peak hour" summary stat.
 pub fn read_peak_hour_for_window(
     conn: &Connection,
     generation_id: &str,

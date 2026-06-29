@@ -6,7 +6,7 @@
    Font vocabulary:
    - BusytokSans (Geist)     → brand wordmark, total cost numeral
    - BusytokMono (IBM Plex)  → receipt body (meta / items / total)
-   - BusytokStamp (Oswald)   → brand circular stamp (ReceiptStamp) */
+   - BusytokStamp (Oswald)   → brand stamp wordmark (.receipt-stamp div) */
 
 @font-face {
   font-family: "BusytokMono";

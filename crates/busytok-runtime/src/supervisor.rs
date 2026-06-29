@@ -1526,12 +1526,18 @@ impl RuntimeControl for BusytokSupervisor {
     ) -> Result<ReadEnvelopeDto<ReceiptDailyDto>> {
         let now_ms = busytok_domain::now_ms();
         let (timezone, _week_starts_on) = self.timezone_and_weekday();
-        let rtz = range::parse_timezone(&timezone).unwrap_or_else(|_| ReportingTimezone::utc());
+        let rtz = range::parse_timezone(&timezone).unwrap_or_else(|_| {
+            warn!(event_code = "receipt.daily_tz_fallback", timezone = %timezone, "timezone parse failed, falling back to UTC");
+            ReportingTimezone::utc()
+        });
         let date = match req.date.clone() {
             Some(d) => d,
             None => rtz
                 .local_date_for_timestamp_ms(now_ms)
-                .unwrap_or_else(|_| "1970-01-01".to_string()),
+                .unwrap_or_else(|_| {
+                    warn!(event_code = "receipt.daily_date_fallback", "local date resolve failed, falling back to 1970-01-01 — receipt will be empty");
+                    "1970-01-01".to_string()
+                }),
         };
         let start_ms = rtz.civil_date_to_utc_start_ms(&date)?;
         let end_ms = rtz.civil_date_to_utc_start_ms(&rtz.next_civil_date(&date)?)?;

@@ -237,7 +237,6 @@ mod tests {
                 cost_usd: None,
                 has_cost: false,
                 has_no_cost: true,
-                event_count: 1,
             }],
             session_count: 1,
             peak_hour: None,

@@ -394,7 +394,6 @@ pub struct ReceiptModelSliceRow {
     pub cost_usd: Option<f64>,
     pub has_cost: bool,
     pub has_no_cost: bool,
-    pub event_count: i64,
 }
 
 /// The highest-token UTC hour bucket within the receipt day window.

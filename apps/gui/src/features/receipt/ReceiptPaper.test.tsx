@@ -154,7 +154,7 @@ describe("ReceiptPaper", () => {
     expect(totalRoles[2]).toBe("receipt__total-cost");
   });
 
-  it("does not render timezone or PEAK labels (removed per spec)", () => {
+  it("does not render timezone or PEAK labels (removed in MVP subtraction — spec/plan originally included them)", () => {
     renderVm();
     expect(screen.queryByText(/PEAK/)).toBeNull();
     expect(screen.queryByText(/TZ/)).toBeNull();
