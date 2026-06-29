@@ -17,7 +17,7 @@ export const NORMAL_DAY: ReceiptDailyDto = {
     { name: "gpt-5.1", tokens: 530_000, cost_usd: 18.4, cost_status: "exact" },
     { name: "deepseek-v3.2", tokens: 252_246, cost_usd: 3.16, cost_status: "exact" },
   ],
-  brand: { name: "BUSYTOK", tagline: "AI CODING · TOKEN RECEIPT", github: "github.com/BalianWang/busytok", generated_at_ms: 1_781_600_000_000 },
+  brand: { name: "BUSYTOK", tagline: "AI CODING · TOKEN USAGE", github: "github.com/BalianWang/busytok", generated_at_ms: 1_781_600_000_000 },
 };
 
 export const MANY_MODELS: ReceiptDailyDto = {
@@ -64,7 +64,7 @@ export const NO_DATA: ReceiptDailyDto = {
     cost_status: "unavailable", event_count: 0, session_count: 0, peak_hour: null,
   },
   top_models: [],
-  brand: { name: "BUSYTOK", tagline: "AI CODING · TOKEN RECEIPT", github: "github.com/BalianWang/busytok", generated_at_ms: 0 },
+  brand: { name: "BUSYTOK", tagline: "AI CODING · TOKEN USAGE", github: "github.com/BalianWang/busytok", generated_at_ms: 0 },
 };
 
 // >5 models where the overflow (models 6-7) are ALL unavailable → the OTHERS

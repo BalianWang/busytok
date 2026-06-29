@@ -640,7 +640,7 @@ impl RuntimeControl for TestRuntimeControl {
                 top_models: vec![],
                 brand: ReceiptBrandDto {
                     name: "BUSYTOK".to_string(),
-                    tagline: "AI CODING · TOKEN RECEIPT".to_string(),
+                    tagline: "AI CODING · TOKEN USAGE".to_string(),
                     github: "github.com/BalianWang/busytok".to_string(),
                     generated_at_ms: 0,
                 },

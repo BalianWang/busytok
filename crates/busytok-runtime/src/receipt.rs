@@ -21,7 +21,7 @@ pub struct ReceiptDailyData {
 }
 
 const BRAND_NAME: &str = "BUSYTOK";
-const BRAND_TAGLINE: &str = "AI CODING · TOKEN RECEIPT";
+const BRAND_TAGLINE: &str = "AI CODING · TOKEN USAGE";
 const BRAND_GITHUB: &str = "github.com/BalianWang/busytok";
 
 /// Map store rows + the reporting timezone into the wire DTO. Pure: no I/O.

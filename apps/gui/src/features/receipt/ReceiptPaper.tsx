@@ -23,7 +23,7 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
 
       <header className="receipt__header">
         <div className="receipt__brand">DAILY BILL</div>
-        <div className="receipt__subtitle">AI CODING · TOKEN RECEIPT</div>
+        <div className="receipt__subtitle">AI CODING · TOKEN USAGE</div>
       </header>
 
       <div className="receipt__divider" />
