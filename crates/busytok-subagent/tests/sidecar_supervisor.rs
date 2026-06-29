@@ -690,7 +690,7 @@ async fn sidecar_handle_supports_prepare_hibernate_close_and_prepare_all() {
 fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
     let db = busytok_store::Database::open_in_memory().unwrap();
     let config = busytok_subagent::sidecar::SidecarConfig {
-        node_binary: std::path::PathBuf::from("bash"),
+        node_binary: support::sidecar_shell_path(),
         bundle_path: std::path::PathBuf::from("/dev/null"),
         env: std::collections::HashMap::new(),
         idle_exit_seconds: 300,
@@ -1120,16 +1120,29 @@ async fn idle_exit_with_db_writes_stop_event() {
     let sup = PiSidecarSupervisor::new(cfg, Some(db.clone()));
     let _ = sup.ensure_started().await.unwrap();
 
-    // Wait for idle exit to trigger (polls every 100ms, idle_exit_seconds=0).
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let db = db.lock().unwrap();
-    let events = db.subagent_list_resource_events(None, 100).unwrap();
-    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
-    assert!(
-        types.contains(&"sidecar_stop"),
-        "idle exit should trigger shutdown which writes sidecar_stop: {types:?}"
-    );
+    // Wait for idle exit to trigger and persist sidecar_stop. Use polling
+    // instead of a fixed sleep: Windows CI runners are slower and a fixed
+    // 400ms may not be enough for the supervision loop to detect idle and
+    // write the event.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let db = db.lock().unwrap();
+            let events = db.subagent_list_resource_events(None, 100).unwrap();
+            if events.iter().any(|e| e.event_type == "sidecar_stop") {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let db = db.lock().unwrap();
+            let events = db.subagent_list_resource_events(None, 100).unwrap();
+            let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+            panic!(
+                "idle exit should trigger shutdown which writes sidecar_stop: {types:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Restart backoff warn (lines 434-435): after a crash, the next spawn
