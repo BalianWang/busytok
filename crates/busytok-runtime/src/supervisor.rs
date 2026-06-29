@@ -4660,6 +4660,9 @@ impl RuntimeControl for BusytokSupervisor {
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
         // Validate id format (used as keychain account name)
+        if req.id.is_empty() {
+            anyhow::bail!("provider id must not be empty");
+        }
         if !req
             .id
             .chars()
@@ -4703,8 +4706,15 @@ impl RuntimeControl for BusytokSupervisor {
     }
 
     async fn provider_list(&self) -> Result<ProviderListResponseDto> {
-        let settings = self.settings.lock().unwrap();
-        let dtos: Vec<ProviderDto> = settings.providers.iter().map(provider_to_dto).collect();
+        // Clone the provider vec under the lock, then drop the guard before
+        // mapping to DTOs — `provider_to_dto` calls `ProviderCredentialStore::has_key`
+        // (sync keychain I/O) for each provider, and holding the settings lock
+        // during that window blocks other settings operations.
+        let providers: Vec<ProviderConfig> = {
+            let settings = self.settings.lock().unwrap();
+            settings.providers.clone()
+        };
+        let dtos: Vec<ProviderDto> = providers.iter().map(provider_to_dto).collect();
         tracing::debug!(count = dtos.len(), "listed providers");
         Ok(ProviderListResponseDto { providers: dtos })
     }
@@ -4731,7 +4741,9 @@ impl RuntimeControl for BusytokSupervisor {
         if let Some(enabled) = req.enabled {
             provider.enabled = enabled;
         }
-        let dto = provider_to_dto(provider);
+        // Snapshot the provider before `pending_settings` is moved into the
+        // in-memory cache — the reference can't outlive that move.
+        let provider_snapshot = provider.clone();
         pending_settings.save(&self.paths)?;
         {
             let mut settings = self.settings.lock().unwrap();
@@ -4748,6 +4760,9 @@ impl RuntimeControl for BusytokSupervisor {
                     .context("failed to update API key")?;
             }
         }
+        // Compute DTO AFTER the keychain write so has_api_key reflects the
+        // post-update keychain state (mirrors provider_create).
+        let dto = provider_to_dto(&provider_snapshot);
         tracing::info!(event_code = "provider.updated", provider_id = %req.id, "provider updated");
         Ok(dto)
     }
@@ -4808,6 +4823,12 @@ impl RuntimeControl for BusytokSupervisor {
                 .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
             (provider.id.clone(), provider.base_url.clone())
         };
+        // Defense-in-depth: the frontend doesn't enforce HTTPS, so the backend
+        // must reject cleartext URLs before reading the key or sending the key
+        // in an Authorization header.
+        if !base_url.starts_with("https://") {
+            anyhow::bail!("provider base_url must use HTTPS (got: {})", base_url);
+        }
         let key = ProviderCredentialStore::get_key(&provider_id)
             .context("failed to read keychain")?
             .ok_or_else(|| anyhow::anyhow!("no API key stored for provider '{}'", provider_id))?;
@@ -4818,8 +4839,12 @@ impl RuntimeControl for BusytokSupervisor {
             url = %url,
             "testing provider connection"
         );
+        // Disable redirects so the Authorization header is never forwarded to
+        // a cross-origin host (a compromised endpoint could otherwise redirect
+        // to an attacker-controlled host and exfiltrate the key).
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let resp = client
             .get(&url)

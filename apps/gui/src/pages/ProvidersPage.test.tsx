@@ -352,6 +352,7 @@ describe("ProvidersPage", () => {
     fireEvent.click(toggle);
     expect(updateMutate).toHaveBeenCalledWith(
       expect.objectContaining({ id: "deepseek-prod", enabled: false }),
+      expect.anything(),
     );
   });
 
@@ -433,6 +434,7 @@ describe("ProvidersPage", () => {
         api_key: "sk-new",
         enabled: null,
       }),
+      expect.anything(),
     );
     expect(input.value).toBe("");
   });
@@ -458,6 +460,7 @@ describe("ProvidersPage", () => {
         id: "deepseek-prod",
         api_key: "sk-enter",
       }),
+      expect.anything(),
     );
     expect(input.value).toBe("");
   });

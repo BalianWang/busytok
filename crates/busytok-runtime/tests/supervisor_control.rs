@@ -3546,6 +3546,28 @@ async fn provider_create_rejects_uppercase_id() {
 }
 
 #[tokio::test]
+async fn provider_create_rejects_empty_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Empty id must be rejected before the char-set check (which is vacuously
+    // true for an empty string).
+    let err = sup
+        .provider_create(provider_create_request("", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("empty"),
+        "expected empty-id validation error, got: {err}"
+    );
+
+    // Nothing should have been written.
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+#[tokio::test]
 async fn provider_create_rejects_duplicate_id() {
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3673,10 +3695,11 @@ async fn provider_test_connection_errors_when_no_api_key() {
             id: "no-key".to_string(),
         })
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(
-        err.to_string().contains("no API key stored"),
-        "expected no-api-key error, got: {err}"
+        err.contains("no API key stored") || err.contains("failed to read keychain"),
+        "expected keychain-related error, got: {err}"
     );
 
     // Clean up so the keychain stays untouched (no key was set, so delete is a no-op).

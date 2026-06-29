@@ -330,6 +330,7 @@ export function ProvidersPage() {
   const [testResults, setTestResults] = useState<
     Record<string, { ok: boolean; error: string | null } | null>
   >({});
+  const [mutationError, setMutationError] = useState<string | null>(null);
 
   const providers = useMemo<ProviderDto[]>(
     () => data?.providers ?? [],
@@ -350,6 +351,7 @@ export function ProvidersPage() {
       models: parseModels(form.models),
       api_key: form.api_key.length > 0 ? form.api_key : null,
     };
+    setMutationError(null);
     createProvider.mutate(payload, {
       onSuccess: () => {
         reportFrontendEventSafely({
@@ -361,6 +363,9 @@ export function ProvidersPage() {
         setForm(EMPTY_FORM);
         setShowForm(false);
       },
+      onError: (err: unknown) => {
+        setMutationError((err as Error)?.message ?? String(err));
+      },
     });
   }, [form, createProvider]);
 
@@ -371,28 +376,44 @@ export function ProvidersPage() {
 
   const handleToggleEnabled = useCallback(
     (provider: ProviderDto) => {
-      updateProvider.mutate({
-        id: provider.id,
-        enabled: !provider.enabled,
-        name: null,
-        base_url: null,
-        models: null,
-        api_key: null,
-      });
+      setMutationError(null);
+      updateProvider.mutate(
+        {
+          id: provider.id,
+          enabled: !provider.enabled,
+          name: null,
+          base_url: null,
+          models: null,
+          api_key: null,
+        },
+        {
+          onError: (err: unknown) => {
+            setMutationError((err as Error)?.message ?? String(err));
+          },
+        },
+      );
     },
     [updateProvider],
   );
 
   const handleUpdateApiKey = useCallback(
     (id: string, apiKey: string) => {
-      updateProvider.mutate({
-        id,
-        api_key: apiKey,
-        enabled: null,
-        name: null,
-        base_url: null,
-        models: null,
-      });
+      setMutationError(null);
+      updateProvider.mutate(
+        {
+          id,
+          api_key: apiKey,
+          enabled: null,
+          name: null,
+          base_url: null,
+          models: null,
+        },
+        {
+          onError: (err: unknown) => {
+            setMutationError((err as Error)?.message ?? String(err));
+          },
+        },
+      );
     },
     [updateProvider],
   );
@@ -403,6 +424,7 @@ export function ProvidersPage() {
         `Delete provider "${provider.name}" (${provider.id})? This cannot be undone.`,
       );
       if (!confirmed) return;
+      setMutationError(null);
       deleteProvider.mutate(provider.id, {
         onSuccess: () => {
           reportFrontendEventSafely({
@@ -416,6 +438,9 @@ export function ProvidersPage() {
             delete next[provider.id];
             return next;
           });
+        },
+        onError: (err: unknown) => {
+          setMutationError((err as Error)?.message ?? String(err));
         },
       });
     },
@@ -499,6 +524,18 @@ export function ProvidersPage() {
   return (
     <div className="settings-page" data-fetching={isFetching ? "true" : "false"}>
       <div className="settings-pane">
+        {mutationError && (
+          <section className="settings-section">
+            <div className="settings-panel">
+              <SettingsRow
+                label="Error"
+                control={
+                  <SettingsValue value={mutationError} tone="danger" />
+                }
+              />
+            </div>
+          </section>
+        )}
         <section className="settings-section">
           <h2>Providers</h2>
           <div className="settings-panel">
