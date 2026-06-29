@@ -171,4 +171,20 @@ describe("ReceiptPaper", () => {
     const body = container.querySelector(".receipt__body");
     expect(body).not.toBeNull();
   });
+
+  it("renders the brand stamp inside the paper (decorative, aria-hidden)", () => {
+    const { container } = renderVm();
+    const stamp = container.querySelector(".receipt-stamp");
+    expect(stamp).not.toBeNull();
+    expect(stamp?.tagName).toBe("svg");
+    expect(stamp?.getAttribute("aria-hidden")).toBe("true");
+    // The stamp carries the BUSYTOK center wordmark + variant captions.
+    const texts = Array.from(stamp?.querySelectorAll("text") ?? []);
+    expect(texts.some((t) => t.textContent === "BUSYTOK")).toBe(true);
+  });
+
+  it("renders the stamp even in the empty state (decorative overlay)", () => {
+    const { container } = renderVm(NO_DATA);
+    expect(container.querySelector(".receipt-stamp")).not.toBeNull();
+  });
 });

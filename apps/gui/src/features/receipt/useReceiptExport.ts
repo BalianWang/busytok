@@ -32,6 +32,8 @@ export function useReceiptExport(
         fonts.load('700 1em "BusytokMono"'),
         fonts.load('400 1em "BusytokSans"'),
         fonts.load('700 1em "BusytokSans"'),
+        fonts.load('500 1em "BusytokStamp"'),
+        fonts.load('700 1em "BusytokStamp"'),
       ]).catch((error) => {
         // A failed font load produces a silently degraded export (fallback
         // face with wrong metrics). Surface it so the operator can correlate

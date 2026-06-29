@@ -1,5 +1,6 @@
 import { useId, type Ref } from "react";
 import type { ReceiptViewModel } from "./viewModel";
+import { ReceiptStamp } from "./ReceiptStamp";
 import "./receipt.css";
 
 interface ReceiptPaperProps {
@@ -16,6 +17,10 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
   const scallopId = `receipt-scallop-${useId()}`;
   return (
     <div className="receipt-paper" ref={paperRef}>
+      {/* Brand stamp — decorative red circular seal over the items area.
+          Positioned via .receipt-stamp (absolute, top:180px, right:24px). */}
+      <ReceiptStamp className="receipt-stamp" />
+
       <header className="receipt__header">
         <div className="receipt__brand">AI CODING BILL</div>
       </header>

@@ -9,6 +9,10 @@ This directory bundles font files under the SIL Open Font License, Version 1.1
     Copyright 2023 Vercel.
     Source: https://github.com/vercel/geist-font
 
+  Oswald (Variable, 200-700)
+    Copyright 2012 Vernon Adams (vern@newtypography.co.uk).
+    Source: https://github.com/google/fonts/tree/main/ofl/oswald
+
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:
 https://openfontlicense.org
