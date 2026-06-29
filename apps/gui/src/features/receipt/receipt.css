@@ -178,7 +178,7 @@
 .receipt__subtitle {
   font-family: "BusytokMono", ui-monospace, monospace;
   font-size: 9.5px;
-  letter-spacing: 0.28em;
+  letter-spacing: 0.22em;
   color: var(--r-ink-muted);
   margin-top: 8px;
   text-transform: uppercase;
@@ -329,7 +329,7 @@
 }
 .receipt__qr-hint {
   font-family: "BusytokMono", ui-monospace, monospace;
-  font-size: 9px;
+  font-size: 9.5px;
   letter-spacing: 0.22em;
   color: var(--r-ink-muted);
   text-transform: uppercase;
@@ -344,9 +344,11 @@
    already carry the brand, and the extra line weakened the hierarchy. */
 .receipt__footer-brand {
   font-family: "BusytokMono", ui-monospace, monospace;
-  font-size: 10px;
-  letter-spacing: 0.14em;
+  font-size: 9.5px;
+  letter-spacing: 0.22em;
   line-height: 1.4;
+  text-transform: uppercase;
+  color: var(--r-ink-muted);
 }
 
 /* The hidden, off-screen export target: rendered at exactly 420px, captured
