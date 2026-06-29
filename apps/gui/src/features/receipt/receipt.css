@@ -204,7 +204,7 @@
    matching real receipts where each line item lists quantity + unit
    price. */
 .receipt__items {
-  margin-top: 4px;
+  margin-top: 16px;
 }
 .receipt__items-header {
   display: grid;
