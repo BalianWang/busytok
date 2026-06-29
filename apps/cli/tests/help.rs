@@ -117,3 +117,14 @@ fn diagnostics_subcommand_help() {
         "diagnostics help should mention 'store-health'"
     );
 }
+
+#[test]
+fn cli_exposes_delegate_and_subagent_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_busytok"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("delegate"), "missing delegate subcommand");
+    assert!(stdout.contains("subagent"), "missing subagent group");
+}

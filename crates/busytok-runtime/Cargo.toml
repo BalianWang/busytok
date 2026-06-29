@@ -12,6 +12,7 @@ busytok-discovery = { path = "../busytok-discovery" }
 busytok-adapters = { path = "../busytok-adapters" }
 busytok-tailer = { path = "../busytok-tailer" }
 busytok-store = { path = "../busytok-store" }
+busytok-subagent = { path = "../busytok-subagent" }
 busytok-aggregator = { path = "../busytok-aggregator" }
 busytok-events = { path = "../busytok-events" }
 busytok-pricing = { path = "../busytok-pricing" }
@@ -32,4 +33,6 @@ dirs = "6"
 [dev-dependencies]
 tempfile.workspace = true
 futures = "0.3"
+sysinfo.workspace = true
+serial_test.workspace = true
 tracing-subscriber = { workspace = true }

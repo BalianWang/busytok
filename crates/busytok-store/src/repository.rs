@@ -434,3 +434,182 @@ pub struct StoreHealthInfo {
     pub usage_event_count: i64,
     pub last_log_checkpoint_ms: Option<i64>,
 }
+
+// ---------------------------------------------------------------------------
+// Logical subagent runtime rows (migration 0003)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct SubagentLogicalSubagentRow {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub repo_path: String,
+    pub repo_hash: String,
+    pub branch: Option<String>,
+    pub intent: Option<String>,
+    pub default_profile: String,
+    pub default_model: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_active_at_ms: Option<i64>,
+}
+
+impl SubagentLogicalSubagentRow {
+    /// Minimal row for tests. Timestamps seeded from `now_ms()`; status `cold`.
+    pub fn for_test(id: &str, name: &str) -> Self {
+        let now = busytok_domain::now_ms();
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            project_id: "repo-hash-test".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            repo_hash: "repo-hash-test".to_string(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".to_string(),
+            default_model: None,
+            status: "cold".to_string(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_active_at_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentMemoryRow {
+    pub id: String,
+    pub subagent_id: String,
+    pub hot_summary: Option<String>,
+    pub long_summary: Option<String>,
+    pub key_files_json: Option<String>,
+    pub decisions_json: Option<String>,
+    pub attempts_json: Option<String>,
+    pub open_questions_json: Option<String>,
+    pub artifact_refs_json: Option<String>,
+    pub last_compacted_at_ms: Option<i64>,
+    pub last_compacted_task_id: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+impl SubagentMemoryRow {
+    /// Create an empty memory row for a subagent (used on creation and as a
+    /// fallback when no memory exists yet).
+    pub fn new_empty(subagent_id: &str) -> Self {
+        Self {
+            id: format!("mem-{subagent_id}"),
+            subagent_id: subagent_id.to_string(),
+            hot_summary: None,
+            long_summary: None,
+            key_files_json: None,
+            decisions_json: None,
+            attempts_json: None,
+            open_questions_json: None,
+            artifact_refs_json: None,
+            last_compacted_at_ms: None,
+            last_compacted_task_id: None,
+            updated_at_ms: busytok_domain::now_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentTaskRow {
+    pub id: String,
+    pub subagent_id: String,
+    pub source_harness: Option<String>,
+    pub source_session_id: Option<String>,
+    pub intent: Option<String>,
+    pub profile: String,
+    pub prompt: Option<String>,
+    pub prompt_artifact_ref: Option<String>,
+    pub output_schema_name: Option<String>,
+    pub output_schema_version: i64,
+    pub status: String,
+    pub result_summary: Option<String>,
+    pub result_json: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    /// Task 7 Round 3 Finding 1 fix: persisted execution param so the
+    /// dispatcher reads it from the row (single source of truth). `None`
+    /// when not specified by the caller (use profile/adapter default).
+    pub timeout_seconds: Option<i64>,
+    /// Task 7 Round 3 Finding 1 fix: persisted model override so the
+    /// dispatcher reads it from the row. `None` → fall back to
+    /// `subagent.default_model` then `profile_model`.
+    pub model_override: Option<String>,
+}
+
+impl SubagentTaskRow {
+    pub fn for_test(id: &str, subagent_id: &str, profile: &str, prompt: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            subagent_id: subagent_id.to_string(),
+            source_harness: None,
+            source_session_id: None,
+            intent: None,
+            profile: profile.to_string(),
+            prompt: Some(prompt.to_string()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: "queued".to_string(),
+            result_summary: None,
+            result_json: None,
+            error: None,
+            created_at_ms: busytok_domain::now_ms(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            timeout_seconds: None,
+            model_override: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentHarnessBindingRow {
+    pub id: String,
+    pub subagent_id: String,
+    pub harness: String,
+    pub adapter_session_id: Option<String>,
+    pub adapter_process_id: Option<String>,
+    pub is_hot: i32,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub last_used_at_ms: Option<i64>,
+    pub closed_at_ms: Option<i64>,
+    pub detail_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentUsageRecordRow {
+    pub id: String,
+    pub task_id: String,
+    pub subagent_id: String,
+    pub source_usage_event_id: Option<String>,
+    pub harness: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub total_cost_usd: Option<f64>,
+    pub duration_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentResourceEventRow {
+    pub id: String,
+    pub event_type: String,
+    pub target_id: Option<String>,
+    pub rss_mb: Option<f64>,
+    pub cpu_percent: Option<f64>,
+    pub detail_json: Option<String>,
+    pub created_at_ms: i64,
+}

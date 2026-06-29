@@ -9,6 +9,7 @@ use busytok_config::{init_logging, BusytokPaths, LogSource};
 use tracing::{error, info};
 
 mod commands;
+mod commands_subagent;
 mod shim;
 
 #[derive(Debug, Parser)]
@@ -76,6 +77,101 @@ enum Command {
     Cli {
         #[command(subcommand)]
         subcommand: CliCommand,
+    },
+
+    /// Delegate a task to a (possibly new) subagent
+    Delegate {
+        #[arg(long)]
+        subagent: String,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        intent: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
+        /// The task prompt (positional)
+        prompt: String,
+    },
+
+    /// Inspect and manage subagents
+    Subagent {
+        #[command(subcommand)]
+        subcommand: SubagentCommand,
+    },
+
+    /// Run doctor health checks (spec §855, §1068: `busytok doctor`).
+    /// Calls the existing `settings.diagnostics` RPC and pretty-prints
+    /// the subagent section. No new RPC method.
+    Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+enum SubagentCommand {
+    /// List known subagents
+    List {
+        /// "hot" | "warm" | "cold"
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        include_deleted: bool,
+    },
+
+    /// Resolve by <name> (within --cwd) or by --id <uuid>.
+    Show {
+        /// Subagent name (within --cwd). Required unless --id is given.
+        #[arg(required_unless_present = "id", conflicts_with = "id")]
+        name: Option<String>,
+        /// Subagent UUID. Mutually exclusive with <name>.
+        #[arg(long, conflicts_with = "name")]
+        id: Option<String>,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+    },
+
+    /// List recent tasks for a subagent
+    Tasks {
+        #[arg(required_unless_present = "id", conflicts_with = "id")]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "name")]
+        id: Option<String>,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+
+    /// Hibernate a subagent (move to cold tier)
+    Hibernate {
+        #[arg(required_unless_present = "id", conflicts_with = "id")]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "name")]
+        id: Option<String>,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+    },
+
+    /// Delete a subagent (use --hard for permanent removal)
+    Delete {
+        #[arg(required_unless_present = "id", conflicts_with = "id")]
+        name: Option<String>,
+        #[arg(long, conflicts_with = "name")]
+        id: Option<String>,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        #[arg(long)]
+        hard: bool,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -336,6 +432,9 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Settings { .. } => "settings",
         Command::Prompt { .. } => "prompt",
         Command::Cli { .. } => "cli",
+        Command::Delegate { .. } => "delegate",
+        Command::Subagent { .. } => "subagent",
+        Command::Doctor => "doctor",
     }
 }
 
@@ -470,5 +569,51 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 manager.uninstall(&bin_path)
             }
         },
+
+        Command::Delegate {
+            subagent,
+            id,
+            cwd,
+            profile,
+            intent,
+            model,
+            timeout,
+            output,
+            prompt,
+        } => {
+            commands_subagent::handle_delegate(
+                subagent, id, cwd, profile, intent, model, timeout, output, prompt,
+            )
+            .await
+        }
+
+        Command::Subagent { subcommand } => match subcommand {
+            SubagentCommand::List {
+                status,
+                project,
+                include_deleted,
+            } => commands_subagent::handle_list(status, project, include_deleted).await,
+            SubagentCommand::Show { name, id, cwd } => {
+                commands_subagent::handle_show(name, id, cwd).await
+            }
+            SubagentCommand::Tasks {
+                name,
+                id,
+                cwd,
+                limit,
+            } => commands_subagent::handle_tasks(name, id, cwd, limit).await,
+            SubagentCommand::Hibernate { name, id, cwd } => {
+                commands_subagent::handle_hibernate(name, id, cwd).await
+            }
+            SubagentCommand::Delete {
+                name,
+                id,
+                cwd,
+                hard,
+                yes,
+            } => commands_subagent::handle_delete(name, id, cwd, hard, yes).await,
+        },
+
+        Command::Doctor => commands::handle_doctor().await,
     }
 }

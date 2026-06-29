@@ -8,9 +8,11 @@ use tracing::{debug, info};
 use crate::repository::{
     CodexTokenSnapshotRow, DailyUsageRow, DiagnosticEventRow, LogFileRow, LogSourceRow,
     ModelSummaryRow, ModelUsageRow, ProjectRow, RollupRows, SessionRow, StoreHealthInfo,
-    StoreWriteBatch,
+    StoreWriteBatch, SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
+    SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
 use crate::schema;
+use crate::subagent_queries;
 
 /// SQLite database handle for the Busytok store.
 ///
@@ -1900,6 +1902,179 @@ impl Database {
             usage_event_count: usage_count,
             last_log_checkpoint_ms,
         })
+    }
+
+    // --- subagent runtime ------------------------------------------------------
+
+    pub fn subagent_upsert_logical(&self, row: &SubagentLogicalSubagentRow) -> Result<()> {
+        subagent_queries::upsert_logical_subagent(self.conn(), row)
+    }
+    pub fn subagent_get_logical(&self, id: &str) -> Result<Option<SubagentLogicalSubagentRow>> {
+        subagent_queries::get_logical_subagent(self.conn(), id)
+    }
+    pub fn subagent_list_active_by_repo(
+        &self,
+        repo_hash: &str,
+    ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+        subagent_queries::list_active_by_repo(self.conn(), repo_hash)
+    }
+    pub fn subagent_find_by_name_in_repo(
+        &self,
+        project_id: &str,
+        repo_hash: &str,
+        name: &str,
+    ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+        subagent_queries::find_by_name_in_repo(self.conn(), project_id, repo_hash, name)
+    }
+    pub fn subagent_upsert_memory(&self, row: &SubagentMemoryRow) -> Result<()> {
+        subagent_queries::upsert_memory(self.conn(), row)
+    }
+    pub fn subagent_get_memory(&self, subagent_id: &str) -> Result<Option<SubagentMemoryRow>> {
+        subagent_queries::get_memory(self.conn(), subagent_id)
+    }
+    pub fn subagent_insert_task(&self, row: &SubagentTaskRow) -> Result<()> {
+        subagent_queries::insert_task(self.conn(), row)
+    }
+    pub fn subagent_get_task(&self, id: &str) -> Result<Option<SubagentTaskRow>> {
+        subagent_queries::get_task(self.conn(), id)
+    }
+    pub fn subagent_list_tasks(
+        &self,
+        subagent_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SubagentTaskRow>> {
+        subagent_queries::list_tasks(self.conn(), subagent_id, limit)
+    }
+    /// Count tasks with `created_at_ms > since_ms` (compaction trigger (a)).
+    pub fn subagent_count_tasks_since(&self, subagent_id: &str, since_ms: i64) -> Result<u32> {
+        subagent_queries::count_tasks_since(self.conn(), subagent_id, since_ms)
+    }
+    /// Atomically pick the oldest queued task and flip it to "running"
+    /// (Task 7 §8.3 step 2 dispatcher). `None` when no queued task is
+    /// eligible (no queued rows OR the only queued rows belong to
+    /// subagents that already have a running task — per-subagent FIFO).
+    pub fn subagent_pick_oldest_queued_task(&self) -> rusqlite::Result<Option<SubagentTaskRow>> {
+        subagent_queries::pick_oldest_queued_task(self.conn())
+    }
+    /// Whether the subagent has a task currently in `'running'` status.
+    /// Used by `delegate()` for per-subagent serialization (spec §6.4).
+    pub fn subagent_has_running_task(&self, subagent_id: &str) -> rusqlite::Result<bool> {
+        subagent_queries::has_running_task(self.conn(), subagent_id)
+    }
+    /// Count subagent tasks by status. Returns (queued, running).
+    pub fn subagent_task_counts_by_status(&self) -> Result<(u32, u32)> {
+        crate::subagent_queries::task_counts_by_status(&self.conn)
+    }
+    pub fn subagent_set_task_status(
+        &self,
+        id: &str,
+        status: &str,
+        result_summary: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        subagent_queries::set_task_status(self.conn(), id, status, result_summary, error)
+    }
+    pub fn subagent_upsert_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
+        subagent_queries::upsert_binding(self.conn(), row)
+    }
+    pub fn subagent_upsert_hot_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::upsert_hot_binding(conn, row)
+    }
+    pub fn subagent_commit_hot_binding_and_status(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::commit_hot_binding_and_status(conn, binding, subagent_id)
+    }
+    pub fn subagent_commit_hibernate_binding_and_status(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+        new_status: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::commit_hibernate_binding_and_status(
+            conn,
+            binding,
+            subagent_id,
+            new_status,
+        )
+    }
+    pub fn subagent_hot_binding(
+        &self,
+        subagent_id: &str,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        subagent_queries::hot_binding(self.conn(), subagent_id, harness)
+    }
+    pub fn subagent_find_hot_binding_by_session(
+        &self,
+        adapter_session_id: &str,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        let conn = self.conn();
+        subagent_queries::find_hot_binding_by_session(conn, adapter_session_id, harness)
+    }
+    pub fn subagent_find_lru_hot_binding(
+        &self,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        let conn = self.conn();
+        subagent_queries::find_lru_hot_binding(conn, harness)
+    }
+    pub fn subagent_write_hot_summary(&self, subagent_id: &str, hot_summary: &str) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::write_hot_summary(conn, subagent_id, hot_summary)
+    }
+    /// Atomically commit an eviction: optional hot_summary write + binding
+    /// flip + logical status computed from final memory state (§3.3).
+    pub fn subagent_commit_eviction(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+        hot_summary: Option<&str>,
+    ) -> Result<String> {
+        let conn = self.conn();
+        subagent_queries::commit_eviction(conn, binding, subagent_id, hot_summary)
+    }
+    pub fn subagent_insert_usage_record(&self, row: &SubagentUsageRecordRow) -> Result<()> {
+        subagent_queries::insert_usage_record(self.conn(), row)
+    }
+    pub fn subagent_insert_resource_event(&self, row: &SubagentResourceEventRow) -> Result<()> {
+        subagent_queries::insert_resource_event(self.conn(), row)
+    }
+    pub fn subagent_list_resource_events(
+        &self,
+        target_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SubagentResourceEventRow>> {
+        subagent_queries::list_resource_events(self.conn(), target_id, limit)
+    }
+    pub fn subagent_reconcile_sidecar_crash(
+        &self,
+        harness: &str,
+    ) -> Result<subagent_queries::CrashReconciliationCounts> {
+        subagent_queries::reconcile_sidecar_crash(self.conn(), harness)
+    }
+    pub fn subagent_release_hot_bindings_for_shutdown(
+        &self,
+        harness: &str,
+    ) -> Result<subagent_queries::ShutdownReconciliationCounts> {
+        subagent_queries::release_hot_bindings_for_shutdown(self.conn(), harness)
+    }
+    pub fn subagent_list_filtered(
+        &self,
+        status: Option<&str>,
+        project: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<Vec<SubagentLogicalSubagentRow>> {
+        subagent_queries::list_filtered(self.conn(), status, project, include_deleted)
+    }
+    pub fn subagent_hard_delete(&self, id: &str) -> Result<()> {
+        subagent_queries::hard_delete_logical_subagent(self.conn(), id)
     }
 }
 

@@ -7,6 +7,7 @@ const DB_NAME: &str = "busytok.db";
 const SOCKET_NAME: &str = "busytok.sock";
 const PRICE_CATALOG_NAME: &str = "price-catalog.json";
 const LOGS_DIR_NAME: &str = "logs";
+pub const ARTIFACTS_DIR_NAME: &str = "artifacts";
 
 /// Resolves local filesystem paths for the Busytok service.
 ///
@@ -125,15 +126,69 @@ impl BusytokPaths {
         self.data_dir.join(PRICE_CATALOG_NAME)
     }
 
+    /// Root for large subagent artifacts (logs, patches, traces).
+    /// Full layout: `<artifacts_dir>/<subagent_id>/<task_id>/...`.
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.data_dir.join(ARTIFACTS_DIR_NAME)
+    }
+
     /// Ensures all directories exist by creating them if needed.
     ///
-    /// Creates `data_dir`, `config_dir`, `runtime_dir`, and `log_dir`.
+    /// Creates `data_dir`, `config_dir`, `runtime_dir`, `log_dir`, and `artifacts_dir`.
     pub fn ensure_dirs_exist(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.config_dir)?;
         std::fs::create_dir_all(&self.runtime_dir)?;
         std::fs::create_dir_all(self.log_dir())?;
+        std::fs::create_dir_all(self.artifacts_dir())?;
         Ok(())
+    }
+
+    /// Resolve the sidecar runtime directory.
+    ///
+    /// Precedence (spec §5.1):
+    /// 1. `runtime_dir` (from `SubagentPiSidecarConfig`) — packaged app and
+    ///    service-only mode both set this via settings.toml or a Tauri-injected
+    ///    env var. This is the "runtime locator" the spec calls for.
+    /// 2. Dev fallback: `apps/pi-sidecar/dist/` resolved via `CARGO_MANIFEST_DIR`
+    ///    of the `busytok-config` crate. Dev-only; brittle if the binary is
+    ///    relocated. Packaged builds MUST set `runtime_dir`.
+    ///
+    /// NO hardcoded `data_dir/sidecars/pi` fallback — that path is neither the
+    /// Tauri bundle location nor a service-only config entry, and silently
+    /// falling back to it would mask a misconfigured packaged build.
+    pub fn sidecar_runtime_dir(&self, runtime_dir: Option<&str>) -> std::path::PathBuf {
+        if let Some(dir) = runtime_dir {
+            return std::path::PathBuf::from(dir);
+        }
+        // Dev fallback only.
+        let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../apps/pi-sidecar/dist");
+        dev
+    }
+
+    /// Path to the sidecar JS bundle. Takes the runtime_dir locator.
+    pub fn sidecar_bundle_path(&self, runtime_dir: Option<&str>) -> std::path::PathBuf {
+        self.sidecar_runtime_dir(runtime_dir)
+            .join("pi-sidecar.bundle.js")
+    }
+
+    /// Path to the sidecar bundle manifest (spec §5.1 line 549).
+    /// `manifest.json` sits alongside `pi-sidecar.bundle.js` in the runtime dir.
+    /// Doctor check verifies this file is readable + valid JSON.
+    pub fn sidecar_manifest_path(&self, runtime_dir: Option<&str>) -> std::path::PathBuf {
+        self.sidecar_runtime_dir(runtime_dir).join("manifest.json")
+    }
+
+    /// Path to the bundled Node binary for the current arch. Returns the path
+    /// even if it doesn't exist — the caller (`resolve_sidecar_config`) decides
+    /// whether to use it (mode `bundled`) or fall back to system `node` (mode
+    /// `system`). NO silent fallback here.
+    pub fn sidecar_bundled_node_path(&self, runtime_dir: Option<&str>) -> std::path::PathBuf {
+        self.sidecar_runtime_dir(runtime_dir)
+            .join("node")
+            .join(std::env::consts::ARCH)
+            .join("node")
     }
 }
 

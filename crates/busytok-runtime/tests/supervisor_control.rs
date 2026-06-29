@@ -3321,3 +3321,97 @@ async fn initial_scan_promotes_active_generation_metadata() {
         .await
         .expect("writer should shut down cleanly");
 }
+
+// ---------------------------------------------------------------------------
+// subagent.* (end-to-end via supervisor RuntimeControl impl)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let supervisor = make_supervisor(db, &tmp);
+
+    // delegate (mock execution)
+    let delegate_resp = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    // SubagentDelegateResponseDto serializes with task_id / subagent_id / status.
+    let sub_id = delegate_resp.subagent_id.clone();
+    assert_eq!(delegate_resp.status, "completed");
+
+    // list (no filters → all active; the just-created subagent must appear).
+    // Response is SubagentListResponseDto { subagents: [...] }.
+    let list = supervisor
+        .subagent_list(SubagentListRequestDto {
+            status: None,
+            project: None,
+            include_deleted: Some(false),
+        })
+        .await
+        .unwrap();
+    assert!(list.subagents.iter().any(|s| s.id == sub_id));
+
+    // show by UUID
+    let shown = supervisor
+        .subagent_show(SubagentResolveRequestDto {
+            name: None,
+            id: Some(sub_id.clone()),
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(shown.name, "reviewer");
+
+    // hibernate then still resolvable by name (memory written → warm)
+    supervisor
+        .subagent_hibernate(SubagentResolveRequestDto {
+            name: None,
+            id: Some(sub_id.clone()),
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    assert!(supervisor
+        .subagent_show(SubagentResolveRequestDto {
+            name: None,
+            id: Some(sub_id.clone()),
+            cwd: None,
+        })
+        .await
+        .is_ok());
+
+    // soft delete
+    supervisor
+        .subagent_delete(SubagentDeleteRequestDto {
+            name: None,
+            id: Some(sub_id.clone()),
+            cwd: None,
+            hard: Some(false),
+        })
+        .await
+        .unwrap();
+    // soft-deleted rows drop out of the active list
+    let after_list = supervisor
+        .subagent_list(SubagentListRequestDto {
+            status: None,
+            project: None,
+            include_deleted: Some(false),
+        })
+        .await
+        .unwrap();
+    assert!(after_list.subagents.iter().all(|s| s.id != sub_id));
+}

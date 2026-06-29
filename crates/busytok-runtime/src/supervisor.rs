@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::Connection;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use busytok_config::{BusytokPaths, BusytokSettings};
 use busytok_control::dispatch::{MethodDispatchError, RuntimeControl};
@@ -63,12 +63,52 @@ pub struct BusytokSupervisor {
     writer_handle: WriterHandle,
     /// Bounded read-only service for overview/activity read paths.
     read_service: crate::read_service::ReadService,
+    /// Logical-subagent manager (subagent.* RPC handlers).
+    subagent_manager: Arc<busytok_subagent::SubagentManager>,
+    /// Pi sidecar supervisor (present when `subagent.pi_sidecar.enabled`).
+    /// Task 6 uses this for graceful shutdown.
+    sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+    /// §8.3 step 2: pressure gate shared between `PiSidecarSupervisor`
+    /// (writer, via `PressureResponder`) and `SubagentManager` (reader, via
+    /// `delegate()`). `Some` when the sidecar is enabled, `None` otherwise.
+    pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
+    /// Concrete `SidecarTaskExecutor` Arc — strong owner (keeps executor
+    /// alive). The `PressureResponder` (Task 4) holds a `Weak` ref to it
+    /// so it can call `evict_lru` without creating an Arc cycle. `None`
+    /// when the sidecar is disabled.
+    sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+    /// §8.3 escalation chain driver. Strong-owned here so it lives as long
+    /// as the supervisor; `PiSidecarSupervisor` holds a `Weak` ref (set via
+    /// `set_pressure_responder`) so the supervision loop can upgrade + invoke
+    /// `respond()` on pressure transitions. `None` when the sidecar is
+    /// disabled. Task 4 implements `respond()`; Task 3 wires the field +
+    /// constructs the (stub) responder.
+    pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
+    /// Error message captured when the sidecar config could not be resolved
+    /// despite `pi_sidecar.enabled = true`. `None` when the sidecar was
+    /// initialized successfully OR when `pi_sidecar.enabled = false` (the
+    /// default). Surfaced via `sidecar_init_error()` so Task 6 / status
+    /// reporting can flag degraded mode without a `Result<Self>` refactor
+    /// of `build_with_settings` (which would touch ~30 call sites).
+    sidecar_init_error: Option<String>,
     /// JoinHandle for the writer actor's background task (None when no
     /// Tokio runtime was active at construction time, e.g. sync tests).
     _writer_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// JoinHandle for the catalog reload background task (None when no
     /// Tokio runtime was active at construction time).
     _catalog_reload_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// §8.3 step 2 "queue only" background task dispatcher (Task 7).
+    /// Polls `subagent_tasks` for queued rows and executes them when the
+    /// pressure gate is not paused. `None` when no Tokio runtime was
+    /// active at construction time. Wrapped in `Mutex<Option<...>>` so
+    /// `shutdown_writer(&self)` (which takes `&self`, not `&mut self`)
+    /// can `.take()` the handle.
+    task_dispatcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Shutdown sender for `task_dispatcher` (Task 7 Finding 3 fix).
+    /// `JoinHandle` drop = detach (NOT abort), so explicit shutdown
+    /// signaling via `tokio::sync::watch` is required. `None` when no
+    /// Tokio runtime was active at construction time.
+    dispatcher_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 enum DatabaseHandle<'a> {
@@ -106,13 +146,42 @@ impl BusytokSupervisor {
     }
 
     /// Create a supervisor with custom adapters and pre-loaded settings.
-    pub(crate) fn with_adapters_and_settings(
+    /// Exposed so integration tests can exercise the production config-
+    /// resolution path (including sidecar config failure → FailingTaskExecutor).
+    #[doc(hidden)]
+    pub fn with_adapters_and_settings(
         db: Database,
         paths: BusytokPaths,
         adapters: Vec<BoxedAdapter>,
         settings: BusytokSettings,
     ) -> Self {
         Self::build_with_settings(db, paths, adapters, settings)
+    }
+
+    /// Construct a supervisor with a pre-resolved `SidecarConfig`.
+    ///
+    /// Used by integration tests that need to substitute a mock sidecar bundle
+    /// path without setting an env var in production code. The rest of the
+    /// build proceeds as normal: settings are loaded from
+    /// `paths.config_dir()/settings.toml` (or defaults if the file is
+    /// missing), and the sidecar supervisor is constructed from the provided
+    /// `sidecar_config` instead of calling `resolve_sidecar_config`.
+    /// `settings.subagent.pi_sidecar.enabled` must be `true` for the sidecar
+    /// to be wired in (same gate as the production path).
+    pub fn new_with_sidecar_config(
+        db: Database,
+        paths: BusytokPaths,
+        sidecar_config: busytok_subagent::sidecar::SidecarConfig,
+    ) -> Self {
+        let adapters: Vec<BoxedAdapter> = vec![
+            Box::new(busytok_adapters::ClaudeCodeAdapter),
+            Box::new(busytok_adapters::CodexAdapter),
+        ];
+        let settings = BusytokSettings::load(&paths).unwrap_or_else(|e| {
+            warn!("Failed to load settings, using defaults: {e}");
+            BusytokSettings::default()
+        });
+        Self::build_with_sidecar_config(db, paths, adapters, settings, sidecar_config)
     }
 
     /// Shared constructor for `new` and `with_adapters`.
@@ -134,6 +203,189 @@ impl BusytokSupervisor {
         let event_bus = AppEventBus::new(64);
 
         let db = Arc::new(Mutex::new(db));
+        // Plan 2 Task 5: gate on `subagent.pi_sidecar.enabled`. When enabled,
+        // construct `SidecarTaskExecutor`; otherwise fall back to `MockTaskExecutor`
+        // (Plan 1 behavior). If `resolve_sidecar_config` fails (e.g. bundled node
+        // binary missing in dev/test), log at `error!` with event_code
+        // `subagent.sidecar.config_resolve_failed`, capture the message in
+        // `sidecar_init_error` (surfaced via `sidecar_init_error()`), and fall
+        // back to the mock executor so the supervisor still starts —
+        // `build_with_settings` returns `Self`, not `Result<Self>`, so the
+        // error cannot propagate. Production deployments with
+        // `pi_sidecar.enabled = true` must ensure the bundle is installed; a
+        // missing bundle surfaces as an `error!` log + queryable init error
+        // and degraded (mock) execution rather than a panic.
+        let (executor, sidecar_supervisor, sidecar_init_error, pressure_gate, sidecar_executor) =
+            Self::construct_sidecar(&settings, &paths, &db, None);
+        Self::assemble_with_sidecar(
+            db,
+            paths,
+            adapters,
+            settings,
+            event_bus,
+            executor,
+            sidecar_supervisor,
+            sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
+        )
+    }
+
+    /// Shared constructor accepting pre-loaded settings AND a pre-resolved
+    /// `SidecarConfig`. Used by `new_with_sidecar_config` so integration tests
+    /// can inject a mock sidecar bundle path without setting an env var in
+    /// production code. Skips `resolve_sidecar_config` and uses the provided
+    /// config directly when constructing the `PiSidecarSupervisor`.
+    fn build_with_sidecar_config(
+        db: Database,
+        paths: BusytokPaths,
+        adapters: Vec<BoxedAdapter>,
+        settings: BusytokSettings,
+        sidecar_config: busytok_subagent::sidecar::SidecarConfig,
+    ) -> Self {
+        let event_bus = AppEventBus::new(64);
+        let db = Arc::new(Mutex::new(db));
+        let (executor, sidecar_supervisor, sidecar_init_error, pressure_gate, sidecar_executor) =
+            Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
+        Self::assemble_with_sidecar(
+            db,
+            paths,
+            adapters,
+            settings,
+            event_bus,
+            executor,
+            sidecar_supervisor,
+            sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
+        )
+    }
+
+    /// Construct the sidecar executor + supervisor + init-error triple.
+    /// When `sidecar_config_override` is `Some`, skip `resolve_sidecar_config`
+    /// and use the provided config directly (test injection path). When
+    /// `None`, resolve from settings + paths (production path).
+    ///
+    /// Returns a 5-tuple: `(executor, sidecar_supervisor, sidecar_init_error,
+    /// pressure_gate, sidecar_executor)`. The last two are `Some` only when
+    /// the sidecar is enabled AND its config resolved successfully — they're
+    /// consumed by `assemble_with_sidecar` to construct the `PressureResponder`
+    /// and wire the manager's `PressureGate`.
+    fn construct_sidecar(
+        settings: &BusytokSettings,
+        paths: &BusytokPaths,
+        db: &Arc<Mutex<Database>>,
+        sidecar_config_override: Option<busytok_subagent::sidecar::SidecarConfig>,
+    ) -> (
+        Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+        Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+        Option<String>,
+        Option<Arc<busytok_subagent::PressureGate>>,
+        Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+    ) {
+        if !settings.subagent.pi_sidecar.enabled {
+            return (
+                Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+                    as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        // Either use the injected config (test path) or resolve from settings.
+        let config_result = match sidecar_config_override {
+            Some(cfg) => Ok(cfg),
+            None => busytok_subagent::sidecar::config::resolve_sidecar_config(
+                &settings.subagent.pi_sidecar,
+                paths,
+            ),
+        };
+        match config_result {
+            Ok(sidecar_config) => {
+                // Wire the deserialized `SubagentResourcePolicyConfig` from
+                // settings → ResourceMonitor so `memory_pressure_free_mb`
+                // and `monitor_interval_seconds` flow from `settings.toml`
+                // into the supervision loop's predicates + sampling cadence.
+                // `PiSidecarSupervisor::new` remains for unit tests that
+                // don't have a policy (it uses the spec-default policy).
+                let policy = settings.subagent.resource_policy.clone();
+                let gate = Arc::new(busytok_subagent::PressureGate::new());
+                let sup = busytok_subagent::sidecar::PiSidecarSupervisor::with_resource_policy(
+                    sidecar_config,
+                    Some(Arc::clone(db)),
+                    policy,
+                    Some(Arc::clone(&gate)),
+                );
+                // Construct the concrete `Arc<SidecarTaskExecutor>` FIRST,
+                // then clone + coerce one copy to `Arc<dyn TaskExecutor>`
+                // for the manager. The concrete copy is kept by
+                // `BusytokSupervisor` so `PressureResponder` (Task 4) can
+                // downgrade it to `Weak<SidecarTaskExecutor>` without an
+                // Arc cycle (responder → executor → supervisor → responder).
+                let exec_concrete =
+                    Arc::new(busytok_subagent::sidecar::SidecarTaskExecutor::with_db(
+                        Arc::clone(&sup),
+                        Arc::clone(db),
+                    ));
+                let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
+                    Arc::clone(&exec_concrete)
+                        as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
+                (exec, Some(sup), None, Some(gate), Some(exec_concrete))
+            }
+            Err(e) => {
+                // `build_with_settings` returns `Self`, not `Result<Self>`,
+                // so the error cannot propagate. Plan 2 requires that
+                // `enabled=true` MUST use the sidecar — falling back to
+                // MockTaskExecutor would mask a deployment misconfiguration
+                // as "functional" (delegate succeeds with mock output).
+                // Instead inject a FailingTaskExecutor that fails every
+                // delegate call with a clear error, AND capture the reason
+                // in `sidecar_init_error` for status reporting.
+                let msg = e.to_string();
+                error!(
+                    event_code = "subagent.sidecar.config_resolve_failed",
+                    error = %e,
+                    "sidecar config resolve failed; injecting FailingTaskExecutor — delegate calls will fail"
+                );
+                (
+                    Arc::new(busytok_subagent::mock_executor::FailingTaskExecutor {
+                        reason: msg.clone(),
+                    })
+                        as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                    None,
+                    Some(msg),
+                    None,
+                    None,
+                )
+            }
+        }
+    }
+
+    /// Assemble the final `BusytokSupervisor` from the shared constructor
+    /// inputs plus the already-constructed sidecar 5-tuple. Both
+    /// `build_with_settings` and `build_with_sidecar_config` funnel through
+    /// this to avoid duplicating the ~60 lines of manager/read-service/
+    /// writer/event-bus wiring.
+    fn assemble_with_sidecar(
+        db: Arc<Mutex<Database>>,
+        paths: BusytokPaths,
+        adapters: Vec<BoxedAdapter>,
+        settings: BusytokSettings,
+        event_bus: AppEventBus,
+        executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+        sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+        sidecar_init_error: Option<String>,
+        pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
+        sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+    ) -> Self {
+        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
+            Arc::clone(&db),
+            settings.subagent.clone(),
+            "pi",
+            executor,
+            pressure_gate.clone(),
+        ));
         let read_service = {
             let db_guard = db.lock().unwrap();
             if let Some(path) = db_guard.path_buf() {
@@ -168,6 +420,50 @@ impl BusytokSupervisor {
 
         let catalog_reload_join = try_spawn_catalog_reloader(paths.price_catalog_path().clone());
 
+        // §8.3 escalation chain driver: construct the `PressureResponder`
+        // (Task 4 implements `respond()`; Task 3 wires the field + sets the
+        // weak ref on the supervisor). The responder holds `Weak` refs to
+        // the supervisor + executor so it can drive the 5-step chain
+        // (hibernate LRU, pause new tasks, graceful restart, force kill)
+        // without creating an Arc cycle. The strong owner is
+        // `BusytokSupervisor.pressure_responder`. Constructed only when all
+        // three are `Some` (sidecar enabled + config resolved).
+        let pressure_responder = match (&sidecar_supervisor, &sidecar_executor, &pressure_gate) {
+            (Some(sup), Some(exec), Some(gate)) => {
+                let responder = Arc::new(busytok_subagent::PressureResponder::new(
+                    Arc::downgrade(sup),
+                    Arc::downgrade(exec),
+                    Arc::clone(gate),
+                ));
+                // Set the weak ref on the supervisor so the supervision loop
+                // can upgrade + invoke `respond()` on pressure transitions.
+                sup.set_pressure_responder(Arc::clone(&responder));
+                Some(responder)
+            }
+            _ => None,
+        };
+
+        // §8.3 step 2 "queue only" background dispatcher (Task 7 Finding 3
+        // fix): spawn the dispatcher that polls `subagent_tasks` for queued
+        // rows and executes them when the pressure gate is not paused. Uses
+        // the sync-safe spawn pattern (mirrors `try_spawn_writer`): when no
+        // Tokio runtime is active (e.g. sync unit tests that construct a
+        // supervisor via `BusytokSupervisor::new()`), the handle + sender
+        // are `None` and the dispatcher is not started. `shutdown_writer()`
+        // and `Drop` both treat `None` as a no-op.
+        //
+        // `spawn_task_dispatcher` is a sync fn that calls `tokio::spawn`
+        // internally; we guard the call with `Handle::try_current()` so the
+        // sync-context path skips the spawn instead of panicking.
+        let (dispatcher_handle, dispatcher_shutdown) =
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let handle = subagent_manager.spawn_task_dispatcher(shutdown_rx);
+                (Some(handle), Some(shutdown_tx))
+            } else {
+                (None, None)
+            };
+
         Self {
             db,
             event_bus,
@@ -180,14 +476,434 @@ impl BusytokSupervisor {
             status,
             writer_handle,
             read_service,
+            subagent_manager,
+            sidecar_supervisor,
+            sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
+            pressure_responder,
             _writer_join: Mutex::new(writer_join),
             _catalog_reload_join: Mutex::new(catalog_reload_join),
+            task_dispatcher: Mutex::new(dispatcher_handle),
+            dispatcher_shutdown: Mutex::new(dispatcher_shutdown),
         }
     }
 
     /// Discover log sources using current settings and user roots from DB.
     fn discover_sources(&self) -> Result<Vec<busytok_discovery::DiscoveredLogSource>> {
         self.source_registry.discover_all()
+    }
+
+    /// Returns the error message captured when `pi_sidecar.enabled = true`
+    /// but `resolve_sidecar_config` failed at construction time, OR `None`
+    /// when the sidecar initialized successfully or was not enabled.
+    ///
+    /// This lets Task 6 / status reporting surface sidecar config degradation
+    /// without refactoring `build_with_settings` to return `Result<Self>`.
+    /// The service is still running in degraded mode (MockTaskExecutor) when
+    /// this returns `Some`; callers should treat a non-`None` value as a
+    /// loud signal that the configured sidecar is NOT backing delegate calls.
+    pub fn sidecar_init_error(&self) -> Option<&str> {
+        self.sidecar_init_error.as_deref()
+    }
+
+    /// §8.3 step 2: pressure gate shared with `SubagentManager`. `None` when
+    /// the sidecar is disabled (no pressure response chain). Task 6 / status
+    /// reporting can read this to expose the current pressure action via
+    /// `gate.last_action()`.
+    pub fn pressure_gate(&self) -> Option<&Arc<busytok_subagent::PressureGate>> {
+        self.pressure_gate.as_ref()
+    }
+
+    /// §8.3 escalation chain driver. `None` when the sidecar is disabled.
+    /// Task 6 / status reporting can read this to surface responder state.
+    pub fn pressure_responder(&self) -> Option<&Arc<busytok_subagent::PressureResponder>> {
+        self.pressure_responder.as_ref()
+    }
+
+    /// Run the 11 spec §7.1 doctor checks. The subagent-specific checks
+    /// (SQLite, sidecar launchable, resource policy, stale subagents) are
+    /// real; the 6 bundle-inspection checks probe the filesystem + sidecar
+    /// supervisor. `overall_ok` is true iff no check has `status == "error"`
+    /// (warnings don't fail). Async because the `protocol_version` check
+    /// does a short-lived probe (`ensure_started().await` +
+    /// `shutdown_internal().await`) when the sidecar is enabled but not
+    /// running.
+    async fn run_subagent_doctor(&self) -> SubagentDoctorResultDto {
+        let mut checks: Vec<DoctorCheckDto> = Vec::new();
+
+        // 1. busytok-service running — always ok (we're running this code).
+        checks.push(DoctorCheckDto {
+            name: "service_running".into(),
+            status: "ok".into(),
+            detail: None,
+        });
+
+        // 2. SQLite readable/writable + schema version (spec §7.1).
+        //    Three probes: SELECT 1 (readable), BEGIN IMMEDIATE; ROLLBACK
+        //    (writable — fails on read-only DBs or locked state), and
+        //    schema_version == SCHEMA_VERSION (correct migration applied).
+        {
+            let db = self.db.lock().unwrap();
+            let readable = db
+                .conn()
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .is_ok();
+            let db_version: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM _schema_version",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            let schema_version_ok = db_version == busytok_store::schema::SCHEMA_VERSION as i64;
+            // Write probe: BEGIN IMMEDIATE + a no-op DELETE, then rollback.
+            // The DELETE matches no rows (version=-999 never exists) but
+            // forces SQLite to acquire a write lock and attempt I/O, which
+            // fails on read-only connections (SQLITE_READONLY). A bare
+            // `BEGIN IMMEDIATE; ROLLBACK;` is insufficient because in WAL
+            // mode some SQLite builds allow acquiring a RESERVED lock on a
+            // read-only connection without actually writing.
+            //
+            // Uses an RAII `Transaction` instead of `execute_batch` so the
+            // transaction is rolled back on BOTH the success and failure
+            // paths of the DELETE. With `execute_batch("BEGIN; DELETE;
+            // ROLLBACK;")`, if DELETE fails (e.g. mid-transaction I/O
+            // error), the batch aborts at the failing statement and the
+            // trailing ROLLBACK never runs — leaving the connection in an
+            // open transaction that pollutes subsequent operations. The
+            // RAII `Transaction` guarantees cleanup via Drop regardless of
+            // how the block exits.
+            let writable = match rusqlite::Transaction::new_unchecked(
+                db.conn(),
+                rusqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => {
+                    let delete_ok = tx
+                        .execute("DELETE FROM _schema_version WHERE version = -999", [])
+                        .is_ok();
+                    // Explicit rollback — Drop would also do it, but be
+                    // explicit so the cleanup guarantee is visible.
+                    let _ = tx.rollback();
+                    delete_ok
+                }
+                Err(_) => false, // BEGIN IMMEDIATE failed (read-only or locked)
+            };
+            let ok = readable && writable && schema_version_ok;
+            let mut detail = format!(
+                "schema_version={db_version} (expected {}), readable={readable}, writable={writable}",
+                busytok_store::schema::SCHEMA_VERSION
+            );
+            if !ok {
+                if !readable {
+                    detail.push_str(" — SELECT 1 failed");
+                } else if !writable {
+                    detail.push_str(" — write probe failed (read-only or locked)");
+                } else if !schema_version_ok {
+                    detail.push_str(" — schema version mismatch");
+                }
+            }
+            checks.push(DoctorCheckDto {
+                name: "sqlite_readable".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 3. Pi sidecar launchable — surface sidecar_init_error if present.
+        //    When pi_sidecar.enabled=false, this is "ok" (feature off).
+        checks.push(DoctorCheckDto {
+            name: "sidecar_launchable".into(),
+            status: if self.sidecar_init_error().is_some() {
+                "error"
+            } else {
+                "ok"
+            }
+            .into(),
+            detail: self.sidecar_init_error().map(|s| s.to_string()),
+        });
+
+        // 4-9. Bundled node arch, manifest, protocol version, model config,
+        //      Pi runtime, artifact store — real probes (spec §7.1 lines
+        //      865-870). Extract all settings-derived values BEFORE any
+        //      `.await` — `self.settings` is a `std::sync::Mutex` and holding
+        //      its guard across `.await` (protocol_version probe below) is
+        //      forbidden. `runtime_dir` and `models` are cloned out as owned
+        //      values so the lock is released before the protocol probe.
+        let (runtime_dir, models) = {
+            let settings = self.settings.lock().unwrap();
+            (
+                settings.subagent.pi_sidecar.runtime_dir.clone(),
+                settings.subagent.models.clone(),
+            )
+        };
+        let runtime_dir_ref = runtime_dir.as_deref();
+
+        // 4. Bundled Node architecture matches (spec §7.1 line 865).
+        {
+            let node_path = self.paths.sidecar_bundled_node_path(runtime_dir_ref);
+            let expected_arch = std::env::consts::ARCH;
+            let arch_ok = node_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n == expected_arch)
+                .unwrap_or(false);
+            let node_exists = node_path.exists();
+            let ok = arch_ok && node_exists;
+            let detail = if !node_exists {
+                format!("bundled node not found at {}", node_path.display())
+            } else if !arch_ok {
+                format!("arch mismatch: expected {expected_arch}")
+            } else {
+                format!("ok ({expected_arch})")
+            };
+            checks.push(DoctorCheckDto {
+                name: "bundled_node_arch".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 5. Bundle manifest readable (spec §7.1 line 866, §5.1 line 549).
+        //    Verifies manifest.json EXISTS, is READABLE (open succeeds), and
+        //    is PARSEABLE as JSON. A missing or malformed manifest is an
+        //    "error" — the sidecar cannot be launched without a valid
+        //    manifest.
+        {
+            let manifest_path = self.paths.sidecar_manifest_path(runtime_dir_ref);
+            let (status, detail) = match std::fs::read_to_string(&manifest_path) {
+                Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+                    Ok(_v) => (
+                        "ok",
+                        format!("manifest readable ({})", manifest_path.display()),
+                    ),
+                    Err(e) => (
+                        "error",
+                        format!(
+                            "manifest at {} is not valid JSON: {}",
+                            manifest_path.display(),
+                            e
+                        ),
+                    ),
+                },
+                Err(e) => (
+                    "error",
+                    format!(
+                        "manifest not readable at {}: {}",
+                        manifest_path.display(),
+                        e
+                    ),
+                ),
+            };
+            checks.push(DoctorCheckDto {
+                name: "bundle_manifest_readable".into(),
+                status: status.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 6. Protocol version matches (spec §7.1 line 867).
+        //    If sidecar is already running, protocol was verified during
+        //    `adapter.initialize` in `ensure_started` → "ok". If not running,
+        //    do a SHORT-LIVED PROBE: `ensure_started()` (spawns + verifies
+        //    protocol via adapter.initialize), then `shutdown_internal()`.
+        //    When `sidecar_supervisor` is None, distinguish "pi_sidecar
+        //    disabled" (warning) from "enabled but config resolve failed"
+        //    (error via `sidecar_init_error`).
+        {
+            let expected_pv = busytok_subagent::sidecar::protocol::PROTOCOL_VERSION;
+            let (status, detail) = match &self.sidecar_supervisor {
+                Some(sup) if sup.try_is_running() => (
+                    "ok",
+                    format!(
+                        "protocol_version={expected_pv}, sidecar running (verified during init)"
+                    ),
+                ),
+                Some(sup) => match sup.ensure_started().await {
+                    Ok(_handle) => {
+                        if let Err(e) = sup.shutdown_internal().await {
+                            warn!(
+                                event_code = "subagent.doctor.protocol_probe_shutdown_failed",
+                                error = %e,
+                                "short-lived probe shutdown failed"
+                            );
+                        }
+                        (
+                            "ok",
+                            format!(
+                                "protocol_version={expected_pv}, verified via short-lived probe"
+                            ),
+                        )
+                    }
+                    Err(e) => (
+                        "error",
+                        format!("protocol probe failed (ensure_started): {e}"),
+                    ),
+                },
+                None => {
+                    if let Some(err) = self.sidecar_init_error() {
+                        (
+                            "error",
+                            format!("protocol probe failed — sidecar not constructed: {err}"),
+                        )
+                    } else {
+                        (
+                            "warning",
+                            "pi_sidecar disabled — cannot probe protocol version".into(),
+                        )
+                    }
+                }
+            };
+            checks.push(DoctorCheckDto {
+                name: "protocol_version".into(),
+                status: status.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 7. Default model config valid (spec §7.1 line 868).
+        {
+            let empty_fields: Vec<&str> = [
+                ("default_cheap_model", &models.default_cheap_model),
+                ("default_review_model", &models.default_review_model),
+                ("default_reasoning_model", &models.default_reasoning_model),
+                ("default_coder_model", &models.default_coder_model),
+            ]
+            .iter()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
+            let ok = empty_fields.is_empty();
+            let detail = if ok {
+                "all 4 default models configured".to_string()
+            } else {
+                format!("empty model fields: {}", empty_fields.join(", "))
+            };
+            checks.push(DoctorCheckDto {
+                name: "default_model_config".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 8. Pi runtime installed (spec §7.1 line 869).
+        {
+            let node_path = self.paths.sidecar_bundled_node_path(runtime_dir_ref);
+            let bundle_path = self.paths.sidecar_bundle_path(runtime_dir_ref);
+            let ok = node_path.exists() && bundle_path.exists();
+            let detail = if ok {
+                "node + bundle present".to_string()
+            } else {
+                format!(
+                    "missing: node={} bundle={}",
+                    node_path.exists(),
+                    bundle_path.exists()
+                )
+            };
+            checks.push(DoctorCheckDto {
+                name: "pi_runtime_installed".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 9. Artifact store writable (spec §7.1 line 870).
+        //    Self-heal: create the artifacts dir if missing so the probe
+        //    tests actual writability rather than reporting a stale "missing"
+        //    state. A missing dir that can't be created is reported as
+        //    "not writable" — what the user cares about is whether artifacts
+        //    can be written, not whether the dir pre-existed.
+        {
+            let artifacts_dir = self.paths.artifacts_dir();
+            let dir_created =
+                artifacts_dir.exists() || std::fs::create_dir_all(&artifacts_dir).is_ok();
+            let probe_ok = if dir_created {
+                let probe_path = artifacts_dir.join(".busytok_doctor_probe");
+                std::fs::write(&probe_path, b"probe").is_ok()
+                    && std::fs::remove_file(&probe_path).is_ok()
+            } else {
+                false
+            };
+            let detail = if probe_ok {
+                format!("writable ({})", artifacts_dir.display())
+            } else {
+                format!("not writable: {}", artifacts_dir.display())
+            };
+            checks.push(DoctorCheckDto {
+                name: "artifact_store_writable".into(),
+                status: if probe_ok { "ok" } else { "error" }.into(),
+                detail: Some(detail),
+            });
+        }
+
+        // 10. Resource policy valid — check the deserialized policy fields.
+        {
+            let settings = self.settings.lock().unwrap();
+            let p = &settings.subagent.resource_policy;
+            let ok = p.memory_pressure_free_mb > 0 && p.monitor_interval_seconds > 0;
+            checks.push(DoctorCheckDto {
+                name: "resource_policy_valid".into(),
+                status: if ok { "ok" } else { "error" }.into(),
+                detail: Some(format!(
+                    "memory_pressure_free_mb={}, monitor_interval_seconds={}",
+                    p.memory_pressure_free_mb, p.monitor_interval_seconds
+                )),
+            });
+        }
+
+        // 11. Subagents unused > 30 days (warning, not error). SQL errors
+        //     (table missing, DB locked) must NOT be swallowed into a
+        //     false-green "ok" — surface them as "error" so overall_ok
+        //     reflects the real state, mirroring the `sqlite_readable`
+        //     check's `is_ok()` pattern above.
+        {
+            let db = self.db.lock().unwrap();
+            let threshold_ms = now_ms() - (30 * 24 * 60 * 60 * 1000);
+            let stale_result: rusqlite::Result<Vec<String>> = db
+                .conn()
+                .prepare(
+                    "SELECT id FROM subagent_logical_subagents \
+                     WHERE last_active_at_ms IS NOT NULL \
+                     AND last_active_at_ms < ?1 \
+                     AND status != 'deleted'",
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![threshold_ms], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                });
+            match stale_result {
+                Ok(stale) => {
+                    let is_warning = !stale.is_empty();
+                    checks.push(DoctorCheckDto {
+                        name: "subagents_unused_30d".into(),
+                        status: if is_warning { "warning" } else { "ok" }.into(),
+                        detail: if is_warning {
+                            Some(format!(
+                                "{} stale subagent(s): {}",
+                                stale.len(),
+                                stale.join(", ")
+                            ))
+                        } else {
+                            None
+                        },
+                    });
+                }
+                Err(e) => {
+                    checks.push(DoctorCheckDto {
+                        name: "subagents_unused_30d".into(),
+                        status: "error".into(),
+                        detail: Some(format!("SQL error: {e}")),
+                    });
+                }
+            }
+        }
+
+        let overall_ok = checks.iter().all(|c| c.status != "error");
+        SubagentDoctorResultDto { checks, overall_ok }
     }
 
     // ── Scan methods ────────────────────────────────────────────────────
@@ -641,11 +1357,34 @@ impl BusytokSupervisor {
         &self.writer_handle
     }
 
+    /// Access the logical-subagent manager (for direct use outside the
+    /// `RuntimeControl` impl).
+    pub fn subagent_manager(&self) -> &busytok_subagent::SubagentManager {
+        &self.subagent_manager
+    }
+
     /// Gracefully drain and stop the writer actor.
     ///
     /// Service shutdown calls this after scan/tail tasks have stopped so the
     /// final metrics checkpoint is persisted before process exit.
+    ///
+    /// Task 7 Finding 3 fix: the §8.3 "queue only" background dispatcher is
+    /// drained FIRST (send `true` on the watch + await the JoinHandle). The
+    /// dispatcher writes directly to `db` (NOT through the writer actor), so
+    /// it must finish before the writer actor's final flush + WAL checkpoint
+    /// to avoid a race where the dispatcher commits a row after the writer
+    /// has stopped accepting commands. No-op when no Tokio runtime was active
+    /// at construction time (both fields are `None`).
     pub async fn shutdown_writer(&self) -> Result<()> {
+        // 1. Drain the §8.3 task dispatcher (if running).
+        if let Some(tx) = self.dispatcher_shutdown.lock().unwrap().take() {
+            let _ = tx.send(true); // signal dispatcher to exit
+        }
+        if let Some(handle) = self.task_dispatcher.lock().unwrap().take() {
+            let _ = handle.await; // wait for dispatcher to actually exit
+        }
+
+        // 2. Drain the writer actor.
         if self._writer_join.lock().unwrap().is_none() {
             return Ok(());
         }
@@ -657,6 +1396,21 @@ impl BusytokSupervisor {
                 .map_err(|e| anyhow::anyhow!("writer actor join error: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Gracefully shut down the Pi sidecar subprocess (hibernate sessions,
+    /// kill child). Called from `ServiceApp::run()` after the control server
+    /// has stopped accepting new delegate requests and before the
+    /// tailer/sampler drain. No-op when `pi_sidecar.enabled = false` (the
+    /// default) — `sidecar_supervisor` is `None` in that case. Failures are
+    /// logged but do not propagate; service shutdown must continue so the
+    /// writer actor flush and WAL checkpoint still run.
+    pub async fn shutdown_sidecar(&self) {
+        if let Some(sup) = &self.sidecar_supervisor {
+            if let Err(e) = sup.shutdown().await {
+                warn!(event_code = "subagent.sidecar.shutdown_failed", error = %e);
+            }
+        }
     }
 
     /// Return a clone of the event bus arc (for starting the sampler).
@@ -1251,6 +2005,102 @@ impl BusytokSupervisor {
         }
 
         samples
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drop — best-effort shutdown of the §8.3 task dispatcher (Task 7 Finding 3
+// fix). `Drop` cannot `.await`, so we can only send the shutdown signal; the
+// dispatcher will exit on its next `select!` iteration (within ~200ms). Tests
+// that need deterministic shutdown call `shutdown_writer()` (which awaits the
+// JoinHandle) before letting the supervisor drop.
+// ---------------------------------------------------------------------------
+
+impl Drop for BusytokSupervisor {
+    fn drop(&mut self) {
+        // Send the shutdown signal if the sender is still owned (i.e. not
+        // already taken by `shutdown_writer()`). Best-effort: ignore errors
+        // (receiver already dropped).
+        if let Some(tx) = self.dispatcher_shutdown.lock().unwrap().take() {
+            let _ = tx.send(true);
+        }
+        // The JoinHandle is detached on drop (tokio semantics) — it does NOT
+        // abort the task. The shutdown signal above guarantees the dispatcher
+        // will exit within one poll cycle (200ms). We do NOT `take()` the
+        // handle here so any subsequent `shutdown_writer()` call (rare, only
+        // possible if drop is somehow re-entered) is a no-op.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subagent bridge — conversion helpers between busytok-subagent models and
+// busytok-protocol DTOs. Free functions (not `From` impls) because both ends
+// are foreign types relative to this crate (avoids E0117 orphan rule).
+// ---------------------------------------------------------------------------
+
+fn map_subagent_error(e: busytok_subagent::SubagentError) -> anyhow::Error {
+    MethodDispatchError::from_read_error(e.code(), e.to_string(), serde_json::Value::Null).into()
+}
+
+fn delegate_request_from_dto(
+    d: busytok_protocol::dto::SubagentDelegateRequestDto,
+) -> busytok_subagent::models::DelegateRequest {
+    busytok_subagent::models::DelegateRequest {
+        subagent_name: d.subagent_name,
+        subagent_id: d.subagent_id,
+        cwd: d.cwd,
+        profile: d.profile,
+        intent: d.intent,
+        prompt: d.prompt,
+        prompt_artifact_ref: d.prompt_artifact_ref,
+        timeout_seconds: d.timeout_seconds,
+        model_override: d.model_override,
+        source_harness: d.source_harness,
+        source_session_id: d.source_session_id,
+    }
+}
+
+fn resolve_params_from_dto(
+    r: busytok_protocol::dto::SubagentResolveRequestDto,
+) -> busytok_subagent::models::ResolveParams {
+    busytok_subagent::models::ResolveParams {
+        name: r.name,
+        id: r.id,
+        cwd: r.cwd,
+    }
+}
+
+fn subagent_detail(s: busytok_subagent::models::LogicalSubagent) -> SubagentDetailDto {
+    SubagentDetailDto {
+        id: s.id,
+        name: s.name,
+        project_id: s.project_id,
+        repo_path: s.repo_path,
+        repo_hash: s.repo_hash,
+        branch: s.branch,
+        intent: s.intent,
+        default_profile: s.default_profile,
+        default_model: s.default_model,
+        status: s.status.as_str().to_string(),
+        created_at_ms: s.created_at_ms,
+        updated_at_ms: s.updated_at_ms,
+        last_active_at_ms: s.last_active_at_ms,
+    }
+}
+
+fn subagent_task_summary(
+    t: busytok_subagent::models::SubagentTaskSummary,
+) -> SubagentTaskSummaryDto {
+    SubagentTaskSummaryDto {
+        id: t.id,
+        subagent_id: t.subagent_id,
+        profile: t.profile,
+        status: t.status.as_str().to_string(),
+        prompt: t.prompt,
+        result_summary: t.result_summary,
+        error: t.error,
+        created_at_ms: t.created_at_ms,
+        completed_at_ms: t.completed_at_ms,
     }
 }
 
@@ -3278,6 +4128,15 @@ impl RuntimeControl for BusytokSupervisor {
             )
             .collect();
 
+        // Spec §7.1 + §7.3: extend settings.diagnostics with subagent doctor
+        // checks. Reuses the existing RPC path — no new method. Always
+        // populate when the runtime is constructed; the per-check status
+        // (e.g. sidecar_launchable "ok" when pi_sidecar.enabled=false)
+        // reflects the current configuration rather than gating the whole
+        // section. The DTO field is still `Option<...>` for wire-level
+        // backwards-compat with older clients.
+        let subagent = Some(self.run_subagent_doctor().await);
+
         let now_ms = busytok_domain::now_ms();
         self.build_read_envelope(
             SettingsDiagnosticsDto {
@@ -3289,6 +4148,7 @@ impl RuntimeControl for BusytokSupervisor {
                 writer_queue_depth,
                 aggregate_lag_ms,
                 recent_diagnostics,
+                subagent,
             },
             now_ms,
         )
@@ -3679,6 +4539,119 @@ impl RuntimeControl for BusytokSupervisor {
         );
 
         Ok(PromptSuggestTagsResponseDto { tags })
+    }
+
+    // ── Subagents ────────────────────────────────────────────────────
+
+    async fn subagent_delegate(
+        &self,
+        req: busytok_protocol::dto::SubagentDelegateRequestDto,
+    ) -> Result<SubagentDelegateResponseDto> {
+        let r = self
+            .subagent_manager
+            .delegate(delegate_request_from_dto(req))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentDelegateResponseDto {
+            task_id: r.task_id,
+            subagent_id: r.subagent_id,
+            subagent_name: r.subagent_name,
+            adapter: r.adapter,
+            adapter_session_id: r.adapter_session_id,
+            session_reused: r.session_reused,
+            status: r.status.as_str().to_string(),
+            profile: r.profile,
+            model: r.model,
+            summary: r.summary,
+            usage: SubagentUsageDto {
+                model: r.usage.model,
+                provider: r.usage.provider,
+                input_tokens: r.usage.input_tokens,
+                output_tokens: r.usage.output_tokens,
+                cache_read_tokens: r.usage.cache_read_tokens,
+                cache_write_tokens: r.usage.cache_write_tokens,
+                cost_usd: r.usage.cost_usd,
+            },
+        })
+    }
+
+    async fn subagent_list(&self, req: SubagentListRequestDto) -> Result<SubagentListResponseDto> {
+        let status = req.status.as_deref().and_then(|s| s.parse().ok());
+        let subs = self
+            .subagent_manager
+            .list(
+                status,
+                req.project.as_deref(),
+                req.include_deleted.unwrap_or(false),
+            )
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentListResponseDto {
+            subagents: subs.into_iter().map(subagent_detail).collect(),
+        })
+    }
+
+    async fn subagent_show(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<SubagentDetailDto> {
+        let s = self
+            .subagent_manager
+            .show(resolve_params_from_dto(req))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(subagent_detail(s))
+    }
+
+    async fn subagent_tasks(
+        &self,
+        req: SubagentTasksRequestDto,
+    ) -> Result<SubagentTasksResponseDto> {
+        let resolve = busytok_subagent::models::ResolveParams {
+            name: req.name,
+            id: req.id,
+            cwd: req.cwd,
+        };
+        let tasks = self
+            .subagent_manager
+            .tasks(resolve, req.limit.unwrap_or(20))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentTasksResponseDto {
+            tasks: tasks.into_iter().map(subagent_task_summary).collect(),
+        })
+    }
+
+    async fn subagent_hibernate(
+        &self,
+        req: busytok_protocol::dto::SubagentResolveRequestDto,
+    ) -> Result<SubagentAckDto> {
+        let id = self
+            .subagent_manager
+            .hibernate(resolve_params_from_dto(req))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentAckDto {
+            id,
+            status: "hibernated".to_string(),
+        })
+    }
+
+    async fn subagent_delete(&self, req: SubagentDeleteRequestDto) -> Result<SubagentAckDto> {
+        let resolve = busytok_subagent::models::ResolveParams {
+            name: req.name,
+            id: req.id,
+            cwd: req.cwd,
+        };
+        let id = self
+            .subagent_manager
+            .delete(resolve, req.hard.unwrap_or(false))
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentAckDto {
+            id,
+            status: "deleted".to_string(),
+        })
     }
 
     // ── Events ───────────────────────────────────────────────────────

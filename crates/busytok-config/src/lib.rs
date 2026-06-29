@@ -21,6 +21,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 /// Atomically write `contents` to `path` via temp-file + rename.
 ///
 /// Shared by `BusytokSettings::save` and the GUI-side local lifecycle
@@ -98,6 +102,8 @@ pub struct BusytokSettings {
     pub discovery: DiscoverySettings,
     #[serde(default)]
     pub prompt_palette_default_action: PromptDefaultAction,
+    #[serde(default)]
+    pub subagent: SubagentSettings,
 }
 
 fn default_week_starts_on() -> u8 {
@@ -112,6 +118,7 @@ impl Default for BusytokSettings {
             privacy: PrivacySettings::default(),
             discovery: DiscoverySettings::default(),
             prompt_palette_default_action: PromptDefaultAction::default(),
+            subagent: SubagentSettings::default(),
         }
     }
 }
@@ -152,6 +159,272 @@ impl Default for DiscoverySettings {
             manual_roots: vec![],
         }
     }
+}
+
+// --- subagent settings -----------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub pi_sidecar: SubagentPiSidecarConfig,
+    #[serde(default)]
+    pub context: SubagentContextConfig,
+    #[serde(default)]
+    pub resource_policy: SubagentResourcePolicyConfig,
+    #[serde(default)]
+    pub models: SubagentModelsConfig,
+    #[serde(default = "default_profiles")]
+    pub profiles: std::collections::HashMap<String, SubagentProfileConfig>,
+}
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pi_sidecar: SubagentPiSidecarConfig::default(),
+            context: SubagentContextConfig::default(),
+            resource_policy: SubagentResourcePolicyConfig::default(),
+            models: SubagentModelsConfig::default(),
+            profiles: default_profiles(),
+        }
+    }
+}
+
+fn default_max_hot_sessions() -> u32 {
+    3
+}
+fn default_idle_exit_seconds() -> u64 {
+    300
+}
+fn default_hibernate_after_seconds() -> u64 {
+    600
+}
+fn default_task_timeout_seconds() -> u64 {
+    300
+}
+fn default_task_queue_max() -> u32 {
+    50
+}
+fn default_memory_soft_limit_mb() -> u32 {
+    800
+}
+fn default_memory_hard_limit_mb() -> u32 {
+    1200
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentPiSidecarConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// "bundled" | "system"
+    #[serde(default = "default_bundled_runtime")]
+    pub node_runtime: String,
+    #[serde(default)]
+    pub system_node_path: String,
+    #[serde(default = "default_max_hot_sessions")]
+    pub max_hot_sessions: u32,
+    #[serde(default = "default_idle_exit_seconds")]
+    pub idle_exit_seconds: u64,
+    #[serde(default = "default_hibernate_after_seconds")]
+    pub hibernate_after_seconds: u64,
+    #[serde(default = "default_task_timeout_seconds")]
+    pub task_timeout_seconds: u64,
+    #[serde(default = "default_memory_soft_limit_mb")]
+    pub memory_soft_limit_mb: u32,
+    #[serde(default = "default_memory_hard_limit_mb")]
+    pub memory_hard_limit_mb: u32,
+    #[serde(default = "default_task_queue_max")]
+    pub task_queue_max: u32,
+    /// Optional override for the sidecar runtime directory (bundle + node binary).
+    /// When set, `BusytokPaths::sidecar_runtime_dir()` returns this path verbatim.
+    /// When None (default), `sidecar_runtime_dir()` resolves to the dev path
+    /// (`apps/pi-sidecar/dist/`) — packaged builds MUST set this via settings.toml
+    /// or a Tauri-injected env var.
+    ///
+    /// Examples:
+    ///   - Packaged GUI (macOS): `/Applications/Busytok.app/Contents/Resources/sidecars/pi`
+    ///   - Service-only: `/usr/local/lib/busytok/sidecars/pi` (or wherever the
+    ///     package manager installs it)
+    ///   - Dev: unset (resolves to apps/pi-sidecar/dist/)
+    #[serde(default)]
+    pub runtime_dir: Option<String>,
+}
+impl Default for SubagentPiSidecarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_runtime: default_bundled_runtime(),
+            system_node_path: String::new(),
+            max_hot_sessions: default_max_hot_sessions(),
+            idle_exit_seconds: default_idle_exit_seconds(),
+            hibernate_after_seconds: default_hibernate_after_seconds(),
+            task_timeout_seconds: default_task_timeout_seconds(),
+            memory_soft_limit_mb: default_memory_soft_limit_mb(),
+            memory_hard_limit_mb: default_memory_hard_limit_mb(),
+            task_queue_max: default_task_queue_max(),
+            runtime_dir: None,
+        }
+    }
+}
+fn default_bundled_runtime() -> String {
+    "bundled".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentContextConfig {
+    #[serde(default = "default_budget_tokens")]
+    pub default_budget_tokens: u32,
+    #[serde(default = "default_max_budget_tokens")]
+    pub max_budget_tokens: u32,
+    #[serde(default = "default_recent_tasks_limit")]
+    pub recent_tasks_limit: u32,
+    #[serde(default = "default_compaction_tasks_threshold")]
+    pub compaction_tasks_threshold: u32,
+    #[serde(default = "default_compaction_budget_ratio")]
+    pub compaction_budget_ratio: f64,
+}
+impl Default for SubagentContextConfig {
+    fn default() -> Self {
+        Self {
+            default_budget_tokens: default_budget_tokens(),
+            max_budget_tokens: default_max_budget_tokens(),
+            recent_tasks_limit: default_recent_tasks_limit(),
+            compaction_tasks_threshold: default_compaction_tasks_threshold(),
+            compaction_budget_ratio: default_compaction_budget_ratio(),
+        }
+    }
+}
+fn default_budget_tokens() -> u32 {
+    4000
+}
+fn default_max_budget_tokens() -> u32 {
+    8000
+}
+fn default_recent_tasks_limit() -> u32 {
+    5
+}
+fn default_compaction_tasks_threshold() -> u32 {
+    5
+}
+fn default_compaction_budget_ratio() -> f64 {
+    0.7
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentResourcePolicyConfig {
+    /// System free-memory threshold below which the runtime applies backpressure.
+    #[serde(default = "default_memory_pressure_free_mb")]
+    pub memory_pressure_free_mb: u32,
+    /// Resource sampling interval for ResourceMonitor (Plan 5).
+    #[serde(default = "default_monitor_interval_seconds")]
+    pub monitor_interval_seconds: u64,
+}
+impl Default for SubagentResourcePolicyConfig {
+    fn default() -> Self {
+        Self {
+            memory_pressure_free_mb: default_memory_pressure_free_mb(),
+            monitor_interval_seconds: default_monitor_interval_seconds(),
+        }
+    }
+}
+fn default_memory_pressure_free_mb() -> u32 {
+    2048
+}
+fn default_monitor_interval_seconds() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentModelsConfig {
+    #[serde(default = "default_cheap_model")]
+    pub default_cheap_model: String,
+    #[serde(default = "default_review_model")]
+    pub default_review_model: String,
+    #[serde(default = "default_reasoning_model")]
+    pub default_reasoning_model: String,
+    #[serde(default = "default_coder_model")]
+    pub default_coder_model: String,
+}
+impl Default for SubagentModelsConfig {
+    fn default() -> Self {
+        Self {
+            default_cheap_model: default_cheap_model(),
+            default_review_model: default_review_model(),
+            default_reasoning_model: default_reasoning_model(),
+            default_coder_model: default_coder_model(),
+        }
+    }
+}
+fn default_cheap_model() -> String {
+    "deepseek-chat".to_string()
+}
+fn default_review_model() -> String {
+    "qwen-coder".to_string()
+}
+fn default_reasoning_model() -> String {
+    "deepseek-reasoner".to_string()
+}
+fn default_coder_model() -> String {
+    "qwen-coder".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentProfileConfig {
+    #[serde(default = "default_false")]
+    pub write_access: bool,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_budget_tokens")]
+    pub context_budget_tokens: u32,
+    #[serde(default = "default_task_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+/// The built-in read-only profiles for MVP. `pi/patch-small` is deferred.
+fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig> {
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "pi/search-cheap".to_string(),
+        SubagentProfileConfig {
+            write_access: false,
+            tools: vec!["read".to_string(), "grep".to_string()],
+            model: default_cheap_model(),
+            context_budget_tokens: 3000,
+            timeout_seconds: 120,
+        },
+    );
+    m.insert(
+        "pi/review-cheap".to_string(),
+        SubagentProfileConfig {
+            write_access: false,
+            tools: vec![
+                "read".to_string(),
+                "grep".to_string(),
+                "git_diff".to_string(),
+            ],
+            model: default_review_model(),
+            context_budget_tokens: 5000,
+            timeout_seconds: 180,
+        },
+    );
+    m.insert(
+        "pi/plan-cheap".to_string(),
+        SubagentProfileConfig {
+            write_access: false,
+            tools: vec![
+                "read".to_string(),
+                "grep".to_string(),
+                "git_diff".to_string(),
+            ],
+            model: default_reasoning_model(),
+            context_budget_tokens: 6000,
+            timeout_seconds: 300,
+        },
+    );
+    m
 }
 
 impl BusytokSettings {
@@ -247,6 +520,13 @@ impl BusytokSettings {
         }
     }
 
+    /// Parse settings from a TOML string (no filesystem canonicalization/validation).
+    /// Used by tests; mirrors `load_from_file`.
+    pub fn load_from_str(toml: &str) -> Result<Self> {
+        let s: Self = toml::from_str(toml)?;
+        Ok(s)
+    }
+
     /// Save settings to a specific file path (for testing).
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -314,6 +594,7 @@ mod tests {
                 manual_roots: vec![],
             },
             prompt_palette_default_action: PromptDefaultAction::OnlyCopy,
+            subagent: SubagentSettings::default(),
         };
 
         settings.save_to_file(&path).unwrap();

@@ -144,7 +144,24 @@ aggregate_lag_ms: number,
  * Recent runtime diagnostic events (e.g. subscription lifecycle,
  * writer thresholds, drift events).
  */
-recent_diagnostics: Array<SettingsDiagnosticEventDto>, };
+recent_diagnostics: Array<SettingsDiagnosticEventDto>, 
+/**
+ * Subagent doctor checks (spec §7.1). Always populated when the runtime
+ * constructs this DTO; per-check status reflects current configuration
+ * (e.g. `sidecar_launchable` is "ok" when `pi_sidecar.enabled=false`).
+ * The `Option` is for wire-level backwards-compatibility only — older
+ * clients may omit the field on deserialize. Reuses the existing
+ * `settings.diagnostics` RPC path — no separate `subagent.doctor` RPC.
+ */
+subagent: SubagentDoctorResultDto | null, };
+
+export type SubagentDoctorResultDto = { checks: Array<DoctorCheckDto>, 
+/**
+ * True iff no check has `status == "error"`. Warnings don't fail.
+ */
+overall_ok: boolean, };
+
+export type DoctorCheckDto = { name: string, status: string, detail: string | null, };
 
 export type SettingsDiagnosticEventDto = { code: string, severity: string, message: string, happened_at_ms: number, };
 
@@ -268,6 +285,40 @@ watermark_ms: number | null,
 is_exact: boolean, };
 
 export type EventSubscriptionBatchDto = { events: Array<RuntimeEventDto>, };
+
+export type SubagentUsageDto = { model: string | null, provider: string | null, input_tokens: number | null, output_tokens: number | null, cache_read_tokens: number | null, cache_write_tokens: number | null, cost_usd: number | null, };
+
+export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string, subagent_name: string, adapter: string, adapter_session_id: string | null, session_reused: boolean, status: string, profile: string, model: string | null, summary: string | null, usage: SubagentUsageDto, };
+
+export type SubagentResolveRequestDto = { name: string | null, id: string | null, cwd: string | null, };
+
+export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: string | null, cwd: string, profile: string, intent: string | null, prompt: string, 
+/**
+ * Spec §4.3: when set, references a stored artifact (relative path within
+ * the artifact store root) instead of the inline `prompt`. Mutually
+ * exclusive with `prompt` — exactly one must be non-empty/Some.
+ */
+prompt_artifact_ref: string | null, timeout_seconds: number | null, model_override: string | null, source_harness: string | null, source_session_id: string | null, };
+
+export type SubagentListRequestDto = { 
+/**
+ * "hot" | "warm" | "cold"
+ */
+status: string | null, project: string | null, include_deleted: boolean | null, };
+
+export type SubagentDetailDto = { id: string, name: string, project_id: string, repo_path: string, repo_hash: string, branch: string | null, intent: string | null, default_profile: string, default_model: string | null, status: string, created_at_ms: number, updated_at_ms: number, last_active_at_ms: number | null, };
+
+export type SubagentListResponseDto = { subagents: Array<SubagentDetailDto>, };
+
+export type SubagentTaskSummaryDto = { id: string, subagent_id: string, profile: string, status: string, prompt: string | null, result_summary: string | null, error: string | null, created_at_ms: number, completed_at_ms: number | null, };
+
+export type SubagentTasksRequestDto = { name: string | null, id: string | null, cwd: string | null, limit: number | null, };
+
+export type SubagentTasksResponseDto = { tasks: Array<SubagentTaskSummaryDto>, };
+
+export type SubagentDeleteRequestDto = { name: string | null, id: string | null, cwd: string | null, hard: boolean | null, };
+
+export type SubagentAckDto = { id: string, status: string, };
 
 export type ReceiptPeakHourDto = { 
 /**

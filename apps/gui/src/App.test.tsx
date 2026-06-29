@@ -274,6 +274,7 @@ beforeEach(() => {
         writer_queue_depth: 0,
         aggregate_lag_ms: 0,
         recent_diagnostics: [],
+        subagent: null,
       },
       recovery_actions: [],
       prompt_palette_default_action: "OnlyCopy",
@@ -289,6 +290,7 @@ beforeEach(() => {
       writer_queue_depth: 0,
       aggregate_lag_ms: 0,
       recent_diagnostics: [],
+      subagent: null,
     }),
   );
   vi.spyOn(busytokClient, "settingsRecoveryAction").mockResolvedValue(

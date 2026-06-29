@@ -140,6 +140,13 @@ impl ServiceApp {
 
         shutdown_control_server(server, server_task, result_already_read).await?;
 
+        // --- NEW: shut down the Pi sidecar subprocess (hibernate sessions,
+        // kill child). Must come AFTER control server shutdown (no new
+        // delegate requests can arrive) and BEFORE the tailer/sampler drain
+        // so in-flight sidecar turns don't compete with the writer actor's
+        // final flush. No-op when `pi_sidecar.enabled = false`. ---
+        supervisor.shutdown_sidecar().await;
+
         let _ = sampler.send(true);
         let _ = tail.shutdown_tx.send(true);
         let _ = tail.join_handle.await;

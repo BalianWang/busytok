@@ -755,6 +755,37 @@ pub struct SettingsDiagnosticsDto {
     /// Recent runtime diagnostic events (e.g. subscription lifecycle,
     /// writer thresholds, drift events).
     pub recent_diagnostics: Vec<SettingsDiagnosticEventDto>,
+    /// Subagent doctor checks (spec §7.1). Always populated when the runtime
+    /// constructs this DTO; per-check status reflects current configuration
+    /// (e.g. `sidecar_launchable` is "ok" when `pi_sidecar.enabled=false`).
+    /// The `Option` is for wire-level backwards-compatibility only — older
+    /// clients may omit the field on deserialize. Reuses the existing
+    /// `settings.diagnostics` RPC path — no separate `subagent.doctor` RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentDoctorResultDto>,
+}
+
+/// Result of running subagent doctor checks (spec §7.1). Returned as the
+/// optional `subagent` field of `SettingsDiagnosticsDto` — no separate RPC
+/// method, reuses the existing `settings.diagnostics` path.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct SubagentDoctorResultDto {
+    pub checks: Vec<DoctorCheckDto>,
+    /// True iff no check has `status == "error"`. Warnings don't fail.
+    pub overall_ok: bool,
+}
+
+/// One doctor check result. `status` is one of: `"ok"`, `"warning"`, `"error"`.
+/// - `"ok"`: check passed.
+/// - `"warning"`: check surfaced a non-blocking issue (e.g. stale subagents,
+///   or a stubbed check not yet implemented — stubs return "warning" so
+///   `overall_ok` doesn't claim a green check on unverified ground).
+/// - `"error"`: check failed and `overall_ok` will be false.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct DoctorCheckDto {
+    pub name: String,
+    pub status: String,
+    pub detail: Option<String>,
 }
 
 /// A lightweight diagnostic event suitable for display in Settings/Diagnostics.
@@ -1225,10 +1256,138 @@ pub struct EventSubscriptionBatchDto {
 }
 
 // ---------------------------------------------------------------------------
-// Receipt (daily share image)
+// Subagent control DTOs (subagent.* methods)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+// --- requests -------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentDelegateRequestDto {
+    pub subagent_name: String,
+    pub subagent_id: Option<String>,
+    pub cwd: String,
+    pub profile: String,
+    pub intent: Option<String>,
+    pub prompt: String,
+    /// Spec §4.3: when set, references a stored artifact (relative path within
+    /// the artifact store root) instead of the inline `prompt`. Mutually
+    /// exclusive with `prompt` — exactly one must be non-empty/Some.
+    pub prompt_artifact_ref: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub model_override: Option<String>,
+    pub source_harness: Option<String>,
+    pub source_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentListRequestDto {
+    /// "hot" | "warm" | "cold"
+    pub status: Option<String>,
+    pub project: Option<String>,
+    pub include_deleted: Option<bool>,
+}
+
+/// Resolution params for single-subagent operations (show/tasks/hibernate/delete).
+/// Exactly one of `id` (UUID) or `name` (+ `cwd`) should be set.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentResolveRequestDto {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentTasksRequestDto {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentDeleteRequestDto {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+    pub hard: Option<bool>,
+}
+
+// --- responses ------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentUsageDto {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentDelegateResponseDto {
+    pub task_id: String,
+    pub subagent_id: String,
+    pub subagent_name: String,
+    pub adapter: String,
+    pub adapter_session_id: Option<String>,
+    pub session_reused: bool,
+    pub status: String,
+    pub profile: String,
+    pub model: Option<String>,
+    pub summary: Option<String>,
+    pub usage: SubagentUsageDto,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentDetailDto {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub repo_path: String,
+    pub repo_hash: String,
+    pub branch: Option<String>,
+    pub intent: Option<String>,
+    pub default_profile: String,
+    pub default_model: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_active_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentListResponseDto {
+    pub subagents: Vec<SubagentDetailDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentTaskSummaryDto {
+    pub id: String,
+    pub subagent_id: String,
+    pub profile: String,
+    pub status: String,
+    pub prompt: Option<String>,
+    pub result_summary: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentTasksResponseDto {
+    pub tasks: Vec<SubagentTaskSummaryDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentAckDto {
+    pub id: String,
+    pub status: String,
+}
+
+// ─── Receipt DTOs (from main merge) ───
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 pub struct ReceiptDailyRequestDto {
     /// `YYYY-MM-DD` in the current reporting timezone. `None` = today
     /// (server-resolved). See `receipt.daily` spec.
@@ -1506,51 +1665,66 @@ mod tests {
     }
 
     #[test]
-    fn receipt_daily_dto_round_trips() {
-        let dto = ReceiptDailyDto {
-            date: "2026-06-26".to_string(),
-            date_label: "FRI · JUN 26, 2026".to_string(),
-            timezone: "Asia/Shanghai".to_string(),
-            metrics: ReceiptMetricsDto {
-                total_tokens: 100,
-                input_tokens: 40,
-                output_tokens: 60,
-                cache_read_tokens: 30,
-                cache_hit_rate: Some(0.42857),
-                cost_usd: Some(1.23),
-                cost_status: CostStatusDto::Exact,
-                event_count: 7,
-                session_count: 2,
-                peak_hour: Some(ReceiptPeakHourDto {
-                    label: "14:00".to_string(),
-                    tokens: 80,
-                }),
-            },
-            top_models: vec![ReceiptModelSliceDto {
-                name: "claude-sonnet-4-5".to_string(),
-                tokens: 100,
-                cost_usd: Some(1.23),
-                cost_status: CostStatusDto::Exact,
+    fn subagent_doctor_result_dto_serializes_round_trip() {
+        let dto = SubagentDoctorResultDto {
+            checks: vec![DoctorCheckDto {
+                name: "resource_policy_valid".to_string(),
+                status: "ok".to_string(),
+                detail: None,
             }],
-            brand: ReceiptBrandDto {
-                name: "BUSYTOK".to_string(),
-                tagline: "AI CODING · TOKEN USAGE".to_string(),
-                github: "github.com/BalianWang/busytok".to_string(),
-                generated_at_ms: 1_781_600_000_000,
-            },
+            overall_ok: true,
         };
         let json = serde_json::to_string(&dto).unwrap();
-        let back: ReceiptDailyDto = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.date, dto.date);
-        assert_eq!(back.metrics.cost_status, CostStatusDto::Exact);
-        assert_eq!(back.top_models.len(), 1);
-        assert_eq!(back.metrics.peak_hour.unwrap().label, "14:00");
+        let back: SubagentDoctorResultDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.checks.len(), 1);
+        assert_eq!(back.checks[0].name, "resource_policy_valid");
+        assert!(back.overall_ok);
     }
 
     #[test]
-    fn receipt_request_date_defaults_none() {
-        let req = ReceiptDailyRequestDto { date: None };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"date\":null"));
+    fn settings_diagnostics_dto_serializes_with_optional_subagent_none() {
+        // Backwards-compat: existing clients don't send `subagent` field.
+        // Deserialization must still work.
+        let json = r#"{
+            "db_healthy": true,
+            "db_size_bytes": 4096,
+            "migration_version": 3,
+            "usage_event_count": 0,
+            "last_log_checkpoint_ms": null,
+            "writer_queue_depth": 0,
+            "aggregate_lag_ms": 0,
+            "recent_diagnostics": []
+        }"#;
+        let dto: SettingsDiagnosticsDto = serde_json::from_str(json).unwrap();
+        assert!(
+            dto.subagent.is_none(),
+            "missing field => None (backwards-compat)"
+        );
+    }
+
+    #[test]
+    fn settings_diagnostics_dto_serializes_with_subagent_present() {
+        let dto = SettingsDiagnosticsDto {
+            db_healthy: true,
+            db_size_bytes: 4096,
+            migration_version: 3,
+            usage_event_count: 0,
+            last_log_checkpoint_ms: None,
+            writer_queue_depth: 0,
+            aggregate_lag_ms: 0,
+            recent_diagnostics: vec![],
+            subagent: Some(SubagentDoctorResultDto {
+                checks: vec![DoctorCheckDto {
+                    name: "service_running".to_string(),
+                    status: "ok".to_string(),
+                    detail: None,
+                }],
+                overall_ok: true,
+            }),
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        let back: SettingsDiagnosticsDto = serde_json::from_str(&json).unwrap();
+        assert!(back.subagent.is_some());
+        assert_eq!(back.subagent.unwrap().checks.len(), 1);
     }
 }

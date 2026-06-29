@@ -1,0 +1,110 @@
+//! Sidecar runtime configuration.
+//!
+//! `SidecarConfig` is the resolved, ready-to-spawn configuration produced from
+//! `SubagentPiSidecarConfig` (settings) + `BusytokPaths` (filesystem locators).
+//! `resolve_sidecar_config` is the single entry point that turns settings into
+//! a spawnable config — including the explicit `bundled` vs `system` node
+//! runtime selection (no silent fallback, spec §10.1/§5.1).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use busytok_config::{BusytokPaths, SubagentPiSidecarConfig};
+
+use crate::sidecar::SidecarError;
+
+/// Resolved sidecar configuration — everything needed to spawn and supervise.
+pub struct SidecarConfig {
+    pub node_binary: PathBuf,
+    pub bundle_path: PathBuf,
+    pub env: HashMap<String, String>,
+    pub idle_exit_seconds: u64,
+    pub health_interval: Duration,
+    pub task_timeout: Duration,
+    pub max_restart_attempts: u32,
+    /// Base delay for exponential backoff on crash-restart (1s → 2s → 4s → 8s).
+    pub restart_backoff_base: Duration,
+    /// Harness name scopes crash reconciliation (spec §5.4). "pi" for Plan 2;
+    /// future harnesses (Claude Code, Codex) set their own.
+    pub harness_name: String,
+    /// Maximum concurrent hot sessions the sidecar will hold before evicting
+    /// the LRU (spec §4.4). Mirrored to the sidecar via the
+    /// `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS` env var (spec §8.2).
+    pub max_hot_sessions: u32,
+    /// Soft RSS limit (MB) — at/above this, log warning + plan graceful
+    /// restart (spec §8.3 step 3).
+    pub memory_soft_limit_mb: u32,
+    /// Hard RSS limit (MB) — at/above this, write `rss_limit_exceeded`
+    /// event; existing crash path will restart (spec §8.3 step 5).
+    pub memory_hard_limit_mb: u32,
+}
+
+/// Resolve a `SidecarConfig` from settings + paths.
+///
+/// Explicit mode selection — NO silent fallback. Spec §10.1/§5.1.
+/// `node_runtime = "bundled"` requires the bundled node binary to exist;
+/// `node_runtime = "system"` uses `system_node_path` (or PATH `node` if empty).
+pub fn resolve_sidecar_config(
+    settings: &SubagentPiSidecarConfig,
+    paths: &BusytokPaths,
+) -> Result<SidecarConfig, SidecarError> {
+    let runtime_dir = settings.runtime_dir.as_deref();
+    // Explicit mode selection — NO silent fallback. Spec §10.1/§5.1.
+    let node_binary = match settings.node_runtime.as_str() {
+        "system" => {
+            if settings.system_node_path.is_empty() {
+                PathBuf::from("node") // rely on PATH (explicit system mode)
+            } else {
+                PathBuf::from(&settings.system_node_path)
+            }
+        }
+        "bundled" => {
+            let bundled = paths.sidecar_bundled_node_path(runtime_dir);
+            if !bundled.exists() {
+                return Err(SidecarError::Spawn(format!(
+                    "node_runtime='bundled' but bundled node not found at {}; \
+                     set node_runtime='system' or install the bundled runtime",
+                    bundled.display()
+                )));
+            }
+            bundled
+        }
+        other => {
+            return Err(SidecarError::Spawn(format!(
+                "unknown node_runtime: '{other}' (expected 'bundled' or 'system')"
+            )));
+        }
+    };
+    let bundle_path = paths.sidecar_bundle_path(runtime_dir);
+    if !bundle_path.exists() {
+        return Err(SidecarError::Spawn(format!(
+            "sidecar bundle not found at {}",
+            bundle_path.display()
+        )));
+    }
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_SIDECAR_MAX_HOT_SESSIONS".to_string(),
+        settings.max_hot_sessions.to_string(),
+    );
+    Ok(SidecarConfig {
+        node_binary,
+        bundle_path,
+        env,
+        idle_exit_seconds: settings.idle_exit_seconds,
+        // Spec §5.4: health ping every 30s. Fixed in MVP (no config knob).
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(settings.task_timeout_seconds),
+        // Spec §5.4: max 3 backoff attempts. The rolling 5-min crash window
+        // (restart_history + MAX_CRASHES_PER_WINDOW=3) is implemented in
+        // supervisor.rs and is independent of this backoff-only counter.
+        // restart_attempts resets on successful spawn; restart_history does not.
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: settings.max_hot_sessions,
+        memory_soft_limit_mb: settings.memory_soft_limit_mb,
+        memory_hard_limit_mb: settings.memory_hard_limit_mb,
+    })
+}

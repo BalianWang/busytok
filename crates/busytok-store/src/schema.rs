@@ -2,7 +2,7 @@
 ///
 /// The baseline schema is applied as a single migration when a new database
 /// is created. Future schema changes will increment from v1.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// SQL to create the schema version tracking table.
 pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
@@ -19,7 +19,21 @@ pub const BASELINE_SQL: &str = include_str!("../migrations/0001_baseline.sql");
 /// `usage_events`.
 const CACHE_METRICS_SQL: &str = include_str!("../migrations/0002_cache_metrics.sql");
 
+/// v3 logical-subagent migration SQL — creates the `subagent_*` runtime tables.
+pub const SUBAGENT_SQL: &str = include_str!("../migrations/0003_subagent.sql");
+
+/// v4 subagent-task-fields migration SQL — adds `timeout_seconds` +
+/// `model_override` columns to `subagent_tasks` so the row is the single
+/// source of truth for execution params (Task 7 Round 3 Finding 3 fix:
+/// incremental ALTER TABLE, not modifying `0003`).
+const SUBAGENT_TASK_FIELDS_SQL: &str = include_str!("../migrations/0004_subagent_task_fields.sql");
+
 /// All migrations in order, from the v1 baseline through the latest version.
 pub fn migrations() -> Vec<(u32, &'static str)> {
-    vec![(1, BASELINE_SQL), (2, CACHE_METRICS_SQL)]
+    vec![
+        (1, BASELINE_SQL),
+        (2, CACHE_METRICS_SQL),
+        (3, SUBAGENT_SQL),
+        (4, SUBAGENT_TASK_FIELDS_SQL),
+    ]
 }
