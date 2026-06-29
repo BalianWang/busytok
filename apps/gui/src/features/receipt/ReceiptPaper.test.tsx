@@ -25,6 +25,7 @@ describe("ReceiptPaper", () => {
     expect(screen.getByText("DAILY AI CODING BILL")).toBeDefined();
     expect(screen.getByText("ITEM")).toBeDefined();
     expect(screen.getByText("TOTAL")).toBeDefined();
+    expect(screen.getByText("TOKEN BREAKDOWN")).toBeDefined();
     expect(screen.getByText(/CACHE HIT/)).toBeDefined();
     // Meta row carries date + PRINTED time only (no RECEIPT #serial).
     expect(screen.getByText(/PRINTED \d{2}:\d{2}/)).toBeDefined();
@@ -63,9 +64,11 @@ describe("ReceiptPaper", () => {
       "github.com/BalianWang/busytok",
     );
     // Old wrappers are gone.
+    expect(container.querySelector(".receipt__qr-stamp")).toBeNull();
     expect(container.querySelector(".receipt__qr-row")).toBeNull();
     expect(container.querySelector(".receipt__qr-cta")).toBeNull();
     expect(container.querySelector(".receipt__barcode")).toBeNull();
+    expect(container.querySelector(".receipt__footer-stats")).toBeNull();
   });
 
   it("caps ITEMS at 5 rows and shows a truncation indicator when there are >5 models", () => {
