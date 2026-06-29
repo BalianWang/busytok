@@ -5,10 +5,12 @@
 mod logging;
 mod paths;
 pub mod platform;
+pub mod providers;
 pub mod service_marker;
 
 pub use logging::{init_logging, prune_old_logs, LogSource, LoggingGuards};
 pub use paths::BusytokPaths;
+pub use providers::{ProviderConfig, ProviderCredentialStore, ProviderKind};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -104,6 +106,9 @@ pub struct BusytokSettings {
     pub prompt_palette_default_action: PromptDefaultAction,
     #[serde(default)]
     pub subagent: SubagentSettings,
+    /// User-configured model providers. Serialized as [[providers]] in TOML.
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
 }
 
 fn default_week_starts_on() -> u8 {
@@ -119,6 +124,7 @@ impl Default for BusytokSettings {
             discovery: DiscoverySettings::default(),
             prompt_palette_default_action: PromptDefaultAction::default(),
             subagent: SubagentSettings::default(),
+            providers: Vec::new(),
         }
     }
 }
@@ -595,6 +601,7 @@ mod tests {
             },
             prompt_palette_default_action: PromptDefaultAction::OnlyCopy,
             subagent: SubagentSettings::default(),
+            providers: Vec::new(),
         };
 
         settings.save_to_file(&path).unwrap();
