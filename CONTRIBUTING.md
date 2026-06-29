@@ -7,7 +7,7 @@ Thanks for your interest in contributing. This document covers the practical set
 Busytok is a **local-first agent token usage audit dashboard**. Before contributing, read:
 - `README.md` — what the project is and is not
 
-The most load-bearing principle: Busytok **never proxies traffic, never stores credentials, never modifies client config, never handles OAuth/session tokens.** A PR that touches any of these will be rejected.
+The most load-bearing principle: Busytok **never proxies traffic, never stores credentials in config files, never modifies client config, never handles OAuth/session tokens.** Provider API keys are stored exclusively in the OS keychain (macOS Keychain / Windows Credential Manager) via `keyring-rs`. Keys are never written to config files, never logged, never transmitted over network. Keys are injected into the sidecar subprocess via environment variables at spawn time only. A PR that violates any of these will be rejected.
 
 ## Dev setup
 
