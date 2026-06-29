@@ -92,7 +92,7 @@ describe("AppShell", () => {
       </Wrapper>,
     );
     const allButtons = document.querySelectorAll(".desktop-sidebar__item");
-    expect(allButtons.length).toBe(4);
+    expect(allButtons.length).toBe(5);
   });
 
   it("calls onNavigate when named sidebar buttons are clicked", async () => {
