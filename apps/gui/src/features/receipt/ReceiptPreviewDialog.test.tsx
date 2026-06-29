@@ -38,7 +38,7 @@ describe("ReceiptPreviewDialog", () => {
     );
     // Both the live preview (inside the dialog) and the off-screen
     // capture root render <ReceiptPaper /> with the same vm.
-    expect(screen.getAllByText("DAILY AI CODING BILL").length).toBe(2);
+    expect(screen.getAllByText("DAILY BILL").length).toBe(2);
     // The toolbar carries two icon buttons: calendar + save (copy removed).
     expect(screen.getByRole("button", { name: /pick receipt date/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /save png/i })).toBeDefined();

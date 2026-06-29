@@ -16,8 +16,13 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
   const scallopId = `receipt-scallop-${useId()}`;
   return (
     <div className="receipt-paper" ref={paperRef}>
+      {/* Rectangular brand stamp — red bordered "BUSYTOK" seal, tilted.
+          Restored to the original pill-shaped div stamp (commit 351cfef),
+          with content narrowed to just the wordmark. */}
+      <div className="receipt-stamp" aria-hidden="true">BUSYTOK</div>
+
       <header className="receipt__header">
-        <div className="receipt__brand">DAILY AI CODING BILL</div>
+        <div className="receipt__brand">DAILY BILL</div>
         <div className="receipt__subtitle">AI CODING · TOKEN RECEIPT</div>
       </header>
 
@@ -59,10 +64,8 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
               <span className="receipt__total-cost">{vm.total.cost}</span>
             </div>
 
-            {/* Breakdown — auxiliary stats band below TOTAL. Label anchors it
-                so the in/out/cache line doesn't read as loose body text. */}
+            {/* Breakdown — auxiliary stats band below TOTAL, centered. */}
             <div className="receipt__breakdown">
-              <div className="receipt__breakdown-label">TOKEN BREAKDOWN</div>
               <div className="receipt__breakdown-stats">
                 <span>{vm.summary}</span>
                 <span>CACHE HIT {vm.cacheHitRate}</span>
@@ -77,15 +80,14 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
           border read like a form card and broke the paper continuity. */}
       <footer className="receipt__footer">
         <div className="receipt__qr-block">
-          <span className="receipt__qr-hint">SCAN TO STAR ON GITHUB</span>
+          <span className="receipt__qr-hint">SCAN TO TRY BUSYTOK</span>
           <img
             className="receipt__qr"
             src="/busytok-gh-qr.svg"
-            alt="Scan to star busytok on GitHub"
+            alt="Scan to try busytok"
             width="56"
             height="56"
           />
-          <span className="receipt__qr-url">github.com/BalianWang/busytok</span>
         </div>
         <div className="receipt__footer-brand">
           LOCAL-FIRST · NO PROMPTS UPLOADED
