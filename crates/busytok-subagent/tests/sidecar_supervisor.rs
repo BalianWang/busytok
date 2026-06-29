@@ -11,7 +11,10 @@ use busytok_store::Database;
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::DelegateRequest;
-use busytok_subagent::sidecar::{PiSidecarSupervisor, SidecarConfig, SidecarError};
+use busytok_subagent::sidecar::{
+    PiSidecarSupervisor, SidecarConfig, SidecarError, SidecarTaskExecutor,
+};
+use busytok_subagent::{PressureAction, PressureGate, PressureResponder};
 
 fn mock_sidecar_script() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -64,7 +67,10 @@ async fn supervisor_try_is_running_tracks_lifecycle() {
     );
 
     let _ = sup.ensure_started().await.unwrap();
-    assert!(sup.try_is_running(), "ensure_started should make child visible");
+    assert!(
+        sup.try_is_running(),
+        "ensure_started should make child visible"
+    );
 
     sup.shutdown().await.unwrap();
     assert!(
@@ -889,4 +895,483 @@ async fn with_resource_policy_threads_limits_into_monitor() {
         events.iter().any(|e| e.event_type == "sidecar_start"),
         "with_resource_policy supervisor must emit sidecar_start event"
     );
+}
+
+// --- additional coverage tests ---
+//
+// These tests target uncovered branches in supervisor.rs: pressure responder
+// wiring, reconcile_crash error path, SIGKILL fallback, health-pinger failure,
+// stale-loop guard, crash detection, idle exit, and restart backoff.
+
+/// `set_pressure_responder` (lines 336-338) + `force_kill` body + `reconcile_crash`
+/// Ok branch (line 301). Constructs a `PressureResponder`, wires it via
+/// `set_pressure_responder`, then calls `respond(ForceKill)` which calls
+/// `force_kill` → `reconcile_crash` (Ok path with empty DB) → `write_resource_event`.
+#[tokio::test]
+async fn pressure_responder_force_kill_kills_sidecar_and_writes_crash_event() {
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let sup = PiSidecarSupervisor::new(mock_config(), Some(db.clone()));
+    let _ = sup.ensure_started().await.unwrap();
+    assert!(sup.try_is_running());
+
+    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let responder = Arc::new(PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&executor),
+        Arc::new(PressureGate::new()),
+    ));
+    sup.set_pressure_responder(Arc::clone(&responder));
+
+    responder.respond(PressureAction::ForceKill).await;
+    assert!(!sup.try_is_running(), "force_kill should stop the sidecar");
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"sidecar_crash"),
+        "force_kill should write sidecar_crash event: {types:?}"
+    );
+}
+
+/// `reconcile_crash` Err branch (lines 304-308): when the DB is read-only,
+/// `subagent_reconcile_sidecar_crash` fails on the UPDATE, covering the error
+/// log path.
+#[tokio::test]
+async fn reconcile_crash_error_path_when_db_write_fails() {
+    let h = make_harness().await;
+    let r = h.manager.delegate(req("crash-err", "work")).await.unwrap();
+    {
+        let db = h.db.lock().unwrap();
+        seed_hot_binding(&db, &r.subagent_id);
+    }
+    // Make all write operations fail so reconcile_sidecar_crash returns Err.
+    h.db.lock()
+        .unwrap()
+        .conn()
+        .execute_batch("PRAGMA query_only = 1")
+        .unwrap();
+
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, Some(h.db.clone()));
+    let _ = sup.ensure_started().await.unwrap();
+
+    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let responder = Arc::new(PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&executor),
+        Arc::new(PressureGate::new()),
+    ));
+    sup.set_pressure_responder(Arc::clone(&responder));
+
+    // ForceKill calls reconcile_crash, which fails due to read-only DB.
+    responder.respond(PressureAction::ForceKill).await;
+    assert!(!sup.try_is_running());
+}
+
+/// SIGKILL fallback in `shutdown_internal` (lines 266-271): when the sidecar
+/// ignores `adapter.shutdown`, the 10s grace period expires and SIGKILL is used.
+/// NOTE: This test takes ~10s due to SHUTDOWN_GRACE.
+#[tokio::test]
+async fn shutdown_internal_sigkills_unresponsive_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("ignore-shutdown.sh");
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env bash\n\
+         IFS= read -r LINE\n\
+         ID=$(printf '%s' \"$LINE\" | sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p')\n\
+         printf '{\"jsonrpc\":\"2.0\",\"result\":{\"protocol_version\":1,\"sidecar_version\":\"mock-1.0\"},\"id\":%s}\\n' \"$ID\"\n\
+         while IFS= read -r line; do\n\
+         \tID=$(printf '%s' \"$line\" | sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p')\n\
+         \tMETHOD=$(printf '%s' \"$line\" | sed -n 's/.*\"method\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\).*/\\1/p')\n\
+         \tcase \"$METHOD\" in\n\
+         \t\tadapter.shutdown)\n\
+         \t\t\tprintf '{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":%s}\\n' \"$ID\"\n\
+         \t\t\tsleep 300\n\
+         \t\t\t;;\n\
+         \t\t*)\n\
+         \t\t\tprintf '{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":%s}\\n' \"$ID\"\n\
+         \t\t\t;;\n\
+         \tesac\n\
+         done\n",
+    )
+    .unwrap();
+
+    let mut cfg = mock_config();
+    cfg.bundle_path = script;
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+
+    sup.shutdown_internal().await.unwrap();
+    assert!(
+        !sup.try_is_running(),
+        "SIGKILL should have killed the sidecar"
+    );
+}
+
+/// Health-pinger failure (lines 658-660): when `adapter.health` returns a
+/// JSON-RPC error, the warn log fires and hot_sessions defaults to 0.
+#[tokio::test]
+async fn health_pinger_warns_on_health_rpc_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("health-error.sh");
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env bash\n\
+         IFS= read -r LINE\n\
+         ID=$(printf '%s' \"$LINE\" | sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p')\n\
+         printf '{\"jsonrpc\":\"2.0\",\"result\":{\"protocol_version\":1,\"sidecar_version\":\"mock-1.0\"},\"id\":%s}\\n' \"$ID\"\n\
+         while IFS= read -r line; do\n\
+         \tID=$(printf '%s' \"$line\" | sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p')\n\
+         \tMETHOD=$(printf '%s' \"$line\" | sed -n 's/.*\"method\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\).*/\\1/p')\n\
+         \tcase \"$METHOD\" in\n\
+         \t\tadapter.health)\n\
+         \t\t\tprintf '{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"health failed\"},\"id\":%s}\\n' \"$ID\"\n\
+         \t\t\t;;\n\
+         \t\tadapter.shutdown)\n\
+         \t\t\tprintf '{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":%s}\\n' \"$ID\"\n\
+         \t\t\texit 0\n\
+         \t\t\t;;\n\
+         \t\t*)\n\
+         \t\t\tprintf '{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":%s}\\n' \"$ID\"\n\
+         \t\t\t;;\n\
+         \tesac\n\
+         done\n",
+    )
+    .unwrap();
+
+    let mut cfg = mock_config();
+    cfg.bundle_path = script;
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    // ensure_started spawns + initializes; no handle is needed here because
+    // calling handle.health() would hit the same failing RPC.
+    sup.ensure_started().await.unwrap();
+
+    // Wait for at least 2 health-ping cycles to fire (200ms each). The
+    // supervisor's internal pinger calls adapter.health, gets a JSON-RPC error,
+    // and logs the warn (lines 658-660).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Health-ping failure is non-fatal: sidecar is still running.
+    assert!(
+        sup.try_is_running(),
+        "health-ping failure should not kill the sidecar"
+    );
+    sup.shutdown().await.unwrap();
+}
+
+/// Stale-loop guard (line 572): after shutdown + quick respawn, the old loop
+/// detects the generation mismatch and exits. Also covers child.is_none()
+/// exit path (lines 577-578) depending on timing.
+#[tokio::test]
+async fn stale_loop_guard_exits_on_generation_mismatch() {
+    let mut cfg = mock_config();
+    cfg.idle_exit_seconds = 3600;
+    cfg.health_interval = Duration::from_secs(3600);
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+
+    // Shutdown + immediate respawn bumps the generation. The old loop
+    // (still sleeping) will detect the mismatch on its next poll.
+    sup.shutdown_internal().await.unwrap();
+    let _ = sup.ensure_started().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        sup.try_is_running(),
+        "sidecar should still be running after respawn"
+    );
+    sup.shutdown().await.unwrap();
+}
+
+/// Loop exits when child is None after shutdown (lines 577-578). The
+/// supervision loop polls, sees `child.is_none()`, resets
+/// `supervision_started`, and returns.
+#[tokio::test]
+async fn loop_exits_when_child_is_none_after_shutdown() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+
+    // shutdown_internal takes the child. The loop detects child.is_none()
+    // on its next poll and exits.
+    sup.shutdown_internal().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // ensure_started should work (spawn new sidecar + new loop).
+    let _ = sup.ensure_started().await.unwrap();
+    sup.shutdown().await.unwrap();
+}
+
+/// Idle exit info log (line 626) with DB attached — verifies the idle_exit
+/// event fires and a `sidecar_stop` event is written to the DB.
+#[tokio::test]
+async fn idle_exit_with_db_writes_stop_event() {
+    let mut cfg = mock_config();
+    cfg.idle_exit_seconds = 0;
+    cfg.health_interval = Duration::from_secs(3600);
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let sup = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+    let _ = sup.ensure_started().await.unwrap();
+
+    // Wait for idle exit to trigger (polls every 100ms, idle_exit_seconds=0).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"sidecar_stop"),
+        "idle exit should trigger shutdown which writes sidecar_stop: {types:?}"
+    );
+}
+
+/// Restart backoff warn (lines 434-435): after a crash, the next spawn
+/// computes a non-zero backoff and logs the warn. Also covers crash detection
+/// warn (lines 599-601) with DB attached.
+#[tokio::test]
+async fn restart_backoff_and_crash_detection_with_db() {
+    let mut cfg = mock_sidecar_config_crash_on_init();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    cfg.restart_backoff_base = Duration::from_millis(10);
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let sup = PiSidecarSupervisor::new(cfg, Some(db.clone()));
+
+    // First spawn succeeds (initialize is message 1; sidecar crashes after).
+    let _ = sup.ensure_started().await.unwrap();
+    // Wait for crash detection (supervision loop polls every 100ms).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Restart triggers backoff warn (restart_attempts=1, backoff=10ms).
+    let _ = sup.ensure_started().await.unwrap();
+    sup.shutdown().await.unwrap();
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"sidecar_start"),
+        "missing sidecar_start: {types:?}"
+    );
+    assert!(
+        types.contains(&"sidecar_crash"),
+        "missing sidecar_crash: {types:?}"
+    );
+    assert!(
+        types.contains(&"sidecar_restart"),
+        "missing sidecar_restart: {types:?}"
+    );
+}
+
+// --- resource sampling coverage tests ---
+//
+// These tests exercise `maybe_sample_resources` (lines 695-839) by using
+// `with_resource_policy` (which attaches a `ResourceMonitor`) combined with a
+// short `health_interval` so the supervision loop's health-pinger + resource
+// sampling block fires within the test window.
+
+/// Normal resource sampling path (lines 701-705, 744, 834): with a DB
+/// attached and normal memory limits, the sampler queries task counts,
+/// computes `Normal` pressure state, and takes no action. Verifies the
+/// `sidecar_start` event is written (proving the sampling path didn't
+/// interfere with the normal lifecycle).
+#[tokio::test]
+async fn resource_sampling_normal_path_with_db() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    // Use memory_pressure_free_mb=0 so is_under_pressure returns false
+    // regardless of the system's available memory (sysinfo may report 0 on
+    // some platforms). Combined with the default soft/hard limits (800/1200
+    // MB), which the bash mock sidecar (~5 MB RSS) never exceeds, this
+    // guarantees the Normal pressure state.
+    let policy = SubagentResourcePolicyConfig {
+        memory_pressure_free_mb: 0,
+        monitor_interval_seconds: 5,
+    };
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, Some(Arc::clone(&db)), policy, None);
+    let _ = sup.ensure_started().await.unwrap();
+
+    // Wait for at least 2 resource-sampling cycles (200ms each).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sup.shutdown().await.unwrap();
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"sidecar_start"),
+        "missing sidecar_start: {types:?}"
+    );
+    assert!(
+        types.contains(&"sidecar_stop"),
+        "missing sidecar_stop: {types:?}"
+    );
+    // Normal path: no pressure events should be written.
+    assert!(
+        !types.contains(&"memory_pressure"),
+        "normal path should not write memory_pressure: {types:?}"
+    );
+    assert!(
+        !types.contains(&"rss_limit_exceeded"),
+        "normal path should not write rss_limit_exceeded: {types:?}"
+    );
+}
+
+/// Hard limit exceeded path (lines 740, 794, 826, 848-850): with a very low
+/// `memory_hard_limit_mb`, the sidecar RSS exceeds the hard limit. The
+/// sampler writes `rss_limit_exceeded` DB event and invokes the pressure
+/// responder with `ForceKill`. A PressureResponder is wired so
+/// `invoke_pressure_responder` actually spawns the respond task (covering
+/// lines 848-850). The ForceKill kills the sidecar; the supervision loop
+/// detects the crash and writes `sidecar_crash`.
+#[tokio::test]
+async fn resource_sampling_hard_limit_triggers_force_kill_via_responder() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    cfg.memory_hard_limit_mb = 1; // sidecar RSS (bash ~5MB) exceeds this
+    cfg.memory_soft_limit_mb = 1;
+    let policy = SubagentResourcePolicyConfig::default();
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, Some(Arc::clone(&db)), policy, None);
+
+    // Wire a PressureResponder so invoke_pressure_responder spawns the
+    // respond task (covers lines 848-850).
+    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let responder = Arc::new(PressureResponder::new(
+        Arc::downgrade(&sup),
+        Arc::downgrade(&executor),
+        Arc::new(PressureGate::new()),
+    ));
+    sup.set_pressure_responder(Arc::clone(&responder));
+
+    let _ = sup.ensure_started().await.unwrap();
+
+    // Wait for resource sampling to detect hard limit, invoke ForceKill via
+    // the responder, and the supervision loop to detect the crash.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"rss_limit_exceeded"),
+        "hard limit should write rss_limit_exceeded: {types:?}"
+    );
+    // ForceKill via responder should kill the sidecar, triggering crash event.
+    assert!(
+        types.contains(&"sidecar_crash"),
+        "ForceKill should produce sidecar_crash: {types:?}"
+    );
+}
+
+/// Soft limit exceeded path (line 828): with a low `memory_soft_limit_mb`
+/// but high `memory_hard_limit_mb`, the sidecar RSS exceeds the soft limit
+/// but not the hard limit. The sampler writes `memory_pressure` DB event.
+/// No responder is wired, so `invoke_pressure_responder` is a no-op (the
+/// action is computed but the spawn block doesn't fire).
+#[tokio::test]
+async fn resource_sampling_soft_limit_writes_memory_pressure() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    cfg.memory_soft_limit_mb = 1; // sidecar RSS exceeds this
+    cfg.memory_hard_limit_mb = 9999; // but not this
+    let policy = SubagentResourcePolicyConfig::default();
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, Some(Arc::clone(&db)), policy, None);
+    let _ = sup.ensure_started().await.unwrap();
+
+    // Wait for resource sampling to detect soft limit.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sup.shutdown().await.unwrap();
+
+    let db = db.lock().unwrap();
+    let events = db.subagent_list_resource_events(None, 100).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"memory_pressure"),
+        "soft limit should write memory_pressure: {types:?}"
+    );
+    assert!(
+        !types.contains(&"rss_limit_exceeded"),
+        "soft limit should not write rss_limit_exceeded: {types:?}"
+    );
+}
+
+/// Shutdown reconcile error path (lines 873-874): when the DB is read-only,
+/// `subagent_release_hot_bindings_for_shutdown` fails, covering the Err
+/// branch of `reconcile_shutdown`. The shutdown itself still succeeds
+/// (the error is logged but not propagated). A hot binding is seeded
+/// first so the store function actually attempts an UPDATE (otherwise it
+/// returns Ok with 0 rows affected, never hitting the Err branch).
+#[tokio::test]
+async fn shutdown_reconcile_error_path_when_db_read_only() {
+    let h = make_harness().await;
+    // Delegate to create a logical subagent (required for the FK on
+    // subagent_harness_bindings).
+    let r = h
+        .manager
+        .delegate(req("shutdown-err", "work"))
+        .await
+        .unwrap();
+    // Seed a hot binding so reconcile_shutdown has a row to UPDATE.
+    {
+        let db = h.db.lock().unwrap();
+        seed_hot_binding(&db, &r.subagent_id);
+    }
+
+    let sup = PiSidecarSupervisor::new(mock_config(), Some(h.db.clone()));
+    let _ = sup.ensure_started().await.unwrap();
+
+    // Make all DB writes fail so reconcile_shutdown's UPDATE fails.
+    h.db.lock()
+        .unwrap()
+        .conn()
+        .execute_batch("PRAGMA query_only = 1")
+        .unwrap();
+
+    // Shutdown should still succeed — the reconcile error is logged, not
+    // propagated.
+    sup.shutdown().await.unwrap();
+    assert!(
+        !sup.try_is_running(),
+        "shutdown should have stopped the sidecar"
+    );
+}
+
+/// `SidecarHandle` Debug impl (lines 978-980): formatting a handle with
+/// `{:?}` should produce a non-exhaustive debug struct.
+#[tokio::test]
+async fn sidecar_handle_debug_impl_produces_struct() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let handle = sup.ensure_started().await.unwrap();
+    let debug_str = format!("{handle:?}");
+    assert!(
+        debug_str.contains("SidecarHandle"),
+        "Debug output should contain struct name: {debug_str}"
+    );
+    assert!(
+        debug_str.contains(".."),
+        "Debug output should use finish_non_exhaustive (..): {debug_str}"
+    );
+    sup.shutdown().await.unwrap();
 }

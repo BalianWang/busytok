@@ -75,7 +75,8 @@ fn make_sidecar_settings() -> BusytokSettings {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
     settings.subagent.pi_sidecar.node_runtime = "system".to_string();
-    settings.subagent.pi_sidecar.system_node_path = sidecar_shell_path().to_string_lossy().to_string();
+    settings.subagent.pi_sidecar.system_node_path =
+        sidecar_shell_path().to_string_lossy().to_string();
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
     settings.subagent.pi_sidecar.task_timeout_seconds = 30;
     settings

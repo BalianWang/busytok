@@ -326,7 +326,10 @@ async fn respond_force_kill_with_live_sidecar_writes_crash_event() {
     );
 
     let _ = sup.ensure_started().await.unwrap();
-    assert!(sup.try_is_running(), "precondition: sidecar should be running");
+    assert!(
+        sup.try_is_running(),
+        "precondition: sidecar should be running"
+    );
 
     responder.respond(PressureAction::ForceKill).await;
 
@@ -372,7 +375,10 @@ async fn respond_graceful_restart_with_live_sidecar_restarts_cleanly() {
     );
 
     let _ = sup.ensure_started().await.unwrap();
-    assert!(sup.try_is_running(), "precondition: sidecar should be running");
+    assert!(
+        sup.try_is_running(),
+        "precondition: sidecar should be running"
+    );
 
     responder.respond(PressureAction::GracefulRestart).await;
 

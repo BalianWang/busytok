@@ -3,17 +3,30 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use busytok_config::SubagentSettings;
+use busytok_config::{SubagentProfileConfig, SubagentSettings};
 use busytok_store::{Database, SubagentHarnessBindingRow};
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::memory::{KeyFile, MemoryUpdate, OpenQuestion};
 use busytok_subagent::mock_executor::{
-    ExecutorInput, ExecutorOutput, MockTaskExecutor, TaskExecutor,
+    ExecutorInput, ExecutorOutput, FailingTaskExecutor, MockTaskExecutor, TaskExecutor,
 };
 use busytok_subagent::models::{
     DelegateRequest, ResolveParams, SubagentStatus, TaskStatus, TaskUsage,
 };
+use busytok_subagent::pressure::{PressureAction, PressureGate};
 use busytok_subagent::SubagentError;
+
+/// Install a thread-local tracing subscriber so `tracing!` macro arguments
+/// (event_code, reason, etc.) are evaluated and counted by line coverage.
+/// Returns a guard that restores the previous default on drop. Each
+/// `#[tokio::test]` runs on its own thread, so parallel tests don't interfere.
+fn install_tracing() -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .finish();
+    tracing::subscriber::set_default(subscriber)
+}
 
 async fn manager() -> SubagentManager {
     // std::sync::Mutex — matches the supervisor's db field type.
@@ -705,7 +718,6 @@ async fn task_counts_returns_zero_when_task_table_query_fails() {
     );
 }
 
-
 #[tokio::test]
 async fn hibernate_closes_existing_hot_binding() {
     // delegate creates no hot binding (Plan 1), so seed one manually to cover
@@ -1026,4 +1038,360 @@ async fn delegate_populates_attempts_after_first_completed_task() {
          got: {:?}",
         attempts[0]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Coverage tests for manager.rs error/edge paths
+// ---------------------------------------------------------------------------
+
+/// Executor that returns a generic (non-SubagentError) anyhow error.
+struct BoomExecutor;
+
+#[async_trait]
+impl TaskExecutor for BoomExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        Err(anyhow::anyhow!("executor boom"))
+    }
+}
+
+/// Executor that returns a non-empty adapter_session_id (triggers hot binding
+/// commit path in execute_task).
+struct HotSessionExecutor;
+
+#[async_trait]
+impl TaskExecutor for HotSessionExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        Ok(ExecutorOutput {
+            adapter_session_id: Some("sess-hot-1".to_string()),
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: "done".into(),
+            usage: Default::default(),
+            memory_update: Default::default(),
+        })
+    }
+}
+
+/// Executor returns a `SubagentError` (via anyhow) → downcast Ok branch (line 390).
+/// `FailingTaskExecutor` returns `SubagentError::SidecarSpawn` wrapped in anyhow.
+#[tokio::test]
+async fn delegate_executor_subagent_error_downcasts_and_propagates() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let m = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(FailingTaskExecutor {
+            reason: "init failed".into(),
+        }),
+    );
+    let err = m.delegate(req("fail-sub", "do")).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "subagent.sidecar_spawn_failed",
+        "SubagentError should downcast and propagate its code"
+    );
+}
+
+/// Executor returns a generic anyhow error → downcast Err branch (lines 391-393).
+#[tokio::test]
+async fn delegate_executor_generic_error_wrapped_as_store() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let m = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BoomExecutor),
+    );
+    let err = m.delegate(req("boom-sub", "do")).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "subagent.store_error",
+        "non-SubagentError anyhow should be wrapped as Store"
+    );
+}
+
+/// When profile model is empty + no model_override + fresh subagent,
+/// execute_task returns model=None → line 277 sets result.model (to None).
+#[tokio::test]
+async fn delegate_sets_model_when_execute_task_returns_none() {
+    let _guard = install_tracing();
+    let mut settings = SubagentSettings::default();
+    settings.profiles.insert(
+        "custom/empty-model".to_string(),
+        SubagentProfileConfig {
+            write_access: false,
+            tools: vec![],
+            model: String::new(), // empty → profile_model returns None
+            context_budget_tokens: 3000,
+            timeout_seconds: 120,
+        },
+    );
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let m = SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor));
+    let r = m
+        .delegate(DelegateRequest {
+            profile: "custom/empty-model".to_string(),
+            ..req("empty-model-sub", "do")
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.profile, "custom/empty-model");
+    assert!(
+        r.model.is_none(),
+        "model is None when profile model is empty and no override"
+    );
+}
+
+/// Hot binding commit failure (table dropped) → lines 509-515.
+/// The executor returns a non-empty adapter_session_id, triggering the hot
+/// binding commit path. Dropping the bindings table makes the commit fail.
+#[tokio::test]
+async fn delegate_hot_binding_commit_failure_returns_store_error() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        g.conn()
+            .execute("DROP TABLE subagent_harness_bindings", [])
+            .unwrap();
+    }
+    let m = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(HotSessionExecutor),
+    );
+    let err = m.delegate(req("hot-bind-sub", "do")).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        "subagent.store_error",
+        "hot binding commit failure should surface as store_error"
+    );
+}
+
+/// Dispatcher shuts down promptly when the watch channel sends true (lines 568-571).
+#[tokio::test]
+async fn dispatcher_shutdown_returns_promptly() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let manager = std::sync::Arc::new(SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    ));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(rx);
+    // Send shutdown immediately.
+    tx.send(true).unwrap();
+    // Must complete within 2s (dispatcher polls every 200ms).
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("dispatcher shuts down promptly after shutdown signal")
+        .expect("dispatcher task joined cleanly");
+}
+
+/// Dispatcher skips queued tasks while the gate is paused (line 580 `continue`).
+/// A queued task is inserted manually; the dispatcher must NOT pick it up
+/// while the gate remains paused across multiple ticks.
+#[tokio::test]
+async fn dispatcher_skips_queued_task_while_gate_paused() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let gate = std::sync::Arc::new(PressureGate::new());
+    gate.set_action(PressureAction::PauseNewTasks);
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+        Some(gate.clone()),
+    ));
+    // Seed a subagent + queued task so the dispatcher has something to skip.
+    {
+        use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentTaskRow};
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(
+            "sub-paused-skip",
+            "paused-skip-sub",
+        ))
+        .unwrap();
+        g.subagent_insert_task(&SubagentTaskRow {
+            id: "task-paused-skip".into(),
+            subagent_id: "sub-paused-skip".into(),
+            source_harness: None,
+            source_session_id: None,
+            intent: None,
+            profile: "pi/search-cheap".into(),
+            prompt: Some("queued".into()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: "queued".into(),
+            result_summary: None,
+            result_json: None,
+            error: None,
+            created_at_ms: busytok_domain::now_ms(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            timeout_seconds: None,
+            model_override: None,
+        })
+        .unwrap();
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(rx);
+    // Wait for several dispatcher ticks (interval = 200ms).
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // Task must still be queued — the dispatcher skipped it (gate paused).
+    {
+        let g = db.lock().unwrap();
+        let tasks = g.subagent_list_tasks("sub-paused-skip", 10).unwrap();
+        let task = tasks.iter().find(|t| t.id == "task-paused-skip").unwrap();
+        assert_eq!(
+            task.status, "queued",
+            "task must remain queued while gate is paused (line 580 continue)"
+        );
+    }
+    tx.send(true).unwrap();
+    let _ = handle.await;
+}
+
+/// Dispatcher marks a queued task as 'failed' when the subagent can't be
+/// resolved (lines 602-615). The task is inserted with FK off so it references
+/// a non-existent subagent_id.
+#[tokio::test]
+async fn dispatcher_marks_task_failed_when_subagent_missing() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let manager = std::sync::Arc::new(SubagentManager::new(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    ));
+    // Insert a queued task with a non-existent subagent_id. FK is disabled
+    // temporarily so the INSERT succeeds.
+    {
+        use busytok_store::repository::SubagentTaskRow;
+        let g = db.lock().unwrap();
+        g.conn().execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        g.subagent_insert_task(&SubagentTaskRow::for_test(
+            "task-orphan",
+            "ghost-sub-id",
+            "pi/search-cheap",
+            "orphan task",
+        ))
+        .unwrap();
+        g.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(rx);
+    // Poll for the dispatcher to pick + fail the orphan task.
+    let mut failed = false;
+    for _ in 0..30 {
+        let status = {
+            let g = db.lock().unwrap();
+            g.subagent_list_tasks("ghost-sub-id", 10)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == "task-orphan")
+                .map(|t| (t.status, t.error))
+        };
+        if let Some((status, error)) = status {
+            if status == "failed" {
+                assert_eq!(
+                    error.as_deref(),
+                    Some("subagent not found"),
+                    "orphan task error message"
+                );
+                failed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        failed,
+        "orphan task must be marked failed when subagent can't be resolved"
+    );
+    tx.send(true).unwrap();
+    let _ = handle.await;
+}
+
+/// Dispatcher's execute_task fails → marks task as 'failed' (lines 621-631).
+/// Uses FailingTaskExecutor so execute_task returns Err. The task is queued
+/// while the gate is paused, then the gate is cleared so the dispatcher picks
+/// it up. Also covers the queued-path info! args (lines 218, 220) and the
+/// executor downcast Ok branch (lines 389-390) via the dispatcher path.
+#[tokio::test]
+async fn dispatcher_marks_task_failed_when_execute_task_errors() {
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let gate = std::sync::Arc::new(PressureGate::new());
+    gate.set_action(PressureAction::PauseNewTasks);
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(FailingTaskExecutor {
+            reason: "dispatch boom".into(),
+        }),
+        Some(gate.clone()),
+    ));
+    // Queue a task while the gate is paused — delegate returns Queued and
+    // the queued info! (lines 214-221) fires with the subscriber installed.
+    let r = manager
+        .delegate(req("fail-dispatch-sub", "do"))
+        .await
+        .unwrap();
+    assert_eq!(r.status, TaskStatus::Queued);
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(rx);
+
+    // Clear the gate — dispatcher picks + execute_task fails.
+    gate.set_action(PressureAction::Resume);
+
+    let mut failed = false;
+    for _ in 0..50 {
+        let status = {
+            let g = db.lock().unwrap();
+            g.subagent_list_tasks(&r.subagent_id, 10)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == r.task_id)
+                .map(|t| (t.status, t.error))
+        };
+        if let Some((status, error)) = status {
+            if status == "failed" {
+                assert!(
+                    error.is_some(),
+                    "failed task must have an error message: {error:?}"
+                );
+                failed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        failed,
+        "task must be marked failed after execute_task returns Err"
+    );
+    tx.send(true).unwrap();
+    let _ = handle.await;
+}
+
+/// Invalid subagent name triggers resolve_by_name error → the warn! at
+/// line 136-140 evaluates `e.code()` with the subscriber installed.
+#[tokio::test]
+async fn delegate_invalid_name_evaluates_reject_warn_args() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let err = m.delegate(req("bad name!", "do")).await.unwrap_err();
+    assert_eq!(err.code(), "subagent.invalid_name");
 }
