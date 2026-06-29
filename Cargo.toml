@@ -34,25 +34,25 @@ clap_complete = "4"
 dirs = "6"
 hex = "0.4"
 notify = "8"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serial_test = "3"
-sha2 = "0.10"
-sysinfo = "0.32"
+sha2 = "0.11"
+sysinfo = "0.39"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "io-util", "process"] }
-toml = "0.8"
+toml = "1.1"
 toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2"
 tracing-log = "0.2"
-ts-rs = { version = "10", features = ["serde-json-impl"] }
+ts-rs = { version = "12", features = ["serde-json-impl"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 jiff = "0.2"
