@@ -310,11 +310,12 @@
 }
 
 /* ── Footer: frameless QR block + single-line trust statement.
-   margin-top:24px gives the data region (TOTAL + breakdown) more room
-   before the divider + QR conversion block. */
+   margin-top:8px keeps the footer close to the second divider so the
+   data region (body, flex:1) absorbs the freed space — giving the
+   token usage + TOTAL more vertical room. */
 .receipt__footer {
   position: relative;
-  margin-top: 24px;
+  margin-top: 8px;
   text-align: center;
   color: var(--r-ink-muted);
   line-height: 1.4;
