@@ -3415,3 +3415,344 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
         .unwrap();
     assert!(after_list.subagents.iter().all(|s| s.id != sub_id));
 }
+
+// ---------------------------------------------------------------------------
+// providers.* (Phase 1: Credential Foundation)
+// ---------------------------------------------------------------------------
+//
+// The settings-CRUD code paths (create without api_key, list, update without
+// api_key, delete) never touch the OS keychain and are safe to run in CI on
+// every platform. `provider_to_dto` calls `ProviderCredentialStore::has_key`,
+// which is a read that returns `false` on `NoEntry` — also safe for CI.
+//
+// Tests that exercise the api_key flow (create/update with a non-empty key,
+// or delete of a provider that has a key) touch the real macOS Keychain and
+// are gated behind `#[cfg(target_os = "macos")] #[ignore]`.
+
+fn provider_create_request(id: &str, name: &str) -> ProviderCreateRequestDto {
+    ProviderCreateRequestDto {
+        id: id.to_string(),
+        name: name.to_string(),
+        base_url: "https://api.example.com/v1".to_string(),
+        api_key_env_name: "EXAMPLE_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["example-model".to_string()],
+        api_key: None,
+    }
+}
+
+#[tokio::test]
+async fn provider_crud_round_trips_without_api_key() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create → list shows it.
+    let created = sup
+        .provider_create(provider_create_request("acme-prod", "Acme"))
+        .await
+        .unwrap();
+    assert_eq!(created.id, "acme-prod");
+    assert_eq!(created.name, "Acme");
+    assert!(created.enabled);
+    assert!(!created.has_api_key, "no api_key was supplied");
+
+    let list = sup.provider_list().await.unwrap();
+    assert_eq!(list.providers.len(), 1);
+    assert_eq!(list.providers[0].id, "acme-prod");
+
+    // Update name + models + enabled, no api_key → keychain untouched.
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "acme-prod".to_string(),
+            name: Some("Acme Renamed".to_string()),
+            base_url: None,
+            models: Some(vec![
+                "example-model".to_string(),
+                "second-model".to_string(),
+            ]),
+            enabled: Some(false),
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "Acme Renamed");
+    assert_eq!(updated.models.len(), 2);
+    assert!(!updated.enabled);
+    assert!(!updated.has_api_key, "still no api_key after update");
+
+    // Delete → list empty.
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: "acme-prod".to_string(),
+    })
+    .await
+    .unwrap();
+    let list_after = sup.provider_list().await.unwrap();
+    assert!(
+        list_after.providers.is_empty(),
+        "provider list should be empty after delete"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_rejects_invalid_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Underscore and dot are not in the allowed alphabet [a-z0-9-].
+    let err = sup
+        .provider_create(provider_create_request("acme_prod", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider id must contain only"),
+        "expected id validation error, got: {err}"
+    );
+
+    let err = sup
+        .provider_create(provider_create_request("acme.prod", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider id must contain only"),
+        "expected id validation error for dotted id, got: {err}"
+    );
+
+    // Nothing should have been written.
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_rejects_uppercase_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Uppercase letters are not in the allowed alphabet [a-z0-9-].
+    let err = sup
+        .provider_create(provider_create_request("UPPER-CASE", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("[a-z0-9-]"),
+        "expected id validation error mentioning [a-z0-9-], got: {err}"
+    );
+
+    // Nothing should have been written.
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_rejects_duplicate_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("dup", "First"))
+        .await
+        .unwrap();
+
+    let err = sup
+        .provider_create(provider_create_request("dup", "Second"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider already exists"),
+        "expected duplicate-id error, got: {err}"
+    );
+
+    let list = sup.provider_list().await.unwrap();
+    assert_eq!(
+        list.providers.len(),
+        1,
+        "duplicate create must not add a second row"
+    );
+    assert_eq!(list.providers[0].name, "First");
+}
+
+#[tokio::test]
+async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("noop-key", "Noop"))
+        .await
+        .unwrap();
+
+    // Update with api_key: None must succeed without touching the keychain.
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "noop-key".to_string(),
+            name: Some("Noop Renamed".to_string()),
+            base_url: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "Noop Renamed");
+    assert!(!updated.has_api_key, "no api_key was ever set");
+}
+
+#[tokio::test]
+async fn provider_update_returns_error_for_unknown_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "ghost".to_string(),
+            name: Some("Ghost".to_string()),
+            base_url: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "expected not-found error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_delete_returns_error_for_unknown_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .provider_delete(ProviderDeleteRequestDto {
+            id: "ghost".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "delete of unknown provider should error early; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_test_connection_errors_when_provider_missing() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .provider_test_connection(ProviderTestConnectionRequestDto {
+            id: "ghost".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "expected not-found error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_test_connection_errors_when_no_api_key() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("no-key", "No Key"))
+        .await
+        .unwrap();
+
+    let err = sup
+        .provider_test_connection(ProviderTestConnectionRequestDto {
+            id: "no-key".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no API key stored"),
+        "expected no-api-key error, got: {err}"
+    );
+
+    // Clean up so the keychain stays untouched (no key was set, so delete is a no-op).
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: "no-key".to_string(),
+    })
+    .await
+    .unwrap();
+}
+
+// --- Keychain-touching tests (manual only) -------------------------------
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "touches real macOS Keychain — run with --ignored"]
+async fn provider_crud_round_trips_with_api_key_macos() {
+    use busytok_config::ProviderCredentialStore;
+
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider_id = "task4-keychain-roundtrip";
+    // Defensive cleanup in case a prior run left a key behind.
+    let _ = ProviderCredentialStore::delete_key(provider_id);
+
+    // Create with api_key → has_api_key true.
+    let created = sup
+        .provider_create(ProviderCreateRequestDto {
+            id: provider_id.to_string(),
+            name: "Keychain Roundtrip".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key_env_name: "EXAMPLE_API_KEY".to_string(),
+            base_url_env_name: None,
+            models: vec!["example-model".to_string()],
+            api_key: Some("sk-test-123".to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        created.has_api_key,
+        "api_key was supplied, has_api_key should be true"
+    );
+
+    // Update with api_key: None → key unchanged.
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: provider_id.to_string(),
+            name: Some("Keychain Roundtrip Renamed".to_string()),
+            base_url: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        updated.has_api_key,
+        "api_key must still be present after update with None"
+    );
+    assert_eq!(updated.name, "Keychain Roundtrip Renamed");
+
+    // Direct keychain read confirms the key value is intact.
+    let stored = ProviderCredentialStore::get_key(provider_id).unwrap();
+    assert_eq!(stored.as_deref(), Some("sk-test-123"));
+
+    // Delete cleans up both settings and keychain.
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: provider_id.to_string(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        !ProviderCredentialStore::has_key(provider_id),
+        "keychain entry must be removed after delete"
+    );
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}

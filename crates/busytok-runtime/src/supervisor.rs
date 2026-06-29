@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use tracing::{error, info, warn};
 
-use busytok_config::{BusytokPaths, BusytokSettings};
+use busytok_config::{
+    BusytokPaths, BusytokSettings, ProviderConfig, ProviderCredentialStore, ProviderKind,
+};
 use busytok_control::dispatch::{MethodDispatchError, RuntimeControl};
 use busytok_domain::{now_ms, ReportingTimezone};
 use busytok_events::AppEventBus;
@@ -4655,29 +4657,191 @@ impl RuntimeControl for BusytokSupervisor {
     }
 
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
-    // Task 4 fills these in with real keychain + config wiring.
 
-    async fn provider_create(&self, _req: ProviderCreateRequestDto) -> Result<ProviderDto> {
-        anyhow::bail!("not yet implemented")
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
+        // Validate id format (used as keychain account name)
+        if !req
+            .id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            anyhow::bail!("provider id must contain only [a-z0-9-]+");
+        }
+        let mut pending_settings = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+        if pending_settings.providers.iter().any(|p| p.id == req.id) {
+            anyhow::bail!("provider already exists: {}", req.id);
+        }
+        let provider = ProviderConfig {
+            id: req.id.clone(),
+            name: req.name,
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: req.base_url,
+            api_key_env_name: req.api_key_env_name,
+            base_url_env_name: req.base_url_env_name,
+            models: req.models,
+            enabled: true,
+        };
+        // Write settings first — if keychain fails, the provider exists
+        // but has no key (user can retry set_key later). If keychain
+        // succeeded but settings.save() fails, the key becomes orphaned.
+        pending_settings.providers.push(provider.clone());
+        pending_settings.save(&self.paths)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending_settings;
+        }
+        if let Some(key) = &req.api_key {
+            ProviderCredentialStore::set_key(&provider.id, key).context(
+                "failed to store API key in keychain; provider config was written — retry if needed",
+            )?;
+        }
+        tracing::info!(event_code = "provider.created", provider_id = %provider.id, "provider created");
+        Ok(provider_to_dto(&provider))
     }
+
     async fn provider_list(&self) -> Result<ProviderListResponseDto> {
-        Ok(ProviderListResponseDto { providers: vec![] })
+        let settings = self.settings.lock().unwrap();
+        let dtos: Vec<ProviderDto> = settings.providers.iter().map(provider_to_dto).collect();
+        tracing::debug!(count = dtos.len(), "listed providers");
+        Ok(ProviderListResponseDto { providers: dtos })
     }
-    async fn provider_update(&self, _req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
-        anyhow::bail!("not yet implemented")
+
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
+        let mut pending_settings = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+        let provider = pending_settings
+            .providers
+            .iter_mut()
+            .find(|p| p.id == req.id)
+            .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
+        if let Some(name) = req.name {
+            provider.name = name;
+        }
+        if let Some(base_url) = req.base_url {
+            provider.base_url = base_url;
+        }
+        if let Some(models) = req.models {
+            provider.models = models;
+        }
+        if let Some(enabled) = req.enabled {
+            provider.enabled = enabled;
+        }
+        // api_key: None = no change; Some("") is ignored (MVP: empty string = no-op).
+        // Future: add clear_api_key: bool if clearing is needed.
+        if let Some(key) = &req.api_key {
+            if !key.is_empty() {
+                ProviderCredentialStore::set_key(&provider.id, key)
+                    .context("failed to update API key")?;
+            }
+        }
+        let dto = provider_to_dto(provider);
+        pending_settings.save(&self.paths)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending_settings;
+        }
+        tracing::info!(event_code = "provider.updated", provider_id = %req.id, "provider updated");
+        Ok(dto)
     }
-    async fn provider_delete(&self, _req: ProviderDeleteRequestDto) -> Result<()> {
-        anyhow::bail!("not yet implemented")
+
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()> {
+        let mut pending_settings = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+        if !pending_settings.providers.iter().any(|p| p.id == req.id) {
+            anyhow::bail!("provider not found: {}", req.id);
+        }
+        // Check if any profile references this provider (Phase 4 adds provider_id to profiles).
+        // NOTE: BusytokSettings.subagent is SubagentSettings (NOT Option), per lib.rs:106.
+        for (_, profile) in &pending_settings.subagent.profiles {
+            if profile_provider_id(profile).as_deref() == Some(req.id.as_str()) {
+                anyhow::bail!(
+                    "cannot delete provider '{}': profiles still reference it",
+                    req.id
+                );
+            }
+        }
+        pending_settings.providers.retain(|p| p.id != req.id);
+        pending_settings.save(&self.paths)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending_settings;
+        }
+        // Delete key from keychain AFTER settings are persisted.
+        // If keychain delete fails, the orphaned key is harmless (no provider references it).
+        ProviderCredentialStore::delete_key(&req.id)
+            .context("failed to delete API key from keychain")?;
+        tracing::info!(event_code = "provider.deleted", provider_id = %req.id, "provider deleted");
+        Ok(())
     }
+
     async fn provider_test_connection(
         &self,
-        _req: ProviderTestConnectionRequestDto,
+        req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto> {
-        Ok(ProviderTestConnectionResponseDto {
-            ok: false,
-            error: Some("not implemented".to_string()),
-            models_detected: None,
-        })
+        // Snapshot the provider fields under the lock, then drop the guard
+        // before awaiting — holding a `MutexGuard` across `.await` makes the
+        // future `!Send` and breaks the `RuntimeControl` trait bound.
+        let (provider_id, base_url) = {
+            let settings = self.settings.lock().unwrap();
+            let provider = settings
+                .providers
+                .iter()
+                .find(|p| p.id == req.id)
+                .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
+            (provider.id.clone(), provider.base_url.clone())
+        };
+        let key = ProviderCredentialStore::get_key(&provider_id)
+            .context("failed to read keychain")?
+            .ok_or_else(|| anyhow::anyhow!("no API key stored for provider '{}'", provider_id))?;
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        tracing::info!(
+            event_code = "provider.test_connection",
+            provider_id = %provider_id,
+            url = %url,
+            "testing provider connection"
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", key))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "connection test succeeded");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: true,
+                    error: None,
+                    models_detected: None,
+                })
+            }
+            Ok(r) => {
+                let status = r.status();
+                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "connection test failed");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("HTTP {}", status)),
+                    models_detected: None,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "connection test error");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(e.to_string()),
+                    models_detected: None,
+                })
+            }
+        }
     }
 
     // ── Events ───────────────────────────────────────────────────────
@@ -4704,6 +4868,30 @@ impl RuntimeControl for BusytokSupervisor {
             .writer_handle
             .try_send(crate::writer::WriteCommand::DiagnosticWrite(cmd));
     }
+}
+
+/// Maps a `ProviderConfig` (settings-layer type) to a `ProviderDto` (wire type).
+///
+/// Free function rather than a method on `BusytokSupervisor` because it only
+/// needs `ProviderCredentialStore::has_key` (a static method) — taking `&self`
+/// would trip `clippy::unused_self`.
+fn provider_to_dto(provider: &ProviderConfig) -> ProviderDto {
+    ProviderDto {
+        id: provider.id.clone(),
+        name: provider.name.clone(),
+        base_url: provider.base_url.clone(),
+        api_key_env_name: provider.api_key_env_name.clone(),
+        base_url_env_name: provider.base_url_env_name.clone(),
+        models: provider.models.clone(),
+        enabled: provider.enabled,
+        has_api_key: ProviderCredentialStore::has_key(&provider.id),
+    }
+}
+
+/// Extracts the provider_id from a profile config. Returns None until Phase 4
+/// adds the provider_id field to SubagentProfileConfig.
+fn profile_provider_id(_profile: &busytok_config::SubagentProfileConfig) -> Option<String> {
+    None // Phase 4: read profile.provider_id
 }
 
 /// Try to spawn a background task that periodically reloads the price catalog.

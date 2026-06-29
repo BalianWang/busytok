@@ -692,6 +692,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
