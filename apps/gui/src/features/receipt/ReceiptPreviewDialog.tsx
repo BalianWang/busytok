@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useRef } from "react";
-import { Calendar as CalendarIcon, Download as DownloadIcon } from "lucide-react";
+import { Calendar as CalendarIcon, Download as DownloadIcon, X as XIcon } from "lucide-react";
 import { useDailyReceipt } from "../../api/useBusytokData";
 import { ReceiptPaper } from "./ReceiptPaper";
 import { toReceiptViewModel } from "./viewModel";
@@ -45,6 +45,19 @@ export function ReceiptPreviewDialog({ open, date, onDateChange, onClose }: Prop
             <Dialog.Description className="receipt-preview__sr-only">
               Preview your day as a shareable receipt.
             </Dialog.Description>
+
+            {/* Close button — top-right corner. Dialog.Close triggers Radix's
+                onOpenChange(false) → onClose(). */}
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                className="receipt-preview__close"
+                aria-label="Close receipt"
+                title="Close"
+              >
+                <XIcon size={16} strokeWidth={1.75} aria-hidden="true" />
+              </button>
+            </Dialog.Close>
 
             <div className="receipt-preview__scroll">
               {vm ? (

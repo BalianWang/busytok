@@ -42,6 +42,8 @@ describe("ReceiptPreviewDialog", () => {
     // The toolbar carries two icon buttons: calendar + save (copy removed).
     expect(screen.getByRole("button", { name: /pick receipt date/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /save png/i })).toBeDefined();
+    // Close button (X) in the top-right corner.
+    expect(screen.getByRole("button", { name: /close receipt/i })).toBeDefined();
     // Hidden date input is in the DOM and labelled for a11y.
     expect(screen.getByLabelText(/^receipt date$/i)).toBeDefined();
   });
@@ -82,5 +84,15 @@ describe("ReceiptPreviewDialog", () => {
       <ReceiptPreviewDialog open={false} date="2026-06-26" onDateChange={vi.fn()} onClose={vi.fn()} />,
     );
     expect(container.querySelector(".receipt-preview")).toBeNull();
+  });
+
+  it("calls onClose when the close button is clicked", () => {
+    const onClose = vi.fn();
+    wrap(
+      <ReceiptPreviewDialog open date="2026-06-26" onDateChange={vi.fn()} onClose={onClose} />,
+    );
+    const closeBtn = screen.getByRole("button", { name: /close receipt/i });
+    closeBtn.click();
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
