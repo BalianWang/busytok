@@ -130,7 +130,7 @@
    wordmark. Positioned in the gap between TOTAL and the breakdown band
    (created by .receipt__breakdown { margin-top: auto }).
 
-   Ink-on-paper feel borrowed from the circular ReceiptStamp design:
+   Ink-on-paper feel borrowed from the brand stamp design:
    - Dedicated stamp red (#A94438) — deeper than --r-accent so the stamp
      doesn't compete with TOTAL's cost color.
    - mix-blend-mode: multiply simulates ink absorption (same approach as
