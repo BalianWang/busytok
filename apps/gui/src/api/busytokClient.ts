@@ -36,6 +36,11 @@ import type {
   PromptUseResultDto,
   PromptSuggestTagsRequestDto,
   PromptSuggestTagsResponseDto,
+  ProviderCreateRequestDto,
+  ProviderDto,
+  ProviderListResponseDto,
+  ProviderTestConnectionResponseDto,
+  ProviderUpdateRequestDto,
   ReceiptDailyDto,
   ReceiptDailyRequestDto,
   ReadEnvelopeDto,
@@ -163,6 +168,18 @@ export function createBusytokClient(deps: { invoke: InvokeFn }) {
       call<PromptUseResultDto>("prompts.use", { ...request }),
     promptsSuggestTags: (request: PromptSuggestTagsRequestDto) =>
       call<PromptSuggestTagsResponseDto>("prompts.suggest_tags", { ...request }),
+
+    // Providers — bare DTOs (not wrapped in ReadEnvelopeDto)
+    providerList: () =>
+      call<ProviderListResponseDto>("provider.list"),
+    providerCreate: (request: ProviderCreateRequestDto) =>
+      call<ProviderDto>("provider.create", { ...request }),
+    providerUpdate: (request: ProviderUpdateRequestDto) =>
+      call<ProviderDto>("provider.update", { ...request }),
+    providerDelete: (id: string) =>
+      call<void>("provider.delete", { id }),
+    providerTestConnection: (id: string) =>
+      call<ProviderTestConnectionResponseDto>("provider.test_connection", { id }),
 
     // Live
     liveWindow: (request: LiveWindowRequestDto) =>

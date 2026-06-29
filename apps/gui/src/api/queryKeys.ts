@@ -45,6 +45,9 @@ export const queryKeys = {
   settingsSnapshot: () => ["settings", "snapshot"] as const,
   settingsDiagnostics: () => ["settings", "diagnostics"] as const,
 
+  // ── Providers ─────────────────────────────────────────────────────
+  providers: () => ["providers"] as const,
+
   // ── Prompts ───────────────────────────────────────────────────────
   promptsList: (request: PromptListQueryDto) =>
     ["prompts", "list", request] as const,

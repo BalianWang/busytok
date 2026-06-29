@@ -41,6 +41,8 @@ import type {
   PromptUseRequestDto,
   PromptUseResultDto,
   PromptSuggestTagsResponseDto,
+  ProviderCreateRequestDto,
+  ProviderUpdateRequestDto,
   ReceiptDailyDto,
   SettingsSnapshotDto,
   SettingsDiagnosticsDto,
@@ -362,4 +364,37 @@ export function useSuggestTags(query: string | null) {
     staleTime: 5_000,
     enabled: query !== null,
   });
+}
+
+// ── Providers ───────────────────────────────────────────────────────
+
+export function useProviders() {
+  return useQuery({
+    queryKey: queryKeys.providers(),
+    queryFn: () => busytokClient.providerList(),
+    staleTime: 30_000,
+  });
+}
+
+export function useProviderMutations() {
+  const queryClient = useQueryClient();
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.providers() });
+
+  const createProvider = useMutation({
+    mutationFn: (req: ProviderCreateRequestDto) => busytokClient.providerCreate(req),
+    onSuccess: invalidate,
+  });
+  const updateProvider = useMutation({
+    mutationFn: (req: ProviderUpdateRequestDto) => busytokClient.providerUpdate(req),
+    onSuccess: invalidate,
+  });
+  const deleteProvider = useMutation({
+    mutationFn: (id: string) => busytokClient.providerDelete(id),
+    onSuccess: invalidate,
+  });
+  const testConnection = useMutation({
+    mutationFn: (id: string) => busytokClient.providerTestConnection(id),
+  });
+
+  return { createProvider, updateProvider, deleteProvider, testConnection };
 }
