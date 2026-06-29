@@ -126,22 +126,33 @@
 }
 
 /* ── Brand stamp — rectangular red-bordered "BUSYTOK" seal, tilted.
-   Pill-shaped div with 2px red border + rotation, carrying only the
-   wordmark. Positioned over the items' tokens/cost columns. */
+   Pill-shaped div with 2px stamp-red border + rotation, carrying only the
+   wordmark. Positioned over the items' tokens/cost columns.
+
+   Ink-on-paper feel borrowed from the circular ReceiptStamp design:
+   - Dedicated stamp red (#A94438) — deeper than --r-accent so the stamp
+     doesn't compete with TOTAL's cost color.
+   - mix-blend-mode: multiply simulates ink absorption (same approach as
+     the paper grain ::after; known to survive foreignObject capture).
+   - BusytokStamp (Oswald) — narrow letterforms read more "rubber-stamp"
+     than the wider Geist wordmark.
+   - opacity 0.55 (down from 0.72): with multiply, the stamp still reads
+     clearly but reads as a residual mark, not a foreground badge. */
 .receipt-stamp {
   position: absolute;
   top: 188px;
   right: 28px;
   transform: rotate(-12deg);
-  border: 2px solid var(--r-accent);
-  color: var(--r-accent);
+  border: 2px solid #a94438;
+  color: #a94438;
   border-radius: 999px;
   padding: 6px 14px;
-  font-family: "BusytokSans", system-ui, sans-serif;
+  font-family: "BusytokStamp", "BusytokSans", system-ui, sans-serif;
   font-weight: 700;
   font-size: 11px;
   letter-spacing: 0.18em;
-  opacity: 0.72;
+  opacity: 0.55;
+  mix-blend-mode: multiply;
   pointer-events: none;
   z-index: 3;
 }
