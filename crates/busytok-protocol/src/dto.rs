@@ -1386,13 +1386,8 @@ pub struct SubagentAckDto {
     pub status: String,
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-
 // ─── Receipt DTOs (from main merge) ───
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 pub struct ReceiptDailyRequestDto {
     /// `YYYY-MM-DD` in the current reporting timezone. `None` = today
     /// (server-resolved). See `receipt.daily` spec.
@@ -1458,6 +1453,8 @@ pub struct ReceiptBrandDto {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json;
