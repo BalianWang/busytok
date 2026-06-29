@@ -4654,6 +4654,32 @@ impl RuntimeControl for BusytokSupervisor {
         })
     }
 
+    // ── Providers (Phase 1: Credential Foundation) ──────────────────
+    // Task 4 fills these in with real keychain + config wiring.
+
+    async fn provider_create(&self, _req: ProviderCreateRequestDto) -> Result<ProviderDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_list(&self) -> Result<ProviderListResponseDto> {
+        Ok(ProviderListResponseDto { providers: vec![] })
+    }
+    async fn provider_update(&self, _req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_delete(&self, _req: ProviderDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_test_connection(
+        &self,
+        _req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        Ok(ProviderTestConnectionResponseDto {
+            ok: false,
+            error: Some("not implemented".to_string()),
+            models_detected: None,
+        })
+    }
+
     // ── Events ───────────────────────────────────────────────────────
 
     fn event_bus(&self) -> &AppEventBus {

@@ -194,6 +194,16 @@ pub trait RuntimeControl: Send + Sync {
         req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto>;
 
+    // Providers (Phase 1: Credential Foundation)
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto>;
+    async fn provider_list(&self) -> Result<ProviderListResponseDto>;
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto>;
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()>;
+    async fn provider_test_connection(
+        &self,
+        req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto>;
+
     // Events (kept from Phase 1)
     fn event_bus(&self) -> &AppEventBus;
 
@@ -489,6 +499,38 @@ impl ControlDispatcher {
                 let req: SubagentDeleteRequestDto = serde_json::from_value(request.params)
                     .map_err(|e| anyhow::anyhow!("invalid params for subagent.delete: {e}"))?;
                 let dto = self.runtime.subagent_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Providers (Phase 1: Credential Foundation)
+            "provider.create" => {
+                let req: ProviderCreateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for provider.create: {e}"))?;
+                let dto = self.runtime.provider_create(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "provider.list" => {
+                let dto = self.runtime.provider_list().await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "provider.update" => {
+                let req: ProviderUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for provider.update: {e}"))?;
+                let dto = self.runtime.provider_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "provider.delete" => {
+                let req: ProviderDeleteRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for provider.delete: {e}"))?;
+                self.runtime.provider_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
+            }
+            "provider.test_connection" => {
+                let req: ProviderTestConnectionRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid params for provider.test_connection: {e}")
+                    })?;
+                let dto = self.runtime.provider_test_connection(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -1098,6 +1140,31 @@ impl RuntimeControl for TestRuntimeControl {
         Ok(Default::default())
     }
 
+    // ── Providers (Phase 1: Credential Foundation) ───────────────────
+
+    async fn provider_create(&self, _req: ProviderCreateRequestDto) -> Result<ProviderDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_list(&self) -> Result<ProviderListResponseDto> {
+        Ok(ProviderListResponseDto { providers: vec![] })
+    }
+    async fn provider_update(&self, _req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_delete(&self, _req: ProviderDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_test_connection(
+        &self,
+        _req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        Ok(ProviderTestConnectionResponseDto {
+            ok: false,
+            error: Some("not implemented".to_string()),
+            models_detected: None,
+        })
+    }
+
     fn event_bus(&self) -> &AppEventBus {
         &self.event_bus
     }
@@ -1282,6 +1349,24 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto> {
         (**self).subagent_delete(req).await
+    }
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
+        (**self).provider_create(req).await
+    }
+    async fn provider_list(&self) -> Result<ProviderListResponseDto> {
+        (**self).provider_list().await
+    }
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
+        (**self).provider_update(req).await
+    }
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()> {
+        (**self).provider_delete(req).await
+    }
+    async fn provider_test_connection(
+        &self,
+        req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        (**self).provider_test_connection(req).await
     }
     fn event_bus(&self) -> &AppEventBus {
         (**self).event_bus()

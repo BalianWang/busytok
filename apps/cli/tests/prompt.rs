@@ -484,6 +484,24 @@ impl RuntimeControl for AliasConflictRuntime {
     ) -> anyhow::Result<busytok_protocol::dto::SubagentAckDto> {
         self.inner.subagent_delete(req).await
     }
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
+        self.inner.provider_create(req).await
+    }
+    async fn provider_list(&self) -> anyhow::Result<ProviderListResponseDto> {
+        self.inner.provider_list().await
+    }
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> anyhow::Result<ProviderDto> {
+        self.inner.provider_update(req).await
+    }
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.provider_delete(req).await
+    }
+    async fn provider_test_connection(
+        &self,
+        req: ProviderTestConnectionRequestDto,
+    ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
+        self.inner.provider_test_connection(req).await
+    }
 }
 
 #[tokio::test]
