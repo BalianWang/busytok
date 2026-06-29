@@ -350,3 +350,29 @@ export type ReceiptDailyDto = { date: string,
  * server-side so the future Rust render path can share the ViewModel.
  */
 date_label: string, timezone: string, metrics: ReceiptMetricsDto, top_models: Array<ReceiptModelSliceDto>, brand: ReceiptBrandDto, };
+
+export type ProviderDto = { id: string, name: string, base_url: string, api_key_env_name: string, base_url_env_name: string | null, models: Array<string>, enabled: boolean, 
+/**
+ * True if an API key is stored in the keychain for this provider.
+ */
+has_api_key: boolean, };
+
+export type ProviderCreateRequestDto = { id: string, name: string, base_url: string, api_key_env_name: string, base_url_env_name: string | null, models: Array<string>, 
+/**
+ * The actual API key. Stored in keychain, never persisted to settings.toml.
+ */
+api_key: string | null, };
+
+export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, models: Array<string> | null, enabled: boolean | null, 
+/**
+ * If provided, replaces the stored key. If None, key is unchanged.
+ */
+api_key: string | null, };
+
+export type ProviderListResponseDto = { providers: Array<ProviderDto>, };
+
+export type ProviderDeleteRequestDto = { id: string, };
+
+export type ProviderTestConnectionRequestDto = { id: string, };
+
+export type ProviderTestConnectionResponseDto = { ok: boolean, error: string | null, models_detected: Array<string> | null, };

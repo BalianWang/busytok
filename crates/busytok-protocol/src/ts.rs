@@ -181,6 +181,14 @@ mod tests {
             dto::ReceiptMetricsDto::decl(),
             dto::ReceiptDailyRequestDto::decl(),
             dto::ReceiptDailyDto::decl(),
+            // Provider (credential foundation)
+            dto::ProviderDto::decl(),
+            dto::ProviderCreateRequestDto::decl(),
+            dto::ProviderUpdateRequestDto::decl(),
+            dto::ProviderListResponseDto::decl(),
+            dto::ProviderDeleteRequestDto::decl(),
+            dto::ProviderTestConnectionRequestDto::decl(),
+            dto::ProviderTestConnectionResponseDto::decl(),
         ]
         .into_iter()
         .collect();

@@ -1450,6 +1450,88 @@ pub struct ReceiptBrandDto {
     pub generated_at_ms: i64,
 }
 
+// ─── Provider DTOs (Phase 1: Credential Foundation) ───────────────────────
+
+/// Provider as seen by the GUI. `has_api_key` indicates keychain state
+/// without exposing the key itself.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderDto {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key_env_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url_env_name: Option<String>,
+    pub models: Vec<String>,
+    pub enabled: bool,
+    /// True if an API key is stored in the keychain for this provider.
+    pub has_api_key: bool,
+}
+// NOTE: provider_kind is NOT exposed in the wire DTOs for MVP. The service
+// always uses ProviderKind::OpenAiCompatible internally. When more provider
+// kinds are added (Phase 3+), the DTO can expose an enum field.
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderCreateRequestDto {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key_env_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url_env_name: Option<String>,
+    pub models: Vec<String>,
+    /// The actual API key. Stored in keychain, never persisted to settings.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderUpdateRequestDto {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// If provided, replaces the stored key. If None, key is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderListResponseDto {
+    pub providers: Vec<ProviderDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderDeleteRequestDto {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderTestConnectionRequestDto {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderTestConnectionResponseDto {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_detected: Option<Vec<String>>,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1458,6 +1540,24 @@ pub struct ReceiptBrandDto {
 mod tests {
     use super::*;
     use serde_json;
+
+    #[test]
+    fn provider_dto_round_trips() {
+        let dto = ProviderDto {
+            id: "deepseek-prod".to_string(),
+            name: "DeepSeek".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key_env_name: "DEEPSEEK_API_KEY".to_string(),
+            base_url_env_name: None,
+            models: vec!["deepseek-chat".to_string()],
+            enabled: true,
+            has_api_key: true,
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        let parsed: ProviderDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "deepseek-prod");
+        assert!(parsed.has_api_key);
+    }
 
     #[test]
     fn overview_heatmap_zero_days_preserve_unavailable_cost() {

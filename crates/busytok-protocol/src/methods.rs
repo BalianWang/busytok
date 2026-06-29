@@ -47,6 +47,12 @@ pub fn method_manifest() -> Vec<String> {
         "subagent.tasks".to_string(),
         "subagent.hibernate".to_string(),
         "subagent.delete".to_string(),
+        // Providers (credential foundation)
+        "provider.create".to_string(),
+        "provider.list".to_string(),
+        "provider.update".to_string(),
+        "provider.delete".to_string(),
+        "provider.test_connection".to_string(),
     ]
 }
 
