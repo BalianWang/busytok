@@ -629,7 +629,6 @@ impl RuntimeControl for TestRuntimeControl {
                     input_tokens: 0,
                     output_tokens: 0,
                     cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
                     cache_hit_rate: None,
                     cost_usd: None,
                     cost_status: CostStatusDto::Unavailable,

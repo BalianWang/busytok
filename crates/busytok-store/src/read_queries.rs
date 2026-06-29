@@ -2132,7 +2132,6 @@ pub fn read_daily_receipt_totals(
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
             COALESCE(SUM(cache_read_tokens), 0),
-            COALESCE(SUM(cache_creation_tokens), 0),
             SUM(cost_usd),
             COALESCE(SUM(event_count), 0),
             COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN event_count ELSE 0 END), 0),
@@ -2141,16 +2140,15 @@ pub fn read_daily_receipt_totals(
          WHERE timezone = ?1 AND date = ?2 AND generation_id = ?3",
         params![timezone, date, generation_id],
         |row| {
-            let with_cost: i64 = row.get(7)?;
-            let without_cost: i64 = row.get(8)?;
+            let with_cost: i64 = row.get(6)?;
+            let without_cost: i64 = row.get(7)?;
             Ok(ReceiptDailyTotalsRow {
                 total_tokens: row.get(0)?,
                 input_tokens: row.get(1)?,
                 output_tokens: row.get(2)?,
                 cache_read_tokens: row.get(3)?,
-                cache_creation_tokens: row.get(4)?,
-                cost_usd: row.get(5)?,
-                event_count: row.get(6)?,
+                cost_usd: row.get(4)?,
+                event_count: row.get(5)?,
                 has_cost: with_cost > 0,
                 has_no_cost: without_cost > 0,
             })
@@ -3106,7 +3104,6 @@ mod tests {
         assert_eq!(t.input_tokens, 200);
         assert_eq!(t.output_tokens, 400);
         assert_eq!(t.cache_read_tokens, 180);
-        assert_eq!(t.cache_creation_tokens, 20);
         assert_eq!(t.cost_usd, Some(0.10));
         assert_eq!(t.event_count, 2);
         assert!(t.has_cost);

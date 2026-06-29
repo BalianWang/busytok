@@ -279,7 +279,7 @@ export type ReceiptModelSliceDto = { name: string, tokens: number, cost_usd: num
 
 export type ReceiptBrandDto = { name: string, tagline: string, github: string, generated_at_ms: number, };
 
-export type ReceiptMetricsDto = { total_tokens: number, input_tokens: number, output_tokens: number, cache_read_tokens: number, cache_creation_tokens: number, 
+export type ReceiptMetricsDto = { total_tokens: number, input_tokens: number, output_tokens: number, cache_read_tokens: number, 
 /**
  * `cache_read_tokens / (input_tokens + cache_read_tokens)`, else `null`.
  */

@@ -6,7 +6,7 @@ export const NORMAL_DAY: ReceiptDailyDto = {
   timezone: "Asia/Shanghai",
   metrics: {
     total_tokens: 3_412_888, input_tokens: 2_100_000, output_tokens: 912_888,
-    cache_read_tokens: 1_800_000, cache_creation_tokens: 60_000,
+    cache_read_tokens: 1_800_000,
     cache_hit_rate: 0.4615, cost_usd: 47.21, cost_status: "exact",
     event_count: 312, session_count: 14,
     peak_hour: { label: "14:00", tokens: 612_000 },
@@ -60,17 +60,21 @@ export const NO_DATA: ReceiptDailyDto = {
   timezone: "UTC",
   metrics: {
     total_tokens: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0,
-    cache_creation_tokens: 0, cache_hit_rate: null, cost_usd: null,
+    cache_hit_rate: null, cost_usd: null,
     cost_status: "unavailable", event_count: 0, session_count: 0, peak_hour: null,
   },
   top_models: [],
   brand: { name: "BUSYTOK", tagline: "AI CODING · TOKEN USAGE", github: "github.com/BalianWang/busytok", generated_at_ms: 0 },
 };
 
-// >5 models where the overflow (models 6-7) are ALL unavailable → the OTHERS
-// row's aggregate cost_status must be "unavailable" (render "—"), not "partial".
+// >5 models where the overflow (models 6-7) are ALL unavailable. Truncation
+// (TOP_N=5) drops them silently — no aggregate row is rendered. The day's
+// aggregate cost_status is "partial" because the underlying data mixes
+// exact-cost and no-cost models (matches production's
+// ui_models::cost_status(has_cost=true, has_no_cost=true)).
 export const OTHERS_ALL_UNAVAILABLE: ReceiptDailyDto = {
   ...NORMAL_DAY,
+  metrics: { ...NORMAL_DAY.metrics, cost_status: "partial" },
   top_models: [
     { name: "m1", tokens: 500, cost_usd: 5, cost_status: "exact" },
     { name: "m2", tokens: 400, cost_usd: 4, cost_status: "exact" },
@@ -82,10 +86,12 @@ export const OTHERS_ALL_UNAVAILABLE: ReceiptDailyDto = {
   ],
 };
 
-// >5 models where the overflow is MIXED (one exact + one unavailable) → the
-// OTHERS row's cost_status must be "partial" (render "≈$X.XX"), not "exact".
+// >5 models where the overflow is MIXED (one exact + one unavailable). With
+// TOP_N=5 truncation, only the top-5 are rendered; the mixed-cost models
+// are dropped. Metrics cost_status reflects the mixed underlying data.
 export const OTHERS_MIXED_COST: ReceiptDailyDto = {
   ...NORMAL_DAY,
+  metrics: { ...NORMAL_DAY.metrics, cost_status: "partial" },
   top_models: [
     { name: "m1", tokens: 500, cost_usd: 5, cost_status: "exact" },
     { name: "m2", tokens: 400, cost_usd: 4, cost_status: "exact" },

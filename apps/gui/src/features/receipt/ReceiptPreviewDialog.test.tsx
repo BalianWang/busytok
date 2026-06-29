@@ -12,7 +12,7 @@ vi.mock("../../api/useBusytokData", () => ({
         timezone: "UTC",
         metrics: {
           total_tokens: 100, input_tokens: 40, output_tokens: 60, cache_read_tokens: 10,
-          cache_creation_tokens: 1, cache_hit_rate: 0.2, cost_usd: 1.0, cost_status: "exact",
+          cache_hit_rate: 0.2, cost_usd: 1.0, cost_status: "exact",
           event_count: 3, session_count: 1, peak_hour: { label: "10:00", tokens: 100 },
         },
         top_models: [{ name: "m", tokens: 100, cost_usd: 1.0, cost_status: "exact" }],

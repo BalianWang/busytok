@@ -1255,7 +1255,6 @@ pub struct ReceiptMetricsDto {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
-    pub cache_creation_tokens: i64,
     /// `cache_read_tokens / (input_tokens + cache_read_tokens)`, else `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_rate: Option<f64>,
@@ -1517,7 +1516,6 @@ mod tests {
                 input_tokens: 40,
                 output_tokens: 60,
                 cache_read_tokens: 30,
-                cache_creation_tokens: 5,
                 cache_hit_rate: Some(0.42857),
                 cost_usd: Some(1.23),
                 cost_status: CostStatusDto::Exact,

@@ -379,7 +379,6 @@ pub struct ReceiptDailyTotalsRow {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
-    pub cache_creation_tokens: i64,
     pub cost_usd: Option<f64>,
     pub has_cost: bool,
     pub has_no_cost: bool,
