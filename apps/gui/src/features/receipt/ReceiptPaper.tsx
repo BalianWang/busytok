@@ -17,8 +17,8 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
   return (
     <div className="receipt-paper" ref={paperRef}>
       {/* Rectangular brand stamp — red bordered "BUSYTOK" seal, tilted.
-          Restored to the original pill-shaped div stamp (commit 351cfef),
-          with content narrowed to just the wordmark. */}
+          Pill-shaped div with 2px red border + rotation, carrying only the
+          wordmark. Positioned over the items' tokens/cost columns. */}
       <div className="receipt-stamp" aria-hidden="true">BUSYTOK</div>
 
       <header className="receipt__header">
@@ -75,9 +75,9 @@ export function ReceiptPaper({ vm, paperRef }: ReceiptPaperProps) {
         )}
       </div>
 
-      {/* Footer: frameless QR conversion block (CTA → QR → short URL), then
-          the two-line trust + signature. No white box — the previous dashed
-          border read like a form card and broke the paper continuity. */}
+      {/* Footer: frameless QR block (CTA above QR), then the single-line
+          trust statement. No white box — the previous dashed border read
+          like a form card and broke the paper continuity. */}
       <footer className="receipt__footer">
         <div className="receipt__qr-block">
           <span className="receipt__qr-hint">SCAN TO TRY BUSYTOK</span>
