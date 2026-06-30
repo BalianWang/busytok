@@ -1583,7 +1583,7 @@ impl BusytokSupervisor {
     /// Best-effort: the caller logs failures at `warn` but does NOT fail
     /// the task — the task result is already persisted; usage is
     /// best-effort observability.
-    fn write_subagent_usage_event(
+    pub fn write_subagent_usage_event(
         &self,
         result: &busytok_subagent::models::DelegateResult,
         cwd: &str,

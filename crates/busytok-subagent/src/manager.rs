@@ -444,7 +444,14 @@ impl SubagentManager {
             .map_err(SubagentError::Store)?;
             // Task 5: persist classified error_kind on the task row.
             if let Some(kind) = &out.error_kind {
-                let _ = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str()));
+                if let Err(e) = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str())) {
+                    tracing::warn!(
+                        event_code = "subagent.error_kind_persist_failed",
+                        task_id = %task.id,
+                        error = %e,
+                        "failed to persist error_kind"
+                    );
+                }
             }
             // Re-fetch recent_tasks AFTER the task result is persisted so the
             // snapshot includes the just-completed task's result_summary. The

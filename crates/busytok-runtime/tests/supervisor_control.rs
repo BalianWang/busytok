@@ -4981,12 +4981,15 @@ async fn write_usage_event_idempotent_on_same_task_id() {
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
-    // First delegate — writes the usage event.
+    let cwd = tmp.path().join("repo").to_string_lossy().to_string();
+
+    // First delegate — writes one usage event via `write_subagent_usage_event`
+    // (called internally by `subagent_delegate`).
     let resp1 = sup
         .subagent_delegate(SubagentDelegateRequestDto {
             subagent_name: "idem".to_string(),
             subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            cwd: cwd.clone(),
             profile: "pi/search-cheap".to_string(),
             intent: None,
             prompt: "first run".to_string(),
@@ -5000,37 +5003,17 @@ async fn write_usage_event_idempotent_on_same_task_id() {
         .unwrap();
     assert_eq!(resp1.status, "completed");
 
-    // Second delegate — same subagent, different prompt. The mock
-    // executor generates a different `task_id` (UUID), so this produces
-    // a SECOND event row. We verify the first event is still there
-    // (dedupe_key is per-task_id, not per-subagent).
-    let resp2 = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "idem".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "second run".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp2.status, "completed");
-
-    // Two different task_ids → two events.
     let count = count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
-    assert_eq!(count, 2, "two distinct task_ids should produce two events");
+    assert_eq!(
+        count, 1,
+        "exactly one subagent usage event should be in usage_events after first delegate"
+    );
 
-    // Now write the SAME task_id again via the internal API to verify
-    // dedupe. We construct a DelegateResult with the same task_id and
-    // call write_subagent_usage_event directly.
+    // Re-issue the SAME task_id via the internal API to verify dedupe.
+    // The `UsageWritePolicy::InsertOnce` dedupe_key (per-task_id) must
+    // suppress the second insert, so the row count stays at 1.
     let result = busytok_subagent::models::DelegateResult {
-        task_id: resp1.task_id.clone(), // reuse the same task_id
+        task_id: resp1.task_id.clone(),
         subagent_id: resp1.subagent_id.clone(),
         subagent_name: "idem".to_string(),
         adapter: "pi".to_string(),
@@ -5050,16 +5033,14 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             cost_usd: None,
         },
     };
-    // write_subagent_usage_event is private — we can't call it directly.
-    // Instead, verify that re-delegating with the same task_id doesn't
-    // duplicate by checking the count is still 2 (the mock executor
-    // always generates new task_ids, so this is the best we can do at
-    // the integration level). The dedupe is verified at the unit level
-    // by the dedupe_key test above.
-    let _ = result;
+    sup.write_subagent_usage_event(&result, &cwd).unwrap();
+
     let final_count =
         count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
-    assert_eq!(final_count, 2, "no duplicate from re-delegate");
+    assert_eq!(
+        final_count, 1,
+        "duplicate write with same task_id should be deduped by InsertOnce"
+    );
 }
 
 /// `write_usage_event_uses_active_generation_id` (P0) — the event row's
