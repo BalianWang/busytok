@@ -3,16 +3,27 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tracing::{error, info, warn};
 
-use busytok_store::{Database, SubagentResourceEventRow};
+use busytok_store::{Database, SubagentHarnessBindingRow, SubagentResourceEventRow};
 
 use crate::error::SubagentError;
 use crate::memory::MemoryUpdate;
 use crate::mock_executor::{ExecutorInput, ExecutorOutput, TaskExecutor};
-use crate::models::{TaskStatus, TaskUsage};
-use crate::sidecar::supervisor::PiSidecarSupervisor;
-use crate::sidecar::{protocol::HOT_SESSION_LIMIT_REACHED, SidecarError};
+use crate::models::{TaskErrorKind, TaskStatus, TaskUsage};
+use crate::sidecar::pool::WorkerPool;
+use crate::sidecar::protocol::{
+    AUTH_FAILURE, HOT_SESSION_LIMIT_REACHED, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT,
+};
+use crate::sidecar::SidecarError;
 
 /// Drives a single subagent turn through the Pi sidecar.
+///
+/// Phase 3 Task 3: rewired from a single `Arc<PiSidecarSupervisor>` to
+/// `Arc<WorkerPool>`. The `execute()` method reads `input.provider_id`,
+/// calls `pool.ensure_worker(provider_id)` to get the supervisor, then
+/// delegates to it. On auth failure (`TaskErrorKind::Auth`), the worker is
+/// hard-killed + removed via `pool.remove_worker_and_kill(provider_id)`
+/// (bypasses the 5-min restart window — the credential is bad, restarting
+/// won't help).
 ///
 /// On `HOT_SESSION_LIMIT_REACHED` from `turn_auto`, the executor catches the
 /// error, extracts the LRU `candidate` from the RPC error's `data.candidate`
@@ -27,42 +38,54 @@ use crate::sidecar::{protocol::HOT_SESSION_LIMIT_REACHED, SidecarError};
 /// propagate the error so the caller knows a sidecar restart is the recovery
 /// path.
 pub struct SidecarTaskExecutor {
-    supervisor: Arc<PiSidecarSupervisor>,
+    pool: Arc<WorkerPool>,
     db: Option<Arc<Mutex<Database>>>,
 }
 
 impl SidecarTaskExecutor {
-    pub fn new(supervisor: Arc<PiSidecarSupervisor>) -> Self {
-        Self {
-            supervisor,
-            db: None,
-        }
+    /// Construct with a `WorkerPool` + optional DB handle (production path).
+    ///
+    /// The pool routes `execute()` calls to the correct per-provider
+    /// supervisor via `ensure_worker(provider_id)`. The DB is used by the
+    /// eviction flow (`evict_lru` / `evict_session`) to persist memory deltas
+    /// and flip bindings atomically. Without a DB the executor cannot persist
+    /// memory deltas or flip bindings, so `HOT_SESSION_LIMIT_REACHED`
+    /// surfaces as a fatal error: `evict_session` rejects the no-DB path up
+    /// front (before any RPC) to avoid silent state divergence — the sidecar
+    /// would release its slot on `close` but the DB would still believe the
+    /// session is hot.
+    pub fn with_pool(pool: Arc<WorkerPool>, db: Option<Arc<Mutex<Database>>>) -> Self {
+        Self { pool, db }
     }
 
-    /// Construct with a DB handle for the eviction flow (production path).
-    /// Without a DB the executor cannot persist memory deltas or flip
-    /// bindings, so `HOT_SESSION_LIMIT_REACHED` surfaces as a fatal error:
-    /// `evict_session` rejects the no-DB path up front (before any RPC) to
-    /// avoid silent state divergence — the sidecar would release its slot on
-    /// `close` but the DB would still believe the session is hot.
-    pub fn with_db(supervisor: Arc<PiSidecarSupervisor>, db: Arc<Mutex<Database>>) -> Self {
-        Self {
-            supervisor,
-            db: Some(db),
-        }
+    /// Access the underlying pool (used by wiring + tests).
+    pub fn pool(&self) -> &Arc<WorkerPool> {
+        &self.pool
     }
 }
 
 #[async_trait]
 impl TaskExecutor for SidecarTaskExecutor {
     async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
-        let handle = self
-            .supervisor
+        // Step 1: extract provider_id. None → error (cannot route).
+        let provider_id = input.provider_id.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("profile not bound to a provider — cannot route execute()")
+        })?;
+
+        // Step 2: ensure_worker (synchronous — I2 fix).
+        let supervisor = self
+            .pool
+            .ensure_worker(provider_id)
+            .map_err(sidecar_to_anyhow)?;
+
+        // Step 3: ensure_started (async — lazy spawn if needed).
+        let handle = supervisor
             .ensure_started()
             .await
             .map_err(sidecar_to_anyhow)?;
-        // Build turn_auto params (spec §4.3). Plan 4 adds tools, memory,
-        // context, and constraints. Memory carries structured objects.
+
+        // Step 4: build turn_auto params (spec §4.3). Include provider_id
+        // so the sidecar knows which provider to use.
         let key_files_json: Vec<serde_json::Value> = input
             .memory
             .key_files
@@ -122,13 +145,16 @@ impl TaskExecutor for SidecarTaskExecutor {
                 "version": 1,
             },
             "adapter_options": {},
+            "provider_id": provider_id,
         });
         info!(
             event_code = "subagent.sidecar.turn_auto.start",
             subagent_id = %input.subagent_id,
             profile = %input.profile,
+            provider_id = %provider_id,
             "sending turn_auto to sidecar"
         );
+        // Step 5-6: call turn_auto, classify errors, auth-fail kill.
         match handle.turn_auto(params.clone()).await {
             Ok(result) => Ok(parse_turn_auto_result(&result)),
             Err(SidecarError::Application(code, _msg, data))
@@ -144,23 +170,124 @@ impl TaskExecutor for SidecarTaskExecutor {
                 // Retry turn_auto after eviction. The sidecar's session pool
                 // now has a free slot (close released it), so this should
                 // succeed; any failure propagates as a normal turn_auto error.
-                let result = handle.turn_auto(params).await.map_err(|e| {
-                    warn!(
-                        event_code = "subagent.sidecar.turn_auto.failed_after_eviction",
-                        error = %e
-                    );
-                    sidecar_to_anyhow(e)
-                })?;
-                Ok(parse_turn_auto_result(&result))
+                match handle.turn_auto(params).await {
+                    Ok(result) => Ok(parse_turn_auto_result(&result)),
+                    Err(e) => {
+                        let kind = classify_sidecar_error(&e);
+                        warn!(
+                            event_code = "subagent.sidecar.turn_auto.failed_after_eviction",
+                            error = %e,
+                            error_kind = ?kind
+                        );
+                        // Auth-fail kill: hard-remove + kill the worker so the
+                        // next execute() re-reads credentials (the bad key
+                        // might have been refreshed in the keychain).
+                        if kind == TaskErrorKind::Auth {
+                            if let Err(kill_err) =
+                                self.pool.remove_worker_and_kill(provider_id).await
+                            {
+                                error!(
+                                    event_code = "subagent.pool.auth_kill_failed",
+                                    provider_id = %provider_id,
+                                    error = %kill_err,
+                                    "remove_worker_and_kill failed after auth error"
+                                );
+                            }
+                        }
+                        Err(sidecar_to_anyhow(e))
+                    }
+                }
             }
             Err(e) => {
+                let kind = classify_sidecar_error(&e);
                 warn!(
                     event_code = "subagent.sidecar.turn_auto.failed",
-                    error = %e
+                    error = %e,
+                    error_kind = ?kind
                 );
+                // Auth-fail kill: hard-remove + kill the worker so the next
+                // execute() re-reads credentials. The 5-min restart window
+                // is bypassed because the credential is bad — restarting
+                // with the same bad key won't help.
+                if kind == TaskErrorKind::Auth {
+                    info!(
+                        event_code = "subagent.pool.auth_kill",
+                        provider_id = %provider_id,
+                        "auth failure detected — hard-killing + removing worker"
+                    );
+                    if let Err(kill_err) = self.pool.remove_worker_and_kill(provider_id).await {
+                        error!(
+                            event_code = "subagent.pool.auth_kill_failed",
+                            provider_id = %provider_id,
+                            error = %kill_err,
+                            "remove_worker_and_kill failed after auth error"
+                        );
+                    }
+                }
+                // Propagate the error. The caller (SubagentManager) records
+                // `error_kind` via the ExecutorOutput — but since execute()
+                // returns Err, the manager doesn't get an ExecutorOutput.
+                // The classification is still useful for logging + future
+                // retry logic (Phase 4). When the sidecar returns a "failed"
+                // status (not an RPC error), parse_turn_auto_result handles
+                // classification via the result payload.
                 Err(sidecar_to_anyhow(e))
             }
         }
+    }
+}
+
+/// Classify a `SidecarError` into a `TaskErrorKind` for recovery strategy
+/// selection (Phase 3 Task 3).
+///
+/// Error code table (spec §4.2 + Phase 3 extensions):
+/// - `-32010` (AUTH_FAILURE) → `TaskErrorKind::Auth` → hard kill + remove worker
+/// - `-32011` (RATE_LIMIT) → `TaskErrorKind::RateLimit` → keep worker, backoff
+/// - `-32012` (NETWORK_ERROR) → `TaskErrorKind::Network` → keep worker, retry
+/// - `-32003` (TASK_TIMEOUT) → `TaskErrorKind::Timeout` → keep worker, retry
+/// - `SidecarError::Crashed` → `TaskErrorKind::Crash` → crash-restart logic
+/// - `SidecarError::Spawn` with "connection refused" → `TaskErrorKind::Network`
+/// - everything else → `TaskErrorKind::Unknown`
+pub fn classify_sidecar_error(err: &SidecarError) -> TaskErrorKind {
+    match err {
+        SidecarError::Application(code, _msg, _data) => {
+            match *code {
+                AUTH_FAILURE => TaskErrorKind::Auth,
+                RATE_LIMIT => TaskErrorKind::RateLimit,
+                NETWORK_ERROR => TaskErrorKind::Network,
+                TASK_TIMEOUT => TaskErrorKind::Timeout,
+                // Other application codes (SESSION_NOT_FOUND,
+                // HOT_SESSION_LIMIT_REACHED, SIDECAR_UNHEALTHY,
+                // PROFILE_NOT_FOUND, TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA,
+                // PROTOCOL_MISMATCH) are handled by their respective flows
+                // (eviction, profile resolution, etc.) — classify as Unknown
+                // for the general error-handling path.
+                _ => TaskErrorKind::Unknown,
+            }
+        }
+        SidecarError::Crashed(_) => TaskErrorKind::Crash,
+        SidecarError::Spawn(msg) => {
+            // Spawn failures with "connection refused" indicate a network
+            // issue (sidecar binary can't be reached / started). Other spawn
+            // failures (missing binary, permissions) are Unknown.
+            if msg.contains("connection refused") {
+                TaskErrorKind::Network
+            } else {
+                TaskErrorKind::Unknown
+            }
+        }
+        // Rpc, Timeout, Io, are less specific — classify by variant.
+        SidecarError::Timeout(_) => TaskErrorKind::Timeout,
+        SidecarError::Io(msg) => {
+            // IO errors with "connection refused" or "broken pipe" are
+            // network-related. Other IO errors are Unknown.
+            if msg.contains("connection refused") || msg.contains("network") {
+                TaskErrorKind::Network
+            } else {
+                TaskErrorKind::Unknown
+            }
+        }
+        SidecarError::Rpc(_) => TaskErrorKind::Unknown,
     }
 }
 
@@ -188,29 +315,64 @@ impl SidecarTaskExecutor {
     /// the LRU from the DB and calls `evict_session` with its adapter_session_id.
     /// Used by `PressureResponder` (§8.3 step 1) when system memory pressure
     /// is detected — proactively sheds one hot session to free RSS.
+    ///
+    /// **C7 fix (pool-wide LRU):** iterates ALL supervisors in the pool via
+    /// `for_each_supervisor` (clone Arcs under lock, do async eviction after).
+    /// For each supervisor, queries `find_lru_hot_binding` with that
+    /// supervisor's `harness_name`. Collects all candidates across all
+    /// providers, picks the globally-oldest by `last_used_at_ms`, then calls
+    /// `evict_session`. This preserves the I5 fix (pool-wide LRU) with the
+    /// correct per-supervisor harness lookup.
     pub async fn evict_lru(&self) -> anyhow::Result<()> {
-        let adapter_session_id = {
+        // Step 1: collect (supervisor, harness_name) pairs under the map
+        // lock. The closure must be trivial (clone+collect) — no async work
+        // under the lock (Task 2 review note).
+        let candidates_for_lru: Vec<(SubagentHarnessBindingRow, String)> = {
             let Some(db) = &self.db else {
                 return Err(anyhow::anyhow!(
                     "evict_lru requires a DB connection; no-DB executor cannot pick LRU"
                 ));
             };
             let db = db.lock().expect("db lock poisoned");
-            let binding = db
-                .subagent_find_lru_hot_binding(&self.supervisor.config().harness_name)
-                .map_err(|e| anyhow::anyhow!("find_lru_hot_binding failed: {e}"))?;
-            let Some(binding) = binding else {
-                info!(
-                    event_code = "subagent.pressure.no_lru",
-                    "no hot binding to hibernate"
-                );
-                return Ok(());
-            };
-            binding
-                .adapter_session_id
-                .ok_or_else(|| anyhow::anyhow!("LRU hot binding has no adapter_session_id"))?
+            // Collect harness names under the map lock (clone only — no async
+            // work under the lock, per Task 2 review note).
+            let mut harnesses: Vec<String> = Vec::new();
+            self.pool.for_each_supervisor(|_pid, sup| {
+                harnesses.push(sup.config().harness_name.clone());
+            });
+            // Query LRU for each harness (DB lock still held — sync query).
+            let mut all_candidates: Vec<(SubagentHarnessBindingRow, String)> = Vec::new();
+            for harness in &harnesses {
+                if let Ok(Some(binding)) = db.subagent_find_lru_hot_binding(harness) {
+                    all_candidates.push((binding, harness.clone()));
+                }
+            }
+            // Drop db lock before any async work.
+            all_candidates
         };
-        // Delegate to the existing eviction flow (prepare_hibernate → commit → close).
+
+        // Step 2: pick the globally-oldest by last_used_at_ms (ascending
+        // order — oldest first). `last_used_at_ms` is `Option<i64>`; treat
+        // `None` as the oldest (epoch 0) so bindings that were never used
+        // get evicted first.
+        let oldest = candidates_for_lru
+            .into_iter()
+            .min_by_key(|(binding, _)| binding.last_used_at_ms.unwrap_or(0));
+
+        let Some((binding, _harness)) = oldest else {
+            info!(
+                event_code = "subagent.pressure.no_lru",
+                "no hot binding to hibernate"
+            );
+            return Ok(());
+        };
+
+        let adapter_session_id = binding
+            .adapter_session_id
+            .ok_or_else(|| anyhow::anyhow!("LRU hot binding has no adapter_session_id"))?;
+
+        // Step 3: delegate to evict_session (resolves the supervisor via
+        // supervisor_for_session — pool-wide routing).
         self.evict_session(&adapter_session_id).await
     }
 
@@ -224,6 +386,13 @@ impl SidecarTaskExecutor {
     ///    never held across an RPC call.
     /// 3. RPC: `session.close(adapter_session_id)` — failure is FATAL (see
     ///    `SidecarTaskExecutor` doc comment).
+    ///
+    /// **C7 fix (pool routing):** the supervisor is resolved via
+    /// `self.pool.supervisor_for_session(adapter_session_id)`. If not found
+    /// (binding belongs to a removed provider, or the sidecar/DB are out of
+    /// sync) → log warning + return a fatal error. Silently skipping would
+    /// cause the `turn_auto` retry to hit `HOT_SESSION_LIMIT_REACHED` again,
+    /// hiding the root cause behind the symptom.
     async fn evict_session(&self, adapter_session_id: &str) -> anyhow::Result<()> {
         // No-DB path: eviction cannot be performed safely. The persist step
         // below (write memory + flip binding atomically) is what keeps the DB
@@ -231,7 +400,7 @@ impl SidecarTaskExecutor {
         // and the sidecar would release its slot while the DB still believes
         // the session is hot — silent state divergence. Surface this as a
         // fatal error BEFORE any RPC so the caller knows a sidecar restart is
-        // the recovery path. (Mirrors the `with_db` doc comment contract.)
+        // the recovery path. (Mirrors the `with_pool` doc comment contract.)
         if self.db.is_none() {
             error!(
                 event_code = "subagent.session.eviction_no_db",
@@ -243,8 +412,33 @@ impl SidecarTaskExecutor {
                  no-DB executor cannot evict safely (adapter_session_id={adapter_session_id})"
             ));
         }
-        let handle = self
-            .supervisor
+
+        // C7 fix: resolve which supervisor owns this session via the pool.
+        let (_provider_id, supervisor) = match self.pool.supervisor_for_session(adapter_session_id)
+        {
+            Some(pair) => pair,
+            None => {
+                // No supervisor owns this session: either the binding belongs
+                // to a removed provider (session already gone), or the sidecar
+                // and DB are out of sync (the sidecar named a candidate the DB
+                // doesn't track). Surface this as a fatal error — silently
+                // skipping would cause the turn_auto retry to hit
+                // HOT_SESSION_LIMIT_REACHED again, hiding the root cause
+                // (out-of-sync) behind the symptom (limit reached).
+                warn!(
+                    event_code = "subagent.session.eviction_no_supervisor",
+                    adapter_session_id = %adapter_session_id,
+                    "no supervisor owns this session — binding may belong to a removed provider, or sidecar/DB are out of sync; aborting eviction"
+                );
+                return Err(anyhow::anyhow!(
+                    "no hot binding found for adapter_session_id {adapter_session_id} \
+                     — no supervisor owns this session (binding may belong to a removed \
+                     provider, or sidecar/DB are out of sync)"
+                ));
+            }
+        };
+
+        let handle = supervisor
             .ensure_started()
             .await
             .map_err(sidecar_to_anyhow)?;
@@ -266,7 +460,7 @@ impl SidecarTaskExecutor {
         //    All DB writes happen in this scoped block; the lock is released
         //    before the `session.close` `.await` below.
         if let Some(db) = &self.db {
-            let harness = self.supervisor.config().harness_name.clone();
+            let harness = supervisor.config().harness_name.clone();
             let (subagent_id, hot_summary_written) = {
                 let db_guard = db.lock().expect("db lock poisoned");
                 // Find the binding for this adapter_session_id.
@@ -534,4 +728,139 @@ fn parse_memory_update(mu: &serde_json::Value) -> MemoryUpdate {
 /// so the control contract (`subagent.profile_not_found`, etc.) is honored.
 fn sidecar_to_anyhow(e: SidecarError) -> anyhow::Error {
     anyhow::Error::from(SubagentError::from(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidecar::protocol::*;
+
+    // --- classify_sidecar_error tests (Step 1) ---
+
+    #[test]
+    fn classify_auth_failure() {
+        // -32010 (AUTH_FAILURE) with "401 Unauthorized" message → Auth.
+        let err = SidecarError::Application(AUTH_FAILURE, "401 Unauthorized".to_string(), None);
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Auth);
+    }
+
+    #[test]
+    fn classify_rate_limit() {
+        // -32011 (RATE_LIMIT) with "429 Too Many Requests" → RateLimit.
+        let err = SidecarError::Application(RATE_LIMIT, "429 Too Many Requests".to_string(), None);
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::RateLimit);
+    }
+
+    #[test]
+    fn classify_network() {
+        // -32012 (NETWORK_ERROR) with "connection refused" → Network.
+        let err = SidecarError::Application(NETWORK_ERROR, "connection refused".to_string(), None);
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Network);
+    }
+
+    #[test]
+    fn classify_timeout() {
+        // -32003 (TASK_TIMEOUT) → Timeout.
+        let err = SidecarError::Application(TASK_TIMEOUT, "task timed out".to_string(), None);
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Timeout);
+    }
+
+    #[test]
+    fn classify_crash() {
+        // SidecarError::Crashed → Crash.
+        let err = SidecarError::Crashed("sidecar exited with code 1".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Crash);
+    }
+
+    #[test]
+    fn classify_spawn_network() {
+        // SidecarError::Spawn with "connection refused" → Network.
+        let err = SidecarError::Spawn("connection refused".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Network);
+    }
+
+    #[test]
+    fn classify_unknown() {
+        // Everything else → Unknown.
+        // An unmapped application code:
+        let err = SidecarError::Application(-32099, "some unknown error".to_string(), None);
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Unknown);
+
+        // A non-network spawn error:
+        let err = SidecarError::Spawn("permission denied".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Unknown);
+
+        // An RPC error:
+        let err = SidecarError::Rpc("internal error".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Unknown);
+    }
+
+    // --- error code regression test ---
+
+    #[test]
+    fn new_error_codes_do_not_overlap_existing_protocol_constants() {
+        // Existing protocol constants: -32001..-32008.
+        let existing: &[i32] = &[
+            SESSION_NOT_FOUND,         // -32001
+            HOT_SESSION_LIMIT_REACHED, // -32002
+            TASK_TIMEOUT,              // -32003
+            SIDECAR_UNHEALTHY,         // -32004
+            PROFILE_NOT_FOUND,         // -32005
+            TOOL_NOT_ALLOWED,          // -32006
+            INVALID_OUTPUT_SCHEMA,     // -32007
+            PROTOCOL_MISMATCH,         // -32008
+        ];
+        // New Phase 3 codes: -32010..-32012.
+        let new_codes: &[i32] = &[AUTH_FAILURE, RATE_LIMIT, NETWORK_ERROR];
+
+        // Verify existing codes are in the expected range.
+        for &code in existing {
+            assert!(
+                (-32008..=-32001).contains(&code),
+                "existing code {code} outside expected range -32001..-32008"
+            );
+        }
+        // Verify new codes are in the expected range.
+        for &code in new_codes {
+            assert!(
+                (-32012..=-32010).contains(&code),
+                "new code {code} outside expected range -32010..-32012"
+            );
+        }
+        // Verify NO overlap between existing and new codes.
+        for &new_code in new_codes {
+            assert!(
+                !existing.contains(&new_code),
+                "new code {new_code} overlaps existing protocol constants"
+            );
+        }
+        // Verify the gap (-32009) is unused (reserved for future use).
+        assert!(
+            !existing.contains(&-32009) && !new_codes.contains(&-32009),
+            "code -32009 should be unused (gap between existing and new ranges)"
+        );
+    }
+
+    // --- classify_sidecar_error variant coverage ---
+
+    #[test]
+    fn classify_timeout_variant() {
+        // SidecarError::Timeout (the variant, not the application code) → Timeout.
+        let err = SidecarError::Timeout("rpc timed out".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Timeout);
+    }
+
+    #[test]
+    fn classify_io_network() {
+        // SidecarError::Io with "connection refused" → Network.
+        let err = SidecarError::Io("connection refused".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Network);
+    }
+
+    #[test]
+    fn classify_io_unknown() {
+        // SidecarError::Io without network keywords → Unknown.
+        let err = SidecarError::Io("disk full".to_string());
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Unknown);
+    }
 }
