@@ -443,6 +443,66 @@ async fn execute_returns_error_when_sidecar_crashes_during_turn_auto() {
     }
 }
 
+// --- auth-fail kill (Phase 3 Task 3) ---
+//
+// `SidecarTaskExecutor::execute` classifies sidecar errors via
+// `classify_sidecar_error`. When the error is `TaskErrorKind::Auth`
+// (sidecar RPC code -32010 AUTH_FAILURE), it calls
+// `pool.remove_worker_and_kill(provider_id)` to hard-kill the worker child
+// and drop it from the pool map. The 5-min restart window is bypassed
+// because the credential is bad — restarting with the same key won't help.
+// This test drives that path end-to-end via `BUSYTOK_MOCK_AUTH_FAIL=1`.
+
+#[tokio::test]
+async fn executor_auth_failure_kills_worker_from_pool() {
+    // BUSYTOK_MOCK_AUTH_FAIL=1 makes the mock sidecar return
+    // {"error":{"code":-32010,"message":"401 Unauthorized"}} for
+    // session.turn_auto. classify_sidecar_error maps -32010 to
+    // TaskErrorKind::Auth, so execute() must call
+    // pool.remove_worker_and_kill(provider_id) before propagating the error.
+    let mut env = HashMap::new();
+    env.insert("BUSYTOK_MOCK_AUTH_FAIL".to_string(), "1".to_string());
+    let mut cfg = mock_sidecar_config_with_env(env);
+    cfg.health_interval = Duration::from_secs(3600);
+    let (pool, executor, _supervisor, _holder) = make_pool_with_config(cfg, None);
+
+    // Sanity: ensure_worker populated the pool with one worker for
+    // TEST_PROVIDER_ID before execute() ran.
+    let before = pool.worker_snapshots().await;
+    assert_eq!(
+        before.len(),
+        1,
+        "pool must hold the test-prov worker before execute()"
+    );
+
+    // execute() hits the auth-fail branch and must propagate an error.
+    let err = match executor.execute(&executor_input()).await {
+        Ok(_) => panic!("expected auth-fail error, got success"),
+        Err(e) => e,
+    };
+    let subagent_err = err
+        .downcast_ref::<busytok_subagent::SubagentError>()
+        .expect("error should downcast to SubagentError");
+    assert!(
+        matches!(subagent_err, busytok_subagent::SubagentError::SidecarRpc(_)),
+        "expected SidecarRpc (AUTH_FAILURE -32010), got {subagent_err:?}"
+    );
+    assert!(
+        format!("{subagent_err}").contains("-32010"),
+        "error should carry the AUTH_FAILURE code, got: {subagent_err}"
+    );
+
+    // The kill: remove_worker_and_kill must have dropped the worker from the
+    // pool map. worker_snapshots() reflects the live map, so it must now be
+    // empty — the bad-credential worker is gone and the next execute() would
+    // re-spawn (re-reading credentials via the keychain).
+    let after = pool.worker_snapshots().await;
+    assert!(
+        after.is_empty(),
+        "pool must be empty after auth-fail kill, got {after:?}"
+    );
+}
+
 // --- eviction driver test (Plan 3 Task 5) ---
 //
 // `SidecarTaskExecutor::execute` must catch `HOT_SESSION_LIMIT_REACHED` from

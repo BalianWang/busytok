@@ -324,9 +324,20 @@ impl SidecarTaskExecutor {
     /// `evict_session`. This preserves the I5 fix (pool-wide LRU) with the
     /// correct per-supervisor harness lookup.
     pub async fn evict_lru(&self) -> anyhow::Result<()> {
-        // Step 1: collect (supervisor, harness_name) pairs under the map
-        // lock. The closure must be trivial (clone+collect) — no async work
-        // under the lock (Task 2 review note).
+        // Step 1: collect harness names under the workers map lock ONLY.
+        // No DB access under the map lock — avoids DB->workers lock ordering
+        // (supervisor_for_session does workers->DB, so we must NOT nest
+        // DB->workers here).
+        let harnesses: Vec<String> = {
+            let mut names: Vec<String> = Vec::new();
+            self.pool.for_each_supervisor(|_pid, sup| {
+                names.push(sup.config().harness_name.clone());
+            });
+            names
+        };
+
+        // Step 2: acquire DB lock + query LRU for each harness. The workers
+        // map lock is NOT held here - correct lock ordering.
         let candidates_for_lru: Vec<(SubagentHarnessBindingRow, String)> = {
             let Some(db) = &self.db else {
                 return Err(anyhow::anyhow!(
@@ -334,13 +345,6 @@ impl SidecarTaskExecutor {
                 ));
             };
             let db = db.lock().expect("db lock poisoned");
-            // Collect harness names under the map lock (clone only — no async
-            // work under the lock, per Task 2 review note).
-            let mut harnesses: Vec<String> = Vec::new();
-            self.pool.for_each_supervisor(|_pid, sup| {
-                harnesses.push(sup.config().harness_name.clone());
-            });
-            // Query LRU for each harness (DB lock still held — sync query).
             let mut all_candidates: Vec<(SubagentHarnessBindingRow, String)> = Vec::new();
             for harness in &harnesses {
                 if let Ok(Some(binding)) = db.subagent_find_lru_hot_binding(harness) {
