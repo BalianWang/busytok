@@ -763,8 +763,10 @@ impl SubagentManager {
     /// could observe inconsistent DB state.
     ///
     /// `recent_limit` is passed through to the store layer; callers are
-    /// responsible for clamping. The `subagents` vector excludes
-    /// deleted rows (`include_deleted=false`), matching the `list()` default.
+    /// responsible for clamping. The `subagents` vector excludes deleted
+    /// rows (filtered in Rust after querying with `include_deleted=true`
+    /// so `name_lookup` can include deleted subagent names), matching the
+    /// `list()` default for the `subagents[]` DTO.
     pub async fn runtime_status_snapshot(
         &self,
         recent_limit: i64,

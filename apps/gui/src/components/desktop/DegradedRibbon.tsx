@@ -1,3 +1,5 @@
+import type { ReactElement } from "react";
+
 /**
  * Reusable degraded-state banner. Renders a warning ribbon when the page's
  * data envelope is stale or approximate. Unifies the previously duplicated
@@ -12,7 +14,7 @@ export function DegradedRibbon({
   show: boolean;
   reason: string | null;
   isStale: boolean;
-}): React.ReactElement | null {
+}): ReactElement | null {
   if (!show) return null;
   const message =
     reason ??
