@@ -196,6 +196,28 @@ describe("SubagentsPage", () => {
     expect(screen.getByText("throttled")).toBeTruthy();
   });
 
+  it("renders pressure warning tone for evicting and restarting levels", () => {
+    for (const level of ["evicting", "restarting"] as const) {
+      mockUseStatus.mockReturnValue(
+        mockStatusQuery(
+          makeEnvelope({
+            data: makeInner({
+              pressure_gate: makePressure({ level, memory_used_pct: 90 }),
+            }),
+          }),
+        ),
+      );
+      const { unmount } = renderPage();
+      // The level value renders; tone is applied via class — assert presence.
+      expect(screen.getByText(level)).toBeTruthy();
+      expect(
+        document.querySelector(".settings-value--warning"),
+      ).not.toBeNull();
+      unmount();
+      cleanup();
+    }
+  });
+
   it("renders empty state when no subagents", () => {
     renderPage();
     expect(screen.getByText(/no subagents/i)).toBeTruthy();

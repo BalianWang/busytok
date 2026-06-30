@@ -19,25 +19,31 @@ import { SettingsValue } from "../components/desktop/SettingsValue";
 import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 
-const PRESSURE_WARN_LEVELS = new Set(["pressure", "throttled", "limit_exceeded"]);
-
+// The handler emits levels from {normal, throttled, evicting, restarting}
+// (crates/busytok-runtime/src/supervisor.rs PressureLevel match). Warn on
+// every non-`normal` level so the two most severe states stay flagged.
 function pressureTone(level: string): "default" | "warning" {
-  return PRESSURE_WARN_LEVELS.has(level) ? "warning" : "default";
+  return level === "normal" ? "default" : "warning";
 }
 
 /** Formats `worker_sampled_at_ms` into a freshness label; `—` if never sampled. */
 function formatSampleFreshness(sampledAtMs: number | null): string {
   if (sampledAtMs == null) return "—";
   const secondsAgo = Math.max(0, Math.round((Date.now() - sampledAtMs) / 1000));
-  return `sampled ${secondsAgo}s ago`;
+  if (secondsAgo < 60) return `sampled ${secondsAgo}s ago`;
+  const minutesAgo = Math.floor(secondsAgo / 60);
+  return `sampled ${minutesAgo}m ago`;
 }
 
 function formatUptime(seconds: number | null): string {
   if (seconds == null) return "—";
   if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
+  const totalMinutes = Math.floor(seconds / 60);
   const s = seconds % 60;
-  return `${m}m ${s}s`;
+  if (totalMinutes < 60) return `${totalMinutes}m ${s}s`;
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return `${h}h ${m}m`;
 }
 
 function formatTimestamp(ms: number | null): string {
