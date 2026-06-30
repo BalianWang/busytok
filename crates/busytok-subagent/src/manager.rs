@@ -708,9 +708,7 @@ impl SubagentManager {
     /// Returns a map of `subagent_id → task_count` (spec §4 Phase 2
     /// `subagents[].task_count`). Only subagents with at least one task
     /// appear; the underlying query groups by `subagent_id`.
-    pub async fn task_counts_by_subagent(
-        &self,
-    ) -> Result<std::collections::HashMap<String, u32>> {
+    pub async fn task_counts_by_subagent(&self) -> Result<std::collections::HashMap<String, u32>> {
         let db = self.db.lock().expect("subagent db lock poisoned");
         let counts = db
             .subagent_count_tasks_by_subagent()

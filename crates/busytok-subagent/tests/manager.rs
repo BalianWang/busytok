@@ -1427,9 +1427,7 @@ fn seed_task(
     db.subagent_insert_task(&row).unwrap();
 }
 
-fn manager_with_db(
-    db: std::sync::Arc<std::sync::Mutex<Database>>,
-) -> SubagentManager {
+fn manager_with_db(db: std::sync::Arc<std::sync::Mutex<Database>>) -> SubagentManager {
     SubagentManager::new(
         db,
         SubagentSettings::default(),
