@@ -1493,18 +1493,50 @@ async fn worker_snapshot_caches_sample_after_health_tick() {
     sup.shutdown().await.unwrap();
 }
 
-/// `memory_used_pct` is `Some` whenever a `ResourceMonitor` is attached
-/// (default for both `new` and `with_resource_policy` constructors). The
-/// `ResourceMonitor` owns a `sysinfo::System` refreshed at construction, so
-/// total + available memory are populated even before the first sample tick.
+/// `memory_used_pct` is `None` before the first sample tick (bound to
+/// `sampled_at_ms` per the stamped-sample invariant, reviewer P1-1). After
+/// a health tick triggers `maybe_sample_resources`, both `sampled_at_ms`
+/// and `memory_used_pct` become `Some` — the freshness timestamp
+/// accurately reflects the memory value.
 #[tokio::test]
-async fn worker_snapshot_memory_used_pct_is_some_when_monitor_attached() {
-    let sup = PiSidecarSupervisor::new(mock_config(), None);
+async fn worker_snapshot_memory_used_pct_bound_to_sample_timestamp() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    let policy = SubagentResourcePolicyConfig {
+        memory_pressure_free_mb: 0,
+        monitor_interval_seconds: 5,
+    };
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, None, policy, None);
+
+    // Before any sample tick: both sampled_at_ms and memory_used_pct are None.
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(
+        snap.sampled_at_ms, None,
+        "sampled_at_ms must be None before first tick"
+    );
+    assert_eq!(
+        snap.memory_used_pct, None,
+        "memory_used_pct must be None before first tick (stamped-sample invariant)"
+    );
+
+    // Start the sidecar so the supervision loop's health pinger fires.
+    let _ = sup.ensure_started().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
     let snap = sup.worker_snapshot().await.unwrap();
     assert!(
+        snap.sampled_at_ms.is_some(),
+        "sampled_at_ms must be set after sampling"
+    );
+    assert!(
         snap.memory_used_pct.is_some(),
-        "memory_used_pct should be Some when monitor is attached"
+        "memory_used_pct must be Some after sampling (bound to sampled_at_ms)"
     );
     let pct = snap.memory_used_pct.unwrap();
     assert!(pct <= 100, "memory_used_pct should be <= 100, got {pct}");
+
+    sup.shutdown().await.unwrap();
 }

@@ -169,6 +169,12 @@ pub struct SupervisorState {
     /// because `ResourceSample` is a pure data struct shared with the DB
     /// event writer. Enables the frontend freshness display (Task 6).
     latest_sample_at_ms: Option<i64>,
+    /// `memory_used_pct` stamped at sample time (bound to
+    /// `latest_sample_at_ms`). Stored separately rather than recomputed in
+    /// `worker_snapshot()` so the freshness timestamp accurately reflects
+    /// BOTH the memory value and the sample. `None` before the first tick;
+    /// the handler falls back to 0% via `unwrap_or(0)`.
+    latest_memory_used_pct: Option<u32>,
     /// Cached `hot_session_count` from the last `adapter.health` response
     /// (the value passed to `ResourceMonitor::sample()`). Surfaced as
     /// `WorkerSnapshot::hot_sessions` so the handler doesn't need to RPC
@@ -206,6 +212,7 @@ impl PiSidecarSupervisor {
                 spawned_at: None,
                 latest_sample: None,
                 latest_sample_at_ms: None,
+                latest_memory_used_pct: None,
                 latest_hot_sessions: 0,
             }),
             spawn_lock: Mutex::new(()),
@@ -247,6 +254,7 @@ impl PiSidecarSupervisor {
                 spawned_at: None,
                 latest_sample: None,
                 latest_sample_at_ms: None,
+                latest_memory_used_pct: None,
                 latest_hot_sessions: 0,
             }),
             spawn_lock: Mutex::new(()),
@@ -288,8 +296,9 @@ impl PiSidecarSupervisor {
     /// "no resource sample yet" (freshly-constructed supervisor or before
     /// the first supervision-loop tick).
     ///
-    /// `memory_used_pct` is computed fresh on each call from the
-    /// `ResourceMonitor`'s `sysinfo::System`; the other fields are stamped
+    /// `memory_used_pct` is stamped at sample time (bound to
+    /// `sampled_at_ms`) so the freshness timestamp accurately reflects both
+    /// the memory value and the sample. The other fields are likewise stamped
     /// by the supervision loop and may be up to `monitor_interval_seconds`
     /// (default 30s) stale — that's the design decision (stamped freshness,
     /// NOT "same moment").
@@ -316,14 +325,12 @@ impl PiSidecarSupervisor {
             None
         };
         let hot_sessions = state.latest_hot_sessions;
-        // memory_used_pct is computed fresh from the ResourceMonitor's
-        // sysinfo::System (refreshed at construction + on each sample tick).
-        // Falls back to None if no monitor is attached (never in production
-        // — both constructors attach one) or if the std Mutex is poisoned.
-        let memory_used_pct = self
-            .resource_monitor
-            .as_ref()
-            .and_then(|m| m.lock().ok().and_then(|g| g.memory_used_pct()));
+        // `memory_used_pct` is read from the stamped sample state (NOT
+        // recomputed fresh) so it stays consistent with `sampled_at_ms`.
+        // `None` before the first sample tick; the handler falls back to 0%
+        // via `unwrap_or(0)`. Reviewer P1-1: the previous fresh-compute
+        // broke the stamped-sample invariant.
+        let memory_used_pct = state.latest_memory_used_pct;
         // Pressure level mapping (spec §4 Phase 2 normal/throttled/evicting/
         // restarting). The supervisor's internal latch has 3 states; the
         // PressureGate's last_action disambiguates the Pressure tier.
@@ -890,10 +897,25 @@ impl PiSidecarSupervisor {
         // stale by the time `worker_snapshot()` reads it — that's
         // acceptable per the design decision (stamped freshness, NOT
         // "same moment").
+        //
+        // `memory_used_pct` is stamped HERE (not recomputed in
+        // `worker_snapshot()`) so the freshness timestamp accurately
+        // reflects both the memory value and the sample. Reviewer P1-1:
+        // computing it fresh in `worker_snapshot()` broke the stamped-sample
+        // invariant — the timestamp said "25s ago" while the adjacent
+        // memory percentage was "just now".
+        let memory_used_pct = {
+            let guard = match monitor.lock() {
+                Ok(g) => g,
+                Err(_) => return, // poisoned — skip caching
+            };
+            guard.memory_used_pct()
+        };
         {
             let mut state = self.state.lock().await;
             state.latest_sample = Some(sample.clone());
             state.latest_sample_at_ms = Some(busytok_domain::now_ms());
+            state.latest_memory_used_pct = memory_used_pct;
             state.latest_hot_sessions = hot_sessions;
         }
         // Compute new pressure state from predicates.

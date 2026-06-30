@@ -14,6 +14,7 @@ import type {
 } from "@busytok/protocol-types";
 import { useSubagentRuntimeStatus } from "../api/useBusytokData";
 import { PageState } from "../components/PageState";
+import { DegradedRibbon } from "../components/desktop/DegradedRibbon";
 import { SettingsRow } from "../components/desktop/SettingsRow";
 import { SettingsValue } from "../components/desktop/SettingsValue";
 import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
@@ -91,17 +92,11 @@ export function SubagentsPage() {
   return (
     <div className="settings-page">
       <div className="settings-pane">
-        {showDegraded && (
-          <div className="degraded-ribbon" role="status">
-            <span className="degraded-ribbon__dot" aria-hidden="true" />
-            <span>
-              {degradedReason ??
-                (envelope.is_stale
-                  ? "Showing stale data — refresh in progress"
-                  : "Data is approximate — exact aggregates not yet available")}
-            </span>
-          </div>
-        )}
+        <DegradedRibbon
+          show={showDegraded}
+          reason={degradedReason}
+          isStale={envelope.is_stale}
+        />
 
         {/* 1. Pressure-gate summary */}
         <section className="settings-section">

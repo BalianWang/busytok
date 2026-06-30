@@ -4336,14 +4336,14 @@ async fn subagent_runtime_status_workers_running_when_sidecar_started() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
-/// `tasks_recent[].subagent_name` fallback: when a task references a subagent
-/// that has been deleted (excluded from `subagents[]` by
-/// `subagent_list_filtered(.., false)`), the `name_lookup` HashMap won't
-/// contain it. The handler must fall back to the raw `subagent_id` (NOT the
-/// deleted subagent's display name). Covers the `unwrap_or_else` branch at
-/// supervisor.rs that the happy-path name-resolution test does not exercise.
+/// `tasks_recent[].subagent_name` resolution for deleted subagents: when a
+/// task references a subagent that has been deleted (excluded from
+/// `subagents[]` by the non-deleted filter), the handler must STILL show the
+/// display name (not the raw `subagent_id`). The `name_lookup` in
+/// `runtime_status_snapshot` includes ALL subagents (including deleted),
+/// decoupling display name from delete filtering (reviewer P1-2).
 #[tokio::test]
-async fn subagent_runtime_status_tasks_recent_falls_back_to_id_for_deleted_subagent() {
+async fn subagent_runtime_status_tasks_recent_shows_display_name_for_deleted_subagent() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let sup = make_supervisor(db, &tmp);
@@ -4369,14 +4369,14 @@ async fn subagent_runtime_status_tasks_recent_falls_back_to_id_for_deleted_subag
         "deleted subagent must be excluded from subagents[]"
     );
 
-    // The task must appear in `tasks_recent` with `subagent_name` falling
-    // back to the raw `subagent_id` ("ghost-id"), NOT the display name.
+    // The task must appear in `tasks_recent` with `subagent_name` showing
+    // the display name "Ghost Agent" (NOT the raw id "ghost-id").
     assert_eq!(envelope.data.tasks_recent.len(), 1);
     let task = &envelope.data.tasks_recent[0];
     assert_eq!(task.task_id, "t1");
     assert_eq!(
-        task.subagent_name, "ghost-id",
-        "subagent_name must fall back to id when subagent is absent from lookup"
+        task.subagent_name, "Ghost Agent",
+        "subagent_name must show display name even for deleted subagent (reviewer P1-2)"
     );
 
     sup.shutdown_writer().await.expect("writer shutdown");

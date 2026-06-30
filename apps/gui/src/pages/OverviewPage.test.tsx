@@ -289,7 +289,7 @@ describe("OverviewPage", () => {
 
     // Page-level degraded ribbon surfaces exactly once (no centered card).
     const degradedRibbons = document.querySelectorAll(
-      ".overview-console__degraded-ribbon",
+      ".degraded-ribbon",
     );
     expect(degradedRibbons.length).toBe(1);
     // The legacy centered PageState degraded card must not appear.

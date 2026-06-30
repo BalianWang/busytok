@@ -23,6 +23,7 @@ import { useReceiptToolbar } from "../features/receipt/useReceiptToolbar";
 import { LedgerTable } from "../components/desktop/LedgerTable";
 import { StatusPill } from "../components/desktop/StatusPill";
 import type { StatusTone } from "../components/desktop/StatusPill";
+import { DegradedRibbon } from "../components/desktop/DegradedRibbon";
 import { formatCacheHitRate, formatCost } from "../lib/formatters";
 import { OverviewSummaryPanel } from "../components/overview/OverviewSummaryPanel";
 import { OverviewTrendPanel } from "../components/overview/OverviewTrendPanel";
@@ -197,12 +198,11 @@ export function OverviewPage() {
   return (
     <div className="overview-console">
       {/* Degraded ribbon (non-blocking) */}
-      {showDegraded && (
-        <div className="overview-console__degraded-ribbon" role="status">
-          <span className="overview-console__degraded-ribbon-dot" aria-hidden="true" />
-          <span>{degradedReason ?? (summaryEnvelope?.is_stale ? "Showing stale data — refresh in progress" : "Data is approximate — exact aggregates not yet available")}</span>
-        </div>
-      )}
+      <DegradedRibbon
+        show={!!showDegraded}
+        reason={degradedReason}
+        isStale={!!summaryEnvelope?.is_stale}
+      />
 
       {/* 1. Summary metric cards */}
       <OverviewSummaryPanel range={range} />

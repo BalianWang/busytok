@@ -52,6 +52,11 @@ pub struct RuntimeStatusSnapshot {
     pub last_tasks: std::collections::HashMap<String, (i64, String)>,
     /// Most recent tasks across ALL subagents, newest first (limit-clamped).
     pub recent_tasks: Vec<SubagentTaskSummary>,
+    /// `subagent_id → display_name` for ALL subagents (including deleted).
+    /// Used by the handler to resolve `tasks_recent[].subagent_name` so the
+    /// task history shows display names even for deleted subagents (reviewer
+    /// P1-2: decouple display name from delete filtering).
+    pub name_lookup: std::collections::HashMap<String, String>,
 }
 
 impl SubagentManager {
@@ -765,10 +770,22 @@ impl SubagentManager {
         recent_limit: i64,
     ) -> Result<RuntimeStatusSnapshot> {
         let db = self.db.lock().expect("subagent db lock poisoned");
-        let rows = db
-            .subagent_list_filtered(None, None, false)
+        // Query ALL subagents (include_deleted=true) once, then split:
+        //  - `name_lookup` from ALL rows (id → name) so tasks_recent can
+        //    resolve display names even for deleted subagents (reviewer P1-2).
+        //  - `subagents` DTO from non-deleted rows only.
+        let all_rows = db
+            .subagent_list_filtered(None, None, true)
             .map_err(SubagentError::Store)?;
-        let subagents: Vec<LogicalSubagent> = rows.iter().map(row_to_model).collect();
+        let name_lookup: std::collections::HashMap<String, String> = all_rows
+            .iter()
+            .map(|r| (r.id.clone(), r.name.clone()))
+            .collect();
+        let subagents: Vec<LogicalSubagent> = all_rows
+            .iter()
+            .filter(|r| r.status != "deleted")
+            .map(row_to_model)
+            .collect();
         let task_counts: std::collections::HashMap<String, u32> = db
             .subagent_count_tasks_by_subagent()
             .map_err(SubagentError::Store)?
@@ -791,6 +808,7 @@ impl SubagentManager {
             task_counts,
             last_tasks,
             recent_tasks,
+            name_lookup,
         })
     }
 

@@ -4765,18 +4765,17 @@ impl RuntimeControl for BusytokSupervisor {
             .collect();
 
         // 7. Build tasks_recent[] DTO. Resolve `subagent_name` via the
-        //    id→name lookup built from the subagents list.
-        let name_lookup: std::collections::HashMap<String, String> = snapshot
-            .subagents
-            .iter()
-            .map(|s| (s.id.clone(), s.name.clone()))
-            .collect();
+        //    id→name lookup from `runtime_status_snapshot` — this includes
+        //    ALL subagents (even deleted), so task history shows display
+        //    names regardless of delete status (reviewer P1-2: decouple
+        //    display name from delete filtering).
         let tasks_recent: Vec<SubagentRuntimeTaskDto> = snapshot
             .recent_tasks
             .iter()
             .map(|t| SubagentRuntimeTaskDto {
                 task_id: t.id.clone(),
-                subagent_name: name_lookup
+                subagent_name: snapshot
+                    .name_lookup
                     .get(&t.subagent_id)
                     .cloned()
                     .unwrap_or_else(|| t.subagent_id.clone()),
