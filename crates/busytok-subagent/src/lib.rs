@@ -17,5 +17,5 @@ pub mod util;
 
 pub use error::{Result, SubagentError};
 pub use manager::SubagentManager;
-pub use models::{DelegateRequest, DelegateResult, TaskStatus};
+pub use models::{DelegateRequest, DelegateResult, TaskErrorKind, TaskStatus};
 pub use pressure::{PressureAction, PressureGate, PressureResponder};

@@ -83,6 +83,9 @@ async fn evict_lru_hibernates_oldest_hot_binding() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
     let _exec = Arc::new(SidecarTaskExecutor::with_db(
@@ -190,6 +193,9 @@ fn mock_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     (config, db)
 }
@@ -209,6 +215,9 @@ fn live_sidecar_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     (config, db)
 }

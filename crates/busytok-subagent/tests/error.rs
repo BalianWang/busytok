@@ -113,6 +113,7 @@ async fn failing_executor_always_errors() {
             source: String::new(),
         },
         write_access: false,
+        provider_id: None,
     };
     let err = match exec.execute(&input).await {
         Ok(_) => panic!("FailingTaskExecutor must always fail"),

@@ -5,7 +5,7 @@ pub mod protocol;
 pub mod supervisor;
 
 pub use client::SidecarRpcClient;
-pub use config::{resolve_sidecar_config, SidecarConfig};
+pub use config::{resolve_base_sidecar_config, resolve_sidecar_config, SidecarConfig};
 pub use executor::SidecarTaskExecutor;
 pub use protocol::*;
 pub use supervisor::{

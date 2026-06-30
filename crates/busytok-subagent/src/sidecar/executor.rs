@@ -440,6 +440,9 @@ fn parse_turn_auto_result(result: &serde_json::Value) -> ExecutorOutput {
         summary,
         usage,
         memory_update,
+        // Phase 3: error classification is added by Task 3's error handler
+        // post-execution; the sidecar executor itself does not classify.
+        error_kind: None,
     }
 }
 

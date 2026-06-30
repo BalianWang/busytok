@@ -33,6 +33,7 @@ impl TaskExecutor for RecordingExecutor {
             summary: "done".into(),
             usage: Default::default(),
             memory_update: Default::default(),
+            error_kind: None,
         })
     }
 }
@@ -344,6 +345,7 @@ impl TaskExecutor for DelayingExecutor {
             summary: "done".into(),
             usage: Default::default(),
             memory_update: Default::default(),
+            error_kind: None,
         })
     }
 }
@@ -477,6 +479,7 @@ async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
                 summary: "done".into(),
                 usage: Default::default(),
                 memory_update: Default::default(),
+                error_kind: None,
             })
         }
     }

@@ -387,6 +387,13 @@ pub struct SubagentProfileConfig {
     pub context_budget_tokens: u32,
     #[serde(default = "default_task_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Phase 3: provider this profile runs on. `None` means "no provider
+    /// bound" — Task 2's WorkerPool treats this as a routing error.
+    /// Defaults to `None` for backward-compat with v0.0.8 configs (which
+    /// predate provider binding). Built-in profiles ship unbound; Phase 4
+    /// adds the UI that lets users set it.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 /// The built-in read-only profiles for MVP. `pi/patch-small` is deferred.
@@ -400,6 +407,7 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
             model: default_cheap_model(),
             context_budget_tokens: 3000,
             timeout_seconds: 120,
+            provider_id: None,
         },
     );
     m.insert(
@@ -414,6 +422,7 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
             model: default_review_model(),
             context_budget_tokens: 5000,
             timeout_seconds: 180,
+            provider_id: None,
         },
     );
     m.insert(
@@ -428,6 +437,7 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
             model: default_reasoning_model(),
             context_budget_tokens: 6000,
             timeout_seconds: 300,
+            provider_id: None,
         },
     );
     m
@@ -701,5 +711,93 @@ codex_default_paths = false
         let settings = BusytokSettings::load_from_file(&path).unwrap();
         let rtz = busytok_domain::ReportingTimezone::parse(&settings.timezone).unwrap();
         assert!(!rtz.canonical_name().is_empty());
+    }
+
+    /// Backward-compat with v0.0.8 configs: a profile TOML without
+    /// `provider_id` deserializes to `None`. Phase 3 makes `provider_id`
+    /// explicit but does not break existing on-disk configs.
+    #[test]
+    fn profile_without_provider_id_deserializes_to_none() {
+        let toml = r#"
+timezone = "UTC"
+
+[subagent.profiles."pi/search-cheap"]
+write_access = false
+tools = ["read", "grep"]
+model = "deepseek-chat"
+context_budget_tokens = 3000
+timeout_seconds = 120
+"#;
+        let settings = BusytokSettings::load_from_str(toml).unwrap();
+        let profile = settings
+            .subagent
+            .profiles
+            .get("pi/search-cheap")
+            .expect("pi/search-cheap profile should be present");
+        assert_eq!(profile.provider_id, None);
+    }
+
+    /// A profile with an explicit `provider_id` deserializes to `Some(...)`.
+    #[test]
+    fn profile_with_provider_id_deserializes_to_some() {
+        let toml = r#"
+timezone = "UTC"
+
+[subagent.profiles."pi/search-cheap"]
+write_access = false
+tools = ["read", "grep"]
+model = "deepseek-chat"
+context_budget_tokens = 3000
+timeout_seconds = 120
+provider_id = "openai"
+"#;
+        let settings = BusytokSettings::load_from_str(toml).unwrap();
+        let profile = settings
+            .subagent
+            .profiles
+            .get("pi/search-cheap")
+            .expect("pi/search-cheap profile should be present");
+        assert_eq!(profile.provider_id.as_deref(), Some("openai"));
+    }
+
+    /// Built-in profiles start with `provider_id: None` — Phase 3 makes the
+    /// binding explicit, so the defaults ship unbound. Phase 4 adds the UI
+    /// that lets users set it; Task 2's WorkerPool treats `None` as
+    /// "no provider bound, cannot route".
+    #[test]
+    fn default_profiles_start_with_provider_id_none() {
+        let profiles = default_profiles();
+        for key in ["pi/search-cheap", "pi/review-cheap", "pi/plan-cheap"] {
+            let profile = profiles
+                .get(key)
+                .unwrap_or_else(|| panic!("built-in profile {key} should exist"));
+            assert_eq!(
+                profile.provider_id, None,
+                "built-in profile {key} must start unbound (provider_id = None)"
+            );
+        }
+    }
+
+    /// Round-trip: a profile with `provider_id` set survives save→load.
+    #[test]
+    fn profile_provider_id_roundtrips_through_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mut settings = BusytokSettings::default();
+        let profile = settings
+            .subagent
+            .profiles
+            .get_mut("pi/search-cheap")
+            .expect("built-in profile");
+        profile.provider_id = Some("openai".to_string());
+        settings.save_to_file(&path).unwrap();
+
+        let loaded = BusytokSettings::load_from_file(&path).unwrap();
+        let p = loaded
+            .subagent
+            .profiles
+            .get("pi/search-cheap")
+            .expect("profile");
+        assert_eq!(p.provider_id.as_deref(), Some("openai"));
     }
 }

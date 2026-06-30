@@ -660,6 +660,7 @@ impl TaskExecutor for WarmMemoryExecutor {
                 decisions: Vec::<String>::new(),
                 open_questions: Vec::<OpenQuestion>::new(),
             },
+            error_kind: None,
         })
     }
 }
@@ -800,6 +801,7 @@ impl TaskExecutor for MemoryUpdateExecutor {
                 source: input.context.source.clone(),
             },
             write_access: input.write_access,
+            provider_id: input.provider_id.clone(),
         };
         *self.captured_input.lock().unwrap() = Some(captured);
         Ok(ExecutorOutput {
@@ -824,6 +826,7 @@ impl TaskExecutor for MemoryUpdateExecutor {
                     last_seen_at_ms: 5000,
                 }],
             },
+            error_kind: None,
         })
     }
 }
@@ -1068,6 +1071,7 @@ impl TaskExecutor for HotSessionExecutor {
             summary: "done".into(),
             usage: Default::default(),
             memory_update: Default::default(),
+            error_kind: None,
         })
     }
 }
@@ -1127,6 +1131,7 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
             model: String::new(), // empty → profile_model returns None
             context_budget_tokens: 3000,
             timeout_seconds: 120,
+            provider_id: None,
         },
     );
     let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));

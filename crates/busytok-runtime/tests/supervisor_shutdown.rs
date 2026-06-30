@@ -74,6 +74,9 @@ fn mock_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     }
 }
 

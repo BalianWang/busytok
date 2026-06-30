@@ -55,6 +55,9 @@ fn mock_sidecar_config_with_env(env: HashMap<String, String>) -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     }
 }
 
@@ -233,6 +236,7 @@ fn executor_input() -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     }
 }
 
@@ -355,6 +359,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     };
     let out1 = executor
         .execute(&input1)
@@ -421,6 +426,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     };
     let out2 = executor
         .execute(&input2)
@@ -489,6 +495,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     };
     let _out1 = executor
         .execute(&input1)
@@ -516,6 +523,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -613,6 +621,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     };
     let _out1 = executor
         .execute(&input1)
@@ -638,6 +647,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -788,6 +798,7 @@ fn evict_input(id: &str) -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
+        provider_id: None,
     }
 }
 

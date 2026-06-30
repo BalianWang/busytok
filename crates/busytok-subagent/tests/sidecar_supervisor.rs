@@ -34,6 +34,9 @@ fn mock_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     }
 }
 
@@ -703,6 +706,9 @@ fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -770,6 +776,9 @@ async fn spawn_rejects_after_3_crashes_within_5_min_window() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -816,6 +825,9 @@ async fn spawn_allows_restart_after_5_min_window_expires() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,

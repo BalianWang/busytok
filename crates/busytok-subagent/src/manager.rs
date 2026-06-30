@@ -400,6 +400,13 @@ impl SubagentManager {
                 memory: snapshot,
                 context: compact,
                 write_access,
+                // Phase 3: thread the profile's `provider_id` so the
+                // WorkerPool (Task 2) can route to the correct per-provider
+                // supervisor. `None` here means the profile is unbound —
+                // Task 2 will reject this at the pool boundary. We read
+                // `profile_cfg.provider_id` (already fetched above) rather
+                // than re-resolving from settings.
+                provider_id: profile_cfg.and_then(|p| p.provider_id.clone()),
             };
             (
                 input,
