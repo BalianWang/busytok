@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Command, Plug, Settings, type LucideIcon } from "lucide-react";
+import { Activity, BarChart3, Bot, Command, Plug, Settings, type LucideIcon } from "lucide-react";
 import type { DesktopPage } from "../AppShell";
 
 interface SidebarProps {
@@ -24,6 +24,7 @@ const GROUPS: SidebarGroup[] = [
     items: [
       { id: "prompt_palette", label: "Prompt Palette", icon: Command },
       { id: "providers", label: "Providers", icon: Plug },
+      { id: "subagents", label: "Subagents", icon: Bot },
     ],
   },
   {

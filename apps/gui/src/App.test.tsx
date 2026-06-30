@@ -438,10 +438,10 @@ describe("App", () => {
     });
   });
 
-  it("renders five sidebar navigation items", () => {
+  it("renders six sidebar navigation items", () => {
     renderApp(<App />);
     const sidebarItems = document.querySelectorAll(".desktop-sidebar__item");
-    expect(sidebarItems.length).toBe(5);
+    expect(sidebarItems.length).toBe(6);
   });
 
   it("renders all navigation labels", () => {
@@ -450,6 +450,30 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Usage" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Prompt Palette" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Providers" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Subagents" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Settings" })).toBeDefined();
+  });
+
+  it("navigates to subagents page when Subagents sidebar item is clicked", async () => {
+    vi.spyOn(busytokClient, "subagentRuntimeStatus").mockResolvedValue(
+      envelope({
+        pressure_gate: {
+          level: "normal",
+          memory_used_pct: 10,
+          hot_sessions_total: 0,
+          hot_sessions_limit: 3,
+          worker_sampled_at_ms: null,
+        },
+        subagents: [],
+        tasks_recent: [],
+        workers: [],
+      }) as any,
+    );
+    const user = userEvent.setup();
+    renderApp(<App />);
+    await user.click(screen.getByRole("button", { name: "Subagents" }));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Pressure Summary" })).toBeDefined();
+    });
   });
 });
