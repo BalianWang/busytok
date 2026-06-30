@@ -47,6 +47,7 @@ import type {
   SettingsDiagnosticsDto,
   SettingsRecoveryActionResponseDto,
   ShellStatusDto,
+  SubagentRuntimeStatusDto,
 } from "@busytok/protocol-types";
 
 const SHELL_STALE_MS = 5_000;
@@ -398,4 +399,23 @@ export function useProviderMutations() {
   });
 
   return { createProvider, updateProvider, deleteProvider, testConnection };
+}
+
+// ── Subagent runtime status ─────────────────────────────────────────
+
+// Poll cadence for the read-only Subagents monitoring page (spec §4 Phase 2:
+// 5s poll). `refetchIntervalInBackground: false` ties polling to a visible
+// window (matches `useShellStatus` pattern).
+const SUBAGENT_REFETCH_MS = 5_000;
+
+export function useSubagentRuntimeStatus() {
+  const client = useBusytokClient();
+  return useQuery<ReadEnvelopeDto<SubagentRuntimeStatusDto>>({
+    ...envelopeQueryOptions({
+      queryKey: queryKeys.subagentRuntimeStatus(),
+      queryFn: () => client.subagentRuntimeStatus(),
+    }),
+    refetchInterval: SUBAGENT_REFETCH_MS,
+    refetchIntervalInBackground: false,
+  });
 }

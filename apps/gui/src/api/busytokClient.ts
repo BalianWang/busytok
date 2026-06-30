@@ -50,6 +50,7 @@ import type {
   SettingsSnapshotDto,
   SettingsUpdateRequestDto,
   ShellStatusDto,
+  SubagentRuntimeStatusDto,
 } from "@busytok/protocol-types";
 
 /** Structured error from the control protocol, surviving the Tauri boundary. */
@@ -180,6 +181,10 @@ export function createBusytokClient(deps: { invoke: InvokeFn }) {
       call<void>("provider.delete", { id }),
     providerTestConnection: (id: string) =>
       call<ProviderTestConnectionResponseDto>("provider.test_connection", { id }),
+
+    // Subagent runtime status — envelope-wrapped (matches overview/settings pattern)
+    subagentRuntimeStatus: () =>
+      call<ReadEnvelopeDto<SubagentRuntimeStatusDto>>("subagent.runtime_status"),
 
     // Live
     liveWindow: (request: LiveWindowRequestDto) =>
