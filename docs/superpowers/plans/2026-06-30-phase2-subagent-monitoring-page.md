@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a read-only "Subagents" monitoring page to the GUI backed by a new `subagent.runtime_status` RPC that returns a single-snapshot aggregate of pressure state, logical subagents (with task counts + last task), recent tasks (20, all subagents), and sidecar worker state.
+**Goal:** Add a read-only "Subagents" monitoring page to the GUI backed by a new `subagent.runtime_status` RPC that returns a single-read aggregate (DB portion) combined with a stamped cached worker sample of pressure state, logical subagents (with task counts + last task), recent tasks (20, all subagents), and sidecar worker state.
 
 **Architecture:** One new RPC (`subagent.runtime_status`) assembled in `BusytokSupervisor` by querying `SubagentManager` (logical subagents + task counts + recent tasks) and `PiSidecarSupervisor` (worker state + pressure + hot sessions). The supervisor caches the latest `ResourceSample` and `hot_session_count` on `SupervisorState` during its existing supervision loop (no new polling thread). The GUI page polls the RPC every 5s using TanStack Query's `refetchInterval`, reusing the ProvidersPage layout shell (SettingsRow/SettingsValue/PageState). No new database migrations — all data comes from existing tables (`subagent_logical_subagents`, `subagent_tasks`, `subagent_memory`) plus in-memory worker state.
 
@@ -10,19 +10,21 @@
 
 ## Global Constraints
 
-- **Single-snapshot semantics:** all fields in one `subagent.runtime_status` response must come from the same moment — no mixing of stale subagent rows with fresh worker state. Implementation: snapshot the worker state first (single lock), then read DB rows; acceptable because DB reads are fast and the supervision loop updates the cache at most every `monitor_interval_seconds` (default 30s).
+- **Stamped worker sample freshness (not "same moment"):** the worker state (pressure, memory, hot sessions) comes from the supervision loop's cached sample, which may be up to `monitor_interval_seconds` (default 30s) stale; the DB rows (subagents, tasks) are read live. These two sources are NOT from the same instant. To make this honest and observable, the response stamps `worker_sampled_at_ms` on the pressure_gate DTO (the absolute ms when the ResourceSample was taken). The handler reads the worker snapshot first (single in-memory lock), then performs all DB reads under one DB lock (single-read aggregate) so the DB portion is internally consistent. The frontend displays sample freshness (e.g., "sampled 5s ago"). See `build_read_envelope` for the envelope-level `generated_at_ms` (response construction time) and `is_stale`/`readiness` (read-plane health, independent of worker sample freshness).
 - **`tasks_recent`:** fixed limit 20, ordered by `created_at_ms desc`, across ALL subagents (no subagent_id filter).
 - **Strictly read-only:** no hibernate/delete/retry buttons. The page must NOT call `subagent.hibernate` / `subagent.delete`. Existing RPCs remain for CLI use.
 - **Subagent rows show logical entities only** (no pid). Worker rows show process entities only (no subagent name).
 - **5s poll cadence** via `refetchInterval` with `refetchIntervalInBackground: false` (matches `useShellStatus` pattern at `useBusytokData.ts:109-137`).
-- **`workers[]` may be empty** pre-Phase-3 (spec line 218). When `sidecar_supervisor` is `None` or not running, return `workers: []`. The page shows "No active sidecar workers."
+- **`workers[]` semantics:** return `workers: []` ONLY when `sidecar_supervisor` is `None` (not configured). When the supervisor exists but the child is not running (stopped/crashed), return ONE worker row with `state="stopped"`, `pid=null`, `uptime_seconds=null` — this keeps "configured but stopped" sidecars observable. Pre-Phase-3 there is at most one worker (single sidecar); Phase 3 adds per-provider workers (spec line 218).
 - **`provider_id` in worker rows:** report `null` for Phase 2 (no provider binding exists yet; Phase 3 adds per-provider workers). The DTO field is `Option<String>`.
 - **`"stale"` worker state** is a Phase 3 concept (spec line 252). Phase 2 only reports `"running"` or `"stopped"`.
 - **Pressure `level` mapping:** `PressureAction::None` → `"normal"`, `PressureGate` paused state → `"throttled"`, `PressureAction::Hibernate` → `"evicting"`, `PressureAction::GracefulRestart`/`ForceKill` → `"restarting"`. (See `pressure.rs:18` for the `PressureAction` enum.)
 - **`memory_used_pct`:** system-wide memory usage percentage = `100 - (system_available_mb / system_total_mb * 100)`, rounded to u32. Derived from the cached `ResourceSample` (which has `system_available_mb`) + `sysinfo::System::total_memory()`.
 - **`hot_sessions_limit`:** from `SubagentSettings.max_hot_sessions` (default 3, config/lib.rs:231).
+- **`worker_sampled_at_ms`:** absolute ms (via `busytok_domain::now_ms()`) captured when the supervision loop takes a `ResourceSample`, stored on `SupervisorState` alongside `latest_sample`. Exposed on `SubagentPressureGateDto` so the frontend can show sample freshness. `None` when no sample has been taken yet.
 - **Observability:** the RPC handler emits `tracing::debug!(event_code = "subagent.runtime_status_served", ...)` on every call (high frequency, so debug not info). The frontend emits `reportFrontendEventSafely({ level: "INFO", event_code: "subagent.page_viewed", ... })` on page mount.
-- **Coverage gate:** new Rust code ≥90% line coverage; new frontend code ≥90% line coverage (matches Phase 1 bar).
+- **ReadEnvelopeDto wrapping (reuse existing read-plane infrastructure):** `subagent.runtime_status` returns `ReadEnvelopeDto<SubagentRuntimeStatusDto>` (NOT a bare DTO), matching the pattern used by `overview.summary` / `settings.snapshot` / `activity.recent`. The backend handler calls `self.build_read_envelope(data, now_ms)` (supervisor.rs:1944) to populate `generated_at_ms` / `readiness` / `is_exact` / `is_stale` / `degraded_reason` from the `ServiceStatusSnapshot`. The frontend hook uses `envelopeQueryOptions()` (useBusytokData.ts:76) with `placeholderData` + `retry` + `staleTime`, and the page reads business data via `data?.data` + diagnostic fields via `data?.is_stale` / `data?.degraded_reason` (matching OverviewPage/SettingsPage pattern). This reuses the global placeholder/retry/stale-state/diagnostic infrastructure instead of building a parallel system.
+- **Coverage gate:** Rust coverage enforced by `bash scripts/coverage.sh` (workspace gate default 82% via `cargo llvm-cov --workspace --exclude busytok-gui --fail-under-lines`, plus per-crate `busytok-subagent` gate 90%). Frontend coverage ≥90% lines on new files via `pnpm exec vitest run --coverage` (matches Phase 1 bar). Both gates are run in Task 10 verification.
 - **Rust trait wiring:** adding a trait method touches 6 sites (trait def, `BusytokSupervisor` impl, `TestRuntimeControl` mock, `Arc<T>` blanket impl, `AliasConflictRuntime` test mock at `apps/cli/tests/prompt.rs`, `MethodDispatchErrorRuntime` test mock at `crates/busytok-control/tests/server.rs`).
 - **TS type regeneration:** after adding DTOs, run `cargo test -p busytok-protocol generate_typescript_types` to regenerate `packages/busytok-protocol-types/src/generated.ts`.
 - **No new Cargo dependencies** unless explicitly stated in a task.
@@ -35,8 +37,8 @@
 - `crates/busytok-store/src/subagent_queries.rs` — new query functions: `list_recent_tasks_all`, `count_tasks_by_subagent`, `last_task_by_subagent`. (Modify)
 - `crates/busytok-store/src/db.rs` — thin wrappers for the new queries. (Modify)
 - `crates/busytok-subagent/src/manager.rs` — new methods: `recent_tasks_all`, `task_counts_by_subagent`, `last_task_by_subagent`. (Modify)
-- `crates/busytok-subagent/src/sidecar/supervisor.rs` — add `spawned_at: Instant` to `SupervisorState`; cache `latest_sample: Option<ResourceSample>` and `latest_hot_sessions: u32` on `SupervisorState`; add public accessors `worker_snapshot()`. (Modify)
-- `crates/busytok-protocol/src/dto.rs` — new DTOs: `SubagentRuntimeStatusRequestDto`, `SubagentRuntimeStatusResponseDto`, `SubagentPressureGateDto`, `SubagentRuntimeSubagentDto`, `SubagentRuntimeTaskDto`, `SubagentWorkerDto`. (Modify)
+- `crates/busytok-subagent/src/sidecar/supervisor.rs` — add `spawned_at: Instant` + `latest_sample: Option<ResourceSample>` + `latest_sample_at_ms: Option<i64>` + `latest_hot_sessions: u32` to `SupervisorState`; add public accessor `worker_snapshot()`. (Modify)
+- `crates/busytok-protocol/src/dto.rs` — new DTOs: `SubagentRuntimeStatusRequestDto`, `SubagentRuntimeStatusDto` (envelope inner data, NOT "Response" — wrapped by `ReadEnvelopeDto<SubagentRuntimeStatusDto>`), `SubagentPressureGateDto` (with `worker_sampled_at_ms`), `SubagentRuntimeSubagentDto`, `SubagentRuntimeTaskDto`, `SubagentWorkerDto`. (Modify)
 - `crates/busytok-protocol/src/methods.rs` — add `"subagent.runtime_status"` to manifest. (Modify)
 - `crates/busytok-protocol/src/ts.rs` — add `decl()` entries for new DTOs. (Modify)
 - `crates/busytok-control/src/dispatch.rs` — add `subagent_runtime_status` to `RuntimeControl` trait + dispatch arm + `TestRuntimeControl` stub + `Arc<T>` forwarding. (Modify)
@@ -313,7 +315,7 @@ git commit -m "feat(store): add aggregate task queries for subagent monitoring (
 **Interfaces:**
 - Consumes: `Database::subagent_list_recent_tasks_all`, `Database::subagent_count_tasks_by_subagent`, `Database::subagent_last_task_by_subagent` (Task 1)
 - Produces: `SubagentManager::recent_tasks_all(limit) -> Result<Vec<SubagentTaskSummary>>`, `SubagentManager::task_counts_by_subagent() -> Result<HashMap<String, u32>>`, `SubagentManager::last_task_by_subagent() -> Result<HashMap<String, (i64, String)>>`
-- Cross-task note: Task 6 Step 2 adds `SubagentManager::runtime_status_snapshot(recent_limit) -> Result<RuntimeStatusSnapshot>` to this same file — a combined method that performs all 4 DB reads under one lock to preserve single-snapshot semantics (spec §4 line 213). The 3 individual methods above are still used by the snapshot internally.
+- Cross-task note: Task 6 Step 2 adds `SubagentManager::runtime_status_snapshot(recent_limit) -> Result<RuntimeStatusSnapshot>` to this same file — a combined method that performs all 4 DB reads under one lock to keep the DB portion internally consistent (single-read aggregate, spec §4 line 213). The 3 individual methods above are still used by the snapshot internally. The cached worker sample (pressure, memory, hot sessions) is read separately from `PiSidecarSupervisor` and stamped with `worker_sampled_at_ms`; the DB and worker portions are NOT from the same instant — see Global Constraints.
 
 - [ ] **Step 1: Write failing tests for the three new manager methods**
 
@@ -425,7 +427,7 @@ git commit -m "feat(subagent): add SubagentManager aggregate methods (recent_tas
 - Test: `crates/busytok-subagent/src/sidecar/supervisor.rs` (inline `#[cfg(test)]` module or `tests/supervisor_phase2.rs`)
 
 **Interfaces:**
-- Produces: `PiSidecarSupervisor::worker_snapshot() -> Option<WorkerSnapshot>` where `WorkerSnapshot` is a new struct with `state: WorkerState` (running/stopped), `pid: Option<u32>`, `uptime_seconds: Option<u64>`, `hot_sessions: u32`, `memory_used_pct: Option<u32>`, `pressure_level: PressureLevel`
+- Produces: `PiSidecarSupervisor::worker_snapshot() -> Option<WorkerSnapshot>` where `WorkerSnapshot` is a new struct with `state: WorkerState` (running/stopped), `pid: Option<u32>`, `uptime_seconds: Option<u64>`, `hot_sessions: u32`, `memory_used_pct: Option<u32>`, `pressure_level: PressureLevel`, `sampled_at_ms: Option<i64>` (absolute ms when the ResourceSample was taken; `None` if no sample yet — enables frontend freshness display)
 
 - [ ] **Step 1: Add `spawned_at` and caches to `SupervisorState`**
 
@@ -444,6 +446,7 @@ pub struct SupervisorState {
     // ── Phase 2 monitoring state ──────────────────────────────
     spawned_at: Option<tokio::time::Instant>,
     latest_sample: Option<ResourceSample>,
+    latest_sample_at_ms: Option<i64>,   // absolute ms via busytok_domain::now_ms()
     latest_hot_sessions: u32,
 }
 ```
@@ -452,6 +455,7 @@ Update the `Default` impl for `SupervisorState` (or the constructor where it's i
 ```rust
 spawned_at: None,
 latest_sample: None,
+latest_sample_at_ms: None,
 latest_hot_sessions: 0,
 ```
 
@@ -466,20 +470,21 @@ state.spawned_at = Some(tokio::time::Instant::now());
 
 And clear it on shutdown (in `shutdown_internal` ~line 225, set `state.spawned_at = None`).
 
-- [ ] **Step 3: Cache `latest_sample` and `latest_hot_sessions` in `maybe_sample_resources`**
+- [ ] **Step 3: Cache `latest_sample`, `latest_sample_at_ms`, and `latest_hot_sessions` in `maybe_sample_resources`**
 
-In `maybe_sample_resources` (~line 695-839), after the sample is computed, cache it:
+In `maybe_sample_resources` (~line 695-839), after the sample is computed, cache it WITH a timestamp:
 
 ```rust
 // After `let sample = self.resource_monitor...sample(...)` (existing code)
 {
     let mut state = self.state.lock().await;
     state.latest_sample = Some(sample.clone());
+    state.latest_sample_at_ms = Some(busytok_domain::now_ms());
     state.latest_hot_sessions = hot_session_count; // the value passed to sample()
 }
 ```
 
-Note: `ResourceSample` must be `Clone` — verify at resource.rs:23 (it derives Clone already per the research).
+Note: `ResourceSample` must be `Clone` — verify at resource.rs:23 (it derives Clone already per the research). `busytok_domain::now_ms()` returns `i64` (ms since UNIX_EPOCH) and is the same clock used by `ReadEnvelopeDto.generated_at_ms`.
 
 - [ ] **Step 4: Define `WorkerSnapshot` + `WorkerState` + `PressureLevel` types**
 
@@ -495,6 +500,9 @@ pub struct WorkerSnapshot {
     pub hot_sessions: u32,
     pub memory_used_pct: Option<u32>,
     pub pressure_level: PressureLevel,
+    /// Absolute ms when the ResourceSample was taken (via busytok_domain::now_ms()).
+    /// None if no sample has been taken yet. Enables frontend freshness display.
+    pub sampled_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,17 +528,18 @@ pub use supervisor::{PiSidecarSupervisor, SharedDb, SidecarHandle, WorkerSnapsho
 
 - [ ] **Step 5: Implement `worker_snapshot()`**
 
-Add a public method on `PiSidecarSupervisor`:
+Add a public method on `PiSidecarSupervisor`. Per Global Constraints: returns `Some` whenever the supervisor exists (even if stopped) so "configured but stopped" sidecars stay observable; only the handler returns `workers: []` when `sidecar_supervisor` is `None`.
 
 ```rust
 /// Returns a snapshot of the worker's current state for monitoring (spec §4 Phase 2).
-/// Returns None if the supervisor was never configured (no resource monitor).
+/// Always returns Some — the caller (handler) decides whether to include the row.
+/// `state=Stopped` with `pid=None`/`uptime_seconds=None` represents a configured-but-not-running sidecar.
 pub async fn worker_snapshot(&self) -> Option<WorkerSnapshot> {
     let state = self.state.lock().await;
     let is_running = state.child.as_ref().map(|c| c.id().is_some()).unwrap_or(false);
     let worker_state = if is_running { WorkerState::Running } else { WorkerState::Stopped };
-    let pid = state.child.as_ref().and_then(|c| c.id());
-    let uptime_seconds = state.spawned_at.map(|t| t.elapsed().as_secs());
+    let pid = if is_running { state.child.as_ref().and_then(|c| c.id()) } else { None };
+    let uptime_seconds = if is_running { state.spawned_at.map(|t| t.elapsed().as_secs()) } else { None };
     let hot_sessions = state.latest_hot_sessions;
     let memory_used_pct = state.latest_sample.as_ref().map(|s| {
         // system_available_mb is in MB; total memory comes from sysinfo
@@ -563,6 +572,7 @@ pub async fn worker_snapshot(&self) -> Option<WorkerSnapshot> {
         hot_sessions,
         memory_used_pct,
         pressure_level,
+        sampled_at_ms: state.latest_sample_at_ms,
     })
 }
 ```
@@ -660,15 +670,16 @@ git commit -m "feat(subagent): expose PiSidecarSupervisor worker snapshot (spawn
 - Regenerate: `packages/busytok-protocol-types/src/generated.ts`
 
 **Interfaces:**
-- Produces: `SubagentRuntimeStatusRequestDto`, `SubagentRuntimeStatusResponseDto`, `SubagentPressureGateDto`, `SubagentRuntimeSubagentDto`, `SubagentRuntimeTaskDto`, `SubagentWorkerDto`
+- Produces: `SubagentRuntimeStatusRequestDto`, `SubagentRuntimeStatusDto` (envelope inner data — wrapped by `ReadEnvelopeDto<SubagentRuntimeStatusDto>` at the handler/dispatch layer), `SubagentPressureGateDto` (with `worker_sampled_at_ms`), `SubagentRuntimeSubagentDto`, `SubagentRuntimeTaskDto`, `SubagentWorkerDto`
 
 - [ ] **Step 1: Define the DTOs in `dto.rs`**
 
-Add to `crates/busytok-protocol/src/dto.rs` after the existing subagent DTOs (~line 1387):
+Add to `crates/busytok-protocol/src/dto.rs` after the existing subagent DTOs (~line 1387). The response DTO is named `SubagentRuntimeStatusDto` (NOT `...ResponseDto`) because it is the inner `data` of a `ReadEnvelopeDto<SubagentRuntimeStatusDto>` — matching the naming convention of `OverviewSummaryDto` / `SettingsSnapshotDto` / `ActivityRecentResponseDto` which are all envelope inner types.
 
 ```rust
 // ---------------------------------------------------------------------------
 // Subagent runtime status DTOs (spec §4 Phase 2)
+// Wrapped by ReadEnvelopeDto<SubagentRuntimeStatusDto> at the handler layer.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
@@ -684,6 +695,11 @@ pub struct SubagentPressureGateDto {
     pub memory_used_pct: u32,
     pub hot_sessions_total: u32,
     pub hot_sessions_limit: u32,
+    /// Absolute ms when the worker ResourceSample was taken (via busytok_domain::now_ms()).
+    /// None if no sample has been taken yet. Enables frontend freshness display.
+    /// This is NOT the same as ReadEnvelopeDto.generated_at_ms (response construction time).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_sampled_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -719,8 +735,9 @@ pub struct SubagentWorkerDto {
     pub hot_sessions: u32,
 }
 
+/// Inner data of ReadEnvelopeDto for subagent.runtime_status.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-pub struct SubagentRuntimeStatusResponseDto {
+pub struct SubagentRuntimeStatusDto {
     pub pressure_gate: SubagentPressureGateDto,
     pub subagents: Vec<SubagentRuntimeSubagentDto>,
     pub tasks_recent: Vec<SubagentRuntimeTaskDto>,
@@ -744,7 +761,7 @@ In `crates/busytok-protocol/src/ts.rs`, add to the `type_defs` vector (~line 192
 
 ```rust
 dto::SubagentRuntimeStatusRequestDto::decl(),
-dto::SubagentRuntimeStatusResponseDto::decl(),
+dto::SubagentRuntimeStatusDto::decl(),
 dto::SubagentPressureGateDto::decl(),
 dto::SubagentRuntimeSubagentDto::decl(),
 dto::SubagentRuntimeTaskDto::decl(),
@@ -769,7 +786,7 @@ Expected: PASS (including the methods manifest test + ts generation test)
 
 ```bash
 git add crates/busytok-protocol/src/dto.rs crates/busytok-protocol/src/methods.rs crates/busytok-protocol/src/ts.rs packages/busytok-protocol-types/src/generated.ts
-git commit -m "feat(protocol): add subagent.runtime_status DTOs (SubagentRuntimeStatusResponseDto + 5 nested DTOs)"
+git commit -m "feat(protocol): add subagent.runtime_status DTOs (SubagentRuntimeStatusDto + 5 nested DTOs)"
 ```
 
 ---
@@ -782,23 +799,23 @@ git commit -m "feat(protocol): add subagent.runtime_status DTOs (SubagentRuntime
 - Modify: `apps/cli/tests/prompt.rs` (AliasConflictRuntime)
 
 **Interfaces:**
-- Consumes: `SubagentRuntimeStatusRequestDto`, `SubagentRuntimeStatusResponseDto` (Task 4)
-- Produces: `RuntimeControl::subagent_runtime_status` trait method available for implementation
+- Consumes: `SubagentRuntimeStatusRequestDto`, `SubagentRuntimeStatusDto` (Task 4)
+- Produces: `RuntimeControl::subagent_runtime_status` trait method returning `ReadEnvelopeDto<SubagentRuntimeStatusDto>` (matching `overview_summary` / `settings_snapshot` envelope pattern)
 
 - [ ] **Step 1: Add trait method to `RuntimeControl`**
 
-In `crates/busytok-control/src/dispatch.rs` ~line 195 (after `subagent_delete`), add:
+In `crates/busytok-control/src/dispatch.rs` ~line 195 (after `subagent_delete`), add. Note the return type wraps `ReadEnvelopeDto` — same pattern as `overview_summary` / `settings_snapshot`:
 
 ```rust
 async fn subagent_runtime_status(
     &self,
     req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
-) -> Result<busytok_protocol::dto::SubagentRuntimeStatusResponseDto>;
+) -> Result<busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>>;
 ```
 
 - [ ] **Step 2: Add dispatch arm**
 
-In `crates/busytok-control/src/dispatch.rs` ~line 503 (after the `subagent.delete` arm), add:
+In `crates/busytok-control/src/dispatch.rs` ~line 503 (after the `subagent.delete` arm), add. The dispatch arm serializes the envelope directly (`serde_json::to_value(dto)?`) — no special handling needed, same as `overview.summary`:
 
 ```rust
 "subagent.runtime_status" => {
@@ -813,26 +830,31 @@ Note: import `SubagentRuntimeStatusRequestDto` at the top of dispatch.rs alongsi
 
 - [ ] **Step 3: Add stub to `TestRuntimeControl`**
 
-In `crates/busytok-control/src/dispatch.rs` ~line 1166 (after the `provider_test_connection` stub), add:
+In `crates/busytok-control/src/dispatch.rs` ~line 1166 (after the `provider_test_connection` stub), add. Reuse the existing `stub_envelope(data)` helper (dispatch.rs:552) to build a minimal envelope — same pattern as `settings_snapshot` / `activity_list` stubs:
 
 ```rust
 async fn subagent_runtime_status(
     &self,
     _req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
-) -> Result<busytok_protocol::dto::SubagentRuntimeStatusResponseDto> {
-    Ok(busytok_protocol::dto::SubagentRuntimeStatusResponseDto {
-        pressure_gate: busytok_protocol::dto::SubagentPressureGateDto {
-            level: "normal".to_string(),
-            memory_used_pct: 0,
-            hot_sessions_total: 0,
-            hot_sessions_limit: 3,
+) -> Result<busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>> {
+    Ok(busytok_control::dispatch::stub_envelope(
+        busytok_protocol::dto::SubagentRuntimeStatusDto {
+            pressure_gate: busytok_protocol::dto::SubagentPressureGateDto {
+                level: "normal".to_string(),
+                memory_used_pct: 0,
+                hot_sessions_total: 0,
+                hot_sessions_limit: 3,
+                worker_sampled_at_ms: None,
+            },
+            subagents: Vec::new(),
+            tasks_recent: Vec::new(),
+            workers: Vec::new(),
         },
-        subagents: Vec::new(),
-        tasks_recent: Vec::new(),
-        workers: Vec::new(),
-    })
+    ))
 }
 ```
+
+Note: `stub_envelope` is a module-level free function at dispatch.rs:552 — it fills `generated_at_ms: 0`, `readiness: Starting`, `is_exact: false`, `is_stale: true`, all `Option` fields `None`. If it's not public, either make it `pub(crate)` or inline the envelope construction (see the `overview_summary` stub at dispatch.rs:634 for the inline pattern).
 
 - [ ] **Step 4: Add forwarding to `Arc<T>` blanket impl**
 
@@ -842,25 +864,25 @@ In `crates/busytok-control/src/dispatch.rs` ~line 1370 (after the `provider_test
 async fn subagent_runtime_status(
     &self,
     req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
-) -> Result<busytok_protocol::dto::SubagentRuntimeStatusResponseDto> {
+) -> Result<busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>> {
     (**self).subagent_runtime_status(req).await
 }
 ```
 
 - [ ] **Step 5: Add to `MethodDispatchErrorRuntime`**
 
-In `crates/busytok-control/tests/server.rs` ~line 87, add to the `RuntimeControl` impl:
+In `crates/busytok-control/tests/server.rs` ~line 87, add to the `RuntimeControl` impl. This wrapper forwards to `self.inner` (matching `overview_trend` / `activity_recent` / `settings_snapshot` forwarding pattern at server.rs:116-195):
 
 ```rust
 async fn subagent_runtime_status(
     &self,
-    _req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
-) -> Result<busytok_protocol::dto::SubagentRuntimeStatusResponseDto> {
-    self.inner.subagent_runtime_status(_req).await
+    req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+) -> anyhow::Result<busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>> {
+    self.inner.subagent_runtime_status(req).await
 }
 ```
 
-Note: match the existing forwarding pattern used by other methods in this impl — check how `provider_test_connection` forwards.
+Note: match the existing forwarding pattern — check how `settings_snapshot` forwards at server.rs:193-195.
 
 - [ ] **Step 6: Add to `AliasConflictRuntime`**
 
@@ -869,13 +891,13 @@ In `apps/cli/tests/prompt.rs` ~line 297, add to the `RuntimeControl` impl:
 ```rust
 async fn subagent_runtime_status(
     &self,
-    _req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
-) -> Result<busytok_protocol::dto::SubagentRuntimeStatusResponseDto> {
-    self.inner.subagent_runtime_status(_req).await
+    req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+) -> anyhow::Result<busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>> {
+    self.inner.subagent_runtime_status(req).await
 }
 ```
 
-Note: match the existing forwarding pattern. If `AliasConflictRuntime` doesn't forward to `inner`, adapt to whatever pattern it uses.
+Note: `AliasConflictRuntime` forwards all envelope methods to `self.inner` (matching `overview_summary` / `settings_snapshot` forwarding at prompt.rs:307-404).
 
 - [ ] **Step 7: Verify compilation**
 
@@ -902,13 +924,13 @@ This commit will be combined with Task 6.
 
 - [ ] **Step 1: Add handler stub (to unblock compilation from Task 5)**
 
-In `crates/busytok-runtime/src/supervisor.rs` ~line 4656 (after `subagent_delete`), add:
+In `crates/busytok-runtime/src/supervisor.rs` ~line 4656 (after `subagent_delete`), add. Note the return type wraps `ReadEnvelopeDto`:
 
 ```rust
 async fn subagent_runtime_status(
     &self,
     _req: SubagentRuntimeStatusRequestDto,
-) -> Result<SubagentRuntimeStatusResponseDto> {
+) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
     todo!("implemented in Step 2")
 }
 ```
@@ -918,13 +940,13 @@ Expected: compiles. Now proceed to Step 2 to replace the todo!.
 
 - [ ] **Step 2: Implement the handler**
 
-Replace the stub with the full implementation. **Single-snapshot semantics (spec line 213):** all DB reads occur under one `SubagentManager` lock acquisition — add a `runtime_status_snapshot()` method to `SubagentManager` (Task 2) that performs all 4 reads under a single DB lock and returns a combined struct. This avoids 4 separate lock acquisitions that could observe inconsistent state.
+Replace the stub with the full implementation. **Single-read aggregate (spec line 213):** all DB reads occur under one `SubagentManager` lock acquisition — add a `runtime_status_snapshot()` method to `SubagentManager` (Task 2) that performs all 4 reads under a single DB lock and returns a combined struct. This avoids 4 separate lock acquisitions that could observe inconsistent DB state. The worker sample is stamped with `worker_sampled_at_ms` so consumers know its freshness (it may lag up to `monitor_interval_seconds`).
 
 First, add a combined snapshot method to `SubagentManager` (in `crates/busytok-subagent/src/manager.rs`, Task 2):
 
 ```rust
 /// Combined snapshot for subagent.runtime_status — all reads under one DB lock
-/// to preserve single-snapshot semantics (spec §4 line 213).
+/// to preserve single-read aggregate semantics (spec §4 line 213).
 pub async fn runtime_status_snapshot(&self, recent_limit: i64) -> Result<RuntimeStatusSnapshot> {
     let db = self.db.lock().await;
     let subs = db.subagent_list_filtered(None, None, false)?;
@@ -949,14 +971,18 @@ pub struct RuntimeStatusSnapshot {
 
 Note: the existing `list()` method calls `db.subagent_list_filtered(...)` then maps rows to `LogicalSubagent` via `row_to_model`. For the snapshot, you may need to call the row-mapping inline (or expose a `list_raw` method). The simplest approach: call the existing `subagent_list_filtered` + `row_to_model` within `runtime_status_snapshot`. Check how `list()` (manager.rs:655) does it and replicate the mapping.
 
-Then the handler in `BusytokSupervisor`:
+Then the handler in `BusytokSupervisor`. The handler builds the inner `SubagentRuntimeStatusDto` then wraps it with `self.build_read_envelope(data, now_ms)` (supervisor.rs:1944) — same pattern as `overview_summary` / `settings_snapshot` / `activity_recent`. This reuses the existing envelope infrastructure (`generated_at_ms` / `readiness` / `is_exact` / `is_stale` / `degraded_reason` from `ServiceStatusSnapshot`):
 
 ```rust
 async fn subagent_runtime_status(
     &self,
     _req: SubagentRuntimeStatusRequestDto,
-) -> Result<SubagentRuntimeStatusResponseDto> {
-    // 1. Snapshot worker state (single SupervisorState lock, fast, in-memory)
+) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
+    let now_ms = busytok_domain::now_ms();
+
+    // 1. Snapshot worker state (single SupervisorState lock, fast, in-memory).
+    //    worker_opt is None ONLY when sidecar_supervisor is None (not configured).
+    //    When supervisor exists but child stopped, worker_snapshot returns Some(stopped).
     let worker_opt = if let Some(sup) = &self.sidecar_supervisor {
         sup.worker_snapshot().await
     } else {
@@ -968,7 +994,7 @@ async fn subagent_runtime_status(
     let hot_sessions_limit = settings.subagent.pi_sidecar.max_hot_sessions;
     drop(settings);
 
-    // 3. Build pressure_gate DTO
+    // 3. Build pressure_gate DTO (with worker_sampled_at_ms for freshness display)
     let pressure_gate = if let Some(ref snap) = worker_opt {
         let level = match snap.pressure_level {
             busytok_subagent::sidecar::PressureLevel::Normal => "normal",
@@ -981,6 +1007,7 @@ async fn subagent_runtime_status(
             memory_used_pct: snap.memory_used_pct.unwrap_or(0),
             hot_sessions_total: snap.hot_sessions,
             hot_sessions_limit,
+            worker_sampled_at_ms: snap.sampled_at_ms,
         }
     } else {
         SubagentPressureGateDto {
@@ -988,10 +1015,13 @@ async fn subagent_runtime_status(
             memory_used_pct: 0,
             hot_sessions_total: 0,
             hot_sessions_limit,
+            worker_sampled_at_ms: None,
         }
     };
 
-    // 4. Build workers DTO (spec line 218: workers[] may be empty pre-Phase-3)
+    // 4. Build workers DTO.
+    //    workers: [] ONLY when sidecar_supervisor is None (not configured).
+    //    When supervisor exists but stopped, return ONE row with state="stopped", pid=null, uptime=null.
     let workers: Vec<SubagentWorkerDto> = if let Some(snap) = worker_opt {
         vec![SubagentWorkerDto {
             provider_id: None, // Phase 2: no provider binding
@@ -1007,7 +1037,7 @@ async fn subagent_runtime_status(
         Vec::new()
     };
 
-    // 5. Single-snapshot DB read (one lock, all 4 queries — spec §4 line 213)
+    // 5. Single-read aggregate DB read (one lock, all 4 queries — spec §4 line 213)
     let snapshot = self.subagent_manager
         .runtime_status_snapshot(20)
         .await
@@ -1051,20 +1081,24 @@ async fn subagent_runtime_status(
         "served subagent.runtime_status"
     );
 
-    Ok(SubagentRuntimeStatusResponseDto {
-        pressure_gate,
-        subagents,
-        tasks_recent,
-        workers,
-    })
+    // 8. Wrap in ReadEnvelopeDto via build_read_envelope (reuses existing infrastructure)
+    self.build_read_envelope(
+        SubagentRuntimeStatusDto {
+            pressure_gate,
+            subagents,
+            tasks_recent,
+            workers,
+        },
+        now_ms,
+    )
 }
 ```
 
-Note: `SubagentTaskSummary` (models.rs:113-123) has `status: TaskStatus` (enum), NOT `String`. Use `t.status.as_str().to_string()` to convert. The `as_str()` method is at models.rs:57.
+Note: `SubagentTaskSummary` (models.rs:113-123) has `status: TaskStatus` (enum), NOT `String`. Use `t.status.as_str().to_string()` to convert. The `as_str()` method is at models.rs:57. `build_read_envelope` (supervisor.rs:1944) populates `readiness` / `is_exact` / `is_stale` / `degraded_reason` / `generation_id` / `watermark_ms` / `progress` from `ServiceStatusSnapshot` — the handler does not touch these fields.
 
 - [ ] **Step 3: Write tests for the handler**
 
-Add to `crates/busytok-runtime/tests/supervisor_control.rs`:
+Add to `crates/busytok-runtime/tests/supervisor_control.rs`. Tests access the inner data via `resp.data` (the envelope's `data` field) and also assert envelope-level fields (`generated_at_ms`, `is_stale`, `readiness`) to verify the envelope wrapping works:
 
 ```rust
 #[tokio::test]
@@ -1072,11 +1106,14 @@ async fn subagent_runtime_status_returns_empty_when_no_data() {
     let sup = test_supervisor().await;
     let result = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await;
     assert!(result.is_ok());
-    let resp = result.unwrap();
-    assert_eq!(resp.pressure_gate.level, "normal");
-    assert_eq!(resp.pressure_gate.hot_sessions_limit, 3); // default
-    assert!(resp.subagents.is_empty());
-    assert!(resp.tasks_recent.is_empty());
+    let envelope = result.unwrap();
+    // Envelope-level assertions (build_read_envelope populates these from ServiceStatusSnapshot)
+    assert!(envelope.generated_at_ms > 0);
+    // Inner data assertions
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3); // default
+    assert!(envelope.data.subagents.is_empty());
+    assert!(envelope.data.tasks_recent.is_empty());
     // workers may be empty if no sidecar configured in test env
 }
 
@@ -1091,7 +1128,8 @@ async fn subagent_runtime_status_includes_subagents_with_task_counts() {
     seed_task(&sup, "t2", "sub-a", "failed", 2000).await;
     seed_task(&sup, "t3", "sub-b", "completed", 3000).await;
 
-    let resp = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    let envelope = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    let resp = &envelope.data;
     assert_eq!(resp.subagents.len(), 2);
     let sub_a = resp.subagents.iter().find(|s| s.name == "sub-a").unwrap();
     assert_eq!(sub_a.task_count, 2);
@@ -1108,7 +1146,8 @@ async fn subagent_runtime_status_tasks_recent_ordered_desc() {
     seed_task(&sup, "t2", "sub-a", "completed", 3000).await;
     seed_task(&sup, "t3", "sub-a", "completed", 2000).await;
 
-    let resp = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    let envelope = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    let resp = &envelope.data;
     assert_eq!(resp.tasks_recent.len(), 3);
     assert_eq!(resp.tasks_recent[0].task_id, "t2"); // 3000ms
     assert_eq!(resp.tasks_recent[1].task_id, "t3"); // 2000ms
@@ -1121,9 +1160,9 @@ async fn subagent_runtime_status_excludes_deleted_subagents() {
     seed_subagent_with_status(&sup, "sub-a", "warm").await;
     seed_subagent_with_status(&sup, "sub-deleted", "deleted").await;
 
-    let resp = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
-    assert_eq!(resp.subagents.len(), 1);
-    assert_eq!(resp.subagents[0].name, "sub-a");
+    let envelope = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    assert_eq!(envelope.data.subagents.len(), 1);
+    assert_eq!(envelope.data.subagents[0].name, "sub-a");
 }
 
 #[tokio::test]
@@ -1132,9 +1171,19 @@ async fn subagent_runtime_status_tasks_recent_includes_subagent_name() {
     seed_subagent(&sup, "my-agent").await;
     seed_task(&sup, "t1", "my-agent", "completed", 1000).await;
 
-    let resp = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
-    assert_eq!(resp.tasks_recent.len(), 1);
-    assert_eq!(resp.tasks_recent[0].subagent_name, "my-agent");
+    let envelope = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    assert_eq!(envelope.data.tasks_recent.len(), 1);
+    assert_eq!(envelope.data.tasks_recent[0].subagent_name, "my-agent");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_pressure_gate_has_worker_sampled_at_ms_when_sampled() {
+    // When a sidecar supervisor exists and has taken a sample, worker_sampled_at_ms should be Some.
+    // When no sidecar supervisor exists, worker_sampled_at_ms should be None.
+    let sup = test_supervisor().await;
+    let envelope = sup.subagent_runtime_status(SubagentRuntimeStatusRequestDto::default()).await.unwrap();
+    // In test env, no sidecar supervisor is configured → worker_sampled_at_ms is None
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
 }
 ```
 
@@ -1143,7 +1192,7 @@ Note: `test_supervisor()`, `seed_subagent()`, `seed_task()` are test helpers —
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p busytok-runtime --test supervisor_control subagent_runtime_status`
-Expected: PASS (5 tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Commit (combines Tasks 5 + 6)**
 
@@ -1162,25 +1211,28 @@ git commit -m "feat(runtime): implement subagent.runtime_status RPC (trait wirin
 - Modify: `apps/gui/src/api/useBusytokData.ts`
 
 **Interfaces:**
-- Produces: `subagentRuntimeStatus()` client method, `useSubagentRuntimeStatus()` hook with 5s polling
+- Produces: `subagentRuntimeStatus()` client method returning `ReadEnvelopeDto<SubagentRuntimeStatusDto>`, `useSubagentRuntimeStatus()` hook with 5s polling via `envelopeQueryOptions()`
 
 - [ ] **Step 1: Add client method**
 
-In `apps/gui/src/api/busytokClient.ts`, add after the provider methods (~line 182):
+In `apps/gui/src/api/busytokClient.ts`, add after the provider methods (~line 182). The client returns `ReadEnvelopeDto<SubagentRuntimeStatusDto>` (NOT a bare DTO) — same pattern as `overviewSummary` / `settingsSnapshot`:
 
 ```typescript
 subagentRuntimeStatus: () =>
-  call<SubagentRuntimeStatusResponseDto>("subagent.runtime_status"),
+  call<ReadEnvelopeDto<SubagentRuntimeStatusDto>>("subagent.runtime_status"),
 ```
 
-Add the type import at the top of the file (alongside existing `@busytok/protocol-types` imports):
+Add the type imports at the top of the file (alongside existing `@busytok/protocol-types` imports):
 
 ```typescript
 import type {
   // ... existing imports ...
-  SubagentRuntimeStatusResponseDto,
+  ReadEnvelopeDto,
+  SubagentRuntimeStatusDto,
 } from "@busytok/protocol-types";
 ```
+
+Note: `ReadEnvelopeDto` is already imported by existing envelope methods (overview, settings, activity) — verify it's in the existing import list and only add `SubagentRuntimeStatusDto`.
 
 - [ ] **Step 2: Add query key**
 
@@ -1190,25 +1242,29 @@ In `apps/gui/src/api/queryKeys.ts`, add after `providers` (~line 49):
 subagentRuntimeStatus: () => ["subagents", "runtime_status"] as const,
 ```
 
-- [ ] **Step 3: Add `useSubagentRuntimeStatus` hook with 5s polling**
+- [ ] **Step 3: Add `useSubagentRuntimeStatus` hook with 5s polling via `envelopeQueryOptions`**
 
-In `apps/gui/src/api/useBusytokData.ts`, add after `useProviders` (~line 377):
+In `apps/gui/src/api/useBusytokData.ts`, add after `useProviders` (~line 377). Reuse `envelopeQueryOptions()` (useBusytokData.ts:76) to get `placeholderData` + `retry` + `staleTime` for free — same pattern as `useOverviewSummary` / `useSettingsSnapshot` / `useActivityRecent`:
 
 ```typescript
 const SUBAGENT_REFETCH_MS = 5_000;
 
 export function useSubagentRuntimeStatus() {
   const client = useBusytokClient();
-  return useQuery({
-    queryKey: queryKeys.subagentRuntimeStatus(),
-    queryFn: () => client.subagentRuntimeStatus(),
-    refetchInterval: SUBAGENT_REFETCH_MS,
-    refetchIntervalInBackground: false,
-  });
+  return useQuery<ReadEnvelopeDto<SubagentRuntimeStatusDto>>(
+    {
+      ...envelopeQueryOptions({
+        queryKey: queryKeys.subagentRuntimeStatus(),
+        queryFn: () => client.subagentRuntimeStatus(),
+      }),
+      refetchInterval: SUBAGENT_REFETCH_MS,
+      refetchIntervalInBackground: false,
+    },
+  );
 }
 ```
 
-Note: import `useQuery` (already imported) and `SubagentRuntimeStatusResponseDto` type if needed for explicit typing (TanStack Query infers it from the queryFn).
+Note: `envelopeQueryOptions` provides `staleTime: ENVELOPE_STALE_TIME_MS` (30s) + `placeholderData` (keepPreviousData) + `retry: 4` with exponential backoff. The 5s `refetchInterval` is added on top for live monitoring. Import `ReadEnvelopeDto` + `SubagentRuntimeStatusDto` types if not already imported. `useQuery` and `envelopeQueryOptions` are already imported in useBusytokData.ts.
 
 - [ ] **Step 4: Run typecheck**
 
@@ -1236,13 +1292,13 @@ git commit -m "feat(gui): add subagentRuntimeStatus client method + useSubagentR
 
 - [ ] **Step 1: Write failing tests**
 
-Create `apps/gui/src/pages/SubagentsPage.test.tsx`:
+Create `apps/gui/src/pages/SubagentsPage.test.tsx`. The mock returns a `ReadEnvelopeDto<SubagentRuntimeStatusDto>` (with `data`, `is_stale`, `degraded_reason`, `generated_at_ms` envelope fields) — the page reads business data via `data?.data`:
 
 ```typescript
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { SubagentRuntimeStatusResponseDto } from "@busytok/protocol-types";
+import type { ReadEnvelopeDto, SubagentRuntimeStatusDto } from "@busytok/protocol-types";
 
 vi.mock("../api/useBusytokData", () => ({
   useSubagentRuntimeStatus: vi.fn(),
@@ -1253,12 +1309,27 @@ import { SubagentsPage } from "./SubagentsPage";
 
 const mockUseStatus = vi.mocked(useSubagentRuntimeStatus);
 
-function makeResponse(overrides: Partial<SubagentRuntimeStatusResponseDto> = {}): SubagentRuntimeStatusResponseDto {
+function makeInner(overrides: Partial<SubagentRuntimeStatusDto> = {}): SubagentRuntimeStatusDto {
   return {
-    pressure_gate: { level: "normal", memory_used_pct: 30, hot_sessions_total: 1, hot_sessions_limit: 3 },
+    pressure_gate: { level: "normal", memory_used_pct: 30, hot_sessions_total: 1, hot_sessions_limit: 3, worker_sampled_at_ms: null },
     subagents: [],
     tasks_recent: [],
     workers: [],
+    ...overrides,
+  };
+}
+
+function makeEnvelope(overrides: Partial<ReadEnvelopeDto<SubagentRuntimeStatusDto>> = {}): ReadEnvelopeDto<SubagentRuntimeStatusDto> {
+  return {
+    data: makeInner(),
+    generated_at_ms: 1000,
+    generation_id: null,
+    readiness: "ReadyExact",
+    is_exact: true,
+    is_stale: false,
+    watermark_ms: null,
+    progress: null,
+    degraded_reason: null,
     ...overrides,
   };
 }
@@ -1274,7 +1345,7 @@ function renderPage() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockUseStatus.mockReturnValue({ data: makeResponse(), isLoading: false, isError: false, isFetching: false });
+  mockUseStatus.mockReturnValue({ data: makeEnvelope(), isLoading: false, isError: false, isFetching: false });
 });
 
 afterEach(() => cleanup());
@@ -1289,7 +1360,7 @@ describe("SubagentsPage", () => {
 
   it("renders subagents section", () => {
     mockUseStatus.mockReturnValue({
-      data: makeResponse({
+      data: makeEnvelope({ data: makeInner({
         subagents: [{
           name: "my-agent",
           status: "warm",
@@ -1297,13 +1368,13 @@ describe("SubagentsPage", () => {
           last_task_at_ms: 1000,
           last_task_status: "completed",
         }],
-      }),
+      }) }),
       isLoading: false, isError: false, isFetching: false,
     });
     renderPage();
     expect(screen.getByText("my-agent")).toBeTruthy();
     expect(screen.getByText("warm")).toBeTruthy();
-    expect(screen.getByText("5")).toBeTruthy();
+    expect(screen.getByText(/5/)).toBeTruthy();
   });
 
   it("renders empty state when no subagents", () => {
@@ -1313,7 +1384,7 @@ describe("SubagentsPage", () => {
 
   it("renders task history section", () => {
     mockUseStatus.mockReturnValue({
-      data: makeResponse({
+      data: makeEnvelope({ data: makeInner({
         tasks_recent: [{
           task_id: "t1",
           subagent_name: "my-agent",
@@ -1321,7 +1392,7 @@ describe("SubagentsPage", () => {
           created_at_ms: 1000,
           error: null,
         }],
-      }),
+      }) }),
       isLoading: false, isError: false, isFetching: false,
     });
     renderPage();
@@ -1332,7 +1403,7 @@ describe("SubagentsPage", () => {
 
   it("renders workers section with running worker", () => {
     mockUseStatus.mockReturnValue({
-      data: makeResponse({
+      data: makeEnvelope({ data: makeInner({
         workers: [{
           provider_id: null,
           state: "running",
@@ -1340,7 +1411,7 @@ describe("SubagentsPage", () => {
           uptime_seconds: 60,
           hot_sessions: 2,
         }],
-      }),
+      }) }),
       isLoading: false, isError: false, isFetching: false,
     });
     renderPage();
@@ -1348,9 +1419,28 @@ describe("SubagentsPage", () => {
     expect(screen.getByText("running")).toBeTruthy();
   });
 
-  it("renders empty workers state", () => {
+  it("renders stopped worker when supervisor exists but not running", () => {
+    mockUseStatus.mockReturnValue({
+      data: makeEnvelope({ data: makeInner({
+        workers: [{
+          provider_id: null,
+          state: "stopped",
+          pid: null,
+          uptime_seconds: null,
+          hot_sessions: 0,
+        }],
+      }) }),
+      isLoading: false, isError: false, isFetching: false,
+    });
     renderPage();
-    expect(screen.getByText(/no active sidecar workers/i)).toBeTruthy();
+    // stopped worker is visible (not hidden as empty state)
+    expect(screen.getByText("stopped")).toBeTruthy();
+  });
+
+  it("renders empty workers state only when no sidecar configured", () => {
+    // workers: [] means sidecar_supervisor is None (not configured)
+    renderPage();
+    expect(screen.getByText(/no sidecar configured/i)).toBeTruthy();
   });
 
   it("shows loading state", () => {
@@ -1367,20 +1457,41 @@ describe("SubagentsPage", () => {
 
   it("shows pressure warning when throttled", () => {
     mockUseStatus.mockReturnValue({
-      data: makeResponse({
-        pressure_gate: { level: "throttled", memory_used_pct: 85, hot_sessions_total: 3, hot_sessions_limit: 3 },
-      }),
+      data: makeEnvelope({ data: makeInner({
+        pressure_gate: { level: "throttled", memory_used_pct: 85, hot_sessions_total: 3, hot_sessions_limit: 3, worker_sampled_at_ms: null },
+      }) }),
       isLoading: false, isError: false, isFetching: false,
     });
     renderPage();
     expect(screen.getByText("throttled")).toBeTruthy();
   });
 
+  it("shows sample freshness when worker_sampled_at_ms is set", () => {
+    const sampledAt = Date.now() - 5000; // 5s ago
+    mockUseStatus.mockReturnValue({
+      data: makeEnvelope({ data: makeInner({
+        pressure_gate: { level: "normal", memory_used_pct: 30, hot_sessions_total: 1, hot_sessions_limit: 3, worker_sampled_at_ms: sampledAt },
+      }) }),
+      isLoading: false, isError: false, isFetching: false,
+    });
+    renderPage();
+    expect(screen.getByText(/sampled/i)).toBeTruthy();
+  });
+
+  it("shows stale banner when envelope is_stale", () => {
+    mockUseStatus.mockReturnValue({
+      data: makeEnvelope({ is_stale: true, degraded_reason: "Read plane is operating in degraded mode" }),
+      isLoading: false, isError: false, isFetching: false,
+    });
+    renderPage();
+    expect(screen.getByText(/degraded/i)).toBeTruthy();
+  });
+
   it("does NOT render any action buttons (read-only)", () => {
     mockUseStatus.mockReturnValue({
-      data: makeResponse({
+      data: makeEnvelope({ data: makeInner({
         subagents: [{ name: "a", status: "warm", task_count: 0, last_task_at_ms: null, last_task_status: null }],
-      }),
+      }) }),
       isLoading: false, isError: false, isFetching: false,
     });
     renderPage();
@@ -1397,11 +1508,11 @@ Expected: FAIL (component not defined)
 
 - [ ] **Step 2: Implement `SubagentsPage`**
 
-Create `apps/gui/src/pages/SubagentsPage.tsx`:
+Create `apps/gui/src/pages/SubagentsPage.tsx`. The page reads the envelope via `useSubagentRuntimeStatus()`, extracts business data via `data?.data`, and displays envelope-level diagnostics (`is_stale` / `degraded_reason`) via a degraded banner (matching OverviewPage pattern at OverviewPage.tsx:190-205). Worker sample freshness is displayed from `pressure.worker_sampled_at_ms`:
 
 ```typescript
 import { useEffect } from "react";
-import type { SubagentRuntimeStatusResponseDto } from "@busytok/protocol-types";
+import type { ReadEnvelopeDto, SubagentRuntimeStatusDto } from "@busytok/protocol-types";
 import { useSubagentRuntimeStatus } from "../api/useBusytokData";
 import { PageState } from "../components/PageState";
 import { SettingsRow } from "../components/desktop/SettingsRow";
@@ -1424,8 +1535,16 @@ function formatTimestamp(ms: number | null | undefined): string {
   return new Date(ms).toLocaleTimeString();
 }
 
+function formatSampleFreshness(sampledAtMs: number | null | undefined): string {
+  if (sampledAtMs == null) return "—";
+  const ageSec = Math.floor((Date.now() - sampledAtMs) / 1000);
+  if (ageSec < 60) return `sampled ${ageSec}s ago`;
+  const m = Math.floor(ageSec / 60);
+  return `sampled ${m}m ago`;
+}
+
 export function SubagentsPage() {
-  const { data, isLoading, isError } = useSubagentRuntimeStatus();
+  const { data: envelope, isLoading, isError } = useSubagentRuntimeStatus();
 
   useEffect(() => {
     reportFrontendEventSafely({
@@ -1438,16 +1557,26 @@ export function SubagentsPage() {
   if (isLoading) {
     return <PageState kind="loading" title="Loading" message="Fetching subagent runtime status…" />;
   }
-  if (isError || !data) {
+  if (isError || !envelope) {
     return <PageState kind="error" title="Error" message="Failed to load subagent runtime status." />;
   }
 
+  const data = envelope.data;
   const pressure = data.pressure_gate;
   const pressureTone = pressure.level === "normal" ? "default" : "warning";
+  const showDegraded = envelope.is_stale || !envelope.is_exact;
 
   return (
     <div className="settings-page">
       <div className="settings-pane">
+        {/* Degraded banner (envelope-level diagnostics — matches OverviewPage pattern) */}
+        {showDegraded && (
+          <div className="overview-console__degraded-ribbon" role="status">
+            <span className="overview-console__degraded-ribbon-dot" aria-hidden="true" />
+            <span>{envelope.degraded_reason ?? (envelope.is_stale ? "Showing stale data — refresh in progress" : "Data is approximate")}</span>
+          </div>
+        )}
+
         {/* Pressure summary */}
         <section className="settings-section">
           <h2>Pressure Summary</h2>
@@ -1466,6 +1595,11 @@ export function SubagentsPage() {
               label="Hot sessions"
               description={`${pressure.hot_sessions_total} / ${pressure.hot_sessions_limit} limit`}
               control={<SettingsValue value={`${pressure.hot_sessions_total}`} />}
+            />
+            <SettingsRow
+              label="Sample freshness"
+              description="When the worker resource sample was taken (may lag up to 30s)"
+              control={<SettingsValue value={formatSampleFreshness(pressure.worker_sampled_at_ms)} tone="muted" />}
             />
           </div>
         </section>
@@ -1527,8 +1661,8 @@ export function SubagentsPage() {
           <div className="settings-panel">
             {data.workers.length === 0 ? (
               <SettingsRow
-                label="No active sidecar workers"
-                description="The sidecar is not running or not configured."
+                label="No sidecar configured"
+                description="The sidecar supervisor is not configured. Workers appear here once a sidecar is set up."
                 control={<SettingsValue value="—" tone="muted" />}
               />
             ) : (
@@ -1537,7 +1671,7 @@ export function SubagentsPage() {
                   key={i}
                   label={w.state}
                   description={`PID: ${w.pid ?? "—"} • Uptime: ${formatUptime(w.uptime_seconds)} • Hot sessions: ${w.hot_sessions}`}
-                  control={<SettingsValue value={w.state} />}
+                  control={<SettingsValue value={w.state} tone={w.state === "running" ? "default" : "muted"} />}
                 />
               ))
             )}
@@ -1552,7 +1686,7 @@ export function SubagentsPage() {
 - [ ] **Step 3: Run tests + iterate**
 
 Run: `cd apps/gui && pnpm exec vitest run src/pages/SubagentsPage.test.tsx`
-Expected: PASS (10 tests)
+Expected: PASS (12 tests)
 
 - [ ] **Step 4: Check coverage**
 
@@ -1667,9 +1801,10 @@ git commit -m "feat(gui): add Subagents page to sidebar + routing (Tools group)"
 cargo fmt --all --check
 cargo clippy --workspace --exclude busytok-gui --all-targets -- -D warnings
 cargo test --workspace --exclude busytok-gui
+bash scripts/coverage.sh
 ```
 
-Expected: fmt clean, clippy clean, all tests pass.
+Expected: fmt clean, clippy clean, all tests pass, coverage gates pass (workspace ≥82% lines via `cargo llvm-cov --workspace --exclude busytok-gui --fail-under-lines`; per-crate `busytok-subagent` ≥90% lines). `scripts/coverage.sh` is the authoritative workspace gate (already used by CI in `.github/workflows/verify.yml`). If the workspace gate needs a lower bar in CI, `COVERAGE_GATE=80 bash scripts/coverage.sh` may be used locally — but Phase 2 must not regress the default 82% workspace gate.
 
 - [ ] **Step 2: Frontend verification**
 
@@ -1684,12 +1819,13 @@ Expected: typecheck clean, all tests pass, coverage ≥90% on new files (Subagen
 
 - [ ] **Step 3: Verify spec coverage checklist**
 
-- [ ] `subagent.runtime_status` RPC returns single-snapshot aggregate
-- [ ] `pressure_gate` has level/memory_used_pct/hot_sessions_total/hot_sessions_limit
+- [ ] `subagent.runtime_status` RPC returns `ReadEnvelopeDto<SubagentRuntimeStatusDto>` (single-read DB aggregate + stamped worker sample)
+- [ ] `pressure_gate` has level/memory_used_pct/hot_sessions_total/hot_sessions_limit/worker_sampled_at_ms
 - [ ] `subagents[]` has name/status/task_count/last_task_at_ms/last_task_status
 - [ ] `tasks_recent` has 20 most recent across ALL subagents, ordered desc, with subagent_name
 - [ ] `workers[]` has provider_id (null)/state/pid/uptime_seconds/hot_sessions
-- [ ] `workers[]` is empty when sidecar not running (graceful)
+- [ ] `workers[]` is empty ONLY when sidecar supervisor is None; stopped worker row when supervisor exists but child not running
+- [ ] Frontend hook uses `envelopeQueryOptions()` (reuses placeholder/retry/stale infrastructure)
 - [ ] Page is read-only (no hibernate/delete/retry buttons)
 - [ ] Page polls every 5s
 - [ ] Subagent rows show logical entities (no pid); worker rows show process entities (no subagent name)
@@ -1713,15 +1849,17 @@ If all gates pass without fixes, no commit needed. If fixes were made, commit th
 ### Spec coverage
 - §4 Phase 2 `subagent.runtime_status` → Tasks 4-6
 - §4 Phase 2 GUI page → Tasks 7-9
-- §4 Phase 2 constraints (single-snapshot, 20 limit, read-only, empty workers) → Global Constraints + Task 6 implementation
+- §4 Phase 2 constraints (stamped worker sample freshness, 20 limit, read-only, workers semantics) → Global Constraints + Task 6 implementation
 - §2.4 CONTRIBUTING.md → NOT updated in Phase 2 (no new credential invariant; the Phase 1 update stands)
 
 ### Architecture decisions
 1. **No new polling thread:** the supervision loop already runs every `monitor_interval_seconds` (default 30s) and caches `latest_sample` + `latest_hot_sessions`. The 5s GUI poll reads the cache — no extra work per poll. Trade-off: the cache may be up to 30s stale, acceptable for monitoring.
 2. **Worker state is a single lock:** `worker_snapshot()` takes the `SupervisorState` lock once, reads all fields, releases. No async I/O under the lock.
-3. **DB reads are separate from worker snapshot:** the handler reads the worker snapshot first (in-memory, fast), then reads DB rows. Single-snapshot semantics are preserved because the DB reads are fast and the worker cache updates infrequently.
+3. **Stamped worker sample freshness (NOT same-moment):** the handler reads the worker snapshot first (single in-memory lock — fast), then performs all DB reads under one DB lock (single-read aggregate). The DB portion is internally consistent. However, the worker sample comes from the supervision loop's cache (up to `monitor_interval_seconds` ≈ 30s stale) and the DB reads are live — they are NOT from the same instant. To make this honest, the response stamps `worker_sampled_at_ms` on `pressure_gate` (the absolute ms when the ResourceSample was taken) so the frontend can display sample freshness (e.g., "sampled 5s ago"). The envelope-level `is_stale` / `readiness` cover read-plane health and are independent of worker sample freshness.
 4. **No new DB migration:** all data comes from existing tables + in-memory state.
 5. **`provider_id: null` in worker DTO:** honest representation — no provider binding exists until Phase 3.
+6. **`ReadEnvelopeDto` wrapping (NOT a bare DTO):** `subagent.runtime_status` returns `ReadEnvelopeDto<SubagentRuntimeStatusDto>`, matching `overview.summary` / `settings.snapshot` / `activity.recent`. The backend calls `self.build_read_envelope(data, now_ms)` (supervisor.rs:1944) so the response carries `generated_at_ms` / `readiness` / `is_exact` / `is_stale` / `degraded_reason`. The frontend hook uses `envelopeQueryOptions()` (useBusytokData.ts:76) for `placeholderData` / `retry` / `staleTime`, and the page reads business data via `data?.data` + diagnostic fields via `data?.is_stale` / `data?.degraded_reason` (matching OverviewPage/SettingsPage). This reuses the global placeholder/retry/stale-state/diagnostic infrastructure instead of building a parallel system.
+7. **`workers[]` keeps stopped sidecars observable:** return `workers: []` ONLY when `sidecar_supervisor` is `None` (not configured). When the supervisor exists but the child is not running, return ONE worker row with `state="stopped"`, `pid=null`, `uptime_seconds=null` — this avoids collapsing "configured but stopped" into "no worker", which would lose monitoring value.
 
 ### Implementation risk points
 1. **`SubagentTaskSummary` field names:** verify the exact field names in models.rs:113-123 when mapping to `SubagentRuntimeTaskDto` in Task 6.
