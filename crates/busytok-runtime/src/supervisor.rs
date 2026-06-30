@@ -523,6 +523,16 @@ impl BusytokSupervisor {
         self.pressure_responder.as_ref()
     }
 
+    /// Pi sidecar supervisor handle. `None` when the sidecar is disabled.
+    /// Exposed so tests (and future status reporting) can drive
+    /// `ensure_started()` / `shutdown()` and read `worker_snapshot()` to
+    /// cover the `WorkerState::Running` branch of `subagent_runtime_status`.
+    pub fn sidecar_supervisor(
+        &self,
+    ) -> Option<&Arc<busytok_subagent::sidecar::PiSidecarSupervisor>> {
+        self.sidecar_supervisor.as_ref()
+    }
+
     /// Run the 11 spec §7.1 doctor checks. The subagent-specific checks
     /// (SQLite, sidecar launchable, resource policy, stale subagents) are
     /// real; the 6 bundle-inspection checks probe the filesystem + sidecar

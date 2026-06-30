@@ -1231,8 +1231,9 @@ pub struct ShutdownReconciliationCounts {
 //   * `count_tasks_by_subagent` — `subagents[].task_count`
 //   * `last_task_by_subagent`   — `subagents[].last_task_{created_at,status}`
 
-/// Most recent tasks across ALL subagents, ordered by `created_at_ms` desc.
-/// Spec §4 Phase 2: `tasks_recent` fixed limit 20, no subagent_id filter.
+/// Most recent tasks across ALL subagents, ordered by `created_at_ms` desc
+/// with `id` desc as a deterministic tie-break (spec §4 Phase 2: `tasks_recent`
+/// fixed limit 20, no subagent_id filter).
 pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<SubagentTaskRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
@@ -1240,7 +1241,7 @@ pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<Subage
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
                 timeout_seconds, model_override \
          FROM subagent_tasks \
-         ORDER BY created_at_ms DESC \
+         ORDER BY created_at_ms DESC, id DESC \
          LIMIT ?1",
     )?;
     let rows = stmt
@@ -1289,18 +1290,21 @@ pub fn count_tasks_by_subagent(conn: &Connection) -> Result<Vec<(String, u32)>> 
 
 /// `(subagent_id, created_at_ms, status)` for the most recent task of each
 /// subagent that has at least one task. Spec §4 Phase 2:
-/// `subagents[].last_task_{created_at,status}`.
+/// `subagents[].last_task_{created_at,status}`. Uses `ROW_NUMBER()` with
+/// `id DESC` tie-break for deterministic output when multiple tasks share
+/// the same `created_at_ms`.
 pub fn last_task_by_subagent(conn: &Connection) -> Result<Vec<(String, i64, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT t.subagent_id, t.created_at_ms, t.status \
-         FROM subagent_tasks t \
-         INNER JOIN ( \
-             SELECT subagent_id, MAX(created_at_ms) AS max_created \
+        "SELECT subagent_id, created_at_ms, status \
+         FROM ( \
+             SELECT subagent_id, created_at_ms, status, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY subagent_id \
+                        ORDER BY created_at_ms DESC, id DESC \
+                    ) AS rn \
              FROM subagent_tasks \
-             GROUP BY subagent_id \
-         ) latest \
-           ON t.subagent_id = latest.subagent_id \
-          AND t.created_at_ms = latest.max_created",
+         ) ranked \
+         WHERE rn = 1",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -1424,5 +1428,40 @@ mod phase2_tests {
         seed_subagent(conn, "sub-a");
         let lasts = last_task_by_subagent(conn).unwrap();
         assert!(lasts.is_empty());
+    }
+
+    /// Tie-break determinism: when two tasks share the same `created_at_ms`,
+    /// `list_recent_tasks_all` must order by `id DESC` so pagination is stable.
+    #[test]
+    fn list_recent_tasks_all_tiebreak_deterministic() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "completed", 1000);
+
+        let tasks = list_recent_tasks_all(conn, 20).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "t2", "higher id wins tie-break");
+        assert_eq!(tasks[1].id, "t1");
+    }
+
+    /// Tie-break determinism: when two tasks for the same subagent share the
+    /// same `created_at_ms`, `last_task_by_subagent` must return exactly one
+    /// row (the higher `id`) — not duplicates.
+    #[test]
+    fn last_task_by_subagent_tiebreak_deterministic() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "failed", 1000);
+
+        let lasts = last_task_by_subagent(conn).unwrap();
+        assert_eq!(lasts.len(), 1, "exactly one row despite tied created_at_ms");
+        let (sub_id, created_at, status) = &lasts[0];
+        assert_eq!(sub_id, "sub-a");
+        assert_eq!(*created_at, 1000);
+        assert_eq!(status, "failed", "higher id wins tie-break");
     }
 }

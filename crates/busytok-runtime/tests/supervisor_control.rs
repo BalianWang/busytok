@@ -4298,3 +4298,86 @@ async fn subagent_runtime_status_workers_one_row_when_sidecar_stopped() {
 
     sup.shutdown_writer().await.expect("writer shutdown");
 }
+
+/// `workers: [one row, state="running"]` path: when the sidecar supervisor is
+/// configured AND the child has been started via `ensure_started`,
+/// `subagent_runtime_status` must return exactly one worker row with
+/// `state="running"`, `pid=Some(..)`, `uptime_seconds=Some(..)`. Covers the
+/// `WorkerState::Running => "running"` branch (supervisor.rs) that the
+/// stopped-sidecar test does not exercise.
+#[tokio::test]
+async fn subagent_runtime_status_workers_running_when_sidecar_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_sidecar_stopped_supervisor(db, &tmp);
+
+    // Start the sidecar child so `worker_snapshot()` reports `Running`.
+    let sidecar = sup
+        .sidecar_supervisor()
+        .expect("sidecar supervisor must be configured");
+    let _handle = sidecar.ensure_started().await.expect("ensure_started");
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.workers.len(), 1, "one worker row");
+    let worker = &envelope.data.workers[0];
+    assert_eq!(worker.state, "running");
+    assert!(worker.pid.is_some(), "pid must be Some when running");
+    assert!(
+        worker.uptime_seconds.is_some(),
+        "uptime must be Some when running"
+    );
+
+    // Clean up: stop the child, then shut down the writer thread.
+    sidecar.shutdown().await.expect("sidecar shutdown");
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `tasks_recent[].subagent_name` fallback: when a task references a subagent
+/// that has been deleted (excluded from `subagents[]` by
+/// `subagent_list_filtered(.., false)`), the `name_lookup` HashMap won't
+/// contain it. The handler must fall back to the raw `subagent_id` (NOT the
+/// deleted subagent's display name). Covers the `unwrap_or_else` branch at
+/// supervisor.rs that the happy-path name-resolution test does not exercise.
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_falls_back_to_id_for_deleted_subagent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Seed a subagent with id != name, then mark it deleted so it's excluded
+    // from the `subagents[]` list but its task still appears in `tasks_recent`.
+    let mut row = SubagentLogicalSubagentRow::for_test("ghost-id", "Ghost Agent");
+    row.status = "deleted".to_string();
+    {
+        let db = sup.db_handle().lock().unwrap();
+        db.subagent_upsert_logical(&row).expect("upsert logical");
+    }
+    seed_task_row(&sup, "t1", "ghost-id", "completed", 1_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // The deleted subagent must NOT appear in `subagents[]`.
+    assert!(
+        envelope.data.subagents.is_empty(),
+        "deleted subagent must be excluded from subagents[]"
+    );
+
+    // The task must appear in `tasks_recent` with `subagent_name` falling
+    // back to the raw `subagent_id` ("ghost-id"), NOT the display name.
+    assert_eq!(envelope.data.tasks_recent.len(), 1);
+    let task = &envelope.data.tasks_recent[0];
+    assert_eq!(task.task_id, "t1");
+    assert_eq!(
+        task.subagent_name, "ghost-id",
+        "subagent_name must fall back to id when subagent is absent from lookup"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
