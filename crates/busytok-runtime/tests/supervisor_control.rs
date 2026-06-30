@@ -3467,6 +3467,8 @@ async fn provider_crud_round_trips_without_api_key() {
             id: "acme-prod".to_string(),
             name: Some("Acme Renamed".to_string()),
             base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
             models: Some(vec![
                 "example-model".to_string(),
                 "second-model".to_string(),
@@ -3611,6 +3613,8 @@ async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
             id: "noop-key".to_string(),
             name: Some("Noop Renamed".to_string()),
             base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
             models: None,
             enabled: None,
             api_key: None,
@@ -3619,6 +3623,60 @@ async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
         .unwrap();
     assert_eq!(updated.name, "Noop Renamed");
     assert!(!updated.has_api_key, "no api_key was ever set");
+}
+
+#[tokio::test]
+async fn provider_update_applies_env_name_fields() {
+    // Spec §3.1 / Plan Task 6: api_key_env_name and base_url_env_name are
+    // editable provider fields surfaced through ProviderUpdateRequestDto.
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("env-edit", "Env Edit"))
+        .await
+        .unwrap();
+
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "env-edit".to_string(),
+            name: None,
+            base_url: None,
+            api_key_env_name: Some("EDITED_API_KEY".to_string()),
+            base_url_env_name: Some("EDITED_BASE_URL".to_string()),
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.api_key_env_name, "EDITED_API_KEY");
+    assert_eq!(
+        updated.base_url_env_name.as_deref(),
+        Some("EDITED_BASE_URL")
+    );
+
+    // A subsequent update that omits the env-name fields leaves them unchanged
+    // (patch semantics: absent == unchanged).
+    let after_omit = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "env-edit".to_string(),
+            name: Some("Env Edit Renamed".to_string()),
+            base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_omit.name, "Env Edit Renamed");
+    assert_eq!(after_omit.api_key_env_name, "EDITED_API_KEY");
+    assert_eq!(
+        after_omit.base_url_env_name.as_deref(),
+        Some("EDITED_BASE_URL")
+    );
 }
 
 #[tokio::test]
@@ -3632,6 +3690,8 @@ async fn provider_update_returns_error_for_unknown_id() {
             id: "ghost".to_string(),
             name: Some("Ghost".to_string()),
             base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
             models: None,
             enabled: None,
             api_key: None,
@@ -3750,6 +3810,8 @@ async fn provider_crud_round_trips_with_api_key_macos() {
             id: provider_id.to_string(),
             name: Some("Keychain Roundtrip Renamed".to_string()),
             base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
             models: None,
             enabled: None,
             api_key: None,

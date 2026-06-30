@@ -363,7 +363,15 @@ export type ProviderCreateRequestDto = { id: string, name: string, base_url: str
  */
 api_key: string | null, };
 
-export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, models: Array<string> | null, enabled: boolean | null, 
+export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, 
+/**
+ * Env var name the sidecar reads for the API key. Editable provider field.
+ */
+api_key_env_name: string | null, 
+/**
+ * Optional env var name for base URL override. Editable provider field.
+ */
+base_url_env_name: string | null, models: Array<string> | null, enabled: boolean | null, 
 /**
  * If provided, replaces the stored key. If None, key is unchanged.
  */

@@ -4735,6 +4735,15 @@ impl RuntimeControl for BusytokSupervisor {
         if let Some(base_url) = req.base_url {
             provider.base_url = base_url;
         }
+        // Spec §3.1: api_key_env_name and base_url_env_name are editable provider
+        // fields. They reach the handler via ProviderUpdateRequestDto (patch
+        // semantics: None == leave unchanged).
+        if let Some(api_key_env_name) = req.api_key_env_name {
+            provider.api_key_env_name = api_key_env_name;
+        }
+        if let Some(base_url_env_name) = req.base_url_env_name {
+            provider.base_url_env_name = Some(base_url_env_name);
+        }
         if let Some(models) = req.models {
             provider.models = models;
         }
@@ -4814,14 +4823,20 @@ impl RuntimeControl for BusytokSupervisor {
         // Snapshot the provider fields under the lock, then drop the guard
         // before awaiting — holding a `MutexGuard` across `.await` makes the
         // future `!Send` and breaks the `RuntimeControl` trait bound.
-        let (provider_id, base_url) = {
+        let (provider_id, base_url, models) = {
             let settings = self.settings.lock().unwrap();
             let provider = settings
                 .providers
                 .iter()
                 .find(|p| p.id == req.id)
                 .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
-            (provider.id.clone(), provider.base_url.clone())
+            // Clone `models` too — the /chat/completions fallback needs a model
+            // id for the probe body.
+            (
+                provider.id.clone(),
+                provider.base_url.clone(),
+                provider.models.clone(),
+            )
         };
         // Defense-in-depth: the frontend doesn't enforce HTTPS, so the backend
         // must reject cleartext URLs before reading the key or sending the key
@@ -4862,6 +4877,66 @@ impl RuntimeControl for BusytokSupervisor {
             }
             Ok(r) => {
                 let status = r.status();
+                // Spec §4: if GET /v1/models is absent/unsupported (404/405/501),
+                // fall back to POST /v1/chat/completions with a 1-token prompt.
+                if models_probe_should_fallback(status) {
+                    tracing::debug!(
+                        event_code = "provider.test_connection.fallback",
+                        provider_id = %provider_id,
+                        models_status = %status,
+                        "falling back to /chat/completions"
+                    );
+                    let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                    let body = serde_json::json!({
+                        "model": chat_probe_model(&models),
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "ping"}],
+                    });
+                    let chat_resp = client
+                        .post(&chat_url)
+                        .header("Authorization", format!("Bearer {}", key))
+                        .json(&body)
+                        .send()
+                        .await;
+                    return match chat_resp {
+                        Ok(cr) => {
+                            let cstatus = cr.status();
+                            let (ok, error) = interpret_chat_probe(cstatus);
+                            if ok {
+                                tracing::info!(
+                                    event_code = "provider.test_connection.ok",
+                                    provider_id = %provider_id,
+                                    "connection test succeeded via /chat/completions fallback"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_code = "provider.test_connection.failed",
+                                    provider_id = %provider_id,
+                                    status = %cstatus,
+                                    "connection test failed via /chat/completions fallback"
+                                );
+                            }
+                            Ok(ProviderTestConnectionResponseDto {
+                                ok,
+                                error,
+                                models_detected: None,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event_code = "provider.test_connection.error",
+                                provider_id = %provider_id,
+                                error = %e,
+                                "connection test error during /chat/completions fallback"
+                            );
+                            Ok(ProviderTestConnectionResponseDto {
+                                ok: false,
+                                error: Some(e.to_string()),
+                                models_detected: None,
+                            })
+                        }
+                    };
+                }
                 tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "connection test failed");
                 Ok(ProviderTestConnectionResponseDto {
                     ok: false,
@@ -4903,6 +4978,47 @@ impl RuntimeControl for BusytokSupervisor {
         let _ = self
             .writer_handle
             .try_send(crate::writer::WriteCommand::DiagnosticWrite(cmd));
+    }
+}
+
+/// Pure decision helpers for `provider_test_connection`. Extracted so the
+/// fallback logic (which status codes trigger a fallback, how the POST probe
+/// status is interpreted) is unit-testable without standing up a TLS mock
+/// server — the handler enforces HTTPS, which rules out plain-HTTP fakes.
+///
+/// Spec §4: probe `GET /v1/models` OR `POST /v1/chat/completions` with a
+/// 1-token prompt.
+
+/// Returns true when a `GET /models` failure should fall back to
+/// `POST /chat/completions`. Only "endpoint absent/unsupported" codes
+/// (404/405/501) trigger the fallback; auth or server errors are reported
+/// directly because the endpoint itself is reachable.
+fn models_probe_should_fallback(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 404 | 405 | 501)
+}
+
+/// First model id to use for the `/chat/completions` probe body. Defaults to a
+/// generic OpenAI model id when the provider's model whitelist is empty — the
+/// probe only checks whether the endpoint accepts the request, so a 401/403
+/// still means "connection works, auth issue".
+fn chat_probe_model(models: &[String]) -> String {
+    models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "gpt-3.5-turbo".to_string())
+}
+
+/// Interprets the `POST /chat/completions` probe status. Returns `(ok, error)`.
+fn interpret_chat_probe(status: reqwest::StatusCode) -> (bool, Option<String>) {
+    if status.is_success() {
+        (true, None)
+    } else {
+        let msg = match status.as_u16() {
+            401 | 403 => "connection works but authentication failed".to_string(),
+            404 | 405 | 501 => "provider does not support /models or /chat/completions".to_string(),
+            _ => format!("HTTP {}", status),
+        };
+        (false, Some(msg))
     }
 }
 
@@ -5056,5 +5172,95 @@ mod tests {
         let dto = BusytokSupervisor::activity_item_from_read_row(&row);
         let dto_rate = dto.cache_hit_rate.expect("dto rate present");
         assert!((dto_rate - rate).abs() < 1e-12);
+    }
+
+    // ── provider_test_connection fallback decision helpers ───────────
+    // The handler enforces HTTPS, which makes a plain-HTTP mock server
+    // infeasible. These tests pin the fallback decision + status
+    // interpretation logic directly (Spec §4).
+
+    fn status(code: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(code).expect("valid status code")
+    }
+
+    #[test]
+    fn provider_test_connection_fallback_triggers_only_for_absent_endpoint_codes() {
+        // 404/405/501 mean the /models endpoint is absent or unsupported → fall back.
+        assert!(models_probe_should_fallback(status(404)));
+        assert!(models_probe_should_fallback(status(405)));
+        assert!(models_probe_should_fallback(status(501)));
+        // Reachable-but-failing endpoints do NOT fall back — the endpoint itself
+        // responded, so a /chat/completions probe would not add signal.
+        assert!(!models_probe_should_fallback(status(200)));
+        assert!(!models_probe_should_fallback(status(401)));
+        assert!(!models_probe_should_fallback(status(403)));
+        assert!(!models_probe_should_fallback(status(429)));
+        assert!(!models_probe_should_fallback(status(500)));
+        assert!(!models_probe_should_fallback(status(502)));
+        assert!(!models_probe_should_fallback(status(503)));
+    }
+
+    #[test]
+    fn provider_test_connection_chat_probe_model_defaults_when_empty() {
+        // Non-empty whitelist → first model.
+        assert_eq!(
+            chat_probe_model(&["deepseek-chat".to_string(), "other".to_string()]),
+            "deepseek-chat"
+        );
+        // Empty whitelist → generic default (probe only checks reachability).
+        assert_eq!(chat_probe_model(&[]), "gpt-3.5-turbo");
+    }
+
+    #[test]
+    fn provider_test_connection_interpret_chat_probe_status() {
+        // 2xx → success.
+        assert_eq!(interpret_chat_probe(status(200)), (true, None));
+        assert_eq!(interpret_chat_probe(status(204)), (true, None));
+        // 401/403 → connection works but auth failed.
+        assert_eq!(
+            interpret_chat_probe(status(401)),
+            (
+                false,
+                Some("connection works but authentication failed".to_string())
+            )
+        );
+        assert_eq!(
+            interpret_chat_probe(status(403)),
+            (
+                false,
+                Some("connection works but authentication failed".to_string())
+            )
+        );
+        // 404/405/501 → both probes failed (endpoint unsupported).
+        assert_eq!(
+            interpret_chat_probe(status(404)),
+            (
+                false,
+                Some("provider does not support /models or /chat/completions".to_string())
+            )
+        );
+        assert_eq!(
+            interpret_chat_probe(status(501)),
+            (
+                false,
+                Some("provider does not support /models or /chat/completions".to_string())
+            )
+        );
+        // Other → generic HTTP status string. `StatusCode`'s Display includes the
+        // canonical reason phrase (e.g. "500 Internal Server Error"), matching the
+        // existing non-fallback path's `format!("HTTP {}", status)`. Assert on the
+        // stable numeric prefix so the test doesn't bind to reason-phrase wording.
+        let (ok, msg) = interpret_chat_probe(status(500));
+        assert!(!ok);
+        assert!(
+            msg.as_deref().unwrap().starts_with("HTTP 500"),
+            "expected an HTTP 500 message, got: {msg:?}"
+        );
+        let (ok, msg) = interpret_chat_probe(status(429));
+        assert!(!ok);
+        assert!(
+            msg.as_deref().unwrap().starts_with("HTTP 429"),
+            "expected an HTTP 429 message, got: {msg:?}"
+        );
     }
 }

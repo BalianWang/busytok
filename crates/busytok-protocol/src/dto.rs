@@ -1495,6 +1495,12 @@ pub struct ProviderUpdateRequestDto {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Env var name the sidecar reads for the API key. Editable provider field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env_name: Option<String>,
+    /// Optional env var name for base URL override. Editable provider field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url_env_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1557,6 +1563,47 @@ mod tests {
         let parsed: ProviderDto = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "deepseek-prod");
         assert!(parsed.has_api_key);
+    }
+
+    #[test]
+    fn provider_update_request_dto_round_trips_with_env_name_fields() {
+        // Spec §3.1: name, base_url, api_key_env_name and base_url_env_name are
+        // editable provider fields. The update DTO must carry the env-name fields
+        // so the edit-provider UI can patch them.
+        let dto = ProviderUpdateRequestDto {
+            id: "deepseek-prod".to_string(),
+            name: Some("DeepSeek".to_string()),
+            base_url: Some("https://api.deepseek.com/v1".to_string()),
+            api_key_env_name: Some("DEEPSEEK_API_KEY".to_string()),
+            base_url_env_name: Some("DEEPSEEK_BASE_URL".to_string()),
+            models: Some(vec!["deepseek-chat".to_string()]),
+            enabled: None,
+            api_key: None,
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        // snake_case wire names.
+        assert_eq!(json["id"], "deepseek-prod");
+        assert_eq!(json["api_key_env_name"], "DEEPSEEK_API_KEY");
+        assert_eq!(json["base_url_env_name"], "DEEPSEEK_BASE_URL");
+        // `None` fields are skipped on serialize (skip_serializing_if).
+        assert!(json.get("enabled").is_none());
+        assert!(json.get("api_key").is_none());
+
+        let parsed: ProviderUpdateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.id, "deepseek-prod");
+        assert_eq!(parsed.api_key_env_name.as_deref(), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(
+            parsed.base_url_env_name.as_deref(),
+            Some("DEEPSEEK_BASE_URL")
+        );
+
+        // An update payload that omits the env-name fields must still deserialize
+        // (they default to None — patch semantics: absent == unchanged).
+        let minimal: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p","name":"P"}"#).unwrap();
+        assert_eq!(minimal.id, "p");
+        assert!(minimal.api_key_env_name.is_none());
+        assert!(minimal.base_url_env_name.is_none());
     }
 
     #[test]

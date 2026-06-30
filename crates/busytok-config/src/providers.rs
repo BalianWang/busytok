@@ -4,8 +4,12 @@ use serde::{Deserialize, Serialize};
 /// Protocol adapter kind. Determines how the sidecar communicates with the provider.
 /// MVP supports only OpenAI-compatible providers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    // serde's `snake_case` would split on EACH uppercase boundary and emit
+    // "open_ai_compatible"; the spec (§3.1) requires "openai_compatible" (no
+    // underscore between "openai" and "compatible"). The explicit rename keeps
+    // the wire format stable regardless of future variant additions.
+    #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
 }
 
@@ -86,9 +90,23 @@ impl ProviderCredentialStore {
             provider_id,
             "checking provider API key presence in keychain"
         );
-        Self::get_key(provider_id)
-            .map(|k| k.is_some())
-            .unwrap_or(false)
+        match Self::get_key(provider_id) {
+            Ok(k) => k.is_some(),
+            Err(e) => {
+                // A broken/unavailable keychain previously surfaced as a silent
+                // `false` ("no key set"), which hid real infrastructure failures.
+                // Log a warning so the failure is observable; `has_key` keeps its
+                // `bool` return for MVP (a tri-state would ripple through every
+                // caller and is deferred).
+                tracing::warn!(
+                    event_code = "provider.keychain_read_failed",
+                    provider_id,
+                    error = %e,
+                    "failed to read keychain; reporting has_api_key=false"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -116,8 +134,26 @@ mod tests {
         assert_eq!(parsed.models.len(), 2);
         assert!(parsed.enabled);
         assert!(
-            toml_str.contains("provider_kind = \"open_ai_compatible\""),
-            "provider_kind must serialize as snake_case, got:\n{toml_str}"
+            toml_str.contains("provider_kind = \"openai_compatible\""),
+            "provider_kind must serialize as \"openai_compatible\", got:\n{toml_str}"
+        );
+        // Deserialization must accept the spec wire format and reject the old
+        // snake_case form that serde would have produced by default.
+        let parsed: ProviderConfig = toml::from_str(&format!(
+            "id = \"x\"\nname = \"X\"\nprovider_kind = \"openai_compatible\"\n\
+             base_url = \"https://x.example.com/v1\"\napi_key_env_name = \"X_API_KEY\"\n\
+             models = []\nenabled = true\n"
+        ))
+        .unwrap();
+        assert_eq!(parsed.provider_kind, ProviderKind::OpenAiCompatible);
+        assert!(
+            toml::from_str::<ProviderConfig>(
+                "id = \"x\"\nname = \"X\"\nprovider_kind = \"open_ai_compatible\"\n\
+                 base_url = \"https://x.example.com/v1\"\napi_key_env_name = \"X_API_KEY\"\n\
+                 models = []\nenabled = true\n"
+            )
+            .is_err(),
+            "the legacy \"open_ai_compatible\" spelling must no longer deserialize"
         );
     }
 

@@ -48,6 +48,12 @@ const EMPTY_FORM: ProviderFormState = {
 
 interface ProviderFormProps {
   form: ProviderFormState;
+  /**
+   * `create` shows the full field set (id + api_key). `edit` hides the immutable
+   * `id` (Spec §3.1: "editable only on create") and the `api_key` field, which
+   * has its own dedicated Update Key flow on the provider row.
+   */
+  mode: "create" | "edit";
   onChange: (patch: Partial<ProviderFormState>) => void;
   onSubmit: () => void;
   onCancel: () => void;
@@ -56,6 +62,7 @@ interface ProviderFormProps {
 
 function ProviderForm({
   form,
+  mode,
   onChange,
   onSubmit,
   onCancel,
@@ -63,21 +70,23 @@ function ProviderForm({
 }: ProviderFormProps) {
   return (
     <div className="settings-panel">
-      <SettingsRow
-        layout="vertical"
-        label="Provider ID"
-        description="Unique identifier for this provider (e.g. deepseek-prod). Cannot be changed after creation."
-        control={
-          <input
-            type="text"
-            className="input"
-            aria-label="Provider ID"
-            placeholder="deepseek-prod"
-            value={form.id}
-            onChange={(e) => onChange({ id: e.currentTarget.value })}
-          />
-        }
-      />
+      {mode === "create" && (
+        <SettingsRow
+          layout="vertical"
+          label="Provider ID"
+          description="Unique identifier for this provider (e.g. deepseek-prod). Cannot be changed after creation."
+          control={
+            <input
+              type="text"
+              className="input"
+              aria-label="Provider ID"
+              placeholder="deepseek-prod"
+              value={form.id}
+              onChange={(e) => onChange({ id: e.currentTarget.value })}
+            />
+          }
+        />
+      )}
       <SettingsRow
         layout="vertical"
         label="Name"
@@ -140,21 +149,23 @@ function ProviderForm({
           />
         }
       />
-      <SettingsRow
-        layout="vertical"
-        label="API Key"
-        description="The actual API key. Stored in the system keychain, never written to settings.toml."
-        control={
-          <input
-            type="password"
-            className="input"
-            aria-label="API Key"
-            placeholder="Enter API key"
-            value={form.api_key}
-            onChange={(e) => onChange({ api_key: e.currentTarget.value })}
-          />
-        }
-      />
+      {mode === "create" && (
+        <SettingsRow
+          layout="vertical"
+          label="API Key"
+          description="The actual API key. Stored in the system keychain, never written to settings.toml."
+          control={
+            <input
+              type="password"
+              className="input"
+              aria-label="API Key"
+              placeholder="Enter API key"
+              value={form.api_key}
+              onChange={(e) => onChange({ api_key: e.currentTarget.value })}
+            />
+          }
+        />
+      )}
       <SettingsRow
         label="Actions"
         control={
@@ -192,6 +203,14 @@ interface ProviderRowProps {
   onToggleEnabled: (provider: ProviderDto) => void;
   onDelete: (provider: ProviderDto) => void;
   onUpdateApiKey: (id: string, apiKey: string) => void;
+  // Inline edit mode (Plan Task 6: editable on update, id immutable).
+  isEditing: boolean;
+  editForm: ProviderFormState;
+  isEditPending: boolean;
+  onEditProvider: (provider: ProviderDto) => void;
+  onEditChange: (patch: Partial<ProviderFormState>) => void;
+  onEditSubmit: () => void;
+  onEditCancel: () => void;
 }
 
 function ProviderRow({
@@ -202,6 +221,13 @@ function ProviderRow({
   onToggleEnabled,
   onDelete,
   onUpdateApiKey,
+  isEditing,
+  editForm,
+  isEditPending,
+  onEditProvider,
+  onEditChange,
+  onEditSubmit,
+  onEditCancel,
 }: ProviderRowProps) {
   const [apiKeyInput, setApiKeyInput] = useState("");
   const apiKeyStatus = provider.has_api_key ? "API key stored" : "API key not set";
@@ -215,6 +241,30 @@ function ProviderRow({
     onUpdateApiKey(provider.id, value);
     setApiKeyInput("");
   };
+
+  // Edit mode replaces the read-only field view with the inline edit form.
+  // The toggle / api-key-update / test / delete actions remain available in
+  // view mode; the Edit button is the entry point into edit mode.
+  if (isEditing) {
+    return (
+      <div className="settings-panel">
+        <div className="settings-row">
+          <div>
+            <h3>{`Editing ${provider.name}`}</h3>
+            <p>Update provider metadata. Provider ID is immutable. API key has its own Update Key flow when not editing.</p>
+          </div>
+        </div>
+        <ProviderForm
+          form={editForm}
+          mode="edit"
+          onChange={onEditChange}
+          onSubmit={onEditSubmit}
+          onCancel={onEditCancel}
+          isSubmitting={isEditPending}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="settings-panel">
@@ -284,6 +334,13 @@ function ProviderRow({
             <button
               type="button"
               className="btn btn--secondary btn--sm"
+              onClick={() => onEditProvider(provider)}
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              className="btn btn--secondary btn--sm"
               onClick={() => onTestConnection(provider.id)}
               disabled={isTestPending}
             >
@@ -331,6 +388,11 @@ export function ProvidersPage() {
     Record<string, { ok: boolean; error: string | null } | null>
   >({});
   const [mutationError, setMutationError] = useState<string | null>(null);
+  // Inline edit state. `editingId` is null in view mode; setting it to a
+  // provider id swaps that row into the edit form (Plan Task 6: editable on
+  // update; id is immutable and omitted from the edit form).
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<ProviderFormState>(EMPTY_FORM);
 
   const providers = useMemo<ProviderDto[]>(
     () => data?.providers ?? [],
@@ -374,6 +436,59 @@ export function ProvidersPage() {
     setShowForm(false);
   }, []);
 
+  // ── Inline edit handlers ───────────────────────────────────────────
+  const handleStartEdit = useCallback((provider: ProviderDto) => {
+    setMutationError(null);
+    setEditForm({
+      id: provider.id, // immutable; not rendered in edit mode
+      name: provider.name,
+      base_url: provider.base_url,
+      api_key_env_name: provider.api_key_env_name,
+      models: provider.models.join(", "),
+      api_key: "", // unused in edit mode (separate Update Key flow)
+    });
+    setEditingId(provider.id);
+  }, []);
+
+  const handleEditChange = useCallback((patch: Partial<ProviderFormState>) => {
+    setEditForm((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleEditSubmit = useCallback(() => {
+    if (editingId === null) return;
+    const id = editingId;
+    setMutationError(null);
+    // Send all editable fields (simpler than per-field null patching; the
+    // backend treats present fields as "set to this value"). enabled / api_key
+    // / base_url_env_name are left null (unchanged) — enabled has its own
+    // toggle and api_key has its own Update Key flow.
+    updateProvider.mutate(
+      {
+        id,
+        name: editForm.name.trim(),
+        base_url: editForm.base_url.trim(),
+        api_key_env_name: editForm.api_key_env_name.trim(),
+        base_url_env_name: null,
+        models: parseModels(editForm.models),
+        enabled: null,
+        api_key: null,
+      },
+      {
+        onSuccess: () => {
+          setEditingId(null);
+        },
+        onError: (err: unknown) => {
+          setMutationError((err as Error)?.message ?? String(err));
+        },
+      },
+    );
+  }, [editForm, editingId, updateProvider]);
+
+  const handleEditCancel = useCallback(() => {
+    setEditingId(null);
+    setEditForm(EMPTY_FORM);
+  }, []);
+
   const handleToggleEnabled = useCallback(
     (provider: ProviderDto) => {
       setMutationError(null);
@@ -383,6 +498,8 @@ export function ProvidersPage() {
           enabled: !provider.enabled,
           name: null,
           base_url: null,
+          api_key_env_name: null,
+          base_url_env_name: null,
           models: null,
           api_key: null,
         },
@@ -406,6 +523,8 @@ export function ProvidersPage() {
           enabled: null,
           name: null,
           base_url: null,
+          api_key_env_name: null,
+          base_url_env_name: null,
           models: null,
         },
         {
@@ -557,6 +676,7 @@ export function ProvidersPage() {
           {showForm && (
             <ProviderForm
               form={form}
+              mode="create"
               onChange={handleFormChange}
               onSubmit={handleFormSubmit}
               onCancel={handleFormCancel}
@@ -584,6 +704,13 @@ export function ProvidersPage() {
                 onToggleEnabled={handleToggleEnabled}
                 onDelete={handleDelete}
                 onUpdateApiKey={handleUpdateApiKey}
+                isEditing={editingId === provider.id}
+                editForm={editForm}
+                isEditPending={updateProvider.isPending && editingId === provider.id}
+                onEditProvider={handleStartEdit}
+                onEditChange={handleEditChange}
+                onEditSubmit={handleEditSubmit}
+                onEditCancel={handleEditCancel}
               />
             ))}
           </section>

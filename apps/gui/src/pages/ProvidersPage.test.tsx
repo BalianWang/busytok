@@ -356,6 +356,103 @@ describe("ProvidersPage", () => {
     );
   });
 
+  it("clicking Edit shows the inline form pre-filled with the provider values (id omitted)", () => {
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([
+          makeProvider({
+            id: "deepseek-prod",
+            name: "DeepSeek",
+            base_url: "https://api.deepseek.com/v1",
+            api_key_env_name: "DEEPSEEK_API_KEY",
+            models: ["deepseek-chat", "deepseek-reasoner"],
+          }),
+        ]),
+      ),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+
+    // Edit form renders the editable fields pre-filled from the provider.
+    expect((screen.getByLabelText(/^name$/i) as HTMLInputElement).value).toBe(
+      "DeepSeek",
+    );
+    expect(
+      (screen.getByLabelText(/base url/i) as HTMLInputElement).value,
+    ).toBe("https://api.deepseek.com/v1");
+    expect(
+      (screen.getByLabelText(/api key env name/i) as HTMLInputElement).value,
+    ).toBe("DEEPSEEK_API_KEY");
+    expect((screen.getByLabelText(/models/i) as HTMLInputElement).value).toBe(
+      "deepseek-chat, deepseek-reasoner",
+    );
+    // id is immutable and must NOT appear in the edit form.
+    expect(screen.queryByLabelText(/provider id/i)).toBeNull();
+    // api_key has its own Update Key flow and must NOT appear in the edit form.
+    expect(screen.queryByLabelText(/^api key$/i)).toBeNull();
+  });
+
+  it("submitting the edit form calls updateProvider.mutate with the edited payload", () => {
+    const updateMutate = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
+    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([
+          makeProvider({
+            id: "deepseek-prod",
+            name: "DeepSeek",
+            base_url: "https://api.deepseek.com/v1",
+            api_key_env_name: "DEEPSEEK_API_KEY",
+            models: ["deepseek-chat"],
+          }),
+        ]),
+      ),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+
+    fireEvent.change(screen.getByLabelText(/^name$/i), {
+      target: { value: "DeepSeek Renamed" },
+    });
+    fireEvent.change(screen.getByLabelText(/models/i), {
+      target: { value: "deepseek-chat, deepseek-reasoner" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+
+    expect(updateMutate).toHaveBeenCalledTimes(1);
+    expect(updateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "deepseek-prod",
+        name: "DeepSeek Renamed",
+        base_url: "https://api.deepseek.com/v1",
+        api_key_env_name: "DEEPSEEK_API_KEY",
+        base_url_env_name: null,
+        models: ["deepseek-chat", "deepseek-reasoner"],
+        enabled: null,
+        api_key: null,
+      }),
+      expect.anything(),
+    );
+    // On success the row exits edit mode (form fields gone).
+    expect(screen.queryByLabelText(/^name$/i)).toBeNull();
+  });
+
+  it("clicking Cancel in the edit form reverts to view mode", () => {
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([makeProvider({ id: "deepseek-prod", name: "DeepSeek" })]),
+      ),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    expect(screen.getByLabelText(/^name$/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+    expect(screen.queryByLabelText(/^name$/i)).toBeNull();
+  });
+
   it("renders loading state", () => {
     mockUseProviders.mockReturnValue({
       data: undefined,
