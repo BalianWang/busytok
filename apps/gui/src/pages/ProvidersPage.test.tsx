@@ -481,4 +481,131 @@ describe("ProvidersPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /update key/i }));
     expect(updateMutate).not.toHaveBeenCalled();
   });
+
+  it("clears and hides the form when Cancel is clicked", () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
+    expect(screen.getByLabelText(/provider id/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+    expect(screen.queryByLabelText(/provider id/i)).toBeNull();
+  });
+
+  it("shows Testing state when Test Connection is pending", () => {
+    const testMutate = vi.fn();
+    mockUseProviderMutations.mockReturnValue(
+      mockMutations({ testMutate: testMutate as never, testPending: true }),
+    );
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([makeProvider({ id: "deepseek-prod" })]),
+      ),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /test connection/i }));
+    expect(screen.getByRole("button", { name: /testing/i })).toBeTruthy();
+  });
+
+  // ── onError paths ──────────────────────────────────────────────
+
+  it("shows error when createProvider fails", () => {
+    const createMutate = vi.fn(
+      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+        opts?.onError?.(new Error("create failed"));
+      },
+    );
+    mockUseProviderMutations.mockReturnValue(mockMutations({ createMutate }));
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
+    fireEvent.change(screen.getByLabelText(/provider id/i), {
+      target: { value: "openai-prod" },
+    });
+    fireEvent.change(screen.getByLabelText(/^name$/i), {
+      target: { value: "OpenAI" },
+    });
+    fireEvent.change(screen.getByLabelText(/base url/i), {
+      target: { value: "https://api.openai.com/v1" },
+    });
+    fireEvent.change(screen.getByLabelText(/api key env name/i), {
+      target: { value: "OPENAI_API_KEY" },
+    });
+    fireEvent.change(screen.getByLabelText(/models/i), {
+      target: { value: "gpt-4" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(screen.getByText("create failed")).toBeTruthy();
+  });
+
+  it("shows error when toggle fails", () => {
+    const updateMutate = vi.fn(
+      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+        opts?.onError?.(new Error("toggle failed"));
+      },
+    );
+    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([makeProvider({ id: "deepseek-prod", enabled: true })]),
+      ),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("checkbox", { name: /enable/i }));
+    expect(screen.getByText("toggle failed")).toBeTruthy();
+  });
+
+  it("shows error when API key update fails", () => {
+    const updateMutate = vi.fn(
+      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+        opts?.onError?.(new Error("key update failed"));
+      },
+    );
+    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([makeProvider({ id: "deepseek-prod", has_api_key: true })]),
+      ),
+    );
+    renderPage();
+    const input = screen.getByPlaceholderText("•••• (stored)") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-new" } });
+    fireEvent.click(screen.getByRole("button", { name: /update key/i }));
+    expect(screen.getByText("key update failed")).toBeTruthy();
+  });
+
+  it("shows error when delete fails", () => {
+    const deleteMutate = vi.fn(
+      (_id: unknown, opts?: { onError?: (e: Error) => void }) => {
+        opts?.onError?.(new Error("delete failed"));
+      },
+    );
+    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    mockUseProviderMutations.mockReturnValue(mockMutations({ deleteMutate }));
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(makeListResponse([makeProvider({ id: "deepseek-prod" })])),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
+    expect(screen.getByText("delete failed")).toBeTruthy();
+    confirmSpy.mockRestore();
+  });
+
+  it("shows failure result when Test Connection errors", async () => {
+    const testMutate = vi.fn(
+      (_id: string, opts?: { onError?: (e: Error) => void }) => {
+        opts?.onError?.(new Error("network error"));
+      },
+    );
+    mockUseProviderMutations.mockReturnValue(
+      mockMutations({ testMutate: testMutate as never }),
+    );
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([makeProvider({ id: "deepseek-prod" })]),
+      ),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /test connection/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/✗|failed/i)).toBeTruthy();
+    });
+  });
 });
