@@ -15,6 +15,12 @@ use busytok_config::{BusytokPaths, SubagentPiSidecarConfig};
 use crate::sidecar::SidecarError;
 
 /// Resolved sidecar configuration — everything needed to spawn and supervise.
+///
+/// `Clone` so the WorkerPool (Task 2) can clone the base config produced by
+/// `resolve_base_sidecar_config` and override `provider_id` +
+/// `api_key_env_name` / `base_url_env_name` per provider before spawning
+/// (Phase 3 multi-provider routing). All fields are `Clone`-able.
+#[derive(Clone)]
 pub struct SidecarConfig {
     pub node_binary: PathBuf,
     pub bundle_path: PathBuf,

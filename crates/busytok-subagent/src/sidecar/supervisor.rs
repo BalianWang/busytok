@@ -503,8 +503,12 @@ impl PiSidecarSupervisor {
     /// Upgrade the weak responder ref — returns `None` if the responder was
     /// dropped (BusytokSupervisor gone). Called by the supervision loop
     /// (Task 4) when pressure transitions occur.
-    #[allow(dead_code)] // Task 4 (PressureResponder::respond) consumes this.
-    pub(crate) fn pressure_responder(&self) -> Option<Arc<PressureResponder>> {
+    ///
+    /// `pub` (not `pub(crate)`) so Task 2's `WorkerPool` integration tests
+    /// can verify `ensure_worker` wired the responder (C6 fix — verify
+    /// `sup.pressure_responder().is_some()`). The internal callers within
+    /// this crate (`invoke_pressure_responder`) are unaffected.
+    pub fn pressure_responder(&self) -> Option<Arc<PressureResponder>> {
         self.pressure_responder
             .lock()
             .unwrap()
