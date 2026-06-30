@@ -91,6 +91,9 @@ pub struct WorkerPool {
     /// `Some` in production (one global gate); `None` in tests that don't
     /// exercise the gate.
     pressure_gate: Option<Arc<PressureGate>>,
+    /// Resource policy for every supervisor (threaded from settings so
+    /// `monitor_interval_seconds` / `memory_pressure_free_mb` flow through).
+    resource_policy: SubagentResourcePolicyConfig,
     /// Responder factory (P1c two-phase init). Set ONCE via
     /// `set_responder_factory` AFTER `SidecarTaskExecutor` is constructed.
     /// `ensure_worker` reads it via `.get().expect(...)` (fail-fast if
@@ -130,6 +133,7 @@ impl WorkerPool {
         providers: ProviderLookup,
         credential_reader: CredentialReader,
         pressure_gate: Option<Arc<PressureGate>>,
+        resource_policy: SubagentResourcePolicyConfig,
     ) -> Self {
         Self {
             base_config,
@@ -137,6 +141,7 @@ impl WorkerPool {
             providers,
             credential_reader,
             pressure_gate,
+            resource_policy,
             responder_factory: OnceLock::new(),
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -268,7 +273,7 @@ impl WorkerPool {
         // Construct supervisor with shared pressure gate. Uses default
         // resource policy (Task 4's construct_sidecar may thread a real
         // policy if needed — not in scope for Task 2).
-        let policy = SubagentResourcePolicyConfig::default();
+        let policy = self.resource_policy.clone();
         let sup = PiSidecarSupervisor::with_resource_policy(
             config,
             self.db.clone(),
@@ -371,7 +376,7 @@ impl WorkerPool {
     /// Iterate over all supervisors (sync). For `evict_lru` iteration
     /// across all providers (Task 3, I5 fix). The closure receives the
     /// provider_id and a strong `Arc<PiSidecarSupervisor>` ref.
-    pub fn for_each_supervisor(&self, f: impl Fn(&str, &Arc<PiSidecarSupervisor>)) {
+    pub fn for_each_supervisor(&self, mut f: impl FnMut(&str, &Arc<PiSidecarSupervisor>)) {
         let workers = self.workers.lock().expect("workers map lock poisoned");
         for (pid, sup) in workers.iter() {
             f(pid, sup);
@@ -382,20 +387,54 @@ impl WorkerPool {
     /// (C7 fix: `evict_session` needs this to route `prepare_hibernate` /
     /// `close` RPCs to the correct supervisor in a multi-provider pool).
     ///
-    /// Returns `None` if no supervisor owns the session.
+    /// Returns `None` if no supervisor owns the session (binding belongs to
+    /// a removed provider, or no binding exists for the session).
     ///
-    /// NOTE: The current binding schema (`subagent_harness_bindings`) does
-    /// not store `provider_id`, so routing `adapter_session_id` →
-    /// `provider_id` → supervisor requires a `subagent → profile →
-    /// provider_id` join that depends on settings not available to the
-    /// pool. Task 3's `evict_session` routing will populate this when it
-    /// adds the lookup path (or threads the profile → provider_id map
-    /// through the pool). The method signature is preserved here so Task 3
-    /// can implement it without changing the public API.
+    /// **Routing strategy:** the binding schema (`subagent_harness_bindings`)
+    /// stores `harness` but NOT `provider_id`. So we iterate the pool's
+    /// supervisors and query `find_hot_binding_by_session` for each
+    /// supervisor's `harness_name`. The first match wins. Since all current
+    /// providers use `harness_name = "pi"`, the first supervisor with a
+    /// matching harness is returned. This is O(n) in the number of
+    /// providers (small — typically 1-3) and avoids a schema migration to
+    /// add `provider_id` to the binding table.
     pub fn supervisor_for_session(
         &self,
-        _adapter_session_id: &str,
+        adapter_session_id: &str,
     ) -> Option<(String, Arc<PiSidecarSupervisor>)> {
+        // Collect (provider_id, supervisor, harness_name) under the map
+        // lock, then release before querying the DB (DB lock is a
+        // `std::sync::Mutex` — never hold both locks simultaneously to
+        // avoid lock-ordering issues).
+        let candidates: Vec<(String, Arc<PiSidecarSupervisor>, String)> = {
+            let workers = self.workers.lock().expect("workers map lock poisoned");
+            workers
+                .iter()
+                .map(|(pid, sup)| {
+                    (
+                        pid.clone(),
+                        Arc::clone(sup),
+                        sup.config().harness_name.clone(),
+                    )
+                })
+                .collect()
+        };
+        let Some(db) = &self.db else {
+            // No DB — can't query bindings. Return the first supervisor
+            // (single-provider fallback for no-DB test paths).
+            return candidates
+                .into_iter()
+                .next()
+                .map(|(pid, sup, _)| (pid, sup));
+        };
+        let db = db.lock().expect("db lock poisoned");
+        for (pid, sup, harness) in &candidates {
+            if let Ok(Some(_binding)) =
+                db.subagent_find_hot_binding_by_session(adapter_session_id, harness)
+            {
+                return Some((pid.clone(), Arc::clone(sup)));
+            }
+        }
         None
     }
 }

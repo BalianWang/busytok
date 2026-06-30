@@ -2,23 +2,122 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[path = "support/mod.rs"]
 mod support;
 
-use busytok_config::SubagentSettings;
+use busytok_config::{
+    ProviderConfig, ProviderKind, SubagentResourcePolicyConfig, SubagentSettings,
+};
 use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
 use busytok_store::Database;
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::DelegateRequest;
 use busytok_subagent::sidecar::{
-    PiSidecarSupervisor, PressureLevel, SidecarConfig, SidecarError, SidecarTaskExecutor,
-    WorkerState,
+    CredentialReader, PiSidecarSupervisor, PressureLevel, ProviderLookup, ResponderFactory,
+    SidecarConfig, SidecarError, SidecarTaskExecutor, WorkerPool, WorkerState,
 };
 use busytok_subagent::{PressureAction, PressureGate, PressureResponder};
+
+/// The test provider ID used by pool-based dummy executors.
+const TEST_PROVIDER_ID: &str = "test-prov";
+
+fn test_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: TEST_PROVIDER_ID.to_string(),
+        name: "Test".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://test.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    }
+}
+
+fn make_providers() -> ProviderLookup {
+    Arc::new(|pid: &str| -> Option<ProviderConfig> {
+        match pid {
+            TEST_PROVIDER_ID => Some(test_provider()),
+            _ => None,
+        }
+    })
+}
+
+fn canned_credential_reader() -> CredentialReader {
+    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+}
+
+/// Build a responder factory that keeps responders alive in a shared holder
+/// (mirrors production wiring in `construct_sidecar`).
+fn make_responder_factory(
+    gate: Arc<PressureGate>,
+    executor_weak: Weak<SidecarTaskExecutor>,
+) -> (ResponderFactory, Arc<Mutex<Vec<Arc<PressureResponder>>>>) {
+    let holder: Arc<Mutex<Vec<Arc<PressureResponder>>>> = Arc::new(Mutex::new(Vec::new()));
+    let holder_for_closure = Arc::clone(&holder);
+    let factory: ResponderFactory = Arc::new(
+        move |sup_weak: Weak<PiSidecarSupervisor>| -> Arc<PressureResponder> {
+            let responder = Arc::new(PressureResponder::new(
+                sup_weak,
+                executor_weak.clone(),
+                Arc::clone(&gate),
+            ));
+            holder_for_closure
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&responder));
+            responder
+        },
+    );
+    (factory, holder)
+}
+
+/// Build a dummy executor (pool with `/usr/bin/true` config) for tests that
+/// construct a supervisor directly with a custom policy. The executor just
+/// needs to exist so the `Weak<SidecarTaskExecutor>` in the responder stays
+/// upgradeable — `execute()` / `evict_lru()` are never called on it.
+fn make_dummy_executor(db: Arc<Mutex<Database>>) -> Arc<SidecarTaskExecutor> {
+    let config = SidecarConfig {
+        node_binary: PathBuf::from("/usr/bin/true"),
+        bundle_path: PathBuf::from("/dev/null"),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(300),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
+    };
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        config,
+        Some(Arc::clone(&db)),
+        make_providers(),
+        canned_credential_reader(),
+        Some(Arc::clone(&gate)),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = Arc::new(SidecarTaskExecutor::with_pool(
+        Arc::clone(&pool),
+        Some(Arc::clone(&db)),
+    ));
+    let (factory, _holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
+    pool.set_responder_factory(factory);
+    let _ = pool
+        .ensure_worker(TEST_PROVIDER_ID)
+        .expect("ensure_worker test-prov");
+    executor
+}
 
 fn mock_config() -> SidecarConfig {
     SidecarConfig {
@@ -924,7 +1023,7 @@ async fn pressure_responder_force_kill_kills_sidecar_and_writes_crash_event() {
     let _ = sup.ensure_started().await.unwrap();
     assert!(sup.try_is_running());
 
-    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let executor = make_dummy_executor(db.clone());
     let responder = Arc::new(PressureResponder::new(
         Arc::downgrade(&sup),
         Arc::downgrade(&executor),
@@ -968,7 +1067,7 @@ async fn reconcile_crash_error_path_when_db_write_fails() {
     let sup = PiSidecarSupervisor::new(cfg, Some(h.db.clone()));
     let _ = sup.ensure_started().await.unwrap();
 
-    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let executor = make_dummy_executor(h.db.clone());
     let responder = Arc::new(PressureResponder::new(
         Arc::downgrade(&sup),
         Arc::downgrade(&executor),
@@ -1274,7 +1373,7 @@ async fn resource_sampling_hard_limit_triggers_force_kill_via_responder() {
 
     // Wire a PressureResponder so invoke_pressure_responder spawns the
     // respond task (covers lines 848-850).
-    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let executor = make_dummy_executor(Arc::clone(&db));
     let responder = Arc::new(PressureResponder::new(
         Arc::downgrade(&sup),
         Arc::downgrade(&executor),

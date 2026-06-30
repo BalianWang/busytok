@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use busytok_config::{ProviderConfig, ProviderKind};
+use busytok_config::{ProviderConfig, ProviderKind, SubagentResourcePolicyConfig};
 use busytok_subagent::pressure::{PressureGate, PressureResponder};
 use busytok_subagent::sidecar::{
     CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, SidecarConfig,
@@ -98,22 +98,21 @@ fn canned_credential_reader() -> CredentialReader {
 
 /// Build a responder_factory that constructs a real `PressureResponder` and
 /// keeps a strong ref alive in a shared holder (so the Weak stored on the
-/// supervisor stays upgradeable). The factory captures the pressure_gate so
-/// the responder shares the pool's gate.
+/// supervisor stays upgradeable). The factory captures the shared
+/// `Weak<SidecarTaskExecutor>` (Phase 3 Task 3: one pool-wide executor, not
+/// a per-supervisor executor) and the pressure_gate so the responder shares
+/// the pool's gate.
 fn make_responder_factory(
     gate: Arc<PressureGate>,
+    executor_weak: Weak<SidecarTaskExecutor>,
 ) -> (ResponderFactory, Arc<Mutex<Vec<Arc<PressureResponder>>>>) {
     let holder: Arc<Mutex<Vec<Arc<PressureResponder>>>> = Arc::new(Mutex::new(Vec::new()));
     let holder_for_closure = Arc::clone(&holder);
     let factory: ResponderFactory = Arc::new(
         move |sup_weak: Weak<PiSidecarSupervisor>| -> Arc<PressureResponder> {
-            let sup = sup_weak
-                .upgrade()
-                .expect("supervisor dropped during responder construction");
-            let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
             let responder = Arc::new(PressureResponder::new(
-                Arc::downgrade(&sup),
-                Arc::downgrade(&executor),
+                sup_weak,
+                executor_weak.clone(),
                 Arc::clone(&gate),
             ));
             // Keep a strong ref so the Weak stored on the supervisor stays
@@ -129,20 +128,36 @@ fn make_responder_factory(
     (factory, holder)
 }
 
-/// Build a fully-wired test pool with a shared PressureGate and the
-/// responder_factory set. Returns the pool + the gate (for assertions).
-fn make_test_pool() -> (WorkerPool, Arc<PressureGate>) {
+/// Build a fully-wired test pool with a shared PressureGate, the
+/// responder_factory set, and a pool-wide `SidecarTaskExecutor`.
+/// Returns `(pool, gate, executor)` — the executor must be kept alive by
+/// the caller so the `Weak<SidecarTaskExecutor>` in each responder stays
+/// upgradeable (two-phase bootstrap: pool → executor → factory → pool).
+fn make_test_pool_with_creds(
+    credential_reader: CredentialReader,
+) -> (Arc<WorkerPool>, Arc<PressureGate>, Arc<SidecarTaskExecutor>) {
     let gate = Arc::new(PressureGate::new());
-    let (factory, _holder) = make_responder_factory(Arc::clone(&gate));
-    let pool = WorkerPool::new(
+    let pool = Arc::new(WorkerPool::new(
         base_config(),
         None,
         make_providers(),
-        canned_credential_reader(),
+        credential_reader,
         Some(Arc::clone(&gate)),
-    );
+        SubagentResourcePolicyConfig::default(),
+    ));
+    // Phase 2: construct executor (captures pool), then factory (captures
+    // executor weak), then set factory on pool. After this, ensure_worker
+    // can construct supervisors with responders wired.
+    let executor = Arc::new(SidecarTaskExecutor::with_pool(Arc::clone(&pool), None));
+    let (factory, _holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
     pool.set_responder_factory(factory);
-    (pool, gate)
+    (pool, gate, executor)
+}
+
+/// Convenience wrapper: `make_test_pool_with_creds` with the canned
+/// credential reader.
+fn make_test_pool() -> (Arc<WorkerPool>, Arc<PressureGate>, Arc<SidecarTaskExecutor>) {
+    make_test_pool_with_creds(canned_credential_reader())
 }
 
 // --- Step 1 test cases (per task-2-brief.md) ---
@@ -151,7 +166,7 @@ fn make_test_pool() -> (WorkerPool, Arc<PressureGate>) {
 /// call returns the same Arc (lazy singleton per provider).
 #[test]
 fn ensure_worker_creates_supervisor_lazily() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     let sup1 = pool.ensure_worker("deepseek").expect("first ensure_worker");
     let sup2 = pool
         .ensure_worker("deepseek")
@@ -168,7 +183,7 @@ fn ensure_worker_creates_supervisor_lazily() {
 ///   `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS`.
 #[test]
 fn ensure_worker_injects_credentials() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     let sup = pool.ensure_worker("deepseek").expect("ensure_worker");
     let env = &sup.config().env;
     assert_eq!(
@@ -206,7 +221,7 @@ fn ensure_worker_injects_credentials() {
 /// `base_url_env_name = None` — should default to `OPENAI_BASE_URL`.
 #[test]
 fn ensure_worker_injects_credentials_default_base_url_env_name() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     let sup = pool.ensure_worker("openai").expect("ensure_worker");
     let env = &sup.config().env;
     assert_eq!(
@@ -228,7 +243,7 @@ fn ensure_worker_injects_credentials_default_base_url_env_name() {
 /// `sup.pressure_responder().is_some()`).
 #[test]
 fn ensure_worker_sets_pressure_responder() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     let sup = pool.ensure_worker("deepseek").expect("ensure_worker");
     assert!(
         sup.pressure_responder().is_some(),
@@ -248,16 +263,7 @@ async fn remove_worker_then_ensure_creates_new_supervisor() {
         Ok(Some("test-key".to_string()))
     });
 
-    let gate = Arc::new(PressureGate::new());
-    let (factory, _holder) = make_responder_factory(Arc::clone(&gate));
-    let pool = WorkerPool::new(
-        base_config(),
-        None,
-        make_providers(),
-        credential_reader,
-        Some(gate),
-    );
-    pool.set_responder_factory(factory);
+    let (pool, _gate, _exec) = make_test_pool_with_creds(credential_reader);
 
     let sup1 = pool.ensure_worker("deepseek").expect("first ensure");
     assert_eq!(
@@ -286,7 +292,7 @@ async fn remove_worker_then_ensure_creates_new_supervisor() {
 /// snapshots.
 #[tokio::test]
 async fn worker_snapshots_returns_all_workers() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     pool.ensure_worker("deepseek").expect("ensure deepseek");
     pool.ensure_worker("openai").expect("ensure openai");
 
@@ -301,7 +307,7 @@ async fn worker_snapshots_returns_all_workers() {
 /// providers → error.
 #[test]
 fn ensure_worker_fails_for_unknown_provider() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     match pool.ensure_worker("nonexistent") {
         Err(SidecarError::Spawn(msg)) => {
             assert!(
@@ -318,7 +324,7 @@ fn ensure_worker_fails_for_unknown_provider() {
 /// → error.
 #[test]
 fn ensure_worker_fails_for_disabled_provider() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     match pool.ensure_worker("disabled-prov") {
         Err(SidecarError::Spawn(msg)) => {
             assert!(
@@ -335,17 +341,8 @@ fn ensure_worker_fails_for_disabled_provider() {
 /// (`Ok(None)` from credential_reader).
 #[test]
 fn ensure_worker_fails_for_missing_api_key() {
-    let gate = Arc::new(PressureGate::new());
-    let (factory, _holder) = make_responder_factory(Arc::clone(&gate));
     let credential_reader: CredentialReader = Arc::new(|_| Ok(None));
-    let pool = WorkerPool::new(
-        base_config(),
-        None,
-        make_providers(),
-        credential_reader,
-        Some(gate),
-    );
-    pool.set_responder_factory(factory);
+    let (pool, _gate, _exec) = make_test_pool_with_creds(credential_reader);
 
     match pool.ensure_worker("deepseek") {
         Err(SidecarError::Spawn(msg)) => {
@@ -363,18 +360,9 @@ fn ensure_worker_fails_for_missing_api_key() {
 /// → `SidecarError::Spawn("keychain read failed: ...")`.
 #[test]
 fn ensure_worker_fails_for_keychain_error() {
-    let gate = Arc::new(PressureGate::new());
-    let (factory, _holder) = make_responder_factory(Arc::clone(&gate));
     let credential_reader: CredentialReader =
         Arc::new(|_| Err(anyhow::anyhow!("simulated keychain failure")));
-    let pool = WorkerPool::new(
-        base_config(),
-        None,
-        make_providers(),
-        credential_reader,
-        Some(gate),
-    );
-    pool.set_responder_factory(factory);
+    let (pool, _gate, _exec) = make_test_pool_with_creds(credential_reader);
 
     match pool.ensure_worker("deepseek") {
         Err(SidecarError::Spawn(msg)) => {
@@ -398,8 +386,7 @@ fn ensure_worker_fails_for_keychain_error() {
 /// actual concurrency (ensure_worker is synchronous).
 #[tokio::test]
 async fn ensure_worker_concurrent_same_provider_no_duplicate() {
-    let (pool, _gate) = make_test_pool();
-    let pool = Arc::new(pool);
+    let (pool, _gate, _exec) = make_test_pool();
     let p1 = Arc::clone(&pool);
     let p2 = Arc::clone(&pool);
 
@@ -429,6 +416,7 @@ fn ensure_worker_panics_if_responder_factory_unset() {
         make_providers(),
         canned_credential_reader(),
         Some(gate),
+        SubagentResourcePolicyConfig::default(),
     );
     // This should panic (P1c fail-fast).
     let _ = pool.ensure_worker("deepseek");
@@ -438,7 +426,7 @@ fn ensure_worker_panics_if_responder_factory_unset() {
 /// `evict_lru` iteration across all providers in Task 3).
 #[test]
 fn for_each_supervisor_iterates_all_workers() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     pool.ensure_worker("deepseek").expect("ensure deepseek");
     pool.ensure_worker("openai").expect("ensure openai");
 
@@ -461,7 +449,7 @@ fn for_each_supervisor_iterates_all_workers() {
 /// no-op on a None child).
 #[tokio::test]
 async fn shutdown_all_clears_map() {
-    let (pool, _gate) = make_test_pool();
+    let (pool, _gate, _exec) = make_test_pool();
     pool.ensure_worker("deepseek").expect("ensure deepseek");
     pool.ensure_worker("openai").expect("ensure openai");
     assert_eq!(

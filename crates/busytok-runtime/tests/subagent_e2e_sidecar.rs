@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use busytok_config::{BusytokPaths, BusytokSettings};
+use busytok_config::{BusytokPaths, BusytokSettings, ProviderConfig, ProviderKind};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
@@ -71,6 +71,10 @@ fn mock_sidecar_bundle_path() -> PathBuf {
 
 /// Settings with pi_sidecar enabled, using system bash as the "node"
 /// binary (mock-sidecar.sh is a bash script, not a Node bundle).
+/// Configures a test provider + binds the "pi/search-cheap" profile to it
+/// so the WorkerPool can route delegate calls. The API key is injected via
+/// `BUSYTOK_TEST_API_KEY` env var (checked by `construct_sidecar`'s
+/// credential reader before falling back to the OS keychain).
 fn make_sidecar_settings() -> BusytokSettings {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
@@ -79,6 +83,27 @@ fn make_sidecar_settings() -> BusytokSettings {
         sidecar_shell_path().to_string_lossy().to_string();
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
     settings.subagent.pi_sidecar.task_timeout_seconds = 30;
+
+    // Add a test provider + bind profiles to it.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider".to_string(),
+        name: "Test Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    // Bind all built-in profiles to the test provider.
+    for profile in settings.subagent.profiles.values_mut() {
+        profile.provider_id = Some("test-provider".to_string());
+    }
+
+    // Inject a fake API key via env var so `construct_sidecar`'s credential
+    // reader returns it without touching the OS keychain.
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+
     settings
 }
 

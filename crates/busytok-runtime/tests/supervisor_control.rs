@@ -29,7 +29,10 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use busytok_adapters::AgentLogAdapter;
-use busytok_config::{BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig};
+use busytok_config::{
+    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig, ProviderConfig,
+    ProviderKind,
+};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_discovery::DiscoveredLogSource;
 use busytok_domain::{
@@ -228,6 +231,23 @@ fn make_sidecar_config() -> SidecarConfig {
 fn make_sidecar_settings() -> BusytokSettings {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
+
+    // Add a test provider + bind profiles so the WorkerPool can route.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider".to_string(),
+        name: "Test Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    for profile in settings.subagent.profiles.values_mut() {
+        profile.provider_id = Some("test-provider".to_string());
+    }
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+
     settings
 }
 

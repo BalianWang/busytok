@@ -15,6 +15,15 @@ pub const PROFILE_NOT_FOUND: i32 = -32005;
 pub const TOOL_NOT_ALLOWED: i32 = -32006;
 pub const INVALID_OUTPUT_SCHEMA: i32 = -32007;
 pub const PROTOCOL_MISMATCH: i32 = -32008;
+// Phase 3 Task 3: error classification codes. Start at -32010 to avoid
+// collisions with the existing -32001..-32008 range. Mapped to
+// `TaskErrorKind` by `classify_sidecar_error` in executor.rs.
+/// Auth failure (401) → `TaskErrorKind::Auth` → hard kill + remove worker.
+pub const AUTH_FAILURE: i32 = -32010;
+/// Rate limit (429) → `TaskErrorKind::RateLimit` → keep worker, surface error.
+pub const RATE_LIMIT: i32 = -32011;
+/// Network error → `TaskErrorKind::Network` → keep worker, surface error.
+pub const NETWORK_ERROR: i32 = -32012;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 

@@ -2,13 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[path = "support/mod.rs"]
 mod support;
 
-use busytok_config::SubagentSettings;
+use busytok_config::{
+    ProviderConfig, ProviderKind, SubagentResourcePolicyConfig, SubagentSettings,
+};
 use busytok_store::repository::{
     SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
 };
@@ -16,12 +18,18 @@ use busytok_store::Database;
 use busytok_subagent::context::{CompactContext, MemorySnapshot};
 use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
+use busytok_subagent::pressure::{PressureGate, PressureResponder};
 use busytok_subagent::sidecar::config::SidecarConfig;
 use busytok_subagent::sidecar::executor::SidecarTaskExecutor;
-use busytok_subagent::sidecar::PiSidecarSupervisor;
+use busytok_subagent::sidecar::{
+    CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, WorkerPool,
+};
 use busytok_subagent::SubagentManager;
 
 type SharedDb = Arc<std::sync::Mutex<Database>>;
+
+/// The test provider ID used by all pool-based tests.
+const TEST_PROVIDER_ID: &str = "test-prov";
 
 fn empty_memory_snapshot() -> MemorySnapshot {
     MemorySnapshot {
@@ -65,10 +73,120 @@ fn mock_config() -> SidecarConfig {
     mock_sidecar_config_with_env(HashMap::new())
 }
 
+// --- Pool-based test helpers (Phase 3 Task 3) ---
+//
+// `SidecarTaskExecutor` now holds `Arc<WorkerPool>` instead of
+// `Arc<PiSidecarSupervisor>`. These helpers construct a pool with a single
+// "test-prov" provider, wire the two-phase bootstrap (pool → executor →
+// factory → pool), and return the supervisor via `ensure_worker`.
+
+fn test_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: TEST_PROVIDER_ID.to_string(),
+        name: "Test".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://test.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    }
+}
+
+fn make_providers() -> ProviderLookup {
+    Arc::new(|pid: &str| -> Option<ProviderConfig> {
+        match pid {
+            TEST_PROVIDER_ID => Some(test_provider()),
+            _ => None,
+        }
+    })
+}
+
+fn canned_credential_reader() -> CredentialReader {
+    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+}
+
+fn make_responder_factory(
+    gate: Arc<PressureGate>,
+    executor_weak: Weak<SidecarTaskExecutor>,
+) -> (ResponderFactory, Arc<Mutex<Vec<Arc<PressureResponder>>>>) {
+    let holder: Arc<Mutex<Vec<Arc<PressureResponder>>>> = Arc::new(Mutex::new(Vec::new()));
+    let holder_for_closure = Arc::clone(&holder);
+    let factory: ResponderFactory = Arc::new(
+        move |sup_weak: Weak<PiSidecarSupervisor>| -> Arc<PressureResponder> {
+            let responder = Arc::new(PressureResponder::new(
+                sup_weak,
+                executor_weak.clone(),
+                Arc::clone(&gate),
+            ));
+            holder_for_closure
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&responder));
+            responder
+        },
+    );
+    (factory, holder)
+}
+
+/// Build a fully-wired test pool + executor + supervisor for the mock
+/// sidecar. The pool is configured with a single `TEST_PROVIDER_ID`
+/// provider and the given base config (env vars preserved).
+///
+/// The DB is threaded to BOTH the pool (for supervisors) and the executor
+/// (for eviction persistence). Returns `(pool, executor, supervisor,
+/// responder_holder)` — the executor must be kept alive by the caller so
+/// the `Weak<SidecarTaskExecutor>` in each responder stays upgradeable.
+fn make_pool_with_config(
+    config: SidecarConfig,
+    db: Option<SharedDb>,
+) -> (
+    Arc<WorkerPool>,
+    Arc<SidecarTaskExecutor>,
+    Arc<PiSidecarSupervisor>,
+    Arc<Mutex<Vec<Arc<PressureResponder>>>>,
+) {
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        config,
+        db.clone(),
+        make_providers(),
+        canned_credential_reader(),
+        Some(Arc::clone(&gate)),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = Arc::new(SidecarTaskExecutor::with_pool(Arc::clone(&pool), db));
+    let (factory, holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
+    pool.set_responder_factory(factory);
+    let supervisor = pool
+        .ensure_worker(TEST_PROVIDER_ID)
+        .expect("ensure_worker test-prov");
+    (pool, executor, supervisor, holder)
+}
+
+/// Build `SubagentSettings` with the `pi/search-cheap` profile bound to
+/// `TEST_PROVIDER_ID` so `SubagentManager::delegate` threads a non-`None`
+/// `provider_id` into `ExecutorInput` (required by the pool-based executor).
+fn settings_with_test_provider() -> SubagentSettings {
+    let mut settings = SubagentSettings::default();
+    settings
+        .profiles
+        .get_mut("pi/search-cheap")
+        .expect("default profiles must include pi/search-cheap")
+        .provider_id = Some(TEST_PROVIDER_ID.to_string());
+    settings
+}
+
 struct TestHarness {
     manager: SubagentManager,
     db: SharedDb,
+    pool: Arc<WorkerPool>,
     supervisor: Arc<PiSidecarSupervisor>,
+    /// Keep the executor alive so the `Weak<SidecarTaskExecutor>` in each
+    /// responder stays upgradeable (mirrors production wiring where
+    /// `BusytokSupervisor` holds the strong ref).
+    _executor: Arc<SidecarTaskExecutor>,
+    _responder_holder: Arc<Mutex<Vec<Arc<PressureResponder>>>>,
 }
 
 fn make_harness() -> TestHarness {
@@ -77,16 +195,22 @@ fn make_harness() -> TestHarness {
 
 fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     let db: SharedDb = Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
-    let supervisor =
-        PiSidecarSupervisor::new(mock_sidecar_config_with_env(env), Some(Arc::clone(&db)));
-    let executor: Arc<dyn TaskExecutor> =
-        Arc::new(SidecarTaskExecutor::new(Arc::clone(&supervisor)));
-    let manager =
-        SubagentManager::new(Arc::clone(&db), SubagentSettings::default(), "pi", executor);
+    let (pool, executor, supervisor, holder) =
+        make_pool_with_config(mock_sidecar_config_with_env(env), Some(Arc::clone(&db)));
+    let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
+    let manager = SubagentManager::new(
+        Arc::clone(&db),
+        settings_with_test_provider(),
+        "pi",
+        exec_dyn,
+    );
     TestHarness {
         manager,
         db,
+        pool,
         supervisor,
+        _executor: executor,
+        _responder_holder: holder,
     }
 }
 
@@ -236,7 +360,7 @@ fn executor_input() -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     }
 }
 
@@ -249,8 +373,7 @@ async fn execute_returns_error_when_supervisor_cannot_spawn() {
     let mut cfg = mock_sidecar_config_with_env(HashMap::new());
     cfg.node_binary = PathBuf::from("/nonexistent/busytok-node-binary");
     cfg.bundle_path = PathBuf::from("/nonexistent/bundle.js");
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let (_pool, executor, _supervisor, _holder) = make_pool_with_config(cfg, None);
 
     let err = match executor.execute(&executor_input()).await {
         Ok(_) => panic!("expected error when supervisor cannot spawn"),
@@ -293,8 +416,7 @@ async fn execute_returns_error_when_sidecar_crashes_during_turn_auto() {
     // Keep the health interval long so the health pinger doesn't race the
     // crash detection.
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let (_pool, executor, _supervisor, _holder) = make_pool_with_config(cfg, None);
 
     let err = match executor.execute(&executor_input()).await {
         Ok(_) => panic!("expected error when sidecar crashes during turn_auto"),
@@ -342,8 +464,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
     cfg.env
         .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     // First delegate — fills the pool (max_hot=1).
     let input1 = ExecutorInput {
@@ -359,7 +480,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     };
     let out1 = executor
         .execute(&input1)
@@ -426,7 +547,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     };
     let out2 = executor
         .execute(&input2)
@@ -478,8 +599,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
     cfg.env
         .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     // First delegate — fills the sidecar's pool (max_hot=1)
     let input1 = ExecutorInput {
@@ -495,7 +615,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     };
     let _out1 = executor
         .execute(&input1)
@@ -523,7 +643,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -604,8 +724,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
     cfg.env
         .insert("BUSYTOK_MOCK_CLOSE_FAILS".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     // First delegate — fills the sidecar's pool (max_hot=1), session pi_sess_mock_1.
     let input1 = ExecutorInput {
@@ -621,7 +740,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     };
     let _out1 = executor
         .execute(&input1)
@@ -647,7 +766,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -718,8 +837,7 @@ async fn executor_turn_auto_failed_status_maps_to_failed() {
     env.insert("BUSYTOK_MOCK_TURN_STATUS".to_string(), "failed".to_string());
     let mut cfg = mock_sidecar_config_with_env(env);
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
 
     let out = executor
         .execute(&executor_input())
@@ -739,8 +857,7 @@ async fn executor_turn_auto_timeout_status_maps_to_failed() {
     );
     let mut cfg = mock_sidecar_config_with_env(env);
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
 
     let out = executor
         .execute(&executor_input())
@@ -763,8 +880,7 @@ async fn executor_turn_auto_unknown_status_falls_back_to_completed() {
     );
     let mut cfg = mock_sidecar_config_with_env(env);
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
 
     let out = executor
         .execute(&executor_input())
@@ -798,7 +914,7 @@ fn evict_input(id: &str) -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: None,
+        provider_id: Some(TEST_PROVIDER_ID.to_string()),
     }
 }
 
@@ -863,8 +979,7 @@ async fn executor_eviction_fails_when_candidate_missing_from_error() {
     cfg.env
         .insert("BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None);
-    let executor = SidecarTaskExecutor::new(supervisor.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
 
     // Fill the pool (max_hot=1).
     executor
@@ -903,8 +1018,7 @@ async fn executor_eviction_fails_without_db() {
     cfg.env
         .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, None); // No DB
-    let executor = SidecarTaskExecutor::new(supervisor.clone()); // No DB
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None); // No DB
 
     // First delegate — fills the pool (max_hot=1).
     executor
@@ -946,8 +1060,7 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
     cfg.env
         .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     let out1 = executor
         .execute(&evict_input("sub-a"))
@@ -983,8 +1096,7 @@ async fn executor_eviction_skips_memory_write_when_memory_delta_null() {
     cfg.env
         .insert("BUSYTOK_MOCK_NULL_MEMORY_DELTA".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     let out1 = executor
         .execute(&evict_input("sub-a"))
@@ -1040,8 +1152,7 @@ async fn executor_eviction_keeps_warm_when_prior_memory_exists_and_delta_null() 
     cfg.env
         .insert("BUSYTOK_MOCK_NULL_MEMORY_DELTA".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     let out1 = executor
         .execute(&evict_input("sub-a"))
@@ -1103,8 +1214,7 @@ async fn executor_eviction_propagates_error_when_retry_turn_auto_fails() {
         "1".into(),
     );
     cfg.health_interval = Duration::from_secs(3600);
-    let supervisor = PiSidecarSupervisor::new(cfg, Some(db.clone()));
-    let executor = SidecarTaskExecutor::with_db(supervisor.clone(), db.clone());
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
     let out1 = executor
         .execute(&evict_input("sub-a"))

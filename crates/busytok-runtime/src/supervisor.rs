@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -217,8 +217,14 @@ impl BusytokSupervisor {
         // `pi_sidecar.enabled = true` must ensure the bundle is installed; a
         // missing bundle surfaces as an `error!` log + queryable init error
         // and degraded (mock) execution rather than a panic.
-        let (executor, sidecar_supervisor, sidecar_init_error, pressure_gate, sidecar_executor) =
-            Self::construct_sidecar(&settings, &paths, &db, None);
+        let (
+            executor,
+            sidecar_supervisor,
+            sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
+            pressure_responder,
+        ) = Self::construct_sidecar(&settings, &paths, &db, None);
         Self::assemble_with_sidecar(
             db,
             paths,
@@ -230,6 +236,7 @@ impl BusytokSupervisor {
             sidecar_init_error,
             pressure_gate,
             sidecar_executor,
+            pressure_responder,
         )
     }
 
@@ -247,8 +254,14 @@ impl BusytokSupervisor {
     ) -> Self {
         let event_bus = AppEventBus::new(64);
         let db = Arc::new(Mutex::new(db));
-        let (executor, sidecar_supervisor, sidecar_init_error, pressure_gate, sidecar_executor) =
-            Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
+        let (
+            executor,
+            sidecar_supervisor,
+            sidecar_init_error,
+            pressure_gate,
+            sidecar_executor,
+            pressure_responder,
+        ) = Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
         Self::assemble_with_sidecar(
             db,
             paths,
@@ -260,19 +273,32 @@ impl BusytokSupervisor {
             sidecar_init_error,
             pressure_gate,
             sidecar_executor,
+            pressure_responder,
         )
     }
 
-    /// Construct the sidecar executor + supervisor + init-error triple.
+    /// Construct the sidecar executor + pool + supervisor + init-error.
     /// When `sidecar_config_override` is `Some`, skip `resolve_sidecar_config`
     /// and use the provided config directly (test injection path). When
     /// `None`, resolve from settings + paths (production path).
     ///
-    /// Returns a 5-tuple: `(executor, sidecar_supervisor, sidecar_init_error,
-    /// pressure_gate, sidecar_executor)`. The last two are `Some` only when
-    /// the sidecar is enabled AND its config resolved successfully — they're
-    /// consumed by `assemble_with_sidecar` to construct the `PressureResponder`
-    /// and wire the manager's `PressureGate`.
+    /// Returns a 6-tuple: `(executor, sidecar_supervisor, sidecar_init_error,
+    /// pressure_gate, sidecar_executor, pressure_responder)`. The last three
+    /// are `Some` only when the sidecar is enabled AND its config resolved
+    /// successfully — they're consumed by `assemble_with_sidecar` to wire
+    /// the manager's `PressureGate` and store the responder.
+    ///
+    /// **Phase 3 Task 3:** the executor is rewired from a single
+    /// `PiSidecarSupervisor` to `Arc<WorkerPool>`. The pool is constructed
+    /// with a providers lookup (from `settings.providers`) + credential
+    /// reader (from `ProviderCredentialStore`). Two-phase bootstrap:
+    /// pool → executor → responder factory → `set_responder_factory` →
+    /// `ensure_worker(first enabled provider)` → supervisor for the
+    /// `sidecar_supervisor` field (used by doctor checks, shutdown, and
+    /// runtime status). If no providers are configured, `sidecar_supervisor`
+    /// stays `None` (degraded — delegate calls fail with "profile not bound
+    /// to a provider"). The full multi-provider runtime status (showing all
+    /// workers) is Task 4's scope.
     fn construct_sidecar(
         settings: &BusytokSettings,
         paths: &BusytokPaths,
@@ -284,6 +310,7 @@ impl BusytokSupervisor {
         Option<String>,
         Option<Arc<busytok_subagent::PressureGate>>,
         Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+        Option<Arc<busytok_subagent::PressureResponder>>,
     ) {
         if !settings.subagent.pi_sidecar.enabled {
             return (
@@ -293,47 +320,135 @@ impl BusytokSupervisor {
                 None,
                 None,
                 None,
+                None,
             );
         }
-        // Either use the injected config (test path) or resolve from settings.
+        // Either use the injected config (test path) or resolve the base
+        // (unbound) config from settings + paths. `resolve_base_sidecar_config`
+        // produces a config with empty `provider_id` / env names — the pool
+        // clones it and sets per-provider fields before constructing each
+        // supervisor.
         let config_result = match sidecar_config_override {
             Some(cfg) => Ok(cfg),
-            None => busytok_subagent::sidecar::config::resolve_sidecar_config(
+            None => busytok_subagent::sidecar::config::resolve_base_sidecar_config(
                 &settings.subagent.pi_sidecar,
                 paths,
             ),
         };
         match config_result {
             Ok(sidecar_config) => {
-                // Wire the deserialized `SubagentResourcePolicyConfig` from
-                // settings → ResourceMonitor so `memory_pressure_free_mb`
-                // and `monitor_interval_seconds` flow from `settings.toml`
-                // into the supervision loop's predicates + sampling cadence.
-                // `PiSidecarSupervisor::new` remains for unit tests that
-                // don't have a policy (it uses the spec-default policy).
-                let policy = settings.subagent.resource_policy.clone();
                 let gate = Arc::new(busytok_subagent::PressureGate::new());
-                let sup = busytok_subagent::sidecar::PiSidecarSupervisor::with_resource_policy(
+
+                // Build the providers lookup closure from `settings.providers`.
+                // Returns `None` for unknown providers, `Some(disabled)` for
+                // disabled providers (the pool's `ensure_worker` handles the
+                // enabled check).
+                let providers_vec = settings.providers.clone();
+                let providers: busytok_subagent::sidecar::ProviderLookup =
+                    Arc::new(move |pid: &str| providers_vec.iter().find(|p| p.id == pid).cloned());
+
+                // Build the credential reader closure from
+                // `ProviderCredentialStore` (OS keychain). E2E tests set
+                // `BUSYTOK_TEST_API_KEY` to bypass the keychain (which may
+                // not be accessible in CI/headless environments).
+                let credential_reader: busytok_subagent::sidecar::CredentialReader =
+                    Arc::new(|pid: &str| {
+                        if let Ok(key) = std::env::var("BUSYTOK_TEST_API_KEY") {
+                            return Ok(Some(key));
+                        }
+                        ProviderCredentialStore::get_key(pid)
+                    });
+
+                // Build the pool. The base config is cloned per-provider by
+                // `ensure_worker`, with env overridden (API key + base URL
+                // injected).
+                let pool = Arc::new(busytok_subagent::sidecar::WorkerPool::new(
                     sidecar_config,
                     Some(Arc::clone(db)),
-                    policy,
+                    providers,
+                    credential_reader,
                     Some(Arc::clone(&gate)),
-                );
-                // Construct the concrete `Arc<SidecarTaskExecutor>` FIRST,
-                // then clone + coerce one copy to `Arc<dyn TaskExecutor>`
-                // for the manager. The concrete copy is kept by
-                // `BusytokSupervisor` so `PressureResponder` (Task 4) can
-                // downgrade it to `Weak<SidecarTaskExecutor>` without an
-                // Arc cycle (responder → executor → supervisor → responder).
+                    settings.subagent.resource_policy.clone(),
+                ));
+
+                // Two-phase bootstrap step 1: construct the executor
+                // (captures the pool). The executor is strong-owned here so
+                // `PressureResponder` can hold a `Weak<SidecarTaskExecutor>`
+                // without an Arc cycle.
                 let exec_concrete =
-                    Arc::new(busytok_subagent::sidecar::SidecarTaskExecutor::with_db(
-                        Arc::clone(&sup),
-                        Arc::clone(db),
+                    Arc::new(busytok_subagent::sidecar::SidecarTaskExecutor::with_pool(
+                        Arc::clone(&pool),
+                        Some(Arc::clone(db)),
                     ));
+
+                // Two-phase bootstrap step 2: construct the responder
+                // factory (captures executor weak + gate + holder). The
+                // factory is called by `ensure_worker` to construct a
+                // `PressureResponder` per supervisor. The holder keeps all
+                // responders alive (strong refs) so the `Weak` refs stored
+                // on each supervisor stay upgradeable.
+                let responder_holder: Arc<Mutex<Vec<Arc<busytok_subagent::PressureResponder>>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let holder_for_factory = Arc::clone(&responder_holder);
+                let exec_weak = Arc::downgrade(&exec_concrete);
+                let gate_for_factory = Arc::clone(&gate);
+                let factory: busytok_subagent::sidecar::ResponderFactory = Arc::new(
+                    move |sup_weak: Weak<busytok_subagent::sidecar::PiSidecarSupervisor>| {
+                        let responder = Arc::new(busytok_subagent::PressureResponder::new(
+                            sup_weak,
+                            exec_weak.clone(),
+                            Arc::clone(&gate_for_factory),
+                        ));
+                        holder_for_factory
+                            .lock()
+                            .unwrap()
+                            .push(Arc::clone(&responder));
+                        responder
+                    },
+                );
+                pool.set_responder_factory(factory);
+
+                // Eagerly `ensure_worker` the first enabled provider so the
+                // `sidecar_supervisor` field has a supervisor for doctor
+                // checks, shutdown, and runtime status. If no providers are
+                // configured (or the first provider's credential is
+                // missing), `sidecar_supervisor` stays `None` — delegate
+                // calls will fail with "profile not bound to a provider"
+                // or "no API key" (surfaced via the executor's error path).
+                let sidecar_supervisor =
+                    settings.providers.iter().find(|p| p.enabled).and_then(|p| {
+                        match pool.ensure_worker(&p.id) {
+                            Ok(sup) => Some(sup),
+                            Err(e) => {
+                                error!(
+                                    event_code = "subagent.sidecar.ensure_worker_failed",
+                                    provider_id = %p.id,
+                                    error = %e,
+                                    "ensure_worker failed for first provider during construction"
+                                );
+                                None
+                            }
+                        }
+                    });
+
+                // Get the first responder from the holder (if ensure_worker
+                // succeeded). This is stored in `BusytokSupervisor.pressure_responder`
+                // so the accessor can return it; all responders (including
+                // future ones from lazy `ensure_worker` calls) are kept alive
+                // by the holder inside the factory closure.
+                let pressure_responder = responder_holder.lock().unwrap().first().cloned();
+
                 let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
                     Arc::clone(&exec_concrete)
                         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
-                (exec, Some(sup), None, Some(gate), Some(exec_concrete))
+                (
+                    exec,
+                    sidecar_supervisor,
+                    None,
+                    Some(gate),
+                    Some(exec_concrete),
+                    pressure_responder,
+                )
             }
             Err(e) => {
                 // `build_with_settings` returns `Self`, not `Result<Self>`,
@@ -359,13 +474,14 @@ impl BusytokSupervisor {
                     Some(msg),
                     None,
                     None,
+                    None,
                 )
             }
         }
     }
 
     /// Assemble the final `BusytokSupervisor` from the shared constructor
-    /// inputs plus the already-constructed sidecar 5-tuple. Both
+    /// inputs plus the already-constructed sidecar 6-tuple. Both
     /// `build_with_settings` and `build_with_sidecar_config` funnel through
     /// this to avoid duplicating the ~60 lines of manager/read-service/
     /// writer/event-bus wiring.
@@ -380,6 +496,7 @@ impl BusytokSupervisor {
         sidecar_init_error: Option<String>,
         pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
         sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+        pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
     ) -> Self {
         let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
             Arc::clone(&db),
@@ -422,28 +539,15 @@ impl BusytokSupervisor {
 
         let catalog_reload_join = try_spawn_catalog_reloader(paths.price_catalog_path().clone());
 
-        // §8.3 escalation chain driver: construct the `PressureResponder`
-        // (Task 4 implements `respond()`; Task 3 wires the field + sets the
-        // weak ref on the supervisor). The responder holds `Weak` refs to
-        // the supervisor + executor so it can drive the 5-step chain
-        // (hibernate LRU, pause new tasks, graceful restart, force kill)
-        // without creating an Arc cycle. The strong owner is
-        // `BusytokSupervisor.pressure_responder`. Constructed only when all
-        // three are `Some` (sidecar enabled + config resolved).
-        let pressure_responder = match (&sidecar_supervisor, &sidecar_executor, &pressure_gate) {
-            (Some(sup), Some(exec), Some(gate)) => {
-                let responder = Arc::new(busytok_subagent::PressureResponder::new(
-                    Arc::downgrade(sup),
-                    Arc::downgrade(exec),
-                    Arc::clone(gate),
-                ));
-                // Set the weak ref on the supervisor so the supervision loop
-                // can upgrade + invoke `respond()` on pressure transitions.
-                sup.set_pressure_responder(Arc::clone(&responder));
-                Some(responder)
-            }
-            _ => None,
-        };
+        // §8.3 escalation chain driver: the `PressureResponder` is now
+        // constructed by the responder factory inside `construct_sidecar`
+        // (Phase 3 Task 3 two-phase bootstrap). The factory is called by
+        // `WorkerPool::ensure_worker` to create a responder per supervisor,
+        // and `set_pressure_responder` is called inside the factory. The
+        // `pressure_responder` parameter is the first provider's responder
+        // (strong-owned here so the `Weak` on the supervisor stays
+        // upgradeable); all future responders (from lazy `ensure_worker`
+        // calls) are kept alive by the holder inside the factory closure.
 
         // §8.3 step 2 "queue only" background dispatcher (Task 7 Finding 3
         // fix): spawn the dispatcher that polls `subagent_tasks` for queued
