@@ -4770,9 +4770,12 @@ impl RuntimeControl for BusytokSupervisor {
             let (profile_provider, profile_model) = {
                 let settings = self.settings.lock().unwrap();
                 let profile_cfg = settings.subagent.profiles.get(&req.profile);
-                profile_cfg
-                    .map(|p| (p.provider_id.clone(), p.model.clone()))
-                    .unwrap_or((None, String::new()))
+                match profile_cfg {
+                    Some(p) => (p.provider_id.clone(), p.model.clone()),
+                    None => {
+                        return Err(anyhow::anyhow!("profile not found: {}", req.profile));
+                    }
+                }
             };
             if let Some(provider_id) = profile_provider.as_deref() {
                 let provider_cfg = {
