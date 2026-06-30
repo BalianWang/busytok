@@ -1223,3 +1223,206 @@ pub struct ShutdownReconciliationCounts {
     pub bindings_released: usize,
     pub status_rolled_back: usize,
 }
+
+// --- Phase 2: aggregate task queries (no subagent_id filter) --------------
+//
+// These three functions feed the Subagent Monitoring Page (spec §4 Phase 2):
+//   * `list_recent_tasks_all`   — `tasks_recent` (fixed limit 20, all subagents)
+//   * `count_tasks_by_subagent` — `subagents[].task_count`
+//   * `last_task_by_subagent`   — `subagents[].last_task_{created_at,status}`
+
+/// Most recent tasks across ALL subagents, ordered by `created_at_ms` desc.
+/// Spec §4 Phase 2: `tasks_recent` fixed limit 20, no subagent_id filter.
+pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<SubagentTaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
+                prompt_artifact_ref, output_schema_name, output_schema_version, status, \
+                result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
+                timeout_seconds, model_override \
+         FROM subagent_tasks \
+         ORDER BY created_at_ms DESC \
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(SubagentTaskRow {
+                id: row.get(0)?,
+                subagent_id: row.get(1)?,
+                source_harness: row.get(2)?,
+                source_session_id: row.get(3)?,
+                intent: row.get(4)?,
+                profile: row.get(5)?,
+                prompt: row.get(6)?,
+                prompt_artifact_ref: row.get(7)?,
+                output_schema_name: row.get(8)?,
+                output_schema_version: row.get(9)?,
+                status: row.get(10)?,
+                result_summary: row.get(11)?,
+                result_json: row.get(12)?,
+                error: row.get(13)?,
+                created_at_ms: row.get(14)?,
+                started_at_ms: row.get(15)?,
+                completed_at_ms: row.get(16)?,
+                timeout_seconds: row.get(17)?,
+                model_override: row.get(18)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `(subagent_id, task_count)` for every subagent that has at least one task.
+/// Spec §4 Phase 2: `subagents[].task_count`.
+pub fn count_tasks_by_subagent(conn: &Connection) -> Result<Vec<(String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT subagent_id, COUNT(*) AS cnt \
+         FROM subagent_tasks \
+         GROUP BY subagent_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `(subagent_id, created_at_ms, status)` for the most recent task of each
+/// subagent that has at least one task. Spec §4 Phase 2:
+/// `subagents[].last_task_{created_at,status}`.
+pub fn last_task_by_subagent(conn: &Connection) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.subagent_id, t.created_at_ms, t.status \
+         FROM subagent_tasks t \
+         INNER JOIN ( \
+             SELECT subagent_id, MAX(created_at_ms) AS max_created \
+             FROM subagent_tasks \
+             GROUP BY subagent_id \
+         ) latest \
+           ON t.subagent_id = latest.subagent_id \
+          AND t.created_at_ms = latest.max_created",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::repository::SubagentTaskRow;
+
+    fn seed_subagent(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO subagent_logical_subagents \
+                 (id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
+                  default_model, status, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 'proj', '/repo', 'hash', NULL, NULL, 'pi/review-cheap', NULL, \
+                     'warm', 1000, 1000)",
+            rusqlite::params![id, id],
+        )
+        .unwrap();
+    }
+
+    fn seed_task(conn: &Connection, id: &str, subagent_id: &str, status: &str, created_at_ms: i64) {
+        let mut row = SubagentTaskRow::for_test(id, subagent_id, "pi/review-cheap", "prompt");
+        row.status = status.to_string();
+        row.created_at_ms = created_at_ms;
+        insert_task(conn, &row).unwrap();
+    }
+
+    #[test]
+    fn list_recent_tasks_all_returns_across_all_subagents() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_subagent(conn, "sub-b");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-b", "failed", 2000);
+        seed_task(conn, "t3", "sub-a", "completed", 3000);
+
+        let tasks = list_recent_tasks_all(conn, 20).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "t3"); // desc order
+        assert_eq!(tasks[1].id, "t2");
+        assert_eq!(tasks[2].id, "t1");
+    }
+
+    #[test]
+    fn list_recent_tasks_all_respects_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        for i in 0..10 {
+            seed_task(conn, &format!("t{i}"), "sub-a", "completed", 1000 + i);
+        }
+        let tasks = list_recent_tasks_all(conn, 3).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "t9");
+    }
+
+    #[test]
+    fn list_recent_tasks_all_empty_when_no_tasks() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tasks = list_recent_tasks_all(conn, 20).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn count_tasks_by_subagent_groups_correctly() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_subagent(conn, "sub-b");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "failed", 2000);
+        seed_task(conn, "t3", "sub-b", "completed", 3000);
+
+        let counts = count_tasks_by_subagent(conn).unwrap();
+        let mut map: std::collections::HashMap<String, u32> = counts.into_iter().collect();
+        assert_eq!(map.remove("sub-a").unwrap(), 2);
+        assert_eq!(map.remove("sub-b").unwrap(), 1);
+    }
+
+    #[test]
+    fn count_tasks_by_subagent_empty_when_no_tasks() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let counts = count_tasks_by_subagent(conn).unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn last_task_by_subagent_returns_latest() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "failed", 2000);
+
+        let lasts = last_task_by_subagent(conn).unwrap();
+        assert_eq!(lasts.len(), 1);
+        let (sub_id, created_at, status) = &lasts[0];
+        assert_eq!(sub_id, "sub-a");
+        assert_eq!(*created_at, 2000);
+        assert_eq!(status, "failed");
+    }
+
+    #[test]
+    fn last_task_by_subagent_empty_when_no_tasks() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        let lasts = last_task_by_subagent(conn).unwrap();
+        assert!(lasts.is_empty());
+    }
+}
