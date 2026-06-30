@@ -1395,3 +1395,156 @@ async fn delegate_invalid_name_evaluates_reject_warn_args() {
     let err = m.delegate(req("bad name!", "do")).await.unwrap_err();
     assert_eq!(err.code(), "subagent.invalid_name");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 Task 2: SubagentManager aggregate data methods
+//   * recent_tasks_all(limit)        — recent tasks across ALL subagents
+//   * task_counts_by_subagent()      — per-subagent task counts
+//   * last_task_by_subagent()        — per-subagent (created_at_ms, status)
+// These tests seed rows directly via the store helpers (bypassing delegate)
+// so the assertions reflect purely the DB query + manager mapping layer.
+// ---------------------------------------------------------------------------
+
+/// Seed a logical subagent row with the given id (also used as the name).
+fn seed_logical_subagent(db: &busytok_store::Database, id: &str) {
+    use busytok_store::repository::SubagentLogicalSubagentRow;
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(id, id))
+        .unwrap();
+}
+
+/// Seed a task row with explicit status + created_at_ms (ms epoch).
+fn seed_task(
+    db: &busytok_store::Database,
+    id: &str,
+    subagent_id: &str,
+    status: &str,
+    created_at_ms: i64,
+) {
+    use busytok_store::repository::SubagentTaskRow;
+    let mut row = SubagentTaskRow::for_test(id, subagent_id, "pi/search-cheap", "prompt");
+    row.status = status.to_string();
+    row.created_at_ms = created_at_ms;
+    db.subagent_insert_task(&row).unwrap();
+}
+
+fn manager_with_db(
+    db: std::sync::Arc<std::sync::Mutex<Database>>,
+) -> SubagentManager {
+    SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    )
+}
+
+#[tokio::test]
+async fn recent_tasks_all_returns_across_all_subagents_in_desc_order() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        seed_logical_subagent(&g, "sub-a");
+        seed_logical_subagent(&g, "sub-b");
+        seed_task(&g, "t1", "sub-a", "completed", 1000);
+        seed_task(&g, "t2", "sub-b", "failed", 2000);
+        seed_task(&g, "t3", "sub-a", "completed", 3000);
+    }
+    let manager = manager_with_db(db);
+    let tasks = manager.recent_tasks_all(20).await.unwrap();
+    assert_eq!(tasks.len(), 3, "all three tasks across both subagents");
+    assert_eq!(tasks[0].id, "t3", "newest first (desc by created_at_ms)");
+    assert_eq!(tasks[1].id, "t2");
+    assert_eq!(tasks[2].id, "t1");
+    // Mapping reuses task_row_to_summary → status parsed, profile preserved.
+    assert_eq!(tasks[0].subagent_id, "sub-a");
+    assert_eq!(tasks[1].subagent_id, "sub-b");
+    assert_eq!(tasks[0].profile, "pi/search-cheap");
+    assert_eq!(tasks[0].status.as_str(), "completed");
+    assert_eq!(tasks[1].status.as_str(), "failed");
+}
+
+#[tokio::test]
+async fn recent_tasks_all_respects_limit() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        seed_logical_subagent(&g, "sub-a");
+        for i in 0..10 {
+            seed_task(&g, &format!("t{i}"), "sub-a", "completed", 1000 + i);
+        }
+    }
+    let manager = manager_with_db(db);
+    let tasks = manager.recent_tasks_all(3).await.unwrap();
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks[0].id, "t9", "limit=3 returns the 3 newest");
+}
+
+#[tokio::test]
+async fn recent_tasks_all_empty_when_no_tasks() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let manager = manager_with_db(db);
+    let tasks = manager.recent_tasks_all(20).await.unwrap();
+    assert!(tasks.is_empty());
+}
+
+#[tokio::test]
+async fn task_counts_by_subagent_groups_correctly_across_subagents() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        seed_logical_subagent(&g, "sub-a");
+        seed_logical_subagent(&g, "sub-b");
+        seed_task(&g, "t1", "sub-a", "completed", 1000);
+        seed_task(&g, "t2", "sub-a", "failed", 2000);
+        seed_task(&g, "t3", "sub-b", "completed", 3000);
+    }
+    let manager = manager_with_db(db);
+    let counts = manager.task_counts_by_subagent().await.unwrap();
+    assert_eq!(counts.get("sub-a"), Some(&2), "sub-a has 2 tasks");
+    assert_eq!(counts.get("sub-b"), Some(&1), "sub-b has 1 task");
+    assert_eq!(
+        counts.len(),
+        2,
+        "only subagents with tasks appear (no zero-count rows)"
+    );
+}
+
+#[tokio::test]
+async fn task_counts_by_subagent_empty_when_no_tasks() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let manager = manager_with_db(db);
+    let counts = manager.task_counts_by_subagent().await.unwrap();
+    assert!(counts.is_empty());
+}
+
+#[tokio::test]
+async fn last_task_by_subagent_returns_latest_per_subagent() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    {
+        let g = db.lock().unwrap();
+        seed_logical_subagent(&g, "sub-a");
+        seed_logical_subagent(&g, "sub-b");
+        // sub-a: t1 completed @1000, t2 failed @2000 → last is t2
+        seed_task(&g, "t1", "sub-a", "completed", 1000);
+        seed_task(&g, "t2", "sub-a", "failed", 2000);
+        // sub-b: single task completed @5000
+        seed_task(&g, "t3", "sub-b", "completed", 5000);
+    }
+    let manager = manager_with_db(db);
+    let lasts = manager.last_task_by_subagent().await.unwrap();
+    assert_eq!(lasts.len(), 2, "one entry per subagent that has tasks");
+    let (created_at, status) = lasts.get("sub-a").unwrap();
+    assert_eq!(*created_at, 2000, "sub-a last task is t2 @2000ms");
+    assert_eq!(status, "failed");
+    let (created_at_b, status_b) = lasts.get("sub-b").unwrap();
+    assert_eq!(*created_at_b, 5000);
+    assert_eq!(status_b, "completed");
+}
+
+#[tokio::test]
+async fn last_task_by_subagent_empty_when_no_tasks() {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let manager = manager_with_db(db);
+    let lasts = manager.last_task_by_subagent().await.unwrap();
+    assert!(lasts.is_empty());
+}

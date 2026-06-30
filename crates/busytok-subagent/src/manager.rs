@@ -692,6 +692,48 @@ impl SubagentManager {
         Ok(rows.into_iter().map(task_row_to_summary).collect())
     }
 
+    /// Returns the most recent tasks across ALL subagents, newest first
+    /// (spec §4 Phase 2 `tasks_recent`). `limit` is passed through to the
+    /// store layer; callers (e.g. Task 6's `runtime_status_snapshot`) are
+    /// responsible for clamping. The mapping reuses `task_row_to_summary`
+    /// so the shape matches `tasks()`.
+    pub async fn recent_tasks_all(&self, limit: i64) -> Result<Vec<SubagentTaskSummary>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let rows = db
+            .subagent_list_recent_tasks_all(limit)
+            .map_err(SubagentError::Store)?;
+        Ok(rows.into_iter().map(task_row_to_summary).collect())
+    }
+
+    /// Returns a map of `subagent_id → task_count` (spec §4 Phase 2
+    /// `subagents[].task_count`). Only subagents with at least one task
+    /// appear; the underlying query groups by `subagent_id`.
+    pub async fn task_counts_by_subagent(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let counts = db
+            .subagent_count_tasks_by_subagent()
+            .map_err(SubagentError::Store)?;
+        Ok(counts.into_iter().collect())
+    }
+
+    /// Returns a map of `subagent_id → (created_at_ms, status)` for each
+    /// subagent's latest task (spec §4 Phase 2 `subagents[].last_task_{created_at,
+    /// status}`). Only subagents with at least one task appear.
+    pub async fn last_task_by_subagent(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (i64, String)>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let lasts = db
+            .subagent_last_task_by_subagent()
+            .map_err(SubagentError::Store)?;
+        Ok(lasts
+            .into_iter()
+            .map(|(sub_id, created_at, status)| (sub_id, (created_at, status)))
+            .collect())
+    }
+
     /// Release any hot binding for this subagent; keep DB state (warm/cold).
     /// Returns the resolved subagent id so callers can echo it back.
     pub async fn hibernate(&self, resolve: ResolveParams) -> Result<String> {
