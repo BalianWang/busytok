@@ -200,6 +200,23 @@ pub enum TaskErrorKind {
     Unknown,
 }
 
+impl TaskErrorKind {
+    /// Stable snake_case string for DB persistence (Task 5). Matches the
+    /// `#[serde(rename_all = "snake_case")]` serialization so the value
+    /// stored in `subagent_tasks.error_kind` is the same string that
+    /// serde_json would emit.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskErrorKind::Auth => "auth",
+            TaskErrorKind::RateLimit => "rate_limit",
+            TaskErrorKind::Timeout => "timeout",
+            TaskErrorKind::Crash => "crash",
+            TaskErrorKind::Network => "network",
+            TaskErrorKind::Unknown => "unknown",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

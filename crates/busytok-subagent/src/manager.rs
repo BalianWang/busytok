@@ -216,6 +216,7 @@ impl SubagentManager {
                 // dispatcher reads them from the row (single source of truth).
                 timeout_seconds: req.timeout_seconds.map(|t| t as i64),
                 model_override: req.model_override.clone(),
+                error_kind: None,
             })
             .map_err(SubagentError::Store)?;
             should_queue
@@ -288,6 +289,7 @@ impl SubagentManager {
             completed_at_ms: None,
             timeout_seconds: req.timeout_seconds.map(|t| t as i64),
             model_override: req.model_override.clone(),
+            error_kind: None,
         };
         let mut result = self.execute_task(&task_row, &subagent).await?;
         // `execute_task` returns the model it actually used (which may differ
@@ -440,6 +442,10 @@ impl SubagentManager {
                 None,
             )
             .map_err(SubagentError::Store)?;
+            // Task 5: persist classified error_kind on the task row.
+            if let Some(kind) = &out.error_kind {
+                let _ = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str()));
+            }
             // Re-fetch recent_tasks AFTER the task result is persisted so the
             // snapshot includes the just-completed task's result_summary. The
             // pre-execution snapshot (used only for context building above)

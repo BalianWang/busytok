@@ -542,6 +542,10 @@ pub struct SubagentTaskRow {
     /// dispatcher reads it from the row. `None` → fall back to
     /// `subagent.default_model` then `profile_model`.
     pub model_override: Option<String>,
+    /// Task 5: classified error kind (snake_case `TaskErrorKind` from
+    /// `busytok-subagent::models`). `None` on success or when the
+    /// executor couldn't classify the failure.
+    pub error_kind: Option<String>,
 }
 
 impl SubagentTaskRow {
@@ -566,6 +570,7 @@ impl SubagentTaskRow {
             completed_at_ms: None,
             timeout_seconds: None,
             model_override: None,
+            error_kind: None,
         }
     }
 }

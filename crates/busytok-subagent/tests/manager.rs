@@ -1244,6 +1244,7 @@ async fn dispatcher_skips_queued_task_while_gate_paused() {
             completed_at_ms: None,
             timeout_seconds: None,
             model_override: None,
+            error_kind: None,
         })
         .unwrap();
     }

@@ -316,8 +316,8 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
              (id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
               prompt_artifact_ref, output_schema_name, output_schema_version, status, \
               result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-              timeout_seconds, model_override) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+              timeout_seconds, model_override, error_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             row.id,
             row.subagent_id,
@@ -338,6 +338,7 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
             row.completed_at_ms,
             row.timeout_seconds,
             row.model_override,
+            row.error_kind,
         ],
     )
     .map(|_| ())
@@ -349,7 +350,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override \
+                timeout_seconds, model_override, error_kind \
          FROM subagent_tasks WHERE id = ?1",
     )?;
     let row_opt = stmt
@@ -374,6 +375,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
                 completed_at_ms: row.get(16)?,
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
+                error_kind: row.get(19)?,
             })
         })
         .ok();
@@ -389,7 +391,7 @@ pub fn list_tasks(
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override \
+                timeout_seconds, model_override, error_kind \
          FROM subagent_tasks WHERE subagent_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
     )?;
     let rows = stmt
@@ -414,6 +416,7 @@ pub fn list_tasks(
                 completed_at_ms: row.get(16)?,
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
+                error_kind: row.get(19)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -438,6 +441,20 @@ pub fn set_task_status(
     )
     .map(|_| ())
     .with_context(|| format!("set task {} status {}", id, status))
+}
+
+/// Set the classified `error_kind` on a task row (Task 5). Called by
+/// `SubagentManager::execute_task` after `executor.execute()` returns a
+/// failed/timeout `ExecutorOutput` with `error_kind: Some(...)`. The
+/// `error_kind` string is the snake_case serialization of `TaskErrorKind`
+/// (see `busytok-subagent::models::TaskErrorKind`); `None` clears it.
+pub fn set_task_error_kind(conn: &Connection, id: &str, error_kind: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE subagent_tasks SET error_kind = ?2 WHERE id = ?1",
+        params![id, error_kind],
+    )
+    .map(|_| ())
+    .with_context(|| format!("set task {} error_kind {:?}", id, error_kind))
 }
 
 /// Count tasks for a subagent with `created_at_ms > since_ms`.
@@ -534,7 +551,7 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
             "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                     prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                     result_summary, result_json, error, created_at_ms, started_at_ms, \
-                    completed_at_ms, timeout_seconds, model_override \
+                    completed_at_ms, timeout_seconds, model_override, error_kind \
              FROM subagent_tasks WHERE id = ?1",
             rusqlite::params![id],
             |r| {
@@ -558,6 +575,7 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
                     completed_at_ms: r.get(16)?,
                     timeout_seconds: r.get(17)?,
                     model_override: r.get(18)?,
+                    error_kind: r.get(19)?,
                 })
             },
         )
@@ -1239,7 +1257,7 @@ pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<Subage
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override \
+                timeout_seconds, model_override, error_kind \
          FROM subagent_tasks \
          ORDER BY created_at_ms DESC, id DESC \
          LIMIT ?1",
@@ -1266,6 +1284,7 @@ pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<Subage
                 completed_at_ms: row.get(16)?,
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
+                error_kind: row.get(19)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

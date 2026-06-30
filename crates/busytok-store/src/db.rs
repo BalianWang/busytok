@@ -1987,6 +1987,10 @@ impl Database {
     ) -> Result<()> {
         subagent_queries::set_task_status(self.conn(), id, status, result_summary, error)
     }
+    /// Set the classified `error_kind` on a task row (Task 5).
+    pub fn subagent_set_task_error_kind(&self, id: &str, error_kind: Option<&str>) -> Result<()> {
+        subagent_queries::set_task_error_kind(self.conn(), id, error_kind)
+    }
     pub fn subagent_upsert_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
         subagent_queries::upsert_binding(self.conn(), row)
     }

@@ -2,7 +2,7 @@
 ///
 /// The baseline schema is applied as a single migration when a new database
 /// is created. Future schema changes will increment from v1.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// SQL to create the schema version tracking table.
 pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
@@ -28,6 +28,13 @@ pub const SUBAGENT_SQL: &str = include_str!("../migrations/0003_subagent.sql");
 /// incremental ALTER TABLE, not modifying `0003`).
 const SUBAGENT_TASK_FIELDS_SQL: &str = include_str!("../migrations/0004_subagent_task_fields.sql");
 
+/// v5 subagent-task-error-kind migration SQL — adds the `error_kind` column
+/// to `subagent_tasks` so the classified failure kind (Task 5) is persisted
+/// on the task row and available to downstream consumers without re-parsing
+/// the error string.
+const SUBAGENT_TASK_ERROR_KIND_SQL: &str =
+    include_str!("../migrations/0005_subagent_task_error_kind.sql");
+
 /// All migrations in order, from the v1 baseline through the latest version.
 pub fn migrations() -> Vec<(u32, &'static str)> {
     vec![
@@ -35,5 +42,6 @@ pub fn migrations() -> Vec<(u32, &'static str)> {
         (2, CACHE_METRICS_SQL),
         (3, SUBAGENT_SQL),
         (4, SUBAGENT_TASK_FIELDS_SQL),
+        (5, SUBAGENT_TASK_ERROR_KIND_SQL),
     ]
 }

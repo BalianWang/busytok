@@ -1571,6 +1571,104 @@ impl BusytokSupervisor {
         &self.subagent_manager
     }
 
+    /// Phase 3 Task 5: bridge a subagent task's usage into the unified
+    /// `usage_events` pipeline so it appears in Overview / Activity / receipts.
+    ///
+    /// This is the P0 + P1a fix: the runtime owns the `GenerationManager`
+    /// (so the event gets the active `generation_id` — P0) and the rollup
+    /// infrastructure (`build_scan_mutations` — P1a, produces REAL
+    /// `daily_usage` + `model_summary` rows so the heatmap/receipt panels
+    /// include subagent tokens). `RollupRows::default()` is forbidden here.
+    ///
+    /// Best-effort: the caller logs failures at `warn` but does NOT fail
+    /// the task — the task result is already persisted; usage is
+    /// best-effort observability.
+    fn write_subagent_usage_event(
+        &self,
+        result: &busytok_subagent::models::DelegateResult,
+        cwd: &str,
+    ) -> Result<()> {
+        use busytok_aggregator::{
+            build_scan_mutations, model_rollups_to_rows, project_rollups_to_rows,
+            session_rollups_to_rows, RollupOptions,
+        };
+        use busytok_domain::UsageWritePolicy;
+        use busytok_store::StoreWriteBatch;
+
+        // P0: resolve the active generation_id. Events written with any other
+        // generation_id are invisible to Overview/Activity read paths.
+        let generation_id = self
+            .generation_manager
+            .active_generation_id()
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active generation — cannot bridge subagent usage")
+            })?;
+
+        // Load the global PriceCatalog snapshot (same accessor scan/tail paths use).
+        let catalog = busytok_pricing::load_catalog();
+
+        let event = crate::subagent_usage::normalize_task_usage(
+            &result.task_id,
+            &result.subagent_id,
+            cwd,
+            &result.usage,
+            Some(&catalog),
+        );
+
+        let input_tokens = event.input_tokens;
+        let output_tokens = event.output_tokens;
+        let model = event.model.clone();
+        let cost_usd = event.cost_usd;
+
+        let batch = StoreWriteBatch::for_test("subagent", &result.task_id)
+            .usage_event(event, UsageWritePolicy::InsertOnce);
+
+        // P1a: build REAL rollup rows via build_scan_mutations (NOT
+        // RollupRows::default()). This mirrors tail.rs:570-581 — same closure
+        // shape, same build_scan_mutations call, same RollupRows assembly.
+        let timezone = self.settings.lock().unwrap().timezone.clone();
+        let rtz = busytok_domain::ReportingTimezone::parse(&timezone).unwrap_or_else(|e| {
+            tracing::warn!(
+                event_code = "subagent.usage_tz_fallback",
+                timezone = %timezone,
+                error = %e,
+                "timezone parse failed, falling back to UTC for subagent usage rollup"
+            );
+            busytok_domain::ReportingTimezone::utc()
+        });
+        let ro = RollupOptions {
+            timezone: rtz.clone(),
+        };
+
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        db.ingest_store_batch(batch, &generation_id, |effective_events, gen_id| {
+            if effective_events.is_empty() {
+                return Ok(busytok_store::RollupRows::default());
+            }
+            let mutations = build_scan_mutations(effective_events, ro.clone(), gen_id)
+                .context("failed to build subagent usage rollup mutations")?;
+            Ok(busytok_store::RollupRows {
+                daily_usage_rows: mutations.daily_usage,
+                model_usage_rows: Vec::new(),
+                session_rows: session_rollups_to_rows(&mutations.session_rollups),
+                project_rows: project_rollups_to_rows(&mutations.project_rollups),
+                model_summary_rows: model_rollups_to_rows(&mutations.model_rollups),
+            })
+        })?;
+
+        tracing::info!(
+            event_code = "subagent.usage_recorded",
+            task_id = %result.task_id,
+            model = ?model,
+            input_tokens,
+            output_tokens,
+            cost_usd = ?cost_usd,
+            generation_id = %generation_id,
+            "recorded subagent usage in unified usage_events"
+        );
+        Ok(())
+    }
+
     /// Gracefully drain and stop the writer actor.
     ///
     /// Service shutdown calls this after scan/tail tasks have stopped so the
@@ -4812,11 +4910,30 @@ impl RuntimeControl for BusytokSupervisor {
             }
         }
 
+        // Phase 3 Task 5: capture cwd before `req` is consumed by
+        // `delegate_request_from_dto`, then bridge the subagent task's usage
+        // into the unified `usage_events` pipeline after delegate returns.
+        // The write is best-effort — failure is logged at `warn` but does NOT
+        // fail the task (the task result is already persisted; usage is
+        // best-effort observability).
+        let cwd = req.cwd.clone();
         let r = self
             .subagent_manager
             .delegate(delegate_request_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
+        // Only bridge usage for completed/failed tasks — queued tasks have
+        // no usage yet (the dispatcher will write it when the task runs).
+        if r.status != busytok_subagent::models::TaskStatus::Queued {
+            if let Err(e) = self.write_subagent_usage_event(&r, &cwd) {
+                tracing::warn!(
+                    event_code = "subagent.usage_write_failed",
+                    task_id = %r.task_id,
+                    error = %e,
+                    "failed to write subagent usage event to unified usage_events"
+                );
+            }
+        }
         Ok(SubagentDelegateResponseDto {
             task_id: r.task_id,
             subagent_id: r.subagent_id,
