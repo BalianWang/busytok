@@ -19,11 +19,12 @@
 - **Auth failure = hard kill (spec §4 Phase 3 error table):** 401 from the model API → task status `failed`, worker immediately killed + removed from pool (bypasses the 5-min rolling restart window). Rate limit (429), timeout, and network errors → task `failed`, worker kept. Sidecar crash → task `failed`, worker killed + removed (goes through existing restart-window logic within that provider's supervisor, but task is NOT retried). The sidecar surfaces HTTP-level errors via new JSON-RPC error codes `-32010` (auth), `-32011` (rate_limit), `-32012` (network). These start at `-32010` to avoid collisions with existing protocol constants (`-32001` SESSION_NOT_FOUND through `-32008` PROTOCOL_MISMATCH in `protocol.rs`). Timeout reuses the existing `-32003` (TASK_TIMEOUT).
 - **Usage bridge to `usage_events` (spec §4 Phase 3 usage flow):** the Rust executor normalizes the sidecar's raw usage (`input_tokens`, `output_tokens`, `model`, `provider`) into a `NormalizedUsageEvent` with `client_kind: "subagent"`, computes `total_tokens = input + output` in Rust, looks up `cost_usd` via `busytok_pricing::estimate_cost_with_catalog` (a FREE FUNCTION in the `busytok_pricing` crate root, NOT a method on `PriceCatalog` — verified in `crates/busytok-pricing/src/lib.rs:534`), and writes the event to `usage_events` via `Database::ingest_store_batch` (the public API; `upsert_usage_events_dedup_aware` is an internal free function taking `&Connection`, not a `Database` method — verified in `crates/busytok-store/src/write_queries.rs:255`). The existing `subagent_usage_records` write remains for internal bookkeeping. The Activity page and Overview page pick up subagent usage naturally from `usage_events`.
 - **esbuild CJS format (spec §4 Phase 3 + spike finding):** switch `esbuild.config.mjs` from `format: 'esm'` to `format: 'cjs'`. The spike (`apps/pi-sidecar/spike/SPIKE-RESULT.md`) found that ESM bundles fail at runtime because `cross-spawn@7.0.6` (a transitive dep of the SDK) uses CJS `require('child_process')` which esbuild's ESM wrapper rejects. CJS format fixes this natively.
-- **New intra-workspace dependency:** `busytok-subagent` must add `busytok-pricing = { path = "../busytok-pricing" }` to its `Cargo.toml` (Task 5 Step 0). This is necessary because `normalize_task_usage` lives in `busytok-subagent` and needs `PriceCatalog` + `estimate_cost_with_catalog` (a free function in `busytok_pricing`, NOT a method on `PriceCatalog` — verified). No new external crates are added; `keyring-rs` is already in `busytok-config`, `reqwest` already in `busytok-runtime`. The `md5` crate is NOT added — `raw_event_hash` uses a plain format string instead (no hashing needed since the dedupe_key already provides idempotency).
-- **Credential rotation via hard removal + lazy re-spawn (spec §4 Phase 3 worker lifecycle):** `ProviderConfig` or API key changes → `WorkerPool::remove_worker(provider_id)` kills the current process + removes the supervisor from the map entirely. The next `ensure_worker(provider_id)` call lazily creates a NEW supervisor with a FRESH keychain read + FRESH env. This is necessary because `SidecarConfig.env` is baked at construction time (`spawn_internal` reads `self.config.env` which is immutable) — a stale-flag-on-the-same-supervisor approach would respawn with the SAME stale env. Both `provider_changed` and `provider_deleted` use `remove_worker`; the difference is purely observability (different log event codes). Auth failure also uses `remove_worker` (hard kill + removal).
+- **Usage bridge lives in `busytok-runtime`, NOT `busytok-subagent` (P0/P1a fix):** the `normalize_task_usage` + `ingest_store_batch` call must execute in the runtime crate's `subagent_delegate` handler (after `SubagentManager::delegate` returns), NOT inside `SubagentManager::execute_task`. This is necessary because: (a) the runtime owns the `GenerationManager` — events MUST be written with the active generation_id (`generation_manager.active_generation_id()`) so they're visible to Overview/Activity read paths (P0: a synthetic `subagent_{task_id}` generation_id makes events invisible); (b) the runtime owns the rollup infrastructure (`build_scan_mutations` in `scan.rs` / `tail.rs`) — the `build_rollups` closure must produce real `daily_usage` + `model_summary` rows so Overview/heatmap/receipt statistics include subagent usage (P1a: `RollupRows::default()` makes subagent tokens invisible to all aggregate panels); (c) `busytok-runtime` already depends on `busytok-pricing`, so no new dependency is needed. `busytok-subagent` does NOT need `busytok-pricing` — `SubagentManager::execute_task` returns `TaskUsage` in `ExecutorOutput`, and the runtime handler normalizes + writes it. The `md5` crate is NOT added — `raw_event_hash` uses a plain format string.
+- **Credential rotation via hard removal + lazy re-spawn (spec §4 Phase 3 worker lifecycle, P1b fix):** `ProviderConfig` or API key changes → `WorkerPool::remove_worker_and_kill(provider_id).await` kills the current process AND removes the supervisor from the map in one self-contained async call. The next `ensure_worker(provider_id)` call lazily creates a NEW supervisor with a FRESH keychain read + FRESH env. This is necessary because `SidecarConfig.env` is baked at construction time (`spawn_internal` reads `self.config.env` which is immutable) — a stale-flag-on-the-same-supervisor approach would respawn with the SAME stale env. `PiSidecarSupervisor` has NO `Drop` fallback (verified — no `impl Drop` in `supervisor.rs`), so the kill MUST be explicit and awaited. The interface is `async fn remove_worker_and_kill(&self, provider_id: &str) -> Result<()>` — callers don't need to remember a separate kill step. Both `provider_changed` and `provider_deleted` use `remove_worker_and_kill`; the difference is purely observability (different log event codes). Auth failure also uses `remove_worker_and_kill` (hard kill + removal).
 - **Idle TTL:** the existing `idle_exit_seconds` supervision-loop logic already kills the child process after idle timeout. Phase 3 changes: when the process exits (idle or crash), the `WorkerPool` entry remains (the supervisor stays in the map with `state=stopped`), and the next `ensure_worker()` lazily respawns. Auth failure and provider config/key change are the ONLY paths that remove the supervisor from the map entirely.
 - **Observability:** every credential read emits `tracing::info!(event_code = "subagent.credential_injected", provider_id = ..., "injected API key into sidecar env")` (key value NEVER logged). Worker pool operations emit `tracing::debug!(event_code = "subagent.worker_pool.*", ...)`. Usage bridge emits `tracing::info!(event_code = "subagent.usage_recorded", task_id = ..., model = ..., ...)`. Auth failure emits `tracing::warn!(event_code = "subagent.auth_failure", provider_id = ..., "auth failure — killing worker")`.
 - **Coverage gate:** Rust workspace ≥82%, `busytok-subagent` ≥90% (enforced by `bash scripts/coverage.sh`). Frontend ≥90% on new files (`pnpm exec vitest run --coverage`). Node sidecar ≥90% (`pnpm test` with vitest). All gates run in Task 8.
+- **Bootstrap ordering (P1c fix — two-phase init):** `WorkerPool` needs a responder-factory that captures `Weak<SidecarTaskExecutor>`, but `SidecarTaskExecutor` needs `Arc<WorkerPool>`. This is a circular dependency. The plan uses two-phase initialization: (1) construct `WorkerPool` with a `OnceLock<Arc<dyn Fn(Weak<PiSidecarSupervisor>) -> Arc<PressureResponder> + Send + Sync>>` — the factory starts as unset; (2) construct `SidecarTaskExecutor::with_pool(Arc::clone(&pool), db)`; (3) `pool.set_responder_factory(move |weak_sup| Arc::new(PressureResponder::new(weak_sup, Arc::downgrade(&executor), gate)))`. `ensure_worker` is only called AFTER bootstrap completes (during the first `delegate`), so the `OnceLock` is always set by then. If `ensure_worker` is called before `set_responder_factory` (bug), it panics with a clear message — this is a fail-fast invariant, not a runtime fallback.
 - **Rust trait wiring:** adding a trait method touches 6 sites (trait def, `BusytokSupervisor` impl, `TestRuntimeControl` mock, `Arc<T>` blanket impl, `AliasConflictRuntime` test mock at `apps/cli/tests/prompt.rs`, `MethodDispatchErrorRuntime` test mock at `crates/busytok-control/tests/server.rs`).
 - **TS type regeneration:** after adding/modifying DTOs, run `cargo test -p busytok-protocol generate_typescript_types` to regenerate `packages/busytok-protocol-types/src/generated.ts`.
 - **Mock sidecar preservation:** the mock `turn_auto` handler is kept behind an env-var flag `BUSYTOK_USE_MOCK_SIDECAR=1` so Rust-side integration tests (which spawn the sidecar bundle) continue to work without a real API key. The real handler is the default. Tests that don't spawn the sidecar use `MockTaskExecutor` / `FailingTaskExecutor` as before.
@@ -35,18 +36,19 @@
 **Rust (backend):**
 - `crates/busytok-config/src/lib.rs` — add `provider_id: Option<String>` to `SubagentProfileConfig`. (Modify)
 - `crates/busytok-subagent/src/sidecar/config.rs` — add `provider_id: String` to `SidecarConfig`; extract `resolve_base_sidecar_config` (shared base) from `resolve_sidecar_config`. (Modify)
-- `crates/busytok-subagent/src/sidecar/supervisor.rs` — no changes to `SupervisorState` (stale flag dropped; credential rotation uses `remove_worker` + lazy re-spawn instead). (No change needed beyond what Task 3 adds for auth-fail kill.)
+- `crates/busytok-subagent/src/sidecar/supervisor.rs` — no changes to `SupervisorState` (stale flag dropped; credential rotation uses `remove_worker_and_kill` + lazy re-spawn instead). (No change needed beyond what Task 3 adds for auth-fail kill.)
 - `crates/busytok-subagent/src/sidecar/pool.rs` — new `WorkerPool` type. (Create)
 - `crates/busytok-subagent/src/sidecar/mod.rs` — re-export `WorkerPool`. (Modify)
-- `crates/busytok-subagent/src/sidecar/executor.rs` — rewire from single supervisor to `Arc<WorkerPool>`; add `provider_id` to `ExecutorInput` path; add error classification + auth-fail handling; add usage normalization + `usage_events` write. (Modify)
+- `crates/busytok-subagent/src/sidecar/executor.rs` — rewire from single supervisor to `Arc<WorkerPool>`; add `provider_id` to `ExecutorInput` path; add error classification + auth-fail handling. (Modify — NO usage normalization here; that lives in `busytok-runtime` per P0/P1a)
 - `crates/busytok-subagent/src/mock_executor.rs` — add `provider_id: Option<String>` to `ExecutorInput`. (Modify)
 - `crates/busytok-subagent/src/models.rs` — add `TaskErrorKind` enum (auth/rate_limit/timeout/crash/network/unknown); add `error_kind: Option<TaskErrorKind>` to `ExecutorOutput`. (Modify)
 - `crates/busytok-subagent/src/manager.rs` — thread `provider_id` from profile config into `ExecutorInput`; persist `error_kind` in task row. (Modify)
 - `crates/busytok-store/src/subagent_queries.rs` — add `error_kind` column to `subagent_tasks` (migration 0005); add `subagent_set_task_error_kind`. (Modify)
 - `crates/busytok-store/src/schema.rs` — bump `SCHEMA_VERSION` to 5; add `(5, SUBAGENT_TASK_ERROR_KIND_SQL)` to `migrations()` Vec. (Modify)
 - `crates/busytok-store/migrations/0005_subagent_task_error_kind.sql` — new migration. (Create)
-- `crates/busytok-runtime/src/supervisor.rs` — replace `sidecar_supervisor` field with `worker_pool`; update `construct_sidecar` to build `WorkerPool` with a shared `PressureGate`; update `subagent_delegate` to resolve provider from profile + validate model whitelist (spec §3.4); update `subagent_runtime_status` to aggregate from pool; wire credential store into pool; add `provider_changed` / `provider_deleted` handlers that call `pool.remove_worker`. (Modify)
-- `crates/busytok-runtime/tests/supervisor_control.rs` — tests for multi-provider delegate, auth-fail kill, usage_events write, runtime_status aggregation. (Modify)
+- `crates/busytok-runtime/src/supervisor.rs` — replace `sidecar_supervisor` field with `worker_pool`; update `construct_sidecar` to build `WorkerPool` with a shared `PressureGate`; update `subagent_delegate` to resolve provider from profile + validate model whitelist (spec §3.4) + normalize usage + write to `usage_events` under the active generation_id with real rollup rows (P0/P1a); update `subagent_runtime_status` to aggregate from pool; wire credential store into pool; add async `provider_changed` / `provider_deleted` handlers that call `pool.remove_worker_and_kill(provider_id).await` (P1b). (Modify)
+- `crates/busytok-runtime/src/subagent_usage.rs` — new module: `normalize_task_usage` + rollup closure (P0/P1a). (Create)
+- `crates/busytok-runtime/tests/supervisor_control.rs` — tests for multi-provider delegate, auth-fail kill, usage_events write + rollup visibility + active generation_id, runtime_status aggregation. (Modify)
 - `crates/busytok-subagent/tests/sidecar_pool.rs` — new integration tests for `WorkerPool`. (Create)
 - `crates/busytok-subagent/tests/sidecar_supervisor.rs` — tests for auth-fail kill path. (Modify)
 
@@ -129,11 +131,12 @@ cargo test -p busytok-subagent --lib
 
 **Interfaces:**
 - Produces: `WorkerPool` struct owning `HashMap<String, Arc<PiSidecarSupervisor>>` + base `SidecarConfig` + `Arc<Mutex<Database>>` + provider config lookup closure + shared `Arc<PressureGate>` + responder-factory closure
-- Produces: `WorkerPool::new(base_config, db, providers, pressure_gate, responder_factory) -> Self` where `providers` is a provider config lookup (`Arc<dyn Fn(&str) -> Option<ProviderConfig> + Send + Sync>`), `pressure_gate: Option<Arc<PressureGate>>` is the shared gate passed to every supervisor, and `responder_factory: Arc<dyn Fn(Weak<PiSidecarSupervisor>) -> Arc<PressureResponder> + Send + Sync>` constructs a per-supervisor responder (C5/C6 fix — the factory captures `Weak<SidecarTaskExecutor>` + `Arc<PressureGate>` so the pool doesn't need to own the executor directly)
-- Produces: `WorkerPool::ensure_worker(&self, provider_id: &str) -> Result<Arc<PiSidecarSupervisor>, SidecarError>` — SYNCHRONOUS (not async — I2 fix: the body is entirely sync: keychain read + config build + supervisor alloc + responder set + insert; no `.await`). **Locking:** (1) read keychain OUTSIDE the map lock (keychain is I/O — I2 fix: `ProviderCredentialStore::get_key` can take 10-100ms+ on macOS, must not serialize all providers); (2) acquire map lock, check if entry exists (someone else may have created it while we read keychain), if yes → return existing + drop key; (3) if no entry → build config + construct supervisor + construct responder via factory + `sup.set_pressure_responder(responder)` (C6 fix) + insert + return Arc.
-- Produces: `WorkerPool::remove_worker(&self, provider_id: &str) -> Option<Arc<PiSidecarSupervisor>>` — hard removal (auth fail + provider config/key change). **Locking (I1 fix):** (1) acquire map lock, (2) `remove` entry → `Option<Arc<PiSidecarSupervisor>>`, (3) DROP the map lock, (4) if `Some(sup)`, `sup.force_kill().await` OUTSIDE the lock (force_kill awaits child.wait() — must not hold sync mutex across .await). Returns the removed supervisor so the caller can await force_kill if needed (or the caller drops the Arc and force_kill runs via Drop semantics — TBD during implementation, but the locking order is fixed).
+- Produces: `WorkerPool::new(base_config, db, providers, pressure_gate) -> Self` where `providers` is a provider config lookup (`Arc<dyn Fn(&str) -> Option<ProviderConfig> + Send + Sync>`) and `pressure_gate: Option<Arc<PressureGate>>` is the shared gate passed to every supervisor. The responder-factory is NOT passed to `new` — it's set via `set_responder_factory` after the executor is constructed (P1c fix: two-phase init).
+- Produces: `WorkerPool::set_responder_factory(&self, factory: Arc<dyn Fn(Weak<PiSidecarSupervisor>) -> Arc<PressureResponder> + Send + Sync>)` — sets the factory on the internal `OnceLock`. Called once during bootstrap AFTER `SidecarTaskExecutor` is constructed.
+- Produces: `WorkerPool::ensure_worker(&self, provider_id: &str) -> Result<Arc<PiSidecarSupervisor>, SidecarError>` — SYNCHRONOUS (not async — I2 fix: the body is entirely sync: keychain read + config build + supervisor alloc + responder set + insert; no `.await`). **Locking:** (1) read keychain OUTSIDE the map lock (keychain is I/O — I2 fix: `ProviderCredentialStore::get_key` can take 10-100ms+ on macOS, must not serialize all providers); (2) acquire map lock, check if entry exists (someone else may have created it while we read keychain), if yes → return existing + drop key; (3) if no entry → build config + construct supervisor + construct responder via factory (panics if `set_responder_factory` not yet called — P1c fail-fast) + `sup.set_pressure_responder(responder)` (C6 fix) + insert + return Arc.
+- Produces: `async fn WorkerPool::remove_worker_and_kill(&self, provider_id: &str) -> Result<()>` — self-contained hard removal + kill (P1b fix). **Locking (I1 fix):** (1) acquire map lock, (2) `remove` entry → `Option<Arc<PiSidecarSupervisor>>`, (3) DROP the map lock, (4) if `Some(sup)`, `sup.force_kill().await?` OUTSIDE the lock (force_kill awaits child.wait() — must not hold sync mutex across .await). `PiSidecarSupervisor` has NO `Drop` fallback (verified), so the kill MUST be explicit and awaited — this method ensures callers don't forget.
 - Produces: `WorkerPool::worker_snapshots(&self) -> Vec<(String, WorkerSnapshot)>` — for runtime_status aggregation
-- Produces: `WorkerPool::shutdown_all(&self)` — graceful shutdown all workers (same lock-ordering as remove_worker: collect all entries under lock, drop lock, then force_kill each outside lock)
+- Produces: `async fn WorkerPool::shutdown_all(&self)` — graceful shutdown all workers (same lock-ordering as `remove_worker_and_kill`: collect all entries under lock, drop lock, then `force_kill().await` each outside lock)
 - Produces: `WorkerPool::for_each_supervisor(&self, f: impl Fn(&str, &Arc<PiSidecarSupervisor>))` — for `evict_lru` iteration across all providers (Task 3, I5 fix)
 - Produces: `WorkerPool::supervisor_for_session(&self, adapter_session_id: &str) -> Option<(String, Arc<PiSidecarSupervisor>)>` — looks up which provider's supervisor owns a given adapter session (C7 fix: `evict_session` needs this to route `prepare_hibernate`/`close` RPCs to the correct supervisor)
 
@@ -160,7 +163,7 @@ Create `crates/busytok-subagent/src/sidecar/pool.rs`. The `WorkerPool` owns:
 - `db: Option<Arc<Mutex<Database>>>` (threaded to each supervisor)
 - `providers: Arc<dyn Fn(&str) -> Option<ProviderConfig> + Send + Sync>` (lookup closure)
 - `pressure_gate: Option<Arc<PressureGate>>` (shared gate — passed to every supervisor)
-- `responder_factory: Arc<dyn Fn(Weak<PiSidecarSupervisor>) -> Arc<PressureResponder> + Send + Sync>` (C5/C6 fix — constructs per-supervisor responder)
+- `responder_factory: std::sync::OnceLock<Arc<dyn Fn(Weak<PiSidecarSupervisor>) -> Arc<PressureResponder> + Send + Sync>>` (P1c fix — set via `set_responder_factory` AFTER executor construction; `ensure_worker` reads it via `.get().expect("responder_factory not set — bootstrap incomplete")`)
 - `workers: Arc<std::sync::Mutex<HashMap<String, Arc<PiSidecarSupervisor>>>>`
 
 `ensure_worker(provider_id)` (SYNCHRONOUS — I2 fix):
@@ -236,7 +239,7 @@ Change `SidecarTaskExecutor` to hold `pool: Arc<WorkerPool>` instead of `supervi
 3. `let handle = supervisor.ensure_started().await?`
 4. Build `turn_auto` params (same as before, but include `provider_id` in the params so the sidecar knows which provider to use).
 5. Call `handle.turn_auto(params)`.
-6. On error: classify via `classify_sidecar_error`. If `Auth` → `if let Some(sup) = self.pool.remove_worker(provider_id) { sup.force_kill().await.ok(); }` (I1 fix: force_kill OUTSIDE the map lock). Record `error_kind` in `ExecutorOutput`.
+6. On error: classify via `classify_sidecar_error`. If `Auth` → `self.pool.remove_worker_and_kill(provider_id).await?` (P1b fix: self-contained kill + remove). Record `error_kind` in `ExecutorOutput`.
 7. On success: parse result (same as before).
 
 Keep the existing hot-session-limit eviction flow unchanged (it operates on the supervisor, which is still a `PiSidecarSupervisor`).
@@ -251,9 +254,9 @@ The existing `evict_lru` reads `self.supervisor.config().harness_name` and `evic
 
 Provide the actual method bodies in the implementation, not just intent — the existing `evict_session` logic (prepare_hibernate → atomic persist → close) is preserved, only the supervisor resolution changes.
 
-- [ ] **Step 3: No new `kill_and_remove` method (M1 fix)**
+- [ ] **Step 3: `remove_worker_and_kill` reuses existing `force_kill` (M1 + P1b fix)**
 
-The `WorkerPool::remove_worker(provider_id)` removes the entry from the map and returns `Option<Arc<PiSidecarSupervisor>>` — it does NOT call `force_kill` itself (I1 fix: force_kill awaits child.wait(), must not be called while holding the map lock). The CALLER awaits `force_kill` on the returned Arc if needed. `force_kill` is already `pub(crate)` in `supervisor.rs:366` — accessible from `WorkerPool` (same crate). No new kill method is added.
+The `WorkerPool::remove_worker_and_kill(provider_id)` is an `async fn` that: (1) locks the map, removes the entry, drops the lock; (2) if `Some(sup)`, calls `sup.force_kill().await?` (existing `pub(crate) async fn` at `supervisor.rs:366`). No new kill method is added — `force_kill` already does `shutdown_internal` + SIGKILL escalation. The method is self-contained: callers don't need to remember a separate kill step (P1b fix — `PiSidecarSupervisor` has NO `Drop` fallback, so the kill MUST be explicit and awaited).
 
 - [ ] **Step 4: Verify (fmt + clippy + test)**
 
@@ -278,8 +281,8 @@ cargo test -p busytok-subagent --lib
 - Modifies: `subagent_delegate` — resolves `profile.provider_id` → validates provider exists + enabled + model whitelist (spec §3.4, M2 fix) → passes to manager
 - Modifies: `subagent_runtime_status` — aggregates workers from pool
 - Modifies: `SubagentManager::execute_task` — passes `provider_id` from profile config to `ExecutorInput`
-- Produces: `BusytokSupervisor::provider_changed(provider_id)` — calls `pool.remove_worker` (hard removal → lazy re-spawn with fresh credentials on next delegate)
-- Produces: `BusytokSupervisor::provider_deleted(provider_id)` — calls `pool.remove_worker` (same mechanism, different log event code)
+- Produces: `async fn BusytokSupervisor::provider_changed(provider_id)` — calls `pool.remove_worker_and_kill(provider_id).await` (P1b: self-contained async kill + remove → lazy re-spawn with fresh credentials on next delegate)
+- Produces: `async fn BusytokSupervisor::provider_deleted(provider_id)` — calls `pool.remove_worker_and_kill(provider_id).await` (same mechanism, different log event code)
 
 - [ ] **Step 1: Write failing tests for multi-provider delegate + runtime_status**
 
@@ -293,16 +296,17 @@ Test cases in `supervisor_control.rs`:
 - `provider_changed_removes_worker_then_respawns` — update provider → worker removed from pool → next delegate creates new worker with fresh credentials
 - `provider_deleted_removes_worker` — delete provider → worker removed from pool
 
-- [ ] **Step 2: Update `construct_sidecar` to build `WorkerPool` with shared `PressureGate` + responder-factory**
+- [ ] **Step 2: Update `construct_sidecar` to build `WorkerPool` with shared `PressureGate` + two-phase bootstrap (P1c fix)**
 
-Replace the single-supervisor construction with:
+Replace the single-supervisor construction with a two-phase bootstrap:
 1. Resolve base config via `resolve_base_sidecar_config(settings, paths)`.
 2. Create ONE shared `Arc<PressureGate>` (same gate used by both `SubagentManager` and all supervisors — C2 fix).
 3. Build a provider lookup closure: `Arc::new(move |id: &str| settings.providers.iter().find(|p| p.id == id && p.enabled).cloned())`.
-4. Build the responder-factory closure (C5/C6 fix): captures `Arc::downgrade(&sidecar_executor)` + `Arc::clone(&pressure_gate)`, returns `Arc::new(PressureResponder::new(weak_sup, weak_exec, gate))`. The factory is called by `ensure_worker` per-supervisor. This replaces the existing `assemble_with_sidecar` block at supervisor.rs:432-445 which constructed a single responder for the single supervisor.
-5. Construct `WorkerPool::new(base_config, Some(db), providers_lookup, Some(Arc::clone(&pressure_gate)), responder_factory)`.
-6. Store `worker_pool: Some(Arc::clone(&pool))` on `BusytokSupervisor`.
-7. Pass `Some(pressure_gate)` to `SubagentManager::with_pressure_gate(...)` (same gate — manager pauses the queue under pressure).
+4. **Phase 1:** Construct `WorkerPool::new(base_config, Some(db), providers_lookup, Some(Arc::clone(&pressure_gate)))` — the responder-factory `OnceLock` is UNSET at this point.
+5. **Phase 1:** Construct `SidecarTaskExecutor::with_pool(Arc::clone(&pool), db)` — captures `Arc<WorkerPool>`.
+6. **Phase 2:** `pool.set_responder_factory(Arc::new({ let weak_exec = Arc::downgrade(&sidecar_executor); let gate = Arc::clone(&pressure_gate); move |weak_sup| Arc::new(PressureResponder::new(weak_sup, weak_exec.clone(), gate.clone())) }))` — injects the factory that captures `Weak<SidecarTaskExecutor>` + `Arc<PressureGate>`. This replaces the existing `assemble_with_sidecar` block at supervisor.rs:432-445 which constructed a single responder for the single supervisor.
+7. Store `worker_pool: Some(Arc::clone(&pool))` on `BusytokSupervisor`.
+8. Pass `Some(pressure_gate)` to `SubagentManager::with_pressure_gate(...)` (same gate — manager pauses the queue under pressure).
 
 The shared `PressureGate` ensures: (a) `SubagentManager::delegate()` pauses the queue when ANY worker reports pressure; (b) each supervisor's `PressureResponder` writes to the same gate. Per-worker `PressureResponder` actions (LRU hibernate, graceful restart, force kill) remain per-supervisor — they operate on the supervisor's own process, not the gate.
 
@@ -314,6 +318,13 @@ In the delegate handler:
 3. Look up `ProviderConfig` by `provider_id`. If not found → `"provider not found"`. If disabled → `"provider disabled"`.
 4. **Model whitelist validation (spec §3.4):** validate `profile.model` is in `provider.models` (a `Vec<String>` — verified in `providers.rs:34`). If not → return validation error `"model '{model}' not in provider '{provider_id}' whitelist"`. This prevents spawning a worker for a model the provider doesn't support. Also handle the edge case where `profile.model` is empty string → same error.
 5. `provider_id` is NOT added to `DelegateRequest` (I5 fix — `DelegateRequest` has no `provider_id` field; the provider is resolved from the profile, not passed by the caller). The `SubagentManager::execute_task` method reads `profile.provider_id` from `self.settings.profiles` and sets it on `ExecutorInput.provider_id` directly. This is the single source of truth: profile config → executor input.
+6. **Usage bridge (P0/P1a fix):** after `SubagentManager::delegate` returns `DelegateResult` with `status: Completed`, the RUNTIME handler (not the manager) normalizes the usage and writes to `usage_events`:
+   - `let gen_id = self.generation_manager.active_generation_id().ok_or_else(|| anyhow!("no active generation"))?;` (P0 fix: use the active generation so events are visible to Overview/Activity read paths)
+   - `let event = normalize_task_usage(&result.task_id, &result.subagent_id, &req.cwd, &result.usage, catalog.as_ref());` (function lives in `busytok-runtime`, not `busytok-subagent`)
+   - `let batch = StoreWriteBatch::for_test("subagent", &result.task_id).usage_event(event, UsageWritePolicy::InsertOnce);`
+   - `db.ingest_store_batch(batch, &gen_id, |effective_events, gen_id| { build_scan_mutations(effective_events, rollup_opts, gen_id).map(|m| RollupRows { daily_usage_rows: m.daily_usage, model_usage_rows: Vec::new(), session_rows: Vec::new(), project_rows: Vec::new(), model_summary_rows: model_rollups_to_rows(&m.model_rollups) }) })?;` (P1a fix: produce REAL rollup rows so Overview/heatmap/receipt statistics include subagent usage — reuse the existing `build_scan_mutations` infra from `scan.rs`/`tail.rs`)
+   - Log `tracing::info!(event_code = "subagent.usage_recorded", task_id = ..., model = ..., input_tokens = ..., output_tokens = ..., cost_usd = ?, "recorded subagent usage in unified usage_events")`.
+   - Usage event write failure is logged at `warn` level with `event_code = "subagent.usage_write_failed"` but does NOT fail the task — the task result is already persisted; usage is best-effort observability.
 
 - [ ] **Step 4: Update `subagent_runtime_status` to aggregate from pool**
 
@@ -326,11 +337,11 @@ Replace the single-supervisor worker snapshot with:
 
 **I3 fix:** there is NO `provider_set_key` handler — key writes happen INSIDE `provider_update` (supervisor.rs:4918: `if let Some(key) = &req.api_key { ProviderCredentialStore::set_key(...) }`). The wiring is:
 
-In `provider_update` (supervisor.rs:4874): after writing config + (if `req.api_key.is_some()`) writing keychain, call `self.provider_changed(&req.id)`. This covers both metadata changes (base_url, env names, models) AND key rotations — all trigger `pool.remove_worker`.
+In `provider_update` (supervisor.rs:4874): after writing config + (if `req.api_key.is_some()`) writing keychain, call `self.provider_changed(&req.id).await` which calls `pool.remove_worker_and_kill(provider_id).await` (P1b fix: self-contained kill + remove). This covers both metadata changes (base_url, env names, models) AND key rotations.
 
-In `provider_create` (supervisor.rs:4813): typically no worker exists yet (new provider), but call `self.provider_changed(&req.id)` defensively (no-op if no worker).
+In `provider_create` (supervisor.rs:4813): typically no worker exists yet (new provider), but call `self.provider_changed(&req.id).await` defensively (no-op if no worker).
 
-In `provider_delete` (supervisor.rs:4931): after deleting config + keychain, call `self.provider_deleted(&provider_id)` which calls `pool.remove_worker(provider_id)` (different log event code `subagent.provider_deleted` vs `subagent.provider_changed`).
+In `provider_delete` (supervisor.rs:4931): after deleting config + keychain, call `self.provider_deleted(&provider_id).await` which calls `pool.remove_worker_and_kill(provider_id).await` (P1b fix — same mechanism, different log event code `subagent.provider_deleted` vs `subagent.provider_changed`).
 
 - [ ] **Step 6: Verify (fmt + clippy + test + coverage)**
 
@@ -344,31 +355,25 @@ bash scripts/coverage.sh
 
 ---
 
-## Task 5: Usage normalization + `usage_events` bridge
+## Task 5: Usage normalization + `usage_events` bridge (lives in `busytok-runtime`)
+
+> **P0/P1a fix:** this whole task lives in `busytok-runtime`, NOT `busytok-subagent`. The runtime owns the `GenerationManager` (so events get the active generation_id and are visible to Overview/Activity read paths) and the rollup infrastructure (`build_scan_mutations` in `scan.rs` / `tail.rs`). `busytok-subagent` does NOT gain a `busytok-pricing` dependency — `SubagentManager::execute_task` returns `TaskUsage` in `ExecutorOutput`, and the runtime handler normalizes + writes it. See Global Constraints → "Usage bridge lives in `busytok-runtime`, NOT `busytok-subagent`".
 
 **Files:**
-- Modify: `crates/busytok-subagent/Cargo.toml` (add `busytok-pricing` dependency — C4 fix)
-- Modify: `crates/busytok-subagent/src/sidecar/executor.rs`
-- Modify: `crates/busytok-subagent/src/manager.rs`
-- Modify: `crates/busytok-store/src/subagent_queries.rs` (add `subagent_insert_usage_event` helper)
-- Modify: `crates/busytok-store/src/db.rs` (thin wrapper)
+- Modify: `crates/busytok-runtime/src/supervisor.rs` (add `normalize_task_usage` + `write_subagent_usage_event` in or near the `subagent_delegate` handler)
+- Modify: `crates/busytok-runtime/Cargo.toml` (NO change — `busytok-pricing` is already a dep, verified in `tail.rs:33`; `busytok-aggregator` is already a dep, verified in `tail.rs:19`)
+- Modify: `crates/busytok-store/src/subagent_queries.rs` (add `subagent_insert_usage_event` helper if needed for the `subagent_usage_records` bookkeeping write)
 - Modify: `crates/busytok-store/src/schema.rs` (bump `SCHEMA_VERSION` to 5, add migration entry)
 - Modify: `crates/busytok-store/migrations/0005_subagent_task_error_kind.sql` (add `error_kind` column)
-- Test: `crates/busytok-subagent/src/sidecar/executor.rs` (inline tests)
+- Modify: `crates/busytok-subagent/src/models.rs` (add `TaskErrorKind` enum + `error_kind: Option<TaskErrorKind>` on `ExecutorOutput` — this part stays in `busytok-subagent` because the executor produces it)
+- Test: `crates/busytok-runtime/src/supervisor.rs` (inline tests for `normalize_task_usage`)
+- Test: `crates/busytok-runtime/tests/supervisor_control.rs` (integration tests for the usage bridge + rollup visibility)
 - Test: `crates/busytok-store/src/subagent_queries.rs` (inline tests)
 
 **Interfaces:**
-- Produces: `normalize_task_usage(task_id, subagent_id, cwd, usage: &TaskUsage, catalog: Option<&PriceCatalog>) -> NormalizedUsageEvent`
-- Produces: `SubagentManager::write_usage_event(db, event)` — constructs a `StoreWriteBatch` via `StoreWriteBatch::for_test(source_id, source_file_id)` (the only public constructor — verified in `repository.rs:112`; despite the `_test` suffix it is `pub` and used in production code elsewhere) and calls `db.ingest_store_batch(batch, generation_id, build_rollups)` (I1 fix: `upsert_usage_events_dedup_aware` is a free function taking `&Connection`, not a `Database` method; use the public `ingest_store_batch` API instead — verified signature at `db.rs:1555`)
+- Produces (in `busytok-runtime`): `fn normalize_task_usage(task_id, subagent_id, cwd, usage: &TaskUsage, catalog: Option<&PriceCatalog>) -> NormalizedUsageEvent`
+- Produces (in `busytok-runtime`): the `subagent_delegate` handler, after `SubagentManager::delegate` returns successfully, resolves the active generation_id via `self.generation_manager.active_generation_id()`, builds a `StoreWriteBatch` containing the normalized event, and calls `db.ingest_store_batch(batch, &generation_id, build_rollups)` where `build_rollups` produces REAL rollup rows via `build_scan_mutations` (P1a fix — `RollupRows::default()` is forbidden; it would make subagent tokens invisible to Overview/heatmap/receipt panels)
 - Produces: migration `0005_subagent_task_error_kind.sql` — `ALTER TABLE subagent_tasks ADD COLUMN error_kind TEXT;` + `SCHEMA_VERSION` bump to 5 in `schema.rs`
-
-- [ ] **Step 0: Add `busytok-pricing` dependency to `busytok-subagent` (C4 fix)**
-
-In `crates/busytok-subagent/Cargo.toml`, add to `[dependencies]`:
-```toml
-busytok-pricing = { path = "../busytok-pricing" }
-```
-This is necessary because `normalize_task_usage` lives in `busytok-subagent` and needs `PriceCatalog` + `estimate_cost_with_catalog`. This is an intra-workspace dependency (no external crate added).
 
 - [ ] **Step 1: Write failing tests for usage normalization**
 
@@ -378,12 +383,15 @@ Test cases:
 - `normalize_usage_computes_cost_via_price_catalog` — with a test catalog, verify `cost_usd` is computed
 - `normalize_usage_cost_none_when_catalog_misses` — model not in catalog → `cost_usd: None`
 - `normalize_usage_cost_none_when_no_catalog` — `catalog: None` → `cost_usd: None`, `cost_source: None`
-- `write_usage_event_inserts_into_usage_events` — after write, `SELECT count(*) FROM usage_events WHERE client_kind='subagent'` = 1
+- `write_usage_event_inserts_into_usage_events` — after the runtime handler writes, `SELECT count(*) FROM usage_events WHERE client_kind='subagent'` = 1
 - `write_usage_event_idempotent_on_same_task_id` — write twice with same `task_id` → only 1 row (dedupe_key works)
+- `write_usage_event_uses_active_generation_id` (P0) — the event row's `generation_id` equals `generation_manager.active_generation_id()`, NOT a synthetic `subagent_{task_id}` string; verify by reading the row back
+- `write_usage_event_produces_real_rollup_rows` (P1a) — after the handler writes, `SELECT count(*) FROM daily_usage WHERE agent='codex'` ≥ 1 AND `SELECT count(*) FROM model_summary` ≥ 1; this proves `build_scan_mutations` ran (not `RollupRows::default()`)
+- `write_usage_event_visible_in_overview_read_path` (P1a end-to-end) — after the handler writes, `read_overview_summary_from_daily_usage(...)` returns totals that include the subagent tokens (proves the Overview panel would render them)
 
-- [ ] **Step 2: Implement `normalize_task_usage`**
+- [ ] **Step 2: Implement `normalize_task_usage` (in `busytok-runtime`)**
 
-In `executor.rs` (or a new `usage.rs` module in `busytok-subagent`):
+In `crates/busytok-runtime/src/supervisor.rs` (or a new `crates/busytok-runtime/src/subagent_usage.rs` module re-exported from `supervisor.rs`):
 ```rust
 use busytok_domain::{AgentKind, NormalizedUsageEvent};
 use busytok_pricing::{CostMode, PriceCatalog, TokenUsage};
@@ -455,24 +463,45 @@ pub fn normalize_task_usage(
 - **I2:** `NormalizedUsageEvent` has no `Default` impl (verified in `events.rs`). Use `minimal_for_test(id, agent)` as the canonical zero-default constructor, then override fields.
 - **I3:** `AgentKind` has only `ClaudeCode` and `Codex` (no `Subagent` variant — verified in `agent.rs`); use `Codex` since the pi-sidecar wraps a Codex-family SDK, and `client_kind = "subagent"` is the discriminator that downstream consumers (Activity page, Overview page) use to distinguish subagent events from top-level Codex runs.
 
-- [ ] **Step 3: Write usage event in `SubagentManager::execute_task`**
+- [ ] **Step 3: Write usage event in the runtime `subagent_delegate` handler (P0/P1a)**
 
-After `executor.execute()` returns successfully (status = Completed), normalize the usage and write to `usage_events`:
-1. Load the global `PriceCatalog` via `busytok_pricing::load_catalog()`.
-2. `let event = normalize_task_usage(&task.id, &subagent.id, &input.cwd, &out.usage, catalog.as_ref());`
-3. Construct a `StoreWriteBatch` with the event (I1 fix: use the public `ingest_store_batch` API — verified signature at `db.rs:1555`; `StoreWriteBatch::for_test` is the only public constructor at `repository.rs:112` — despite the `_test` name it is `pub` and used in production):
+> This step runs in `busytok-runtime`'s `subagent_delegate` handler, AFTER `SubagentManager::delegate` returns successfully with `ExecutorOutput.usage`. It does NOT run inside `SubagentManager::execute_task` — the manager returns the raw `TaskUsage` and the runtime normalizes + writes it. This is mandatory because only the runtime has access to the active generation_id (P0) and the rollup infrastructure (P1a).
+
+After `SubagentManager::delegate` returns successfully:
+1. Resolve the active generation_id: `let generation_id = self.generation_manager.active_generation_id().ok_or_else(|| anyhow!("no active generation"))?;` (P0 — events written with any other generation_id are invisible to Overview/Activity read paths, which filter by active generation; verified at `supervisor.rs:2340`, `supervisor.rs:2858`, `supervisor.rs:2890`).
+2. Load the global `PriceCatalog` (the runtime already holds an `Arc<ArcSwap<PriceCatalog>>` or equivalent — reuse the same accessor the scan/tail paths use; do NOT add a new field to `SubagentManager`).
+3. `let event = normalize_task_usage(&task.id, &subagent.id, &input.cwd, &out.usage, catalog.as_ref());`
+4. Build a `StoreWriteBatch` containing the event and call `db.ingest_store_batch(batch, &generation_id, build_rollups)` where `build_rollups` produces REAL rollup rows via `build_scan_mutations` (P1a — `RollupRows::default()` is forbidden):
    ```rust
-   use busytok_store::{RollupRows, StoreWriteBatch, UsageWritePolicy};
+   use busytok_aggregator::{build_scan_mutations, model_rollups_to_rows,
+       project_rollups_to_rows, session_rollups_to_rows, RollupOptions};
+   use busytok_store::{StoreWriteBatch, UsageWritePolicy};
+
    let batch = StoreWriteBatch::for_test("subagent", &task.id)
        .usage_event(event, UsageWritePolicy::InsertOnce);
-   let generation_id = format!("subagent_{}", task.id);
-   db.ingest_store_batch(batch, &generation_id, |_events, _gen| {
-       Ok(RollupRows::default()) // subagent events don't feed rollups
+
+   // Reuse the same RollupOptions construction pattern as tail.rs:420-429
+   // (timezone from settings). This is the P1a fix — the closure MUST produce
+   // real daily_usage + model_summary rows so Overview/heatmap/receipt panels
+   // include subagent tokens. Rolling your own RollupRows::default() here is a
+   // regression.
+   let ro = RollupOptions { timezone: rtz.clone() };
+   db.ingest_store_batch(batch, &generation_id, |effective_events, gen_id| {
+       let mutations = build_scan_mutations(effective_events, ro.clone(), gen_id)
+           .context("failed to build subagent usage rollup mutations")?;
+       Ok(busytok_store::RollupRows {
+           daily_usage_rows: mutations.daily_usage,
+           model_usage_rows: Vec::new(),
+           session_rows: session_rollups_to_rows(&mutations.session_rollups),
+           project_rows: project_rollups_to_rows(&mutations.project_rollups),
+           model_summary_rows: model_rollups_to_rows(&mutations.model_rollups),
+       })
    })?;
    ```
-4. Log `tracing::info!(event_code = "subagent.usage_recorded", task_id = ..., model = ..., input_tokens = ..., output_tokens = ..., cost_usd = ?, "recorded subagent usage in unified usage_events")`.
+   Reference the existing pattern verbatim at `crates/busytok-runtime/src/tail.rs:570-581` — same closure shape, same `build_scan_mutations` call, same `RollupRows` assembly. The only difference is the input event source (subagent delegate vs. file tail).
+5. Log `tracing::info!(event_code = "subagent.usage_recorded", task_id = ..., model = ..., input_tokens = ..., output_tokens = ..., cost_usd = ?, "recorded subagent usage in unified usage_events")`.
 
-The `PriceCatalog` needs to be accessible from the manager. Thread it as `Option<Arc<PriceCatalog>>` on `SubagentManager` (loaded at construction time from the global `ArcSwap`). If None (no catalog loaded), skip cost computation (`cost_usd = None`). Usage event write failure is logged at `warn` level with `event_code = "subagent.usage_write_failed"` but does NOT fail the task — the task result is already persisted; usage is best-effort observability.
+The existing `subagent_usage_records` write (internal bookkeeping, inside `SubagentManager`) remains unchanged — it is separate from the unified `usage_events` write above. Usage event write failure is logged at `warn` level with `event_code = "subagent.usage_write_failed"` but does NOT fail the task — the task result is already persisted; usage is best-effort observability.
 
 - [ ] **Step 4: Add `error_kind` column migration + persistence (C4 fix: 0005, not 0006)**
 
@@ -492,8 +521,9 @@ Add `error_kind: Option<String>` to `SubagentTaskRow`. In `SubagentManager::exec
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p busytok-subagent -p busytok-store --tests
-cargo test -p busytok-subagent --lib
+cargo clippy -p busytok-runtime -p busytok-store --tests
+cargo test -p busytok-runtime --lib
+cargo test -p busytok-runtime --test supervisor_control
 cargo test -p busytok-store --lib
 bash scripts/coverage.sh
 ```
@@ -511,6 +541,7 @@ bash scripts/coverage.sh
 - Modify: `apps/pi-sidecar/src/types.ts` (add error code constants)
 - Modify: `apps/pi-sidecar/src/handlers/turn_auto.test.ts`
 - Create: `apps/pi-sidecar/tests/real_sdk.test.ts`
+- Create: `apps/pi-sidecar/tests/bundle_smoke.test.ts` (P2 fix: real JSON-RPC handshake smoke test against the CJS bundle)
 
 **Interfaces:**
 - Produces: real `PiSdkSession` wrapper around `createAgentSession` return value
@@ -619,7 +650,7 @@ In `apps/pi-sidecar/tests/real_sdk.test.ts`:
 - Test session reuse (same logical_subagent_id → `session_reused: true`).
 - Test hot session limit (full pool → `-32002` with candidate).
 
-- [ ] **Step 7: Verify build + test**
+- [ ] **Step 7: Verify build + test + CJS bundle smoke (P2 fix)**
 
 ```bash
 cd apps/pi-sidecar
@@ -627,23 +658,32 @@ pnpm install
 pnpm typecheck
 pnpm test
 pnpm build
-node dist/pi-sidecar.bundle.js --help  # verify CJS bundle runs
 ```
+
+Then run a **real handshake smoke test** against the CJS bundle (P2 fix — the previous `node dist/pi-sidecar.bundle.js --help` / `--version` is a fake green: `main.ts` is a pure stdio JSON-RPC server with NO CLI args, verified at `apps/pi-sidecar/src/main.ts:1`; `--help`/`--version` would just hang). The smoke test must:
+
+1. Spawn the bundle as a child process: `node dist/pi-sidecar.bundle.js` (no args).
+2. Send a JSON-RPC `adapter.initialize` request over the child's stdin: `{"jsonrpc":"2.0","method":"adapter.initialize","params":{"protocol_version":1},"id":1}` (the registered handler is at `main.ts:14`; the request shape matches the existing Rust client handshake at `crates/busytok-subagent/src/sidecar/supervisor.rs:655`).
+3. Read the response from stdout and assert it is a valid JSON-RPC response with `id: 1` and a non-error `result`.
+4. Send `adapter.shutdown` (`main.ts:16`): `{"jsonrpc":"2.0","method":"adapter.shutdown","params":null,"id":2}`.
+5. Assert the child process exits with code 0 within a timeout (e.g. 5s).
+
+Write this as a vitest test in `apps/pi-sidecar/tests/bundle_smoke.test.ts` so it runs in `pnpm test`. Use Node's `child_process.spawn` + a line-buffered stdout reader. Skip with `it.skipIf(process.env.CI && process.platform === 'win32')` only if cross-platform flakiness is observed during implementation — do NOT skip by default; the whole point of P2 is that the bundle must be proven to boot, not just parse.
 
 ---
 
-## Task 7: Provider change handlers — removal wiring
+## Task 7: Provider change handlers — removal wiring (async kill)
 
 **Files:**
 - Modify: `crates/busytok-runtime/src/supervisor.rs`
 - Test: `crates/busytok-runtime/tests/supervisor_control.rs`
 
 **Interfaces:**
-- Produces: `BusytokSupervisor::provider_changed(provider_id: &str)` — calls `pool.remove_worker` (hard removal → lazy re-spawn with fresh credentials on next delegate)
-- Produces: `BusytokSupervisor::provider_deleted(provider_id: &str)` — calls `pool.remove_worker` (same mechanism, different log event code)
-- Modifies: `provider_update` handler (supervisor.rs:4874) — calls `provider_changed` after config + keychain write
-- Modifies: `provider_create` handler (supervisor.rs:4813) — calls `provider_changed` defensively (typically no-op, new provider has no worker yet)
-- Modifies: `provider_delete` handler (supervisor.rs:4931) — calls `provider_deleted` after config + keychain delete
+- Produces: `async fn BusytokSupervisor::provider_changed(provider_id: &str)` — calls `pool.remove_worker_and_kill(provider_id).await` (P1b fix: self-contained async kill + remove; `PiSidecarSupervisor` has NO `Drop` fallback, so the kill MUST be awaited here)
+- Produces: `async fn BusytokSupervisor::provider_deleted(provider_id: &str)` — calls `pool.remove_worker_and_kill(provider_id).await` (same mechanism, different log event code)
+- Modifies: `provider_update` handler (supervisor.rs:4874) — calls `self.provider_changed(&req.id).await` after config + keychain write
+- Modifies: `provider_create` handler (supervisor.rs:4813) — calls `self.provider_changed(&req.id).await` defensively (typically no-op, new provider has no worker yet)
+- Modifies: `provider_delete` handler (supervisor.rs:4931) — calls `self.provider_deleted(&provider_id).await` after config + keychain delete
 
 - [ ] **Step 1: Write failing tests for removal wiring**
 
@@ -651,16 +691,28 @@ Test cases:
 - `provider_update_removes_worker_then_respawns` — create provider → delegate (spawns worker) → update provider (metadata change) → verify worker removed from pool → next delegate creates new worker with fresh keychain read
 - `provider_update_with_api_key_removes_worker_then_respawns` — create provider → delegate → update provider with `req.api_key = Some("new-key")` → verify worker removed from pool → next delegate creates new worker with fresh key (I3 fix: key rotation happens INSIDE `provider_update`, not a separate `provider_set_key` handler)
 - `provider_delete_removes_worker` — create provider → delegate → delete provider → verify worker removed from pool
+- `provider_update_kills_old_process` (P1b) — create provider → delegate (spawns worker, capture child pid) → update provider → assert the old child pid is NO LONGER alive (the `remove_worker_and_kill` call awaited `force_kill`; a mere `remove_worker` that forgets to kill would leave the orphan process running)
 - `provider_changed_no_op_when_pool_none` — no pool → `provider_changed` is a no-op (no panic)
 
-- [ ] **Step 2: Implement `provider_changed` / `provider_deleted`**
+- [ ] **Step 2: Implement `provider_changed` / `provider_deleted` (P1b — async kill)**
 
-Both call `pool.remove_worker(provider_id)` — the C1 fix. Credential rotation requires a NEW supervisor because `SidecarConfig.env` is baked at construction time. The stale-flag approach was dropped because it would respawn the SAME supervisor with the SAME stale env.
+Both `await` `pool.remove_worker_and_kill(provider_id)` — the P1b fix. This is a self-contained async call that kills the current process AND removes the supervisor from the map. Callers do NOT need to remember a separate `force_kill` step — the old design (`remove_worker` returns `Arc`, caller remembers to kill) was dropped because Task 7's example impl forgot the kill, and `PiSidecarSupervisor` has NO `Drop` fallback (verified — no `impl Drop` in `supervisor.rs`), so a forgotten kill leaks an orphan process and breaks the "next delegate uses fresh credentials" guarantee (the old process keeps running with the old env). Credential rotation requires a NEW supervisor because `SidecarConfig.env` is baked at construction time.
 
 ```rust
-fn provider_changed(&self, provider_id: &str) {
+async fn provider_changed(&self, provider_id: &str) {
     if let Some(pool) = &self.worker_pool {
-        pool.remove_worker(provider_id);
+        // P1b: self-contained kill + remove. The previous design returned an
+        // Arc and relied on the caller to await force_kill — which Task 7's
+        // own example forgot. PiSidecarSupervisor has no Drop fallback, so
+        // a forgotten kill leaks an orphan process running stale credentials.
+        if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
+            tracing::warn!(
+                event_code = "subagent.provider_changed_kill_failed",
+                provider_id = %provider_id,
+                error = %e,
+                "failed to kill+remove sidecar worker — next delegate may re-spawn with stale credentials"
+            );
+        }
         tracing::info!(
             event_code = "subagent.provider_changed",
             provider_id = %provider_id,
@@ -669,9 +721,16 @@ fn provider_changed(&self, provider_id: &str) {
     }
 }
 
-fn provider_deleted(&self, provider_id: &str) {
+async fn provider_deleted(&self, provider_id: &str) {
     if let Some(pool) = &self.worker_pool {
-        pool.remove_worker(provider_id);
+        if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
+            tracing::warn!(
+                event_code = "subagent.provider_deleted_kill_failed",
+                provider_id = %provider_id,
+                error = %e,
+                "failed to kill+remove sidecar worker on provider deletion"
+            );
+        }
         tracing::info!(
             event_code = "subagent.provider_deleted",
             provider_id = %provider_id,
@@ -681,13 +740,13 @@ fn provider_deleted(&self, provider_id: &str) {
 }
 ```
 
-- [ ] **Step 3: Wire into provider RPC handlers (I3 fix)**
+- [ ] **Step 3: Wire into provider RPC handlers (I3 + P1b)**
 
-In `provider_update` (supervisor.rs:4874): after writing config + (if `req.api_key.is_some()`) writing keychain via `ProviderCredentialStore::set_key`, call `self.provider_changed(&req.id)`. This covers BOTH metadata changes (base_url, env names, models) AND key rotations — all trigger `pool.remove_worker`. There is NO separate `provider_set_key` handler (I3 fix — verified: key writes happen INSIDE `provider_update` at supervisor.rs:4918).
+In `provider_update` (supervisor.rs:4874): after writing config + (if `req.api_key.is_some()`) writing keychain via `ProviderCredentialStore::set_key`, call `self.provider_changed(&req.id).await`. This covers BOTH metadata changes (base_url, env names, models) AND key rotations — all trigger `pool.remove_worker_and_kill`. There is NO separate `provider_set_key` handler (I3 fix — verified: key writes happen INSIDE `provider_update` at supervisor.rs:4918). The handler is already `async`, so the `.await` is natural.
 
-In `provider_create` (supervisor.rs:4813): after writing config + keychain, call `self.provider_changed(&req.id)` defensively (typically no-op — new provider has no worker yet, but the call is safe).
+In `provider_create` (supervisor.rs:4813): after writing config + keychain, call `self.provider_changed(&req.id).await` defensively (typically no-op — new provider has no worker yet, but the call is safe).
 
-In `provider_delete` (supervisor.rs:4931): after deleting config + `ProviderCredentialStore::delete_key`, call `self.provider_deleted(&provider_id)`.
+In `provider_delete` (supervisor.rs:4931): after deleting config + `ProviderCredentialStore::delete_key`, call `self.provider_deleted(&provider_id).await`.
 
 - [ ] **Step 4: Verify (fmt + clippy + test)**
 
@@ -729,9 +788,8 @@ bash scripts/coverage.sh  # workspace ≥82%, busytok-subagent ≥90%
 # Node sidecar
 cd apps/pi-sidecar
 pnpm typecheck
-pnpm test
+pnpm test          # includes bundle_smoke.test.ts (P2 fix: real adapter.initialize handshake)
 pnpm build
-node dist/pi-sidecar.bundle.js --version  # verify CJS bundle executes
 
 # Frontend (unchanged but verify no regressions)
 cd ../gui
@@ -740,14 +798,19 @@ pnpm exec vitest run
 pnpm build
 ```
 
+> P2 fix: the CJS bundle is verified by `bundle_smoke.test.ts` (created in Task 6 Step 7), which spawns the bundle and performs a real `adapter.initialize` → `adapter.shutdown` JSON-RPC handshake. The previous `node dist/pi-sidecar.bundle.js --version` was removed — `main.ts` has no CLI args, so that command would hang and prove nothing.
+
 - [ ] **Step 3: Verify acceptance criteria (spec §6 Phase 3)**
 
 - [ ] `turn_auto` calls real model API (verified: delegate returns real model output) — manual verification with a real API key
 - [ ] One worker process per provider (verified: multiple providers → multiple node processes) — automated test `e2e_multi_provider_creates_separate_workers`
 - [ ] Auth failure immediately kills worker — automated test `e2e_auth_failure_kills_worker`
 - [ ] Usage recorded in unified `usage_events` with `client_kind: "subagent"` — automated test `e2e_usage_events_has_subagent_kind`
+- [ ] Subagent usage visible in Overview/daily_usage rollups (P1a) — automated test `write_usage_event_produces_real_rollup_rows` + `write_usage_event_visible_in_overview_read_path` (Task 5 Step 1)
+- [ ] Subagent usage written under active generation_id (P0) — automated test `write_usage_event_uses_active_generation_id` (Task 5 Step 1)
+- [ ] Provider change kills old worker process (P1b) — automated test `provider_update_kills_old_process` (Task 7 Step 1)
 - [ ] Activity page shows subagent token consumption — manual verification (Activity page reads from `usage_events`, no code change needed)
-- [ ] esbuild produces CJS bundle — automated test (bundle runs via `node dist/pi-sidecar.bundle.js`)
+- [ ] esbuild produces CJS bundle — automated test `bundle_smoke.test.ts` (real handshake, not fake CLI args)
 
 - [ ] **Step 4: Update CONTRIBUTING.md (if needed)**
 
@@ -764,12 +827,14 @@ Verify the CONTRIBUTING.md invariant from spec §2.4 is still accurate after Pha
 | 3 | Auth failure kills worker | Automated: `e2e_auth_failure_kills_worker` |
 | 4 | Usage in `usage_events` with `client_kind: "subagent"` | Automated: `e2e_usage_events_has_subagent_kind` |
 | 5 | Activity page shows subagent tokens | Manual: Activity page reads `usage_events` |
-| 6 | esbuild CJS bundle | Automated: `node dist/pi-sidecar.bundle.js` runs |
+| 6 | esbuild CJS bundle boots + handshakes (P2) | Automated: `bundle_smoke.test.ts` (real `adapter.initialize` → `adapter.shutdown`) |
 | 7 | Model whitelist validation (spec §3.4) | Automated: `e2e_model_not_in_whitelist_fails` |
-| 8 | Provider change removes + re-spawns worker | Automated: `e2e_provider_change_removes_and_respawns_worker` |
+| 8 | Provider change kills + removes + re-spawns worker (P1b) | Automated: `e2e_provider_change_removes_and_respawns_worker` + `provider_update_kills_old_process` |
 | 9 | Error codes avoid protocol collisions | Automated: regression test in Task 3 |
 | 10 | Unbound profile fails (I6 regression doc) | Automated: `e2e_unbound_profile_fails` |
 | 11 | `agent_kind = codex` round-trips (I3) | Automated: `e2e_usage_events_agent_kind_is_codex` |
 | 12 | PressureResponder wired per-supervisor (C5/C6) | Automated: `ensure_worker_sets_pressure_responder` |
 | 13 | `evict_lru` operates pool-wide (C7) | Automated: Task 3 inline test |
-| 14 | `busytok-pricing` dep added (C4) | Automated: `cargo build -p busytok-subagent` succeeds |
+| 14 | Subagent usage written under active generation_id (P0) | Automated: `write_usage_event_uses_active_generation_id` |
+| 15 | Subagent usage produces real `daily_usage` + `model_summary` rollups (P1a) | Automated: `write_usage_event_produces_real_rollup_rows` + `write_usage_event_visible_in_overview_read_path` |
+| 16 | Usage bridge lives in `busytok-runtime` (P0/P1a) | Automated: `cargo build -p busytok-subagent` succeeds with NO `busytok-pricing` dep (regression guard) |
