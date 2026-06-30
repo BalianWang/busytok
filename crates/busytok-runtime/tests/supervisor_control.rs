@@ -22,8 +22,9 @@
 //! control method, asserting the shape and content of the returned DTOs.
 
 use futures::FutureExt;
+use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ use busytok_runtime::status::CachedClientRollup;
 use busytok_runtime::BusytokSupervisor;
 use busytok_store::repository::LogSourceRow;
 use busytok_store::Database;
+use busytok_subagent::sidecar::SidecarConfig;
 use time::{Duration as TimeDuration, Month, OffsetDateTime, Time, UtcOffset};
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -144,6 +146,98 @@ fn make_supervisor_with_settings(
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .ok();
     BusytokSupervisor::new(db, paths)
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar test helpers — used by the `workers: [one row]` stopped-sidecar
+// path (`subagent_runtime_status_workers_one_row_when_sidecar_stopped`).
+// Mirrors the helpers in `subagent_e2e_sidecar.rs`; duplicated because the
+// `busytok-subagent` test `support` module is test-private to that crate.
+// ---------------------------------------------------------------------------
+
+fn sidecar_shell_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            return PathBuf::from(program_files)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+        }
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/bin/bash")
+    }
+}
+
+fn mock_sidecar_path() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(format!(
+        "{manifest}/../busytok-subagent/tests/fixtures/mock-sidecar.sh"
+    ))
+}
+
+fn mock_sidecar_bundle_path() -> PathBuf {
+    let path = mock_sidecar_path();
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = raw.split_once(":/") {
+            let drive = drive.to_ascii_lowercase();
+            return PathBuf::from(format!("/{drive}/{rest}"));
+        }
+        PathBuf::from(raw)
+    }
+
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+/// `SidecarConfig` pointing at the mock-sidecar.sh fixture. Mirrors the fields
+/// `resolve_sidecar_config` would produce, with `bundle_path` set to the mock
+/// fixture (no env var needed).
+fn make_sidecar_config() -> SidecarConfig {
+    SidecarConfig {
+        node_binary: sidecar_shell_path(),
+        bundle_path: mock_sidecar_bundle_path(),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    }
+}
+
+/// Settings with `pi_sidecar.enabled = true` so `new_with_sidecar_config`
+/// takes the sidecar wiring path. The injected `SidecarConfig` means
+/// `resolve_sidecar_config` is skipped, so `node_runtime`/`system_node_path`
+/// are irrelevant here.
+fn make_sidecar_settings() -> BusytokSettings {
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+    settings
+}
+
+/// Construct a supervisor with `pi_sidecar.enabled = true` and the mock sidecar
+/// bundle injected via `new_with_sidecar_config`. The sidecar child is NOT
+/// started (`ensure_started` is never called), so `worker_snapshot()` reports
+/// `Stopped` — the "configured-but-stopped" posture under test.
+fn make_sidecar_stopped_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
+    let paths = BusytokPaths::for_test(tmp.path());
+    make_sidecar_settings()
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
 }
 
 fn seed_event(
@@ -3853,7 +3947,7 @@ async fn provider_crud_round_trips_with_api_key_macos() {
 // (`subagent_delegate`) timestamps tasks at `now_ms()` and only produces
 // `completed` rows, which doesn't let us verify ordering or last_task_status.
 
-use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow, SubagentTaskRow};
+use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentTaskRow};
 
 /// Helper: insert a logical subagent row with the given name + status.
 /// Returns the row id (same as `name` for tests).
@@ -3862,11 +3956,6 @@ fn seed_subagent_row(sup: &BusytokSupervisor, name: &str, status: &str) -> Strin
     row.status = status.to_string();
     let db = sup.db_handle().lock().unwrap();
     db.subagent_upsert_logical(&row).expect("upsert logical");
-    // Also seed an empty memory row — `subagent_list_filtered` joins on
-    // memory in some paths and a missing memory row can cause the subagent
-    // to be filtered out.
-    db.subagent_upsert_memory(&SubagentMemoryRow::new_empty(name))
-        .expect("upsert memory");
     row.id
 }
 
@@ -4159,6 +4248,53 @@ async fn subagent_runtime_status_subagent_status_string_mapped() {
         .find(|s| s.name == "cold-sub")
         .unwrap();
     assert_eq!(cold.status, "cold");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+/// `workers: [one row]` path: when a sidecar supervisor is configured but the
+/// child has never been started, `subagent_runtime_status` must return exactly
+/// one worker row with `state="stopped"`, `pid=None`, `uptime_seconds=None`,
+/// and a `pressure_gate` reporting `level="normal"` with
+/// `worker_sampled_at_ms=None` (pre-first-sample). Covers the
+/// `if let Some(ref snap) = worker_opt` branches (PressureLevel/WorkerState
+/// string mapping; `worker_sampled_at_ms = Some(..)` is the NOT-taken branch
+/// here) that `..._pressure_gate_no_sidecar_defaults` does not exercise.
+#[tokio::test]
+async fn subagent_runtime_status_workers_one_row_when_sidecar_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_sidecar_stopped_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // Envelope is always populated.
+    assert!(
+        envelope.generated_at_ms > 0,
+        "generated_at_ms must be positive"
+    );
+
+    // workers: [one row] — the configured-but-stopped sidecar.
+    assert_eq!(envelope.data.workers.len(), 1, "stopped sidecar -> one row");
+    let worker = &envelope.data.workers[0];
+    assert_eq!(worker.state, "stopped");
+    assert_eq!(worker.pid, None, "pid must be None when stopped");
+    assert_eq!(
+        worker.uptime_seconds, None,
+        "uptime must be None when stopped"
+    );
+    assert_eq!(worker.hot_sessions, 0, "hot_sessions starts at 0");
+
+    // pressure_gate: normal, no sample yet, hot_sessions_total=0.
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3);
+    assert_eq!(
+        envelope.data.pressure_gate.worker_sampled_at_ms, None,
+        "worker_sampled_at_ms is None before first sample"
+    );
 
     sup.shutdown_writer().await.expect("writer shutdown");
 }
