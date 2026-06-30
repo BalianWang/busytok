@@ -30,7 +30,7 @@ use busytok_config::SubagentResourcePolicyConfig;
 use busytok_store::{Database, SubagentResourceEventRow};
 
 use crate::pressure::{PressureAction, PressureGate, PressureResponder};
-use crate::resource::{ResourceMonitor, ResourcePressureState};
+use crate::resource::{ResourceMonitor, ResourcePressureState, ResourceSample};
 use crate::sidecar::client::SidecarRpcClient;
 use crate::sidecar::config::SidecarConfig;
 use crate::sidecar::protocol::PROTOCOL_VERSION;
@@ -40,6 +40,58 @@ use crate::sidecar::SidecarError;
 /// resource events and crash-reconciliation synchronously (no `.await` held
 /// across the lock). Mirrors the `SubagentManager` pattern.
 pub type SharedDb = Arc<std::sync::Mutex<Database>>;
+
+/// Read-only snapshot of a sidecar worker's state for the `runtime_status`
+/// handler (spec §4 Phase 2 `workers[]`). Returned by
+/// `PiSidecarSupervisor::worker_snapshot()`.
+#[derive(Debug, Clone)]
+pub struct WorkerSnapshot {
+    /// `Running` while the child process is alive, `Stopped` otherwise
+    /// (configured-but-not-running).
+    pub state: WorkerState,
+    /// OS pid of the sidecar child. `None` when `state == Stopped`.
+    pub pid: Option<u32>,
+    /// Seconds since the sidecar was spawned. `None` when `state == Stopped`.
+    pub uptime_seconds: Option<u64>,
+    /// Hot session count from the last `adapter.health` response cached in
+    /// `SupervisorState::latest_hot_sessions`. `0` before the first tick.
+    pub hot_sessions: u32,
+    /// System memory usage percentage (0–100). Computed fresh on each call
+    /// from the `ResourceMonitor`'s `sysinfo::System`. `None` when no
+    /// monitor is attached (never in production — both constructors attach
+    /// one).
+    pub memory_used_pct: Option<u32>,
+    /// Coarse pressure level derived from `ResourcePressureState` + the
+    /// `PressureGate`'s last action. Maps the supervisor's internal
+    /// Normal/Pressure/LimitExceeded latch to the spec's frontend-facing
+    /// `normal/throttled/evicting/restarting` vocabulary.
+    pub pressure_level: PressureLevel,
+    /// Absolute ms (Unix epoch) when the cached `ResourceSample` was taken,
+    /// via `busytok_domain::now_ms()`. `None` before the first resource
+    /// sample tick. Enables the frontend freshness display (Task 6).
+    pub sampled_at_ms: Option<i64>,
+}
+
+/// Worker lifecycle state for `WorkerSnapshot` (spec §4 Phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerState {
+    Running,
+    Stopped,
+}
+
+/// Frontend-facing pressure level for `WorkerSnapshot` (spec §4 Phase 2).
+/// Derived from `ResourcePressureState` + `PressureGate::last_action()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureLevel {
+    /// `ResourcePressureState::Normal`.
+    Normal,
+    /// `Pressure` state + queue paused (`PauseNewTasks` last action).
+    Throttled,
+    /// `Pressure` state + `HibernateLru` last action (evicting LRU session).
+    Evicting,
+    /// `LimitExceeded` state (`ForceKill`/`GracefulRestart` in flight).
+    Restarting,
+}
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -101,6 +153,27 @@ pub struct SupervisorState {
     /// reset on successful spawn (unlike `restart_attempts`) — the window
     /// is the hard cap, `restart_attempts` is for backoff calculation.
     pub restart_history: VecDeque<tokio::time::Instant>,
+    // ── Phase 2 monitoring state (Task 3) ─────────────────────────
+    /// `Some(Instant)` set in `spawn_internal` after a successful spawn;
+    /// cleared in `shutdown_internal`. Read by `worker_snapshot()` to
+    /// compute `uptime_seconds`. `None` while stopped.
+    spawned_at: Option<tokio::time::Instant>,
+    /// Latest `ResourceSample` cached by `maybe_sample_resources`. Read by
+    /// the future Task 6 `runtime_status` handler (which may expose
+    /// additional sample fields like `sidecar_rss_mb` / `sidecar_cpu_percent`
+    /// beyond the `WorkerSnapshot` surface). `None` before the first tick.
+    latest_sample: Option<ResourceSample>,
+    /// Absolute ms (Unix epoch, `busytok_domain::now_ms()`) when
+    /// `latest_sample` was captured. `None` before the first tick. Stored
+    /// SEPARATELY from the sample (rather than as a field on `ResourceSample`)
+    /// because `ResourceSample` is a pure data struct shared with the DB
+    /// event writer. Enables the frontend freshness display (Task 6).
+    latest_sample_at_ms: Option<i64>,
+    /// Cached `hot_session_count` from the last `adapter.health` response
+    /// (the value passed to `ResourceMonitor::sample()`). Surfaced as
+    /// `WorkerSnapshot::hot_sessions` so the handler doesn't need to RPC
+    /// the sidecar.
+    latest_hot_sessions: u32,
 }
 
 impl PiSidecarSupervisor {
@@ -130,6 +203,10 @@ impl PiSidecarSupervisor {
                 generation: 0,
                 resource_pressure_state: ResourcePressureState::Normal,
                 restart_history: VecDeque::new(),
+                spawned_at: None,
+                latest_sample: None,
+                latest_sample_at_ms: None,
+                latest_hot_sessions: 0,
             }),
             spawn_lock: Mutex::new(()),
             db,
@@ -167,6 +244,10 @@ impl PiSidecarSupervisor {
                 generation: 0,
                 resource_pressure_state: ResourcePressureState::Normal,
                 restart_history: VecDeque::new(),
+                spawned_at: None,
+                latest_sample: None,
+                latest_sample_at_ms: None,
+                latest_hot_sessions: 0,
             }),
             spawn_lock: Mutex::new(()),
             db,
@@ -193,6 +274,78 @@ impl PiSidecarSupervisor {
             .try_lock()
             .map(|s| s.child.as_ref().map(|c| c.id().is_some()).unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// Read-only snapshot of the worker's current state for the
+    /// `runtime_status` handler (spec §4 Phase 2 `workers[]`). ALWAYS returns
+    /// `Some` — even when the sidecar is not running — so
+    /// "configured-but-stopped" sidecars stay observable. Only the Task 6
+    /// handler returns `workers: []` (when `sidecar_supervisor` is `None` /
+    /// not configured).
+    ///
+    /// `state=Stopped` with `pid=None`/`uptime_seconds=None` represents a
+    /// configured-but-not-running sidecar. `sampled_at_ms=None` represents
+    /// "no resource sample yet" (freshly-constructed supervisor or before
+    /// the first supervision-loop tick).
+    ///
+    /// `memory_used_pct` is computed fresh on each call from the
+    /// `ResourceMonitor`'s `sysinfo::System`; the other fields are stamped
+    /// by the supervision loop and may be up to `monitor_interval_seconds`
+    /// (default 30s) stale — that's the design decision (stamped freshness,
+    /// NOT "same moment").
+    pub async fn worker_snapshot(&self) -> Option<WorkerSnapshot> {
+        let state = self.state.lock().await;
+        let is_running = state
+            .child
+            .as_ref()
+            .map(|c| c.id().is_some())
+            .unwrap_or(false);
+        let worker_state = if is_running {
+            WorkerState::Running
+        } else {
+            WorkerState::Stopped
+        };
+        let pid = if is_running {
+            state.child.as_ref().and_then(|c| c.id())
+        } else {
+            None
+        };
+        let uptime_seconds = if is_running {
+            state.spawned_at.map(|t| t.elapsed().as_secs())
+        } else {
+            None
+        };
+        let hot_sessions = state.latest_hot_sessions;
+        // memory_used_pct is computed fresh from the ResourceMonitor's
+        // sysinfo::System (refreshed at construction + on each sample tick).
+        // Falls back to None if no monitor is attached (never in production
+        // — both constructors attach one) or if the std Mutex is poisoned.
+        let memory_used_pct = self
+            .resource_monitor
+            .as_ref()
+            .and_then(|m| m.lock().ok().and_then(|g| g.memory_used_pct()));
+        // Pressure level mapping (spec §4 Phase 2 normal/throttled/evicting/
+        // restarting). The supervisor's internal latch has 3 states; the
+        // PressureGate's last_action disambiguates the Pressure tier.
+        let pressure_level = match state.resource_pressure_state {
+            ResourcePressureState::Normal => PressureLevel::Normal,
+            ResourcePressureState::Pressure => {
+                match self.pressure_gate.as_ref().and_then(|g| g.last_action()) {
+                    Some(PressureAction::HibernateLru) => PressureLevel::Evicting,
+                    _ => PressureLevel::Throttled,
+                }
+            }
+            ResourcePressureState::LimitExceeded => PressureLevel::Restarting,
+        };
+        Some(WorkerSnapshot {
+            state: worker_state,
+            pid,
+            uptime_seconds,
+            hot_sessions,
+            memory_used_pct,
+            pressure_level,
+            sampled_at_ms: state.latest_sample_at_ms,
+        })
     }
 
     /// §8.3 step 5: force-kill the sidecar child (SIGKILL, no graceful
@@ -257,6 +410,9 @@ impl PiSidecarSupervisor {
         let child = {
             let mut state = self.state.lock().await;
             state.supervision_started = false;
+            // Phase 2: clear spawn time so `worker_snapshot()` reports
+            // `Stopped` with `uptime_seconds=None` after shutdown.
+            state.spawned_at = None;
             state.child.take()
         };
         if let Some(mut child) = child {
@@ -509,6 +665,7 @@ impl PiSidecarSupervisor {
             state.client = Some(Arc::new(Mutex::new(client)));
             state.last_activity = tokio::time::Instant::now();
             state.restart_attempts = 0; // reset on successful spawn
+            state.spawned_at = Some(tokio::time::Instant::now()); // Phase 2: uptime
             if !state.supervision_started {
                 state.supervision_started = true;
                 // Bump generation so any stale loop from a prior lifecycle
@@ -724,6 +881,21 @@ impl PiSidecarSupervisor {
             system_available_mb = sample.system_available_mb,
             "resource sample"
         );
+        // Phase 2: cache the sample + absolute timestamp + hot_sessions for
+        // `worker_snapshot()`. The timestamp is captured via
+        // `busytok_domain::now_ms()` (the same clock used by
+        // `ReadEnvelopeDto::generated_at_ms`) so the frontend can display
+        // freshness independently of the supervision loop's poll cadence.
+        // The sample may be up to `monitor_interval_seconds` (default 30s)
+        // stale by the time `worker_snapshot()` reads it — that's
+        // acceptable per the design decision (stamped freshness, NOT
+        // "same moment").
+        {
+            let mut state = self.state.lock().await;
+            state.latest_sample = Some(sample.clone());
+            state.latest_sample_at_ms = Some(busytok_domain::now_ms());
+            state.latest_hot_sessions = hot_sessions;
+        }
         // Compute new pressure state from predicates.
         let (under_pressure, exceeds_soft, exceeds_hard) = {
             let guard = match monitor.lock() {

@@ -8,7 +8,9 @@ pub use client::SidecarRpcClient;
 pub use config::{resolve_sidecar_config, SidecarConfig};
 pub use executor::SidecarTaskExecutor;
 pub use protocol::*;
-pub use supervisor::{PiSidecarSupervisor, SharedDb, SidecarHandle};
+pub use supervisor::{
+    PiSidecarSupervisor, PressureLevel, SharedDb, SidecarHandle, WorkerSnapshot, WorkerState,
+};
 
 /// Errors from sidecar operations.
 #[derive(Debug, thiserror::Error)]

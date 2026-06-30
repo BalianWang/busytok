@@ -15,7 +15,8 @@ use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::DelegateRequest;
 use busytok_subagent::sidecar::{
-    PiSidecarSupervisor, SidecarConfig, SidecarError, SidecarTaskExecutor,
+    PiSidecarSupervisor, PressureLevel, SidecarConfig, SidecarError, SidecarTaskExecutor,
+    WorkerState,
 };
 use busytok_subagent::{PressureAction, PressureGate, PressureResponder};
 
@@ -1382,4 +1383,128 @@ async fn sidecar_handle_debug_impl_produces_struct() {
         "Debug output should use finish_non_exhaustive (..): {debug_str}"
     );
     sup.shutdown().await.unwrap();
+}
+
+// --- Phase 2 worker_snapshot tests (Task 3) ---
+//
+// `worker_snapshot()` exposes the sidecar's current state for the
+// `runtime_status` handler (Task 6). Critical invariant: it ALWAYS returns
+// `Some` — even when the sidecar is stopped — so "configured-but-stopped"
+// sidecars stay observable. Only the handler returns `workers: []` when
+// `sidecar_supervisor` is `None`.
+
+/// Critical invariant: `worker_snapshot()` MUST always return `Some` — even
+/// when the sidecar is freshly constructed (never started). `state=Stopped`
+/// with `pid=None`/`uptime_seconds=None`/`sampled_at_ms=None` represents a
+/// configured-but-not-running sidecar.
+#[tokio::test]
+async fn worker_snapshot_always_returns_some_even_when_stopped() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let snap = sup.worker_snapshot().await;
+    assert!(snap.is_some(), "worker_snapshot must always return Some");
+    let snap = snap.unwrap();
+    assert_eq!(snap.state, WorkerState::Stopped);
+    assert!(snap.pid.is_none(), "pid must be None when stopped");
+    assert!(
+        snap.uptime_seconds.is_none(),
+        "uptime must be None when stopped"
+    );
+    assert_eq!(snap.hot_sessions, 0, "hot_sessions starts at 0");
+    assert!(
+        snap.sampled_at_ms.is_none(),
+        "sampled_at_ms is None before first sample"
+    );
+}
+
+/// Pressure level is `Normal` by default (no pressure transitions yet).
+#[tokio::test]
+async fn worker_snapshot_pressure_level_normal_by_default() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(snap.pressure_level, PressureLevel::Normal);
+}
+
+/// After `ensure_started`, the snapshot reports `Running` with a pid and
+/// uptime. Verifies `spawned_at` is set in `spawn_internal`.
+#[tokio::test]
+async fn worker_snapshot_reports_running_after_ensure_started() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(
+        snap.state,
+        WorkerState::Running,
+        "sidecar should be running"
+    );
+    assert!(snap.pid.is_some(), "pid must be Some when running");
+    assert!(
+        snap.uptime_seconds.is_some(),
+        "uptime must be Some when running"
+    );
+    sup.shutdown().await.unwrap();
+}
+
+/// After `shutdown`, the snapshot reports `Stopped` with no pid/uptime.
+/// Verifies `spawned_at` is cleared in `shutdown_internal` AND that
+/// `worker_snapshot()` still returns `Some` (the critical invariant).
+#[tokio::test]
+async fn worker_snapshot_reports_stopped_after_shutdown() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+    sup.shutdown().await.unwrap();
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(snap.state, WorkerState::Stopped);
+    assert!(snap.pid.is_none(), "pid must be cleared after shutdown");
+    assert!(
+        snap.uptime_seconds.is_none(),
+        "uptime must be cleared after shutdown"
+    );
+}
+
+/// After the supervision loop's health-pinger + resource-sampling tick fires,
+/// `sampled_at_ms` is set (absolute ms via `busytok_domain::now_ms()`). This
+/// enables the frontend freshness display (Task 6).
+#[tokio::test]
+async fn worker_snapshot_caches_sample_after_health_tick() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    let policy = SubagentResourcePolicyConfig {
+        memory_pressure_free_mb: 0,
+        monitor_interval_seconds: 5,
+    };
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, None, policy, None);
+    let _ = sup.ensure_started().await.unwrap();
+    // Wait for at least 2 health-pinger + resource-sampling cycles (200ms).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert!(
+        snap.sampled_at_ms.is_some(),
+        "sampled_at_ms must be set after sampling"
+    );
+    sup.shutdown().await.unwrap();
+}
+
+/// `memory_used_pct` is `Some` whenever a `ResourceMonitor` is attached
+/// (default for both `new` and `with_resource_policy` constructors). The
+/// `ResourceMonitor` owns a `sysinfo::System` refreshed at construction, so
+/// total + available memory are populated even before the first sample tick.
+#[tokio::test]
+async fn worker_snapshot_memory_used_pct_is_some_when_monitor_attached() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert!(
+        snap.memory_used_pct.is_some(),
+        "memory_used_pct should be Some when monitor is attached"
+    );
+    let pct = snap.memory_used_pct.unwrap();
+    assert!(pct <= 100, "memory_used_pct should be <= 100, got {pct}");
 }
