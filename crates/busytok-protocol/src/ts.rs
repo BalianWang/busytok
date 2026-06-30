@@ -174,6 +174,13 @@ mod tests {
             dto::SubagentTasksResponseDto::decl(),
             dto::SubagentDeleteRequestDto::decl(),
             dto::SubagentAckDto::decl(),
+            // Subagent runtime status (spec §4 Phase 2)
+            dto::SubagentRuntimeStatusRequestDto::decl(),
+            dto::SubagentRuntimeStatusDto::decl(),
+            dto::SubagentPressureGateDto::decl(),
+            dto::SubagentRuntimeSubagentDto::decl(),
+            dto::SubagentRuntimeTaskDto::decl(),
+            dto::SubagentWorkerDto::decl(),
             // Receipt (daily share image)
             dto::ReceiptPeakHourDto::decl(),
             dto::ReceiptModelSliceDto::decl(),

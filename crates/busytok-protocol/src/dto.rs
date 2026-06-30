@@ -1386,6 +1386,74 @@ pub struct SubagentAckDto {
     pub status: String,
 }
 
+// ---------------------------------------------------------------------------
+// Subagent runtime status DTOs (spec §4 Phase 2)
+// Wrapped by ReadEnvelopeDto<SubagentRuntimeStatusDto> at the handler layer.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+pub struct SubagentRuntimeStatusRequestDto {
+    /// Reserved for future filtering; Phase 2 ignores this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentPressureGateDto {
+    pub level: String,
+    pub memory_used_pct: u32,
+    pub hot_sessions_total: u32,
+    pub hot_sessions_limit: u32,
+    /// Absolute ms when the worker ResourceSample was taken (via
+    /// `busytok_domain::now_ms()`). `None` if no sample has been taken yet.
+    /// Enables frontend freshness display. This is NOT the same as
+    /// `ReadEnvelopeDto.generated_at_ms` (response construction time).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_sampled_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentRuntimeSubagentDto {
+    pub name: String,
+    pub status: String,
+    pub task_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_task_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_task_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentRuntimeTaskDto {
+    pub task_id: String,
+    pub subagent_name: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentWorkerDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<u64>,
+    pub hot_sessions: u32,
+}
+
+/// Inner data of `ReadEnvelopeDto` for `subagent.runtime_status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentRuntimeStatusDto {
+    pub pressure_gate: SubagentPressureGateDto,
+    pub subagents: Vec<SubagentRuntimeSubagentDto>,
+    pub tasks_recent: Vec<SubagentRuntimeTaskDto>,
+    pub workers: Vec<SubagentWorkerDto>,
+}
+
 // ─── Receipt DTOs (from main merge) ───
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 pub struct ReceiptDailyRequestDto {

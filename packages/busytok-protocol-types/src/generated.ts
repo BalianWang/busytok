@@ -320,6 +320,29 @@ export type SubagentDeleteRequestDto = { name: string | null, id: string | null,
 
 export type SubagentAckDto = { id: string, status: string, };
 
+export type SubagentRuntimeStatusRequestDto = { 
+/**
+ * Reserved for future filtering; Phase 2 ignores this field.
+ */
+project: string | null, };
+
+export type SubagentRuntimeStatusDto = { pressure_gate: SubagentPressureGateDto, subagents: Array<SubagentRuntimeSubagentDto>, tasks_recent: Array<SubagentRuntimeTaskDto>, workers: Array<SubagentWorkerDto>, };
+
+export type SubagentPressureGateDto = { level: string, memory_used_pct: number, hot_sessions_total: number, hot_sessions_limit: number, 
+/**
+ * Absolute ms when the worker ResourceSample was taken (via
+ * `busytok_domain::now_ms()`). `None` if no sample has been taken yet.
+ * Enables frontend freshness display. This is NOT the same as
+ * `ReadEnvelopeDto.generated_at_ms` (response construction time).
+ */
+worker_sampled_at_ms: number | null, };
+
+export type SubagentRuntimeSubagentDto = { name: string, status: string, task_count: number, last_task_at_ms: number | null, last_task_status: string | null, };
+
+export type SubagentRuntimeTaskDto = { task_id: string, subagent_name: string, status: string, created_at_ms: number, error: string | null, };
+
+export type SubagentWorkerDto = { provider_id: string | null, state: string, pid: number | null, uptime_seconds: number | null, hot_sessions: number, };
+
 export type ReceiptPeakHourDto = { 
 /**
  * Reporting-TZ wall-clock hour, e.g. "14:00".
