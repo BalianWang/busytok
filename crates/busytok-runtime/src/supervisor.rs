@@ -4656,6 +4656,149 @@ impl RuntimeControl for BusytokSupervisor {
         })
     }
 
+    async fn subagent_runtime_status(
+        &self,
+        _req: SubagentRuntimeStatusRequestDto,
+    ) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
+        let now_ms = now_ms();
+
+        // 1. Snapshot worker state first (single in-memory lock, fast).
+        //    `worker_snapshot()` always returns `Some` when the supervisor
+        //    exists — even if the child is stopped. `None` here means no
+        //    sidecar supervisor is configured (`workers: []` semantics).
+        //    The worker sample may lag up to `monitor_interval_seconds`
+        //    behind `now_ms`; that's exposed via `worker_sampled_at_ms`.
+        let worker_opt = if let Some(sup) = &self.sidecar_supervisor {
+            sup.worker_snapshot().await
+        } else {
+            None
+        };
+
+        // 2. Read `hot_sessions_limit` from settings (default 3).
+        let hot_sessions_limit = {
+            let settings = self.settings.lock().unwrap();
+            settings.subagent.pi_sidecar.max_hot_sessions
+        };
+
+        // 3. Build pressure_gate DTO. `worker_sampled_at_ms` exposes the
+        //    freshness of the worker sample so the frontend can show "stale".
+        let pressure_gate = if let Some(ref snap) = worker_opt {
+            let level = match snap.pressure_level {
+                busytok_subagent::sidecar::PressureLevel::Normal => "normal",
+                busytok_subagent::sidecar::PressureLevel::Throttled => "throttled",
+                busytok_subagent::sidecar::PressureLevel::Evicting => "evicting",
+                busytok_subagent::sidecar::PressureLevel::Restarting => "restarting",
+            };
+            SubagentPressureGateDto {
+                level: level.to_string(),
+                memory_used_pct: snap.memory_used_pct.unwrap_or(0),
+                hot_sessions_total: snap.hot_sessions,
+                hot_sessions_limit,
+                worker_sampled_at_ms: snap.sampled_at_ms,
+            }
+        } else {
+            SubagentPressureGateDto {
+                level: "normal".to_string(),
+                memory_used_pct: 0,
+                hot_sessions_total: 0,
+                hot_sessions_limit,
+                worker_sampled_at_ms: None,
+            }
+        };
+
+        // 4. Build workers[] DTO.
+        //    `[]` ONLY when `sidecar_supervisor` is `None` (not configured).
+        //    When the supervisor exists but the child is stopped, return ONE
+        //    row with `state="stopped"`, `pid=null`, `uptime_seconds=null`.
+        let workers: Vec<SubagentWorkerDto> = if let Some(ref snap) = worker_opt {
+            let state = match snap.state {
+                busytok_subagent::sidecar::WorkerState::Running => "running",
+                busytok_subagent::sidecar::WorkerState::Stopped => "stopped",
+            };
+            vec![SubagentWorkerDto {
+                provider_id: None, // Phase 2: no provider binding yet
+                state: state.to_string(),
+                pid: snap.pid,
+                uptime_seconds: snap.uptime_seconds,
+                hot_sessions: snap.hot_sessions,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        // 5. Single-read aggregate DB read (one DB lock, all 4 queries —
+        //    spec §4 line 213). The DB portion is internally consistent;
+        //    the worker portion may be from a slightly earlier moment,
+        //    exposed via `worker_sampled_at_ms`.
+        let snapshot = self
+            .subagent_manager
+            .runtime_status_snapshot(20)
+            .await
+            .map_err(map_subagent_error)?;
+
+        // 6. Build subagents[] DTO. Join logical subagents with their
+        //    task_count and last_task (created_at, status).
+        let subagents: Vec<SubagentRuntimeSubagentDto> = snapshot
+            .subagents
+            .iter()
+            .map(|s| {
+                let task_count = snapshot.task_counts.get(&s.id).copied().unwrap_or(0);
+                let last_task = snapshot.last_tasks.get(&s.id);
+                SubagentRuntimeSubagentDto {
+                    name: s.name.clone(),
+                    status: s.status.as_str().to_string(),
+                    task_count,
+                    last_task_at_ms: last_task.map(|(ts, _)| *ts),
+                    last_task_status: last_task.map(|(_, st)| st.clone()),
+                }
+            })
+            .collect();
+
+        // 7. Build tasks_recent[] DTO. Resolve `subagent_name` via the
+        //    id→name lookup built from the subagents list.
+        let name_lookup: std::collections::HashMap<String, String> = snapshot
+            .subagents
+            .iter()
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect();
+        let tasks_recent: Vec<SubagentRuntimeTaskDto> = snapshot
+            .recent_tasks
+            .iter()
+            .map(|t| SubagentRuntimeTaskDto {
+                task_id: t.id.clone(),
+                subagent_name: name_lookup
+                    .get(&t.subagent_id)
+                    .cloned()
+                    .unwrap_or_else(|| t.subagent_id.clone()),
+                status: t.status.as_str().to_string(),
+                created_at_ms: t.created_at_ms,
+                error: t.error.clone(),
+            })
+            .collect();
+
+        tracing::debug!(
+            event_code = "subagent.runtime_status_served",
+            subagent_count = subagents.len(),
+            task_count = tasks_recent.len(),
+            worker_count = workers.len(),
+            "served subagent.runtime_status"
+        );
+
+        // 8. Wrap in ReadEnvelopeDto via `build_read_envelope` — reuses the
+        //    existing envelope infrastructure (readiness / is_exact / is_stale
+        //    / degraded_reason / generation_id / watermark_ms / progress from
+        //    `ServiceStatusSnapshot`).
+        self.build_read_envelope(
+            SubagentRuntimeStatusDto {
+                pressure_gate,
+                subagents,
+                tasks_recent,
+                workers,
+            },
+            now_ms,
+        )
+    }
+
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {

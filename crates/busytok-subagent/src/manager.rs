@@ -36,6 +36,24 @@ pub struct SubagentManager {
     pressure_gate: Option<Arc<PressureGate>>,
 }
 
+/// Combined snapshot for `subagent.runtime_status` — all DB reads occur under
+/// a single `SubagentManager` lock acquisition to preserve single-read
+/// aggregate semantics (spec §4 line 213). The worker sample (collected
+/// separately by the supervisor from `PiSidecarSupervisor::worker_snapshot`)
+/// is NOT part of this struct — it is stamped with `worker_sampled_at_ms` at
+/// the handler layer so consumers know its freshness.
+pub struct RuntimeStatusSnapshot {
+    /// Active (non-deleted) logical subagents, mapped from raw rows.
+    pub subagents: Vec<LogicalSubagent>,
+    /// `subagent_id → task_count` (only subagents with ≥1 task appear).
+    pub task_counts: std::collections::HashMap<String, u32>,
+    /// `subagent_id → (created_at_ms, status_string)` for each subagent's
+    /// latest task (only subagents with ≥1 task appear).
+    pub last_tasks: std::collections::HashMap<String, (i64, String)>,
+    /// Most recent tasks across ALL subagents, newest first (limit-clamped).
+    pub recent_tasks: Vec<SubagentTaskSummary>,
+}
+
 impl SubagentManager {
     pub fn new(
         db: SharedDb,
@@ -730,6 +748,50 @@ impl SubagentManager {
             .into_iter()
             .map(|(sub_id, created_at, status)| (sub_id, (created_at, status)))
             .collect())
+    }
+
+    /// Combined snapshot for `subagent.runtime_status` — performs all 4 DB
+    /// reads (`subagent_list_filtered`, `subagent_count_tasks_by_subagent`,
+    /// `subagent_last_task_by_subagent`, `subagent_list_recent_tasks_all`)
+    /// under a single DB lock acquisition to preserve single-read aggregate
+    /// semantics (spec §4 line 213). Avoids 4 separate lock acquisitions that
+    /// could observe inconsistent DB state.
+    ///
+    /// `recent_limit` is passed through to the store layer; callers are
+    /// responsible for clamping. The `subagents` vector excludes
+    /// deleted rows (`include_deleted=false`), matching the `list()` default.
+    pub async fn runtime_status_snapshot(
+        &self,
+        recent_limit: i64,
+    ) -> Result<RuntimeStatusSnapshot> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let rows = db
+            .subagent_list_filtered(None, None, false)
+            .map_err(SubagentError::Store)?;
+        let subagents: Vec<LogicalSubagent> = rows.iter().map(row_to_model).collect();
+        let task_counts: std::collections::HashMap<String, u32> = db
+            .subagent_count_tasks_by_subagent()
+            .map_err(SubagentError::Store)?
+            .into_iter()
+            .collect();
+        let last_tasks: std::collections::HashMap<String, (i64, String)> = db
+            .subagent_last_task_by_subagent()
+            .map_err(SubagentError::Store)?
+            .into_iter()
+            .map(|(sub_id, created_at, status)| (sub_id, (created_at, status)))
+            .collect();
+        let recent_tasks: Vec<SubagentTaskSummary> = db
+            .subagent_list_recent_tasks_all(recent_limit)
+            .map_err(SubagentError::Store)?
+            .into_iter()
+            .map(task_row_to_summary)
+            .collect();
+        Ok(RuntimeStatusSnapshot {
+            subagents,
+            task_counts,
+            last_tasks,
+            recent_tasks,
+        })
     }
 
     /// Release any hot binding for this subagent; keep DB state (warm/cold).

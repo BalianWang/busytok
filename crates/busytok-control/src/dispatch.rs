@@ -193,6 +193,12 @@ pub trait RuntimeControl: Send + Sync {
         &self,
         req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto>;
+    async fn subagent_runtime_status(
+        &self,
+        req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    >;
 
     // Providers (Phase 1: Credential Foundation)
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto>;
@@ -499,6 +505,14 @@ impl ControlDispatcher {
                 let req: SubagentDeleteRequestDto = serde_json::from_value(request.params)
                     .map_err(|e| anyhow::anyhow!("invalid params for subagent.delete: {e}"))?;
                 let dto = self.runtime.subagent_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.runtime_status" => {
+                let req: SubagentRuntimeStatusRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| {
+                    anyhow::anyhow!("invalid params for subagent.runtime_status: {e}")
+                })?;
+                let dto = self.runtime.subagent_runtime_status(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -1139,6 +1153,27 @@ impl RuntimeControl for TestRuntimeControl {
     ) -> Result<busytok_protocol::dto::SubagentAckDto> {
         Ok(Default::default())
     }
+    async fn subagent_runtime_status(
+        &self,
+        _req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    > {
+        Ok(stub_envelope(
+            busytok_protocol::dto::SubagentRuntimeStatusDto {
+                pressure_gate: busytok_protocol::dto::SubagentPressureGateDto {
+                    level: "normal".to_string(),
+                    memory_used_pct: 0,
+                    hot_sessions_total: 0,
+                    hot_sessions_limit: 3,
+                    worker_sampled_at_ms: None,
+                },
+                subagents: Vec::new(),
+                tasks_recent: Vec::new(),
+                workers: Vec::new(),
+            },
+        ))
+    }
 
     // ── Providers (Phase 1: Credential Foundation) ───────────────────
 
@@ -1349,6 +1384,14 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto> {
         (**self).subagent_delete(req).await
+    }
+    async fn subagent_runtime_status(
+        &self,
+        req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    > {
+        (**self).subagent_runtime_status(req).await
     }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
         (**self).provider_create(req).await

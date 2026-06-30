@@ -484,6 +484,14 @@ impl RuntimeControl for AliasConflictRuntime {
     ) -> anyhow::Result<busytok_protocol::dto::SubagentAckDto> {
         self.inner.subagent_delete(req).await
     }
+    async fn subagent_runtime_status(
+        &self,
+        req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> anyhow::Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    > {
+        self.inner.subagent_runtime_status(req).await
+    }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await
     }

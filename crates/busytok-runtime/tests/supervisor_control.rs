@@ -3841,3 +3841,324 @@ async fn provider_crud_round_trips_with_api_key_macos() {
     let list = sup.provider_list().await.unwrap();
     assert!(list.providers.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// subagent.runtime_status (Phase 2: Subagent Monitoring Page)
+// ---------------------------------------------------------------------------
+//
+// Tests exercise the BusytokSupervisor handler end-to-end via the RuntimeControl
+// trait. Data is seeded directly via the shared DB handle (`sup.db_handle()`)
+// using `SubagentLogicalSubagentRow` / `SubagentTaskRow` so we can control
+// `created_at_ms` and `status` precisely — the mock executor path
+// (`subagent_delegate`) timestamps tasks at `now_ms()` and only produces
+// `completed` rows, which doesn't let us verify ordering or last_task_status.
+
+use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow, SubagentTaskRow};
+
+/// Helper: insert a logical subagent row with the given name + status.
+/// Returns the row id (same as `name` for tests).
+fn seed_subagent_row(sup: &BusytokSupervisor, name: &str, status: &str) -> String {
+    let mut row = SubagentLogicalSubagentRow::for_test(name, name);
+    row.status = status.to_string();
+    let db = sup.db_handle().lock().unwrap();
+    db.subagent_upsert_logical(&row).expect("upsert logical");
+    // Also seed an empty memory row — `subagent_list_filtered` joins on
+    // memory in some paths and a missing memory row can cause the subagent
+    // to be filtered out.
+    db.subagent_upsert_memory(&SubagentMemoryRow::new_empty(name))
+        .expect("upsert memory");
+    row.id
+}
+
+/// Helper: insert a task row with the given id, subagent_id, status, and
+/// created_at_ms. `SubagentTaskRow::for_test` defaults to `status="queued"`;
+/// we override it (and the timestamp) after construction.
+fn seed_task_row(
+    sup: &BusytokSupervisor,
+    id: &str,
+    subagent_id: &str,
+    status: &str,
+    created_at_ms: i64,
+) {
+    let mut row = SubagentTaskRow::for_test(id, subagent_id, "pi/search-cheap", "do work");
+    row.status = status.to_string();
+    row.created_at_ms = created_at_ms;
+    if status == "completed" || status == "failed" || status == "cancelled" {
+        row.completed_at_ms = Some(created_at_ms + 1000);
+    }
+    if status == "failed" {
+        row.error = Some("boom".to_string());
+    }
+    let db = sup.db_handle().lock().unwrap();
+    db.subagent_insert_task(&row).expect("insert task");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_returns_empty_when_no_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .expect("runtime_status should succeed on empty DB");
+
+    // Envelope-level assertions — `build_read_envelope` populates these from
+    // `ServiceStatusSnapshot`. `generated_at_ms` is `now_ms()` so must be > 0.
+    assert!(
+        envelope.generated_at_ms > 0,
+        "generated_at_ms must be populated"
+    );
+
+    // Inner data — empty state.
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.memory_used_pct, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    // Default `max_hot_sessions` from `SubagentSettings::default()` is 3.
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3);
+    // No sidecar supervisor in `make_supervisor` → `worker_sampled_at_ms` is None.
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
+    assert!(envelope.data.subagents.is_empty());
+    assert!(envelope.data.tasks_recent.is_empty());
+    // `make_supervisor` doesn't configure a sidecar → `workers: []`.
+    assert!(envelope.data.workers.is_empty());
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_includes_subagents_with_task_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-a", "warm");
+    seed_subagent_row(&sup, "sub-b", "warm");
+    // sub-a: 2 tasks (one completed, one failed — failed is the latest by ts)
+    seed_task_row(&sup, "t1", "sub-a", "completed", 1_000);
+    seed_task_row(&sup, "t2", "sub-a", "failed", 2_000);
+    // sub-b: 1 task
+    seed_task_row(&sup, "t3", "sub-b", "completed", 3_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.subagents.len(), 2);
+    let sub_a = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "sub-a")
+        .expect("sub-a present");
+    assert_eq!(sub_a.task_count, 2);
+    assert_eq!(sub_a.last_task_at_ms, Some(2_000));
+    assert_eq!(sub_a.last_task_status.as_deref(), Some("failed"));
+
+    let sub_b = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "sub-b")
+        .expect("sub-b present");
+    assert_eq!(sub_b.task_count, 1);
+    assert_eq!(sub_b.last_task_at_ms, Some(3_000));
+    assert_eq!(sub_b.last_task_status.as_deref(), Some("completed"));
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_ordered_desc_by_created_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-a", "hot");
+    // Insert out of order — handler must return newest-first.
+    seed_task_row(&sup, "t1", "sub-a", "completed", 1_000);
+    seed_task_row(&sup, "t2", "sub-a", "completed", 3_000);
+    seed_task_row(&sup, "t3", "sub-a", "completed", 2_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.tasks_recent.len(), 3);
+    // Descending by created_at_ms.
+    assert_eq!(envelope.data.tasks_recent[0].task_id, "t2"); // 3000ms
+    assert_eq!(envelope.data.tasks_recent[1].task_id, "t3"); // 2000ms
+    assert_eq!(envelope.data.tasks_recent[2].task_id, "t1"); // 1000ms
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_excludes_deleted_subagents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-active", "warm");
+    seed_subagent_row(&sup, "sub-gone", "deleted");
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // `subagent_list_filtered(None, None, false)` excludes `deleted` rows.
+    assert_eq!(envelope.data.subagents.len(), 1);
+    assert_eq!(envelope.data.subagents[0].name, "sub-active");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_resolves_subagent_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "my-agent", "hot");
+    seed_task_row(&sup, "t1", "my-agent", "completed", 1_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.tasks_recent.len(), 1);
+    assert_eq!(envelope.data.tasks_recent[0].task_id, "t1");
+    assert_eq!(envelope.data.tasks_recent[0].subagent_name, "my-agent");
+    assert_eq!(envelope.data.tasks_recent[0].status, "completed");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_includes_error_for_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-a", "warm");
+    seed_task_row(&sup, "t1", "sub-a", "failed", 1_000);
+    seed_task_row(&sup, "t2", "sub-a", "completed", 2_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    let failed = envelope
+        .data
+        .tasks_recent
+        .iter()
+        .find(|t| t.task_id == "t1")
+        .expect("failed task present");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error.as_deref(), Some("boom"));
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_envelope_populated_from_status_snapshot() {
+    // The handler must wrap the inner DTO via `build_read_envelope`, which
+    // populates `readiness` / `is_exact` / `is_stale` / `degraded_reason`
+    // from `ServiceStatusSnapshot`. On a fresh supervisor the snapshot is
+    // `Starting` (no scan has run), so `is_stale=true` and `is_exact=false`.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert!(envelope.generated_at_ms > 0);
+    // Fresh supervisor → readiness is `Starting`.
+    assert_eq!(envelope.readiness, ReadinessStateDto::Starting);
+    assert!(!envelope.is_exact);
+    assert!(envelope.is_stale);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_pressure_gate_no_sidecar_defaults() {
+    // When no sidecar supervisor is configured (`make_supervisor` path), the
+    // pressure gate must report `level=normal`, `memory_used_pct=0`,
+    // `hot_sessions_total=0`, `worker_sampled_at_ms=None`, and
+    // `hot_sessions_limit` from settings (default 3). `workers` must be `[]`.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.memory_used_pct, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3);
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
+    assert!(envelope.data.workers.is_empty(), "no sidecar → workers: []");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_subagent_status_string_mapped() {
+    // Verify `LogicalSubagent.status` (enum) → DTO `status` (String) mapping
+    // via `as_str()`. Seeds one subagent per non-deleted status variant.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "hot-sub", "hot");
+    seed_subagent_row(&sup, "warm-sub", "warm");
+    seed_subagent_row(&sup, "cold-sub", "cold");
+    // `deleted` excluded from the list — not asserted here (covered by
+    // `subagent_runtime_status_excludes_deleted_subagents`).
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // Ordering of subagents is by `last_active_at_ms DESC NULLS LAST`; all
+    // seeded rows have `last_active_at_ms = None`, so the order among them is
+    // unspecified. Assert presence + status mapping instead of order.
+    assert_eq!(envelope.data.subagents.len(), 3);
+    let hot = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "hot-sub")
+        .unwrap();
+    assert_eq!(hot.status, "hot");
+    let warm = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "warm-sub")
+        .unwrap();
+    assert_eq!(warm.status, "warm");
+    let cold = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "cold-sub")
+        .unwrap();
+    assert_eq!(cold.status, "cold");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
