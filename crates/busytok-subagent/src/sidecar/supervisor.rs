@@ -93,6 +93,23 @@ pub enum PressureLevel {
     Restarting,
 }
 
+impl PressureLevel {
+    /// Severity rank used by `subagent_runtime_status` aggregation
+    /// (Phase 3 Task 4, I4 fix). Higher = more severe. `PressureLevel`
+    /// does NOT derive `Ord` (only `PartialEq`/`Eq`) because the enum
+    /// variants don't have a natural total order — this helper makes the
+    /// escalation ordering explicit: Normal < Throttled < Evicting <
+    /// Restarting.
+    pub fn severity(&self) -> u8 {
+        match self {
+            PressureLevel::Normal => 0,
+            PressureLevel::Throttled => 1,
+            PressureLevel::Evicting => 2,
+            PressureLevel::Restarting => 3,
+        }
+    }
+}
+
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Spec §5.4: rolling 5-min window for crash restart attempts.

@@ -95,9 +95,14 @@ fn make_sidecar_settings() -> BusytokSettings {
         models: vec!["test-model".to_string()],
         enabled: true,
     });
-    // Bind all built-in profiles to the test provider.
+    // Bind all built-in profiles to the test provider. Also set the
+    // profile model to "test-model" (matches the provider's whitelist) so
+    // Phase 3 Task 4's whitelist validation (spec §3.4) doesn't reject
+    // delegate calls. The default profile model ("deepseek-chat") is NOT
+    // in the test-provider's whitelist.
     for profile in settings.subagent.profiles.values_mut() {
         profile.provider_id = Some("test-provider".to_string());
+        profile.model = "test-model".to_string();
     }
 
     // Inject a fake API key via env var so `construct_sidecar`'s credential

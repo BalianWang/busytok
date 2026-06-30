@@ -4404,3 +4404,442 @@ async fn subagent_runtime_status_tasks_recent_shows_display_name_for_deleted_sub
 
     sup.shutdown_writer().await.expect("writer shutdown");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 Task 4: BusytokSupervisor wiring — delegate validation,
+// runtime_status aggregation, provider_changed/deleted worker lifecycle.
+// ---------------------------------------------------------------------------
+//
+// These tests cover the Task 4 brief requirements:
+// - `subagent_delegate` validates profile.provider_id (unbound → error),
+//   provider existence (unknown → error), provider enabled state (disabled
+//   → error), and model whitelist (model not in provider.models → error).
+// - `subagent_runtime_status` aggregates `pool.worker_snapshots()` across
+//   all providers (not just the first).
+// - `provider_update` / `provider_delete` kill + remove the affected
+//   provider's worker so the next delegate re-spawns with fresh state.
+
+/// Build sidecar-enabled settings with a single test provider whose model
+/// whitelist is `["test-model"]`. Profiles are NOT bound by default (caller
+/// binds per-test). Used by the delegate validation tests.
+fn make_unbound_sidecar_settings() -> BusytokSettings {
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+    settings.providers.push(ProviderConfig {
+        id: "test-provider".to_string(),
+        name: "Test Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    settings
+}
+
+/// Build a sidecar-stopped supervisor from arbitrary settings. Mirrors
+/// `make_sidecar_stopped_supervisor` but accepts custom settings so the
+/// delegate validation tests can configure provider/profile bindings.
+fn make_sidecar_stopped_supervisor_with_settings(
+    db: Database,
+    tmp: &tempfile::TempDir,
+    settings: BusytokSettings,
+) -> BusytokSupervisor {
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
+}
+
+/// `delegate_fails_for_unbound_profile`: when the sidecar is enabled AND the
+/// profile has `provider_id: None`, the runtime handler must reject the
+/// delegate with "profile not bound to a provider" BEFORE the manager inserts
+/// a task row. Covers spec §3.4 + Phase 3 Task 4 Step 3.
+#[tokio::test]
+async fn delegate_fails_for_unbound_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // Built-in profiles ship unbound (`provider_id: None`).
+    let settings = make_unbound_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("unbound profile must fail validation");
+
+    assert!(
+        err.to_string().contains("profile not bound to a provider"),
+        "expected 'profile not bound to a provider' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `delegate_fails_for_unknown_provider`: profile bound to a provider_id that
+/// doesn't exist in `settings.providers` → "provider not found: ...".
+#[tokio::test]
+async fn delegate_fails_for_unknown_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Bind the profile to a provider that doesn't exist.
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .provider_id = Some("nonexistent".to_string());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("unknown provider must fail validation");
+
+    assert!(
+        err.to_string().contains("provider not found: nonexistent"),
+        "expected 'provider not found: nonexistent' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `delegate_fails_for_disabled_provider`: provider exists but `enabled:
+/// false` → "provider disabled: ...".
+#[tokio::test]
+async fn delegate_fails_for_disabled_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Add a disabled provider + bind the profile to it.
+    settings.providers.push(ProviderConfig {
+        id: "disabled-prov".to_string(),
+        name: "Disabled Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.disabled.example.com/v1".to_string(),
+        api_key_env_name: "DISABLED_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: false,
+    });
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .provider_id = Some("disabled-prov".to_string());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("disabled provider must fail validation");
+
+    assert!(
+        err.to_string().contains("provider disabled: disabled-prov"),
+        "expected 'provider disabled: disabled-prov' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `delegate_fails_for_model_not_in_whitelist` (M2 fix, spec §3.4): profile
+/// bound to an enabled provider, but `profile.model` is NOT in
+/// `provider.models` → "model '...' not in provider '...' whitelist". Also
+/// covers the empty-model edge case.
+#[tokio::test]
+async fn delegate_fails_for_model_not_in_whitelist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Bind the profile to the valid test-provider, but set its model to
+    // something NOT in the provider's `["test-model"]` whitelist.
+    {
+        let profile = settings
+            .subagent
+            .profiles
+            .get_mut("pi/search-cheap")
+            .unwrap();
+        profile.provider_id = Some("test-provider".to_string());
+        profile.model = "wrong-model".to_string();
+    }
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("model not in whitelist must fail validation");
+
+    assert!(
+        err.to_string()
+            .contains("model 'wrong-model' not in provider 'test-provider' whitelist"),
+        "expected whitelist violation error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `runtime_status_aggregates_multiple_workers`: when the pool has workers
+/// for MORE than one provider, `subagent_runtime_status` must return one
+/// worker row per provider (not just the first). Covers Phase 3 Task 4
+/// Step 4 multi-provider aggregation.
+#[tokio::test]
+async fn runtime_status_aggregates_multiple_workers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Add a second enabled provider so the pool can spawn two workers.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-2".to_string(),
+        name: "Test Provider 2".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY_2".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    // construct_sidecar auto-spawns the FIRST enabled provider's worker.
+    // Spawn the SECOND provider's worker via the pool to exercise the
+    // multi-provider aggregation path.
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+    pool.ensure_worker("test-provider-2")
+        .expect("ensure_worker for second provider must succeed");
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .expect("runtime_status must succeed");
+
+    // Two workers — one per provider. Both stopped (no ensure_started call).
+    assert_eq!(
+        envelope.data.workers.len(),
+        2,
+        "multi-provider pool must aggregate to two worker rows"
+    );
+
+    // Both provider_ids must be present (order is not guaranteed by HashMap).
+    let provider_ids: Vec<Option<String>> = envelope
+        .data
+        .workers
+        .iter()
+        .map(|w| w.provider_id.clone())
+        .collect();
+    assert!(
+        provider_ids.contains(&Some("test-provider".to_string())),
+        "workers must include test-provider, got: {provider_ids:?}"
+    );
+    assert!(
+        provider_ids.contains(&Some("test-provider-2".to_string())),
+        "workers must include test-provider-2, got: {provider_ids:?}"
+    );
+
+    // Both workers are stopped (child never started).
+    for worker in &envelope.data.workers {
+        assert_eq!(worker.state, "stopped");
+        assert_eq!(worker.pid, None);
+    }
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `runtime_status_workers_empty_when_pool_none`: when the sidecar is
+/// disabled (`worker_pool` is `None`), `subagent_runtime_status` must
+/// return `workers: []` and a default pressure_gate. Covers Phase 3 Task 4
+/// Step 4 "no pool" branch.
+#[tokio::test]
+async fn runtime_status_workers_empty_when_pool_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // `make_supervisor` uses default settings → sidecar disabled → pool None.
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .expect("runtime_status must succeed");
+
+    assert!(
+        envelope.data.workers.is_empty(),
+        "no pool → workers must be empty"
+    );
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_changed_removes_worker_then_respawns` (P1b fix): calling
+/// `provider_update` must kill + remove the affected provider's worker from
+/// the pool. The next `ensure_worker` call re-spawns a fresh worker (with
+/// updated credentials/config). Covers Phase 3 Task 4 Step 5.
+#[tokio::test]
+async fn provider_changed_removes_worker_then_respawns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Initially, construct_sidecar auto-spawned ONE worker for test-provider.
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 1, "initial state: one worker");
+    assert_eq!(snaps[0].0, "test-provider");
+
+    // Trigger provider_changed via provider_update (metadata-only change:
+    // update the display name). This must remove the worker.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: Some("Updated Name".to_string()),
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: None,
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .expect("provider_update must succeed");
+
+    // Worker must be gone from the pool.
+    let snaps_after = pool.worker_snapshots().await;
+    assert!(
+        snaps_after.is_empty(),
+        "provider_update must remove the worker from the pool, got: {snaps_after:?}"
+    );
+
+    // Re-spawn: ensure_worker creates a NEW worker with the updated config.
+    let re_spawned = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker must re-spawn the worker");
+    assert!(
+        re_spawned.worker_snapshot().await.is_some(),
+        "re-spawned worker must produce a snapshot"
+    );
+    let snaps_final = pool.worker_snapshots().await;
+    assert_eq!(
+        snaps_final.len(),
+        1,
+        "re-spawned worker must be in the pool"
+    );
+    assert_eq!(snaps_final[0].0, "test-provider");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_deleted_removes_worker` (P1b fix): calling `provider_delete`
+/// must kill + remove the deleted provider's worker from the pool. Other
+/// providers' workers are unaffected. Covers Phase 3 Task 4 Step 5.
+#[tokio::test]
+async fn provider_deleted_removes_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Add a second provider that NO profile references — `provider_delete`
+    // rejects if any profile still references the provider.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-2".to_string(),
+        name: "Test Provider 2".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY_2".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Spawn a worker for the second provider (no profile references it, so
+    // `provider_delete` won't reject on profile-reference check).
+    pool.ensure_worker("test-provider-2")
+        .expect("ensure_worker for second provider must succeed");
+    assert_eq!(
+        pool.worker_snapshots().await.len(),
+        2,
+        "two workers before delete"
+    );
+
+    // Delete the second provider — must remove ONLY its worker.
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: "test-provider-2".to_string(),
+    })
+    .await
+    .expect("provider_delete must succeed");
+
+    let snaps_after = pool.worker_snapshots().await;
+    assert_eq!(
+        snaps_after.len(),
+        1,
+        "only the deleted provider's worker must be removed, got: {snaps_after:?}"
+    );
+    assert_eq!(
+        snaps_after[0].0, "test-provider",
+        "the first provider's worker must still be alive"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}

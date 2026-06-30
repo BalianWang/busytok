@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rusqlite::Connection;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use busytok_config::{
     BusytokPaths, BusytokSettings, ProviderConfig, ProviderCredentialStore, ProviderKind,
@@ -70,6 +70,14 @@ pub struct BusytokSupervisor {
     /// Pi sidecar supervisor (present when `subagent.pi_sidecar.enabled`).
     /// Task 6 uses this for graceful shutdown.
     sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+    /// Phase 3 Task 4: multi-provider worker pool. `Some` when the sidecar
+    /// is enabled AND its config resolved successfully; `None` when the
+    /// sidecar is disabled or config resolution failed (FailingTaskExecutor
+    /// path). Used by `subagent_runtime_status` (aggregate `worker_snapshots`
+    /// across all providers) and `provider_changed` / `provider_deleted`
+    /// (kill + remove a single provider's worker so the next delegate
+    /// re-spawns with fresh credentials).
+    worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
     /// §8.3 step 2: pressure gate shared between `PiSidecarSupervisor`
     /// (writer, via `PressureResponder`) and `SubagentManager` (reader, via
     /// `delegate()`). `Some` when the sidecar is enabled, `None` otherwise.
@@ -224,6 +232,7 @@ impl BusytokSupervisor {
             pressure_gate,
             sidecar_executor,
             pressure_responder,
+            worker_pool,
         ) = Self::construct_sidecar(&settings, &paths, &db, None);
         Self::assemble_with_sidecar(
             db,
@@ -237,6 +246,7 @@ impl BusytokSupervisor {
             pressure_gate,
             sidecar_executor,
             pressure_responder,
+            worker_pool,
         )
     }
 
@@ -261,6 +271,7 @@ impl BusytokSupervisor {
             pressure_gate,
             sidecar_executor,
             pressure_responder,
+            worker_pool,
         ) = Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
         Self::assemble_with_sidecar(
             db,
@@ -274,6 +285,7 @@ impl BusytokSupervisor {
             pressure_gate,
             sidecar_executor,
             pressure_responder,
+            worker_pool,
         )
     }
 
@@ -311,11 +323,13 @@ impl BusytokSupervisor {
         Option<Arc<busytok_subagent::PressureGate>>,
         Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
         Option<Arc<busytok_subagent::PressureResponder>>,
+        Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
     ) {
         if !settings.subagent.pi_sidecar.enabled {
             return (
                 Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
                     as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+                None,
                 None,
                 None,
                 None,
@@ -448,6 +462,7 @@ impl BusytokSupervisor {
                     Some(gate),
                     Some(exec_concrete),
                     pressure_responder,
+                    Some(Arc::clone(&pool)),
                 )
             }
             Err(e) => {
@@ -475,13 +490,14 @@ impl BusytokSupervisor {
                     None,
                     None,
                     None,
+                    None,
                 )
             }
         }
     }
 
     /// Assemble the final `BusytokSupervisor` from the shared constructor
-    /// inputs plus the already-constructed sidecar 6-tuple. Both
+    /// inputs plus the already-constructed sidecar 7-tuple. Both
     /// `build_with_settings` and `build_with_sidecar_config` funnel through
     /// this to avoid duplicating the ~60 lines of manager/read-service/
     /// writer/event-bus wiring.
@@ -497,6 +513,7 @@ impl BusytokSupervisor {
         pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
         sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
         pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
+        worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
     ) -> Self {
         let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
             Arc::clone(&db),
@@ -584,6 +601,7 @@ impl BusytokSupervisor {
             read_service,
             subagent_manager,
             sidecar_supervisor,
+            worker_pool,
             sidecar_init_error,
             pressure_gate,
             sidecar_executor,
@@ -635,6 +653,80 @@ impl BusytokSupervisor {
         &self,
     ) -> Option<&Arc<busytok_subagent::sidecar::PiSidecarSupervisor>> {
         self.sidecar_supervisor.as_ref()
+    }
+
+    /// Multi-provider worker pool handle. `None` when the sidecar is
+    /// disabled or config resolution failed. Exposed so tests can drive
+    /// `pool.ensure_worker(pid)` / `pool.remove_worker_and_kill(pid)` and
+    /// read `pool.worker_snapshots()` to cover the multi-provider
+    /// aggregation branch of `subagent_runtime_status` (Phase 3 Task 4).
+    pub fn worker_pool(&self) -> Option<&Arc<busytok_subagent::sidecar::WorkerPool>> {
+        self.worker_pool.as_ref()
+    }
+
+    /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
+    /// so the next delegate re-spawns it with fresh credentials/config.
+    /// Called by `provider_update` (covers both metadata changes AND key
+    /// rotations) and `provider_create` (defensive — typically a no-op
+    /// since no worker exists yet for a brand-new provider).
+    ///
+    /// Self-contained: callers don't need to remember to kill — this
+    /// method delegates to `pool.remove_worker_and_kill(provider_id)`
+    /// which does the remove + `force_kill().await` outside the map lock.
+    /// If no worker exists for `provider_id`, this is a logged no-op.
+    /// If the sidecar is disabled (`worker_pool` is `None`), this is a
+    /// logged no-op.
+    pub async fn provider_changed(&self, provider_id: &str) {
+        if let Some(pool) = &self.worker_pool {
+            info!(
+                event_code = "subagent.provider_changed",
+                provider_id = %provider_id,
+                "provider changed — killing worker for lazy re-spawn with fresh credentials"
+            );
+            if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
+                warn!(
+                    event_code = "subagent.provider_changed_kill_failed",
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to kill worker after provider change (best-effort)"
+                );
+            }
+        } else {
+            debug!(
+                event_code = "subagent.provider_changed_noop",
+                provider_id = %provider_id,
+                "provider_changed called but sidecar is disabled — no-op"
+            );
+        }
+    }
+
+    /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
+    /// after the provider is deleted. Same mechanism as `provider_changed`
+    /// but a distinct log event code so audit trails can distinguish
+    /// "changed" from "deleted". Called by `provider_delete` AFTER the
+    /// settings + keychain deletes succeed.
+    pub async fn provider_deleted(&self, provider_id: &str) {
+        if let Some(pool) = &self.worker_pool {
+            info!(
+                event_code = "subagent.provider_deleted",
+                provider_id = %provider_id,
+                "provider deleted — killing worker (if any) to release resources"
+            );
+            if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
+                warn!(
+                    event_code = "subagent.provider_deleted_kill_failed",
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to kill worker after provider delete (best-effort)"
+                );
+            }
+        } else {
+            debug!(
+                event_code = "subagent.provider_deleted_noop",
+                provider_id = %provider_id,
+                "provider_deleted called but sidecar is disabled — no-op"
+            );
+        }
     }
 
     /// Run the 11 spec §7.1 doctor checks. The subagent-specific checks
@@ -4663,6 +4755,60 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: busytok_protocol::dto::SubagentDelegateRequestDto,
     ) -> Result<SubagentDelegateResponseDto> {
+        // Phase 3 Task 4: provider whitelist validation (spec §3.4, M2 fix).
+        // Only validate when the sidecar pool is wired — when the sidecar is
+        // disabled (mock executor) or config resolution failed
+        // (FailingTaskExecutor), validation is skipped because no real
+        // provider routing happens. This keeps the legacy mock-delegate tests
+        // (which use unbound built-in profiles) working unchanged.
+        //
+        // Spec §3.4: the profile's `provider_id` must refer to an enabled
+        // provider, AND `profile.model` must be in that provider's `models`
+        // whitelist. Failures return a validation error BEFORE the manager
+        // inserts a task row — so no DB write happens for rejected delegates.
+        if self.worker_pool.is_some() {
+            let (profile_provider, profile_model) = {
+                let settings = self.settings.lock().unwrap();
+                let profile_cfg = settings.subagent.profiles.get(&req.profile);
+                profile_cfg
+                    .map(|p| (p.provider_id.clone(), p.model.clone()))
+                    .unwrap_or((None, String::new()))
+            };
+            if let Some(provider_id) = profile_provider.as_deref() {
+                let provider_cfg = {
+                    let settings = self.settings.lock().unwrap();
+                    settings
+                        .providers
+                        .iter()
+                        .find(|p| p.id == provider_id)
+                        .cloned()
+                };
+                let provider_cfg = provider_cfg
+                    .ok_or_else(|| anyhow::anyhow!("provider not found: {}", provider_id))?;
+                if !provider_cfg.enabled {
+                    anyhow::bail!("provider disabled: {}", provider_id);
+                }
+                // Model whitelist (spec §3.4). Empty `profile.model` is
+                // treated as a whitelist violation — the sidecar would have
+                // no model to send.
+                if profile_model.is_empty()
+                    || !provider_cfg.models.iter().any(|m| m == &profile_model)
+                {
+                    anyhow::bail!(
+                        "model '{}' not in provider '{}' whitelist",
+                        profile_model,
+                        provider_id
+                    );
+                }
+            } else {
+                // Profile has no provider_id bound. When the sidecar is
+                // enabled, the executor's `ensure_worker(provider_id)` would
+                // fail with "no provider_id" — surface the validation error
+                // here for a clearer message.
+                anyhow::bail!("profile not bound to a provider");
+            }
+        }
+
         let r = self
             .subagent_manager
             .delegate(delegate_request_from_dto(req))
@@ -4776,17 +4922,35 @@ impl RuntimeControl for BusytokSupervisor {
     ) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
         let now_ms = now_ms();
 
-        // 1. Snapshot worker state first (single in-memory lock, fast).
-        //    `worker_snapshot()` always returns `Some` when the supervisor
-        //    exists — even if the child is stopped. `None` here means no
-        //    sidecar supervisor is configured (`workers: []` semantics).
-        //    The worker sample may lag up to `monitor_interval_seconds`
-        //    behind `now_ms`; that's exposed via `worker_sampled_at_ms`.
-        let worker_opt = if let Some(sup) = &self.sidecar_supervisor {
-            sup.worker_snapshot().await
-        } else {
-            None
-        };
+        // 1. Aggregate worker snapshots across all providers in the pool
+        //    (Phase 3 Task 4). When `worker_pool` is `Some` (sidecar enabled
+        //    + config resolved), `pool.worker_snapshots()` returns one
+        //    `(provider_id, WorkerSnapshot)` pair per spawned worker —
+        //    covering the multi-provider case. When `worker_pool` is `None`
+        //    but `sidecar_supervisor` is `Some` (legacy/degraded path that
+        //    shouldn't normally occur since Task 3 wires both together), fall
+        //    back to a single snapshot with `provider_id: None`. When neither
+        //    is set (sidecar disabled), `worker_snaps` is empty → `workers: []`
+        //    + default pressure_gate.
+        //
+        //    Lock-ordering: `pool.worker_snapshots()` collects `(pid, Arc<sup>)`
+        //    pairs under the pool's map lock, DROPS the lock, then calls
+        //    `sup.worker_snapshot().await` on each OUTSIDE the lock — safe.
+        let worker_snaps: Vec<(Option<String>, busytok_subagent::sidecar::WorkerSnapshot)> =
+            if let Some(pool) = &self.worker_pool {
+                pool.worker_snapshots()
+                    .await
+                    .into_iter()
+                    .map(|(pid, s)| (Some(pid), s))
+                    .collect()
+            } else if let Some(sup) = &self.sidecar_supervisor {
+                match sup.worker_snapshot().await {
+                    Some(s) => vec![(None, s)],
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
 
         // 2. Read `hot_sessions_limit` from settings (default 3).
         let hot_sessions_limit = {
@@ -4794,23 +4958,16 @@ impl RuntimeControl for BusytokSupervisor {
             settings.subagent.pi_sidecar.max_hot_sessions
         };
 
-        // 3. Build pressure_gate DTO. `worker_sampled_at_ms` exposes the
-        //    freshness of the worker sample so the frontend can show "stale".
-        let pressure_gate = if let Some(ref snap) = worker_opt {
-            let level = match snap.pressure_level {
-                busytok_subagent::sidecar::PressureLevel::Normal => "normal",
-                busytok_subagent::sidecar::PressureLevel::Throttled => "throttled",
-                busytok_subagent::sidecar::PressureLevel::Evicting => "evicting",
-                busytok_subagent::sidecar::PressureLevel::Restarting => "restarting",
-            };
-            SubagentPressureGateDto {
-                level: level.to_string(),
-                memory_used_pct: snap.memory_used_pct.unwrap_or(0),
-                hot_sessions_total: snap.hot_sessions,
-                hot_sessions_limit,
-                worker_sampled_at_ms: snap.sampled_at_ms,
-            }
-        } else {
+        // 3. Build pressure_gate DTO by aggregating across all workers
+        //    (Phase 3 Task 4, I4 fix). Aggregation rules:
+        //    - `level`: max severity across all workers (Normal < Throttled
+        //      < Evicting < Restarting via `PressureLevel::severity()`).
+        //    - `memory_used_pct`: max across all workers.
+        //    - `hot_sessions_total`: SUM across all workers.
+        //    - `worker_sampled_at_ms`: most recent (max) `sampled_at_ms`
+        //      across all workers — exposes the freshest sample.
+        //    When `worker_snaps` is empty, defaults to `normal` / zeros.
+        let pressure_gate = if worker_snaps.is_empty() {
             SubagentPressureGateDto {
                 level: "normal".to_string(),
                 memory_used_pct: 0,
@@ -4818,27 +4975,65 @@ impl RuntimeControl for BusytokSupervisor {
                 hot_sessions_limit,
                 worker_sampled_at_ms: None,
             }
+        } else {
+            let mut max_severity: u8 = 0;
+            let mut max_level: busytok_subagent::sidecar::PressureLevel =
+                busytok_subagent::sidecar::PressureLevel::Normal;
+            let mut max_memory_pct: u32 = 0;
+            let mut hot_sessions_total: u32 = 0;
+            let mut latest_sampled_at_ms: Option<i64> = None;
+            for (_, snap) in &worker_snaps {
+                let sev = snap.pressure_level.severity();
+                if sev >= max_severity {
+                    max_severity = sev;
+                    max_level = snap.pressure_level;
+                }
+                if let Some(pct) = snap.memory_used_pct {
+                    if pct > max_memory_pct {
+                        max_memory_pct = pct;
+                    }
+                }
+                hot_sessions_total = hot_sessions_total.saturating_add(snap.hot_sessions);
+                match (latest_sampled_at_ms, snap.sampled_at_ms) {
+                    (Some(cur), Some(new)) if new > cur => latest_sampled_at_ms = Some(new),
+                    (None, Some(new)) => latest_sampled_at_ms = Some(new),
+                    _ => {}
+                }
+            }
+            let level = match max_level {
+                busytok_subagent::sidecar::PressureLevel::Normal => "normal",
+                busytok_subagent::sidecar::PressureLevel::Throttled => "throttled",
+                busytok_subagent::sidecar::PressureLevel::Evicting => "evicting",
+                busytok_subagent::sidecar::PressureLevel::Restarting => "restarting",
+            };
+            SubagentPressureGateDto {
+                level: level.to_string(),
+                memory_used_pct: max_memory_pct,
+                hot_sessions_total,
+                hot_sessions_limit,
+                worker_sampled_at_ms: latest_sampled_at_ms,
+            }
         };
 
-        // 4. Build workers[] DTO.
-        //    `[]` ONLY when `sidecar_supervisor` is `None` (not configured).
-        //    When the supervisor exists but the child is stopped, return ONE
-        //    row with `state="stopped"`, `pid=null`, `uptime_seconds=null`.
-        let workers: Vec<SubagentWorkerDto> = if let Some(ref snap) = worker_opt {
-            let state = match snap.state {
-                busytok_subagent::sidecar::WorkerState::Running => "running",
-                busytok_subagent::sidecar::WorkerState::Stopped => "stopped",
-            };
-            vec![SubagentWorkerDto {
-                provider_id: None, // Phase 2: no provider binding yet
-                state: state.to_string(),
-                pid: snap.pid,
-                uptime_seconds: snap.uptime_seconds,
-                hot_sessions: snap.hot_sessions,
-            }]
-        } else {
-            Vec::new()
-        };
+        // 4. Build workers[] DTO — one row per worker snapshot, with the
+        //    provider_id from the pool key (or `None` for the legacy
+        //    single-supervisor fallback path).
+        let workers: Vec<SubagentWorkerDto> = worker_snaps
+            .iter()
+            .map(|(provider_id, snap)| {
+                let state = match snap.state {
+                    busytok_subagent::sidecar::WorkerState::Running => "running",
+                    busytok_subagent::sidecar::WorkerState::Stopped => "stopped",
+                };
+                SubagentWorkerDto {
+                    provider_id: provider_id.clone(),
+                    state: state.to_string(),
+                    pid: snap.pid,
+                    uptime_seconds: snap.uptime_seconds,
+                    hot_sessions: snap.hot_sessions,
+                }
+            })
+            .collect();
 
         // 5. Single-read aggregate DB read (one DB lock, all 4 queries —
         //    spec §4 line 213). The DB portion is internally consistent;
@@ -4958,6 +5153,12 @@ impl RuntimeControl for BusytokSupervisor {
             )?;
         }
         tracing::info!(event_code = "provider.created", provider_id = %provider.id, "provider created");
+        // Phase 3 Task 4 (I3 fix): defensively kill any pre-existing worker
+        // for this provider id. Typically a no-op (brand-new provider has no
+        // worker yet), but covers the edge case where a provider was deleted
+        // without the worker being cleaned up, then re-created with the same
+        // id — the stale worker would hold the OLD credentials.
+        self.provider_changed(&provider.id).await;
         Ok(provider_to_dto(&provider))
     }
 
@@ -5029,6 +5230,12 @@ impl RuntimeControl for BusytokSupervisor {
         // post-update keychain state (mirrors provider_create).
         let dto = provider_to_dto(&provider_snapshot);
         tracing::info!(event_code = "provider.updated", provider_id = %req.id, "provider updated");
+        // Phase 3 Task 4 (I3 fix): kill the worker so the next delegate
+        // re-spawns it with the updated config (metadata changes like
+        // base_url / api_key_env_name / models AND key rotations). Covers
+        // both `req.api_key.is_some()` (key rotation) and metadata-only
+        // changes. Safe no-op when no worker exists for this provider.
+        self.provider_changed(&req.id).await;
         Ok(dto)
     }
 
@@ -5069,6 +5276,12 @@ impl RuntimeControl for BusytokSupervisor {
             );
         }
         tracing::info!(event_code = "provider.deleted", provider_id = %req.id, "provider deleted");
+        // Phase 3 Task 4 (I3 fix): kill + remove the worker for the deleted
+        // provider so its sidecar process doesn't keep running with stale
+        // credentials. Distinct log event code (`subagent.provider_deleted`
+        // vs `subagent.provider_changed`) for audit trail clarity. Safe
+        // no-op when no worker exists for this provider.
+        self.provider_deleted(&req.id).await;
         Ok(())
     }
 
@@ -5296,10 +5509,19 @@ fn provider_to_dto(provider: &ProviderConfig) -> ProviderDto {
     }
 }
 
-/// Extracts the provider_id from a profile config. Returns None until Phase 4
-/// adds the provider_id field to SubagentProfileConfig.
-fn profile_provider_id(_profile: &busytok_config::SubagentProfileConfig) -> Option<String> {
-    None // Phase 4: read profile.provider_id
+/// Extracts the provider_id from a profile config (Phase 3 Task 4).
+///
+/// Single source of truth for "which provider does this profile run on?".
+/// Used by:
+/// - `subagent_delegate` (validation before delegating + whitelist check);
+/// - `provider_delete` (reject deletion when a profile still references
+///   the provider).
+///
+/// Returns `None` for unbound profiles (built-in defaults ship unbound;
+/// Phase 4 adds the UI that lets users set it). Caller decides whether
+/// `None` is an error (delegate path: yes; delete path: just skip).
+fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Option<String> {
+    profile.provider_id.clone()
 }
 
 /// Try to spawn a background task that periodically reloads the price catalog.
