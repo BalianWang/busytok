@@ -5782,8 +5782,13 @@ impl RuntimeControl for BusytokSupervisor {
             profile.provider_id = new_provider_id;
         }
 
-        // Handle model patch: if updating model and provider is bound, validate.
+        // Handle model patch: validate non-empty first (mirrors profile_create),
+        // then whitelist-check against the bound provider if any.
         if let Some(ref model) = req.model {
+            if model.is_empty() {
+                tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
+                anyhow::bail!("model must not be empty");
+            }
             if let Some(ref pid) = profile.provider_id {
                 let provider = pending.providers.iter().find(|p| &p.id == pid.as_str());
                 if let Some(provider) = provider {
