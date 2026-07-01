@@ -443,6 +443,18 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
     m
 }
 
+/// Returns true if `name` is one of the 3 built-in profiles.
+///
+/// Used by the runtime (to reject `profile.delete` on built-in profiles)
+/// and by the DTO mapper (to set `is_builtin: bool` on `ProfileDto`).
+/// Single source of truth — do NOT duplicate this check elsewhere.
+pub fn is_builtin_profile(name: &str) -> bool {
+    matches!(
+        name,
+        "pi/search-cheap" | "pi/review-cheap" | "pi/plan-cheap"
+    )
+}
+
 impl BusytokSettings {
     /// Load settings from `paths.config_dir()/settings.toml`.
     ///
@@ -486,6 +498,8 @@ impl BusytokSettings {
                         let _ = settings.save(paths);
                     }
                 }
+                // Canonicalize built-in profiles: fill missing, never overwrite.
+                settings.canonicalize_builtin_profiles();
                 Ok(settings)
             }
             Err(e) => {
@@ -513,6 +527,30 @@ impl BusytokSettings {
         atomic_write(&file_path, &toml_str)?;
 
         Ok(())
+    }
+
+    /// Ensure all 3 built-in profiles exist. Missing ones are filled with
+    /// defaults; present ones are left untouched (even if user modified them).
+    ///
+    /// Called by `load()` after timezone canonicalization. Spec §4 Phase 4:
+    /// "Service ensures 3 built-in profiles exist on every config load.
+    /// Missing → fill with defaults. Present → leave untouched."
+    pub fn canonicalize_builtin_profiles(&mut self) {
+        let builtins = default_profiles();
+        let mut filled = Vec::new();
+        for (name, cfg) in &builtins {
+            if !self.subagent.profiles.contains_key(name) {
+                self.subagent.profiles.insert(name.clone(), cfg.clone());
+                filled.push(name.clone());
+            }
+        }
+        if !filled.is_empty() {
+            tracing::info!(
+                event_code = "profile.builtin_canonicalized",
+                filled = ?filled,
+                "filled missing built-in profiles during config load"
+            );
+        }
     }
 
     /// Load settings from a specific file path (for testing).
