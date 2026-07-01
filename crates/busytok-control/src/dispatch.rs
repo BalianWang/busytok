@@ -210,6 +210,12 @@ pub trait RuntimeControl: Send + Sync {
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto>;
 
+    // Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto>;
+
     // Profiles (Phase 4: Profile/Model Configuration UI)
     async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto>;
     async fn profile_update(&self, req: ProfileUpdateRequestDto) -> Result<ProfileDto>;
@@ -550,6 +556,16 @@ impl ControlDispatcher {
                         anyhow::anyhow!("invalid params for provider.test_connection: {e}")
                     })?;
                 let dto = self.runtime.provider_test_connection(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
+            "pi_sidecar_locator_update" => {
+                let req: PiSidecarLocatorUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid params for pi_sidecar_locator_update: {e}")
+                    })?;
+                let dto = self.runtime.pi_sidecar_locator_update(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -1233,6 +1249,19 @@ impl RuntimeControl for TestRuntimeControl {
         })
     }
 
+    // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
+
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto> {
+        Ok(PiSidecarLocatorUpdateResponseDto {
+            runtime_dir: req.runtime_dir,
+            enabled: req.enabled,
+            in_memory_updated: true,
+        })
+    }
+
     // ── Profiles (Phase 4: Profile/Model Configuration UI) ──────────
 
     async fn profile_create(&self, _req: ProfileCreateRequestDto) -> Result<ProfileDto> {
@@ -1455,6 +1484,12 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto> {
         (**self).provider_test_connection(req).await
+    }
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto> {
+        (**self).pi_sidecar_locator_update(req).await
     }
     async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto> {
         (**self).profile_create(req).await

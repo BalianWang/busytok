@@ -510,6 +510,12 @@ impl RuntimeControl for AliasConflictRuntime {
     ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
         self.inner.provider_test_connection(req).await
     }
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> anyhow::Result<PiSidecarLocatorUpdateResponseDto> {
+        self.inner.pi_sidecar_locator_update(req).await
+    }
     async fn profile_create(&self, req: ProfileCreateRequestDto) -> anyhow::Result<ProfileDto> {
         self.inner.profile_create(req).await
     }

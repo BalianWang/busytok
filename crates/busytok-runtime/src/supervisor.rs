@@ -170,6 +170,21 @@ impl BusytokSupervisor {
         Self::build_with_settings(db, paths, adapters, settings)
     }
 
+    /// Test-only accessor for the in-memory pi_sidecar locator state.
+    /// Used by integration tests to verify `pi_sidecar_locator_update`
+    /// mutated the shared Arc<Mutex<BusytokSettings>> (not just the file).
+    /// The `settings` field is private; `settings_snapshot` RPC returns a
+    /// DTO that omits `pi_sidecar.runtime_dir`, so this is the only way
+    /// for tests to observe the in-memory locator state directly.
+    #[doc(hidden)]
+    pub fn pi_sidecar_state(&self) -> (Option<String>, bool) {
+        let s = self.settings.lock().unwrap();
+        (
+            s.subagent.pi_sidecar.runtime_dir.clone(),
+            s.subagent.pi_sidecar.enabled,
+        )
+    }
+
     /// Construct a supervisor with a pre-resolved `SidecarConfig`.
     ///
     /// Used by integration tests that need to substitute a mock sidecar bundle
@@ -5662,6 +5677,60 @@ impl RuntimeControl for BusytokSupervisor {
                 })
             }
         }
+    }
+
+    // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update) ──
+    //
+    // Mirrors `provider_update` (line 5434): clone → mutate → save → swap.
+    // The daemon holds settings in `Arc<Mutex<BusytokSettings>>` — a direct
+    // file write would leave the running daemon's in-memory state stale
+    // ("file fixed, current session still can't find sidecar"). This method
+    // atomically (1) persists to `settings.toml` AND (2) swaps the in-memory
+    // Arc so the worker pool / doctor checks see the new locator immediately.
+    // The GUI calls this via the `pi_sidecar_locator_update` RPC on startup
+    // (spec §371: refresh mechanism — the service owns the mutation).
+
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto> {
+        let mut pending_settings = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+
+        let changed = pending_settings.subagent.pi_sidecar.runtime_dir.as_deref()
+            != Some(req.runtime_dir.as_str())
+            || pending_settings.subagent.pi_sidecar.enabled != req.enabled;
+
+        pending_settings.subagent.pi_sidecar.runtime_dir = Some(req.runtime_dir.clone());
+        pending_settings.subagent.pi_sidecar.enabled = req.enabled;
+
+        // Persist to disk BEFORE swapping in-memory (mirrors provider_update
+        // at line 5468: save first so a swap failure doesn't leave memory
+        // ahead of disk).
+        pending_settings.save(&self.paths)?;
+
+        // Swap the in-memory settings so the running daemon's worker pool /
+        // doctor checks see the new locator immediately.
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending_settings;
+        }
+
+        tracing::info!(
+            event_code = "pi_sidecar.locator_updated",
+            runtime_dir = %req.runtime_dir,
+            enabled = req.enabled,
+            changed = changed,
+            "pi_sidecar locator updated (in-memory + on-disk)"
+        );
+
+        Ok(PiSidecarLocatorUpdateResponseDto {
+            runtime_dir: req.runtime_dir,
+            enabled: req.enabled,
+            in_memory_updated: true,
+        })
     }
 
     // ── Profiles (Phase 4: Profile/Model Configuration UI) ──────────

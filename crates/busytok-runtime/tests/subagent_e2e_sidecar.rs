@@ -2368,3 +2368,72 @@ async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
 
     supervisor.shutdown_writer().await.unwrap();
 }
+
+// --- Phase 5 Task 3: service-owned pi_sidecar locator update (in-memory + disk) ---
+//
+// P1 regression guard: the service-owned update must mutate the in-memory
+// Arc<Mutex<BusytokSettings>> (so the running daemon's worker pool sees the
+// new locator immediately) AND persist to settings.toml (so a cold-start
+// service reads it on its own startup). A direct file write would leave the
+// in-memory state stale — the "file fixed, current session still can't find
+// sidecar" state-drift bug.
+//
+// Mirrors the provider_update pattern (supervisor.rs): clone → mutate →
+// save → swap. The pi_sidecar_state() test accessor reads from the SAME
+// Arc<Mutex<BusytokSettings>> that pi_sidecar_locator_update swapped — if
+// the swap didn't happen, the post-condition assertion fails.
+
+#[tokio::test]
+#[serial]
+async fn pi_sidecar_locator_update_mutates_in_memory_and_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let settings = BusytokSettings::default();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor =
+        BusytokSupervisor::with_adapters_and_settings(db, paths.clone(), vec![], settings);
+
+    // Pre-condition: read the in-memory state via the test accessor
+    // (the `settings` field is private; `settings_snapshot` RPC returns a
+    // DTO that omits pi_sidecar.runtime_dir).
+    let (pre_dir, pre_enabled) = supervisor.pi_sidecar_state();
+    assert!(pre_dir.is_none());
+    assert!(!pre_enabled);
+
+    // Call the service-owned update (the method the GUI invokes via RPC).
+    let fake_dir = tmp.path().join("fake-pi-sidecar");
+    std::fs::create_dir_all(&fake_dir).unwrap();
+    let resp = supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: fake_dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(resp.in_memory_updated);
+    assert_eq!(resp.runtime_dir, fake_dir.to_string_lossy());
+    assert!(resp.enabled);
+
+    // Verify in-memory state was updated (the P1 guard — no state drift).
+    // pi_sidecar_state reads from the SAME Arc<Mutex<BusytokSettings>> that
+    // pi_sidecar_locator_update swapped — if the swap didn't happen, this
+    // assertion fails.
+    let (post_dir, post_enabled) = supervisor.pi_sidecar_state();
+    assert_eq!(post_dir.as_deref(), Some(fake_dir.to_str().unwrap()));
+    assert!(post_enabled);
+
+    // Verify the file was also persisted (cold-start path).
+    let reloaded = BusytokSettings::load(&paths).unwrap();
+    assert_eq!(
+        reloaded.subagent.pi_sidecar.runtime_dir.as_deref(),
+        Some(fake_dir.to_str().unwrap())
+    );
+    assert!(reloaded.subagent.pi_sidecar.enabled);
+
+    supervisor.shutdown_writer().await.unwrap();
+}

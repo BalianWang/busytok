@@ -56,6 +56,8 @@ mod palette_native_tests;
 #[cfg(test)]
 mod panel_bridge_tests;
 #[cfg(test)]
+mod phase5_tests;
+#[cfg(test)]
 mod prompt_palette_tests;
 #[cfg(test)]
 mod updater_tests;
@@ -63,6 +65,7 @@ mod updater_tests;
 use busytok_config::BusytokPaths;
 use desktop_service_status::{ServiceBootstrapState, ServiceStatusEvent};
 use host_application_services::{BusytokState, HostServices};
+use crate::commands::invoke_busytok;
 use palette_controller::PaletteController;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
@@ -129,6 +132,159 @@ const BOOTSTRAP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_mil
 /// task emits `Ready` (not `Unavailable`) once the service is actually up.
 pub(crate) fn bootstrap_failure_is_retryable(err: &str) -> bool {
     !err.contains("requires user approval")
+}
+
+// ── Phase 5: sidecar runtime-dir persistence ──────────────────────────
+
+/// Testable core: resolve the sidecar resource directory from a given exe
+/// path by walking up to find the enclosing `.app` bundle, then checking
+/// for `Contents/Resources/pi-sidecar/`. Returns None if no `.app` ancestor
+/// or if the sidecar directory is absent (incomplete install).
+///
+/// Extracted as a free function (not inlined in `resolve_packaged_sidecar_dir`)
+/// so tests can exercise the real algorithm without `current_exe()`.
+fn resolve_sidecar_dir_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cursor = exe.parent()?;
+    loop {
+        if cursor
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".app"))
+            .unwrap_or(false)
+        {
+            let sidecar = cursor.join("Contents/Resources/pi-sidecar");
+            return sidecar.is_dir().then_some(sidecar);
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+/// Production entry point: resolve the packaged sidecar dir via
+/// `current_exe()`. Deviates from spec §371 ("via Tauri resource API") —
+/// `current_exe()` walk-up is simpler, testable without an `AppHandle`,
+/// and resolves to the same `Contents/Resources/` path.
+///
+/// Spec §370-373: NO current_exe() path guessing in the SERVICE — this
+/// resolution happens in the GUI only, and the result is PERSISTED to
+/// settings.toml (via the service-owned RPC) so the service reads it on
+/// its own startup.
+fn resolve_packaged_sidecar_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    resolve_sidecar_dir_from_exe(&exe)
+}
+
+/// Refresh the sidecar locator via the service-owned RPC. If the service is
+/// transport-unreachable (cold-start edge case: GUI starts before service on
+/// first login auto-start), fall back to a direct file write so the service
+/// reads the locator on its own startup.
+///
+/// **Fallback condition (tightened):** The file fallback fires ONLY on
+/// transport/bootstrap unreachability (socket connect failed, bootstrap
+/// failed, connect/call timed out). Service business errors (validation
+/// failures, serialization errors, dispatch errors) are logged + surfaced —
+/// NOT bypassed — because they indicate a real bug that direct file write
+/// would mask, re-introducing the in-memory/disk state drift the service-
+/// owned update was designed to prevent.
+///
+/// Spec §371: refresh mechanism. The service owns the in-memory + on-disk
+/// mutation (mirrors provider_update) — the GUI just provides the resolved
+/// path. The file fallback is ONLY for the cold-start case.
+async fn refresh_sidecar_locator(
+    sidecar_dir: std::path::PathBuf,
+    state: &tauri::State<'_, BusytokState>,
+    app: &tauri::AppHandle,
+) {
+    let sidecar_str = sidecar_dir.to_string_lossy().to_string();
+
+    // Primary path: service-owned RPC (updates in-memory + on-disk atomically).
+    let params = serde_json::json!({
+        "runtime_dir": sidecar_str,
+        "enabled": true,
+    });
+    let rpc_result = invoke_busytok(
+        "pi_sidecar_locator_update".to_string(),
+        params,
+        None,
+        state.clone(),
+        app.clone(),
+    )
+    .await;
+
+    match rpc_result {
+        Ok(_) => {
+            tracing::info!(
+                event_code = "gui.sidecar_locator_refreshed_via_rpc",
+                path = %sidecar_str,
+                "refreshed sidecar locator via service-owned RPC (in-memory + on-disk updated)"
+            );
+            return;
+        }
+        Err(err_str) => {
+            // Distinguish transport-unreachable (cold-start → file fallback)
+            // from service business errors (log + surface, do NOT bypass).
+            if is_transport_unreachable(&err_str) {
+                tracing::warn!(
+                    event_code = "gui.sidecar_locator_rpc_unreachable_file_fallback",
+                    path = %sidecar_str,
+                    error = %err_str,
+                    "service transport-unreachable; falling back to direct file write (cold-start case)"
+                );
+                // Fall through to file fallback below.
+            } else {
+                // Service returned a business error (validation, dispatch,
+                // serialization). This is a real bug — do NOT bypass it with
+                // a file write, which would mask the error and re-introduce
+                // state drift. Log + surface.
+                tracing::error!(
+                    event_code = "gui.sidecar_locator_rpc_business_error",
+                    path = %sidecar_str,
+                    error = %err_str,
+                    "service-owned RPC returned a business error; NOT falling back to file write"
+                );
+                return;
+            }
+        }
+    }
+
+    // File fallback: service transport-unreachable (cold-start). Write
+    // directly to file so the service reads the locator on its own startup.
+    // This does NOT update the running daemon's in-memory state — but the
+    // daemon isn't running yet, so there's no state to drift. When the
+    // service starts, it reads this file.
+    let paths = busytok_config::BusytokPaths::new();
+    let settings_path = paths.config_dir().join("settings.toml");
+    let mut settings = busytok_config::BusytokSettings::load(&paths).unwrap_or_default();
+    settings.subagent.pi_sidecar.runtime_dir = Some(sidecar_str.clone());
+    settings.subagent.pi_sidecar.enabled = true;
+    if let Err(e) = settings.save_to_file(&settings_path) {
+        tracing::warn!(
+            event_code = "gui.sidecar_settings_persist_failed",
+            path = %sidecar_str,
+            error = %e,
+            "failed to persist sidecar settings to settings.toml (file fallback)"
+        );
+    }
+}
+
+/// Classify an `invoke_busytok` error string as transport-unreachable
+/// (cold-start → file fallback) vs. service business error (log + surface).
+///
+/// Transport-unreachable errors come from:
+/// - `host_application_services.rs:67` — `"connect/bootstrap phase timed out"`
+/// - `service_recovery.rs:45` — `"service unavailable: {e}"`
+/// - `service_recovery.rs:85` — `"service bootstrap failed: {e}"`
+/// - `host_application_services.rs:74` — `"call to '{method}' timed out"`
+///
+/// Service business errors come from:
+/// - `host_application_services.rs:80-86` — `"[{code}] {message}"` (RPC Err)
+/// - `host_application_services.rs:88` — `"dispatch error: {e}"`
+///
+/// This classification is tested by `classifies_transport_vs_business_errors`.
+fn is_transport_unreachable(err: &str) -> bool {
+    err.starts_with("connect/bootstrap phase timed out")
+        || err.starts_with("service unavailable:")
+        || err.starts_with("service bootstrap failed:")
+        || err.starts_with("call to '")
 }
 
 pub fn run() {
@@ -338,6 +494,24 @@ pub fn run() {
                 let layout = BundleLayout::for_app_root(&bundle_root);
 
                 let paths_for_lc = busytok_config::BusytokPaths::new();
+
+                // Phase 5: refresh the sidecar locator via the service-owned
+                // RPC (in-memory + on-disk atomic update). Falls back to a
+                // direct file write if the service is unreachable (cold-start).
+                // Spec §370-373, §406. Spawned async because the setup closure
+                // is sync and `refresh_sidecar_locator` is async; the refresh
+                // is fire-and-forget (logs success/failure, no return value
+                // needed by setup). `BusytokState` is retrieved from Tauri's
+                // managed state (it was registered via `.manage()` above).
+                if let Some(sidecar_dir) = resolve_packaged_sidecar_dir() {
+                    let refresh_app = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(state) = refresh_app.try_state::<BusytokState>() {
+                            refresh_sidecar_locator(sidecar_dir, &state, &refresh_app).await;
+                        }
+                    });
+                }
+
                 let platform = PlatformPaths::new();
                 let socket_path = paths_for_lc
                     .control_endpoint()

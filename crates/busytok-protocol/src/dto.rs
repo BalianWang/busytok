@@ -1614,6 +1614,34 @@ pub struct ProviderTestConnectionResponseDto {
     pub models_detected: Option<Vec<String>>,
 }
 
+// ─── Pi Sidecar Locator DTOs (Phase 5: GUI Startup Runtime-Dir Persistence) ─
+
+/// Request to update the pi_sidecar locator fields (runtime_dir + enabled).
+/// Spec §371: GUI injects the packaged sidecar path on startup; the service
+/// owns the in-memory + on-disk mutation (mirrors provider_update pattern).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct PiSidecarLocatorUpdateRequestDto {
+    /// Absolute path to the sidecar resource directory
+    /// (e.g. `/Applications/Busytok.app/Contents/Resources/pi-sidecar`).
+    pub runtime_dir: String,
+    /// Whether the pi_sidecar subsystem should be enabled. In packaged
+    /// mode, this is `true` so the protocol_version doctor check moves
+    /// from "warning" to "ok" (spec §406).
+    pub enabled: bool,
+}
+
+/// Response confirming the persisted locator state.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct PiSidecarLocatorUpdateResponseDto {
+    pub runtime_dir: String,
+    pub enabled: bool,
+    /// `true` if the in-memory settings were also updated (service was
+    /// reachable); `false` if only the file was written (fallback path).
+    pub in_memory_updated: bool,
+}
+
 // ── Profiles (Phase 4: Profile/Model Configuration UI) ──────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
