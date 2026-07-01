@@ -80,10 +80,13 @@ fn sidecar_error_remaining_variants_map_to_subagent_error() {
     use busytok_subagent::sidecar::{SidecarError, PROTOCOL_MISMATCH, SIDECAR_UNHEALTHY};
     use busytok_subagent::SubagentError;
 
-    // Rpc → SidecarRpc (preserves message verbatim).
+    // Rpc → SidecarRpc (preserves message verbatim, code = None).
     let e: SubagentError = SidecarError::Rpc("serialize boom".into()).into();
     match &e {
-        SubagentError::SidecarRpc(msg) => assert_eq!(msg, "serialize boom"),
+        SubagentError::SidecarRpc { message, code } => {
+            assert_eq!(message, "serialize boom");
+            assert!(code.is_none(), "raw Rpc has no structured code");
+        }
         other => panic!("expected SidecarRpc, got {other:?}"),
     }
     assert_eq!(e.code(), "subagent.sidecar_rpc_error");
@@ -105,19 +108,21 @@ fn sidecar_error_remaining_variants_map_to_subagent_error() {
     assert_eq!(e.code(), "subagent.sidecar_crashed");
 
     // Unmatched Application codes → SidecarRpc with "[code] msg" formatting.
-    // Each of these exercises the `_ =>` catch-all arm.
+    // Each of these exercises the `_ =>` catch-all arm. The numeric code is
+    // preserved in the structured `code` field.
     for (code, label) in [
         (SIDECAR_UNHEALTHY, "unhealthy"),
         (PROTOCOL_MISMATCH, "mismatch"),
     ] {
         let e: SubagentError = SidecarError::Application(code, label.into(), None).into();
         match &e {
-            SubagentError::SidecarRpc(msg) => {
+            SubagentError::SidecarRpc { message, code: c } => {
+                assert_eq!(*c, Some(code), "structured code must be preserved");
                 assert!(
-                    msg.contains(&format!("[{code}]")),
-                    "expected '[{code}]' prefix in '{msg}'"
+                    message.contains(&format!("[{code}]")),
+                    "expected '[{code}]' prefix in '{message}'"
                 );
-                assert!(msg.contains(label), "expected '{label}' in '{msg}'");
+                assert!(message.contains(label), "expected '{label}' in '{message}'");
             }
             other => panic!("expected SidecarRpc for code {code}, got {other:?}"),
         }

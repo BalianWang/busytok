@@ -5470,11 +5470,35 @@ async fn e2e_auth_failure_kills_worker() {
     let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
 
     let pool = sup.worker_pool().expect("worker_pool must be Some");
-    // Auto-spawn created one worker for test-provider.
+    // Auto-spawn created one worker for test-provider (Stopped — no child).
     assert_eq!(
         pool.worker_snapshots().await.len(),
         1,
         "one worker before delegate"
+    );
+
+    // Start the sidecar child so we have a real OS PID to verify kill.
+    // The auto-spawned worker is Stopped; `ensure_started` spawns the bash
+    // child running mock-sidecar.sh.
+    let sidecar = sup
+        .sidecar_supervisor()
+        .expect("sidecar supervisor must be configured for the first enabled provider");
+    let _handle = sidecar
+        .ensure_started()
+        .await
+        .expect("ensure_started must spawn the child");
+
+    // Capture the sidecar child PID before the delegate triggers auth-fail kill.
+    let old_pid = {
+        let snaps = pool.worker_snapshots().await;
+        snaps[0]
+            .1
+            .pid
+            .expect("worker must have a PID after ensure_started")
+    };
+    assert!(
+        is_process_alive(old_pid),
+        "sidecar child (pid={old_pid}) must be alive before delegate"
     );
 
     // Delegate — will hit the auth-fail path. The executor's `execute()`
@@ -5530,6 +5554,24 @@ async fn e2e_auth_failure_kills_worker() {
     assert!(
         pool.worker_snapshots().await.is_empty(),
         "pool must be empty after auth-fail kill"
+    );
+
+    // The sidecar child PROCESS must actually be dead (P1b guarantee).
+    // `remove_worker_and_kill` calls `force_kill` which SIGKILLs the child;
+    // a mere `remove_worker` (without kill) would orphan the bash child.
+    // Poll up to 2s — sysinfo's process table may lag by a tick.
+    let mut killed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !is_process_alive(old_pid) {
+            killed = true;
+            break;
+        }
+    }
+    assert!(
+        killed,
+        "sidecar child (pid={old_pid}) must be DEAD after auth-fail — \
+         remove_worker_and_kill must have force-killed it"
     );
 
     // Next ensure_worker creates a new worker (slot was freed).

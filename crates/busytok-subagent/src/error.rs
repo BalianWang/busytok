@@ -39,8 +39,16 @@ pub enum SubagentError {
     #[error("sidecar spawn failed: {0}")]
     SidecarSpawn(String),
 
-    #[error("sidecar rpc error: {0}")]
-    SidecarRpc(String),
+    #[error("sidecar rpc error: {message}")]
+    SidecarRpc {
+        message: String,
+        /// Numeric JSON-RPC error code, preserved from
+        /// `SidecarError::Application(code, ...)` when available. `None` for
+        /// raw `SidecarError::Rpc(msg)` (no structured code). Used by
+        /// `subagent_error_to_task_error_kind` to classify the failure
+        /// without re-parsing the message string.
+        code: Option<i32>,
+    },
 
     #[error("sidecar io error: {0}")]
     SidecarIo(String),
@@ -68,7 +76,7 @@ impl SubagentError {
             SubagentError::Store(_) => "subagent.store_error",
             SubagentError::TaskTimeout => "subagent.task_timeout",
             SubagentError::SidecarSpawn(_) => "subagent.sidecar_spawn_failed",
-            SubagentError::SidecarRpc(_) => "subagent.sidecar_rpc_error",
+            SubagentError::SidecarRpc { .. } => "subagent.sidecar_rpc_error",
             SubagentError::SidecarIo(_) => "subagent.sidecar_io_error",
             SubagentError::SidecarTimeout(_) => "subagent.sidecar_timeout",
             SubagentError::SidecarCrashed(_) => "subagent.sidecar_crashed",
@@ -86,7 +94,10 @@ impl From<SidecarError> for SubagentError {
     fn from(e: SidecarError) -> Self {
         match e {
             SidecarError::Spawn(msg) => SubagentError::SidecarSpawn(msg),
-            SidecarError::Rpc(msg) => SubagentError::SidecarRpc(msg),
+            SidecarError::Rpc(msg) => SubagentError::SidecarRpc {
+                message: msg,
+                code: None,
+            },
             SidecarError::Timeout(msg) => SubagentError::SidecarTimeout(msg),
             SidecarError::Crashed(msg) => SubagentError::SidecarCrashed(msg),
             SidecarError::Io(msg) => SubagentError::SidecarIo(msg),
@@ -110,8 +121,14 @@ impl From<SidecarError> for SubagentError {
                     }
                     // Other application codes (SIDECAR_UNHEALTHY,
                     // TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA, PROTOCOL_MISMATCH)
-                    // surface as generic sidecar RPC errors.
-                    _ => SubagentError::SidecarRpc(format!("[{code}] {msg}")),
+                    // surface as generic sidecar RPC errors. The numeric code
+                    // is preserved in `code` so downstream classifiers
+                    // (`subagent_error_to_task_error_kind`) can match on the
+                    // structured value rather than re-parsing the message.
+                    _ => SubagentError::SidecarRpc {
+                        message: format!("[{code}] {msg}"),
+                        code: Some(code),
+                    },
                 }
             }
         }

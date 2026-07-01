@@ -1060,30 +1060,28 @@ fn task_row_to_summary(r: SubagentTaskRow) -> SubagentTaskSummary {
 /// Best-effort classification of a `SubagentError` (from the executor's Err
 /// path) into a `TaskErrorKind` for persistence on the task row. Mirrors the
 /// executor's `classify_sidecar_error` but operates on the already-converted
-/// `SubagentError` (the executor returns `Err(anyhow::Error)` which loses the
-/// structured `SidecarError`). The `SidecarRpc` variant embeds the numeric
-/// code as `"[code] msg"` (see `error.rs`), so we match on the code prefix.
+/// `SubagentError`. The `SidecarRpc` variant carries a structured `code`
+/// field (preserved from `SidecarError::Application(code, ...)` at
+/// conversion time), so we match on the numeric code directly — no string
+/// parsing. This keeps the manager's classification in sync with the
+/// executor's structured `classify_sidecar_error` automatically: both
+/// reference the same protocol constants.
 fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind> {
+    use crate::sidecar::protocol::{
+        AUTH_FAILURE, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT,
+    };
     match e {
         SubagentError::SidecarTimeout(_) | SubagentError::TaskTimeout => {
             Some(TaskErrorKind::Timeout)
         }
         SubagentError::SidecarCrashed(_) => Some(TaskErrorKind::Crash),
-        SubagentError::SidecarRpc(msg) => {
-            // The RPC error message embeds the numeric code as "[code] msg"
-            // (error.rs:114). Match on the code prefix to classify.
-            if msg.contains("[-32010]") {
-                Some(TaskErrorKind::Auth)
-            } else if msg.contains("[-32011]") {
-                Some(TaskErrorKind::RateLimit)
-            } else if msg.contains("[-32012]") {
-                Some(TaskErrorKind::Network)
-            } else if msg.contains("[-32003]") {
-                Some(TaskErrorKind::Timeout)
-            } else {
-                None
-            }
-        }
+        SubagentError::SidecarRpc { code, .. } => match *code {
+            Some(AUTH_FAILURE) => Some(TaskErrorKind::Auth),
+            Some(RATE_LIMIT) => Some(TaskErrorKind::RateLimit),
+            Some(NETWORK_ERROR) => Some(TaskErrorKind::Network),
+            Some(TASK_TIMEOUT) => Some(TaskErrorKind::Timeout),
+            _ => None,
+        },
         _ => None,
     }
 }
