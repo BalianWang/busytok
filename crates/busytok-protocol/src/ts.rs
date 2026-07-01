@@ -112,6 +112,7 @@ mod tests {
             dto::SettingsRecoveryActionRequestDto::decl(),
             dto::SettingsRecoveryActionResponseDto::decl(),
             dto::SettingsValidationErrorDto::decl(),
+            dto::SettingsSubagentDto::decl(),
             dto::SettingsSnapshotDto::decl(),
             dto::SettingsUpdateRequestDto::decl(),
             // Prompt Palette DTOs
@@ -196,6 +197,11 @@ mod tests {
             dto::ProviderDeleteRequestDto::decl(),
             dto::ProviderTestConnectionRequestDto::decl(),
             dto::ProviderTestConnectionResponseDto::decl(),
+            // Profiles (Phase 4: Profile/Model Configuration UI)
+            dto::ProfileDto::decl(),
+            dto::ProfileCreateRequestDto::decl(),
+            dto::ProfileUpdateRequestDto::decl(),
+            dto::ProfileDeleteRequestDto::decl(),
         ]
         .into_iter()
         .collect();

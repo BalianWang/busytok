@@ -173,7 +173,9 @@ export type SettingsRecoveryActionResponseDto = { id: SettingsRecoveryActionIdDt
 
 export type SettingsValidationErrorDto = { code: SettingsValidationErrorCodeDto, field_path: string, message: string, };
 
-export type SettingsSnapshotDto = { timezone: string, week_starts_on: WeekdayIndexDto, discovery: SettingsDiscoveryDto, privacy: SettingsPrivacyDto, diagnostics: SettingsDiagnosticsDto, recovery_actions: Array<SettingsRecoveryActionDto>, prompt_palette_default_action: PromptActionDto, };
+export type SettingsSubagentDto = { enabled: boolean, profiles: Array<ProfileDto>, };
+
+export type SettingsSnapshotDto = { timezone: string, week_starts_on: WeekdayIndexDto, discovery: SettingsDiscoveryDto, privacy: SettingsPrivacyDto, diagnostics: SettingsDiagnosticsDto, recovery_actions: Array<SettingsRecoveryActionDto>, prompt_palette_default_action: PromptActionDto, subagent: SettingsSubagentDto, };
 
 export type SettingsUpdateRequestDto = { timezone: string | null, week_starts_on: WeekdayIndexDto | null, discovery: SettingsDiscoveryDto | null, privacy: SettingsPrivacyDto | null, prompt_palette_default_action: PromptActionDto | null, };
 
@@ -407,3 +409,24 @@ export type ProviderDeleteRequestDto = { id: string, };
 export type ProviderTestConnectionRequestDto = { id: string, };
 
 export type ProviderTestConnectionResponseDto = { ok: boolean, error: string | null, models_detected: Array<string> | null, };
+
+export type ProfileDto = { id: string, 
+/**
+ * True if this is one of the 3 built-in profiles (pi/search-cheap, etc.).
+ * Derived by the service from `is_builtin_profile()` — not stored in config.
+ */
+is_builtin: boolean, 
+/**
+ * Provider this profile runs on. None = unbound (delegate will reject).
+ */
+provider_id: string | null, model: string, tools: Array<string>, context_budget_tokens: number, timeout_seconds: number, write_access: boolean, };
+
+export type ProfileCreateRequestDto = { id: string, model: string, provider_id: string | null, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
+
+export type ProfileUpdateRequestDto = { id: string, 
+/**
+ * Some("openai") = bind to openai; Some("") = unbind; None = unchanged.
+ */
+provider_id: string | null, model: string | null, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
+
+export type ProfileDeleteRequestDto = { id: string, };
