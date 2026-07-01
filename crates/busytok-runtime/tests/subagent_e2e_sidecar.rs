@@ -2405,8 +2405,14 @@ async fn pi_sidecar_locator_update_mutates_in_memory_and_disk() {
     assert!(!pre_enabled);
 
     // Call the service-owned update (the method the GUI invokes via RPC).
+    // Stage minimal files (bundle.js + manifest.json) so P1 validation passes.
+    // The node binary is NOT staged — resolve_base_sidecar_config will fail
+    // inside construct_sidecar, producing a sidecar_init_error (degraded
+    // mode). That's fine for this test — it only checks the settings mutation.
     let fake_dir = tmp.path().join("fake-pi-sidecar");
     std::fs::create_dir_all(&fake_dir).unwrap();
+    std::fs::write(fake_dir.join("pi-sidecar.bundle.js"), "// stub").unwrap();
+    std::fs::write(fake_dir.join("manifest.json"), "{}").unwrap();
     let resp = supervisor
         .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
             runtime_dir: fake_dir.to_string_lossy().to_string(),

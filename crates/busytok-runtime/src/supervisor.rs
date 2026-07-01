@@ -38,6 +38,47 @@ use crate::writer::{self, WriterHandle};
 /// Type alias for boxed adapter with Send + Sync bounds.
 type BoxedAdapter = Box<dyn busytok_adapters::AgentLogAdapter + Send + Sync>;
 
+/// Output of `construct_sidecar` — the executor + 6 associated fields.
+/// Consumed by `build_sidecar_runtime` which constructs the `SubagentManager`
+/// from the executor + pressure_gate and returns a complete `SidecarRuntime`.
+struct SidecarComponents {
+    executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
+    sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+    sidecar_init_error: Option<String>,
+    pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
+    sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+    pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
+    worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
+}
+
+/// Swappable sidecar runtime bundle — all 7 fields that `construct_sidecar`
+/// produces. Wrapped in `RwLock<SidecarRuntime>` on `BusytokSupervisor` so
+/// `pi_sidecar_locator_update` can rebuild the entire sidecar subsystem
+/// mid-flight (spec §472-475: fresh-install closed loop must work in the
+/// CURRENT session, no service restart). Readers acquire a short read lock
+/// and clone out the `Arc` they need; the write lock is only held for the
+/// pointer swap during rebuild (microseconds).
+struct SidecarRuntime {
+    /// Logical-subagent manager (subagent.* RPC handlers). Owns the
+    /// `TaskExecutor` — swapping the executor requires rebuilding the
+    /// manager, so the whole runtime is rebuilt as a unit.
+    subagent_manager: Arc<busytok_subagent::SubagentManager>,
+    /// Pi sidecar supervisor (present when `pi_sidecar.enabled` AND its
+    /// config resolved AND at least one provider is configured).
+    sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
+    /// Multi-provider worker pool. `Some` when sidecar enabled + config OK.
+    worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
+    /// Pressure gate shared between supervisor (writer) and manager (reader).
+    pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
+    /// Concrete `SidecarTaskExecutor` Arc — strong owner.
+    sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
+    /// Escalation chain driver. Strong-owned here; supervisor holds `Weak`.
+    pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
+    /// Error message when sidecar config could not be resolved despite
+    /// `enabled = true`. `None` when OK or when disabled.
+    sidecar_init_error: Option<String>,
+}
+
 /// Top-level service supervisor that orchestrates the Busytok runtime.
 ///
 /// Owns the database, event bus, and adapter list. Implements `RuntimeControl`
@@ -67,42 +108,19 @@ pub struct BusytokSupervisor {
     writer_handle: WriterHandle,
     /// Bounded read-only service for overview/activity read paths.
     read_service: crate::read_service::ReadService,
-    /// Logical-subagent manager (subagent.* RPC handlers).
-    subagent_manager: Arc<busytok_subagent::SubagentManager>,
-    /// Pi sidecar supervisor (present when `subagent.pi_sidecar.enabled`).
-    /// Task 6 uses this for graceful shutdown.
-    sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
-    /// Phase 3 Task 4: multi-provider worker pool. `Some` when the sidecar
-    /// is enabled AND its config resolved successfully; `None` when the
-    /// sidecar is disabled or config resolution failed (FailingTaskExecutor
-    /// path). Used by `subagent_runtime_status` (aggregate `worker_snapshots`
-    /// across all providers) and `provider_changed` / `provider_deleted`
-    /// (kill + remove a single provider's worker so the next delegate
-    /// re-spawns with fresh credentials).
-    worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
-    /// §8.3 step 2: pressure gate shared between `PiSidecarSupervisor`
-    /// (writer, via `PressureResponder`) and `SubagentManager` (reader, via
-    /// `delegate()`). `Some` when the sidecar is enabled, `None` otherwise.
-    pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
-    /// Concrete `SidecarTaskExecutor` Arc — strong owner (keeps executor
-    /// alive). The `PressureResponder` (Task 4) holds a `Weak` ref to it
-    /// so it can call `evict_lru` without creating an Arc cycle. `None`
-    /// when the sidecar is disabled.
-    sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
-    /// §8.3 escalation chain driver. Strong-owned here so it lives as long
-    /// as the supervisor; `PiSidecarSupervisor` holds a `Weak` ref (set via
-    /// `set_pressure_responder`) so the supervision loop can upgrade + invoke
-    /// `respond()` on pressure transitions. `None` when the sidecar is
-    /// disabled. Task 4 implements `respond()`; Task 3 wires the field +
-    /// constructs the (stub) responder.
-    pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
-    /// Error message captured when the sidecar config could not be resolved
-    /// despite `pi_sidecar.enabled = true`. `None` when the sidecar was
-    /// initialized successfully OR when `pi_sidecar.enabled = false` (the
-    /// default). Surfaced via `sidecar_init_error()` so Task 6 / status
-    /// reporting can flag degraded mode without a `Result<Self>` refactor
-    /// of `build_with_settings` (which would touch ~30 call sites).
-    sidecar_init_error: Option<String>,
+    /// Swappable sidecar runtime (7-field bundle). Wrapped in `RwLock` so
+    /// `pi_sidecar_locator_update` can rebuild the entire sidecar subsystem
+    /// when `enabled` flips to `true` mid-flight (spec §472-475 fresh-install
+    /// closed loop). Readers hold the read lock for microseconds (clone an
+    /// `Arc` out); the write lock is only held for the pointer swap.
+    sidecar_runtime: std::sync::RwLock<SidecarRuntime>,
+    /// Serializes `rebuild_sidecar_runtime` calls so concurrent
+    /// `pi_sidecar_locator_update` RPCs can't leak dispatcher tasks (one
+    /// call takes the dispatcher handle, the other gets `None`, and the
+    /// second call's new dispatcher overwrites the first's — leaking it).
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the rebuild
+    /// holds the guard across `.await` points (drain + shutdown).
+    rebuild_lock: tokio::sync::Mutex<()>,
     /// JoinHandle for the writer actor's background task (None when no
     /// Tokio runtime was active at construction time, e.g. sync tests).
     _writer_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -238,29 +256,8 @@ impl BusytokSupervisor {
         // visible to `ensure_worker` when it re-spawns a worker — the respawned
         // supervisor would run with stale `base_url` / `base_url_env_name`.
         let settings = Arc::new(Mutex::new(settings));
-        let (
-            executor,
-            sidecar_supervisor,
-            sidecar_init_error,
-            pressure_gate,
-            sidecar_executor,
-            pressure_responder,
-            worker_pool,
-        ) = Self::construct_sidecar(&settings, &paths, &db, None);
-        Self::assemble_with_sidecar(
-            db,
-            paths,
-            adapters,
-            settings,
-            event_bus,
-            executor,
-            sidecar_supervisor,
-            sidecar_init_error,
-            pressure_gate,
-            sidecar_executor,
-            pressure_responder,
-            worker_pool,
-        )
+        let sidecar = Self::construct_sidecar(&settings, &paths, &db, None);
+        Self::assemble_with_sidecar(db, paths, adapters, settings, event_bus, sidecar)
     }
 
     /// Shared constructor accepting pre-loaded settings AND a pre-resolved
@@ -280,29 +277,8 @@ impl BusytokSupervisor {
         // See `build_with_settings`: wrap settings so the pool's provider
         // lookup reads live settings (provider_update visibility fix).
         let settings = Arc::new(Mutex::new(settings));
-        let (
-            executor,
-            sidecar_supervisor,
-            sidecar_init_error,
-            pressure_gate,
-            sidecar_executor,
-            pressure_responder,
-            worker_pool,
-        ) = Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
-        Self::assemble_with_sidecar(
-            db,
-            paths,
-            adapters,
-            settings,
-            event_bus,
-            executor,
-            sidecar_supervisor,
-            sidecar_init_error,
-            pressure_gate,
-            sidecar_executor,
-            pressure_responder,
-            worker_pool,
-        )
+        let sidecar = Self::construct_sidecar(&settings, &paths, &db, Some(sidecar_config));
+        Self::assemble_with_sidecar(db, paths, adapters, settings, event_bus, sidecar)
     }
 
     /// Construct the sidecar executor + pool + supervisor + init-error.
@@ -310,11 +286,10 @@ impl BusytokSupervisor {
     /// and use the provided config directly (test injection path). When
     /// `None`, resolve from settings + paths (production path).
     ///
-    /// Returns a 6-tuple: `(executor, sidecar_supervisor, sidecar_init_error,
-    /// pressure_gate, sidecar_executor, pressure_responder)`. The last three
-    /// are `Some` only when the sidecar is enabled AND its config resolved
-    /// successfully — they're consumed by `assemble_with_sidecar` to wire
-    /// the manager's `PressureGate` and store the responder.
+    /// Returns a `SidecarRuntime` whose fields are `Some` only when the
+    /// sidecar is enabled AND its config resolved successfully. The executor
+    /// is `MockTaskExecutor` when disabled, `FailingTaskExecutor` when
+    /// enabled-but-broken (with `sidecar_init_error` set).
     ///
     /// **Phase 3 Task 3:** the executor is rewired from a single
     /// `PiSidecarSupervisor` to `Arc<WorkerPool>`. The pool is constructed
@@ -327,20 +302,16 @@ impl BusytokSupervisor {
     /// stays `None` (degraded — delegate calls fail with "profile not bound
     /// to a provider"). The full multi-provider runtime status (showing all
     /// workers) is Task 4's scope.
+    ///
+    /// **Phase 5:** returns `SidecarComponents` (not a 7-tuple) so the same
+    /// construction path is reused by `rebuild_sidecar_runtime` when
+    /// `pi_sidecar_locator_update` flips `enabled` to `true` mid-flight.
     fn construct_sidecar(
         settings: &Arc<Mutex<BusytokSettings>>,
         paths: &BusytokPaths,
         db: &Arc<Mutex<Database>>,
         sidecar_config_override: Option<busytok_subagent::sidecar::SidecarConfig>,
-    ) -> (
-        Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
-        Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
-        Option<String>,
-        Option<Arc<busytok_subagent::PressureGate>>,
-        Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
-        Option<Arc<busytok_subagent::PressureResponder>>,
-        Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
-    ) {
+    ) -> SidecarComponents {
         // Lock settings briefly for the reads below. `settings` is the SAME
         // `Arc<Mutex<BusytokSettings>>` shared with the supervisor's
         // `self.settings` field (constructed in `build_with_settings`), so
@@ -348,16 +319,16 @@ impl BusytokSupervisor {
         // provider-lookup closure (which captures an `Arc::clone`).
         let pi_sidecar_enabled = settings.lock().unwrap().subagent.pi_sidecar.enabled;
         if !pi_sidecar_enabled {
-            return (
-                Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
+            return SidecarComponents {
+                executor: Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
                     as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
+                sidecar_supervisor: None,
+                sidecar_init_error: None,
+                pressure_gate: None,
+                sidecar_executor: None,
+                pressure_responder: None,
+                worker_pool: None,
+            };
         }
         // Either use the injected config (test path) or resolve the base
         // (unbound) config from settings + paths. `resolve_base_sidecar_config`
@@ -368,10 +339,7 @@ impl BusytokSupervisor {
             Some(cfg) => Ok(cfg),
             None => {
                 let pi_sidecar = settings.lock().unwrap().subagent.pi_sidecar.clone();
-                busytok_subagent::sidecar::config::resolve_base_sidecar_config(
-                    &pi_sidecar,
-                    paths,
-                )
+                busytok_subagent::sidecar::config::resolve_base_sidecar_config(&pi_sidecar, paths)
             }
         };
         match config_result {
@@ -469,8 +437,8 @@ impl BusytokSupervisor {
                     .iter()
                     .find(|p| p.enabled)
                     .map(|p| p.id.clone());
-                let sidecar_supervisor = first_enabled_provider.and_then(|pid| {
-                    match pool.ensure_worker(&pid) {
+                let sidecar_supervisor =
+                    first_enabled_provider.and_then(|pid| match pool.ensure_worker(&pid) {
                         Ok(sup) => Some(sup),
                         Err(e) => {
                             error!(
@@ -481,8 +449,7 @@ impl BusytokSupervisor {
                             );
                             None
                         }
-                    }
-                });
+                    });
 
                 // Get the first responder from the holder (if ensure_worker
                 // succeeded). This is stored in `BusytokSupervisor.pressure_responder`
@@ -494,15 +461,15 @@ impl BusytokSupervisor {
                 let exec: Arc<dyn busytok_subagent::mock_executor::TaskExecutor> =
                     Arc::clone(&exec_concrete)
                         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
-                (
-                    exec,
+                SidecarComponents {
+                    executor: exec,
                     sidecar_supervisor,
-                    None,
-                    Some(gate),
-                    Some(exec_concrete),
+                    sidecar_init_error: None,
+                    pressure_gate: Some(gate),
+                    sidecar_executor: Some(exec_concrete),
                     pressure_responder,
-                    Some(Arc::clone(&pool)),
-                )
+                    worker_pool: Some(Arc::clone(&pool)),
+                }
             }
             Err(e) => {
                 // `build_with_settings` returns `Self`, not `Result<Self>`,
@@ -519,24 +486,24 @@ impl BusytokSupervisor {
                     error = %e,
                     "sidecar config resolve failed; injecting FailingTaskExecutor — delegate calls will fail"
                 );
-                (
-                    Arc::new(busytok_subagent::mock_executor::FailingTaskExecutor {
+                SidecarComponents {
+                    executor: Arc::new(busytok_subagent::mock_executor::FailingTaskExecutor {
                         reason: msg.clone(),
                     })
                         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
-                    None,
-                    Some(msg),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                    sidecar_supervisor: None,
+                    sidecar_init_error: Some(msg),
+                    pressure_gate: None,
+                    sidecar_executor: None,
+                    pressure_responder: None,
+                    worker_pool: None,
+                }
             }
         }
     }
 
     /// Assemble the final `BusytokSupervisor` from the shared constructor
-    /// inputs plus the already-constructed sidecar 7-tuple. Both
+    /// inputs plus the already-constructed sidecar components. Both
     /// `build_with_settings` and `build_with_sidecar_config` funnel through
     /// this to avoid duplicating the ~60 lines of manager/read-service/
     /// writer/event-bus wiring.
@@ -546,24 +513,8 @@ impl BusytokSupervisor {
         adapters: Vec<BoxedAdapter>,
         settings: Arc<Mutex<BusytokSettings>>,
         event_bus: AppEventBus,
-        executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
-        sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
-        sidecar_init_error: Option<String>,
-        pressure_gate: Option<Arc<busytok_subagent::PressureGate>>,
-        sidecar_executor: Option<Arc<busytok_subagent::sidecar::SidecarTaskExecutor>>,
-        pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
-        worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
+        components: SidecarComponents,
     ) -> Self {
-        // `settings` is already the shared `Arc<Mutex<BusytokSettings>>` (shared
-        // with the pool's provider-lookup closure) — no need to wrap it here.
-        let subagent_settings = settings.lock().unwrap().subagent.clone();
-        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
-            Arc::clone(&db),
-            subagent_settings,
-            "pi",
-            executor,
-            pressure_gate.clone(),
-        ));
         let read_service = {
             let db_guard = db.lock().unwrap();
             if let Some(path) = db_guard.path_buf() {
@@ -587,9 +538,10 @@ impl BusytokSupervisor {
             Arc::clone(&event_bus),
         );
 
-        let generation_manager = Arc::new(
-            crate::generation_manager::GenerationManager::new(Arc::clone(&db), Arc::clone(&status)),
-        );
+        let generation_manager = Arc::new(crate::generation_manager::GenerationManager::new(
+            Arc::clone(&db),
+            Arc::clone(&status),
+        ));
 
         let (writer_handle, writer_join) = writer::try_spawn_writer(
             Arc::clone(&db),
@@ -601,15 +553,12 @@ impl BusytokSupervisor {
 
         let catalog_reload_join = try_spawn_catalog_reloader(paths.price_catalog_path().clone());
 
-        // §8.3 escalation chain driver: the `PressureResponder` is now
-        // constructed by the responder factory inside `construct_sidecar`
-        // (Phase 3 Task 3 two-phase bootstrap). The factory is called by
-        // `WorkerPool::ensure_worker` to create a responder per supervisor,
-        // and `set_pressure_responder` is called inside the factory. The
-        // `pressure_responder` parameter is the first provider's responder
-        // (strong-owned here so the `Weak` on the supervisor stays
-        // upgradeable); all future responders (from lazy `ensure_worker`
-        // calls) are kept alive by the holder inside the factory closure.
+        // Construct the complete `SidecarRuntime` (manager + 6 fields) from
+        // the components. Shared with `rebuild_sidecar_runtime` so the same
+        // completion-hook + manager-construction path is used both at startup
+        // and on mid-flight rebuild.
+        let sidecar_runtime =
+            Self::build_sidecar_runtime(components, &db, &settings, &generation_manager);
 
         // §8.3 step 2 "queue only" background dispatcher (Task 7 Finding 3
         // fix): spawn the dispatcher that polls `subagent_tasks` for queued
@@ -619,45 +568,12 @@ impl BusytokSupervisor {
         // supervisor via `BusytokSupervisor::new()`), the handle + sender
         // are `None` and the dispatcher is not started. `shutdown_writer()`
         // and `Drop` both treat `None` as a no-op.
-        //
-        // `spawn_task_dispatcher` is a sync fn that calls `tokio::spawn`
-        // internally; we guard the call with `Handle::try_current()` so the
-        // sync-context path skips the spawn instead of panicking.
-        //
-        // P1 #2 fix: register a post-task completion hook BEFORE spawning the
-        // dispatcher. The dispatcher invokes it after `execute_task()` succeeds
-        // so queued tasks' usage flows into `usage_events` + rollups via the
-        // SAME `bridge_subagent_usage` seam as synchronous `delegate()`.
-        // Without this, queued tasks (pressure-gated or busy-queued work) are
-        // invisible in Overview / Activity / receipt reads.
-        let hook_db = Arc::clone(&db);
-        let hook_gen = Arc::clone(&generation_manager);
-        let hook_settings = Arc::clone(&settings);
-        subagent_manager.set_task_completion_hook(Arc::new(
-            move |result: &busytok_subagent::models::DelegateResult, cwd: &str| {
-                // Read the active generation ID fresh on each invocation so a
-                // later promotion is picked up by queued-task completion events.
-                let gen_id = hook_gen.active_generation_id();
-                if let Err(e) = bridge_subagent_usage(
-                    &hook_db,
-                    gen_id.as_deref(),
-                    &hook_settings,
-                    result,
-                    cwd,
-                ) {
-                    tracing::warn!(
-                        event_code = "subagent.usage_write_failed",
-                        task_id = %result.task_id,
-                        error = %e,
-                        "dispatcher: failed to write subagent usage event to unified usage_events"
-                    );
-                }
-            },
-        ));
         let (dispatcher_handle, dispatcher_shutdown) =
             if tokio::runtime::Handle::try_current().is_ok() {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                let handle = subagent_manager.spawn_task_dispatcher(shutdown_rx);
+                let handle = sidecar_runtime
+                    .subagent_manager
+                    .spawn_task_dispatcher(shutdown_rx);
                 (Some(handle), Some(shutdown_tx))
             } else {
                 (None, None)
@@ -675,18 +591,181 @@ impl BusytokSupervisor {
             status,
             writer_handle,
             read_service,
-            subagent_manager,
-            sidecar_supervisor,
-            worker_pool,
-            sidecar_init_error,
-            pressure_gate,
-            sidecar_executor,
-            pressure_responder,
+            sidecar_runtime: std::sync::RwLock::new(sidecar_runtime),
+            rebuild_lock: tokio::sync::Mutex::new(()),
             _writer_join: Mutex::new(writer_join),
             _catalog_reload_join: Mutex::new(catalog_reload_join),
             task_dispatcher: Mutex::new(dispatcher_handle),
             dispatcher_shutdown: Mutex::new(dispatcher_shutdown),
         }
+    }
+
+    /// Build a complete `SidecarRuntime` from `SidecarComponents`: constructs
+    /// the `SubagentManager` (which owns the executor) and installs the
+    /// post-task completion hook (writes queued tasks' usage into the unified
+    /// `usage_events` table). Shared between initial construction
+    /// (`assemble_with_sidecar`) and mid-flight rebuild
+    /// (`rebuild_sidecar_runtime`) so the manager wiring is identical in
+    /// both paths.
+    fn build_sidecar_runtime(
+        components: SidecarComponents,
+        db: &Arc<Mutex<Database>>,
+        settings: &Arc<Mutex<BusytokSettings>>,
+        generation_manager: &Arc<crate::generation_manager::GenerationManager>,
+    ) -> SidecarRuntime {
+        let subagent_settings = settings.lock().unwrap().subagent.clone();
+        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
+            Arc::clone(db),
+            subagent_settings,
+            "pi",
+            components.executor,
+            components.pressure_gate.clone(),
+        ));
+
+        // P1 #2 fix: register a post-task completion hook so queued tasks'
+        // usage flows into `usage_events` + rollups via the SAME
+        // `bridge_subagent_usage` seam as synchronous `delegate()`.
+        let hook_db = Arc::clone(db);
+        let hook_gen = Arc::clone(generation_manager);
+        let hook_settings = Arc::clone(settings);
+        subagent_manager.set_task_completion_hook(Arc::new(
+            move |result: &busytok_subagent::models::DelegateResult, cwd: &str| {
+                // Read the active generation ID fresh on each invocation so a
+                // later promotion is picked up by queued-task completion events.
+                let gen_id = hook_gen.active_generation_id();
+                if let Err(e) =
+                    bridge_subagent_usage(&hook_db, gen_id.as_deref(), &hook_settings, result, cwd)
+                {
+                    tracing::warn!(
+                        event_code = "subagent.usage_write_failed",
+                        task_id = %result.task_id,
+                        error = %e,
+                        "dispatcher: failed to write subagent usage event to unified usage_events"
+                    );
+                }
+            },
+        ));
+
+        SidecarRuntime {
+            subagent_manager,
+            sidecar_supervisor: components.sidecar_supervisor,
+            worker_pool: components.worker_pool,
+            pressure_gate: components.pressure_gate,
+            sidecar_executor: components.sidecar_executor,
+            pressure_responder: components.pressure_responder,
+            sidecar_init_error: components.sidecar_init_error,
+        }
+    }
+
+    /// Rebuild the entire sidecar runtime mid-flight after
+    /// `pi_sidecar_locator_update` changed `enabled` or `runtime_dir`.
+    /// Drains the old task dispatcher, constructs a fresh
+    /// `SidecarRuntime` (new executor/pool/supervisor/manager), spawns a
+    /// new dispatcher, and atomically swaps the runtime under the write
+    /// lock. The old sidecar supervisor is shut down AFTER the swap so the
+    /// lock is held for the minimum possible time.
+    ///
+    /// Spec §472-475: fresh-install closed loop. The GUI calls
+    /// `pi_sidecar_locator_update` → this rebuild → `doctor`/`delegate`
+    /// work in the CURRENT session (no service restart required).
+    ///
+    /// Cannot fail: `construct_sidecar` produces `SidecarComponents` (with
+    /// a `FailingTaskExecutor` + `sidecar_init_error` if config resolution
+    /// fails). The error is surfaced via `sidecar_init_error()` / doctor
+    /// checks, not propagated.
+    ///
+    /// Serialized by `rebuild_lock` so concurrent `pi_sidecar_locator_update`
+    /// RPCs can't leak dispatcher tasks (one call takes the handle, the
+    /// other gets `None`, and the second call's new dispatcher overwrites
+    /// the first's — leaking it as a detached task).
+    async fn rebuild_sidecar_runtime(&self) {
+        let _rebuild_guard = self.rebuild_lock.lock().await;
+
+        info!(
+            event_code = "pi_sidecar.rebuild_start",
+            "starting sidecar runtime rebuild"
+        );
+
+        // 1. Drain the old task dispatcher (stop polling for queued tasks).
+        //    Mirrors `shutdown_writer`: send `true` on the watch channel +
+        //    await the JoinHandle. No-op when no Tokio runtime was active at
+        //    construction time (both fields are `None`).
+        let old_dispatcher_handle = self.task_dispatcher.lock().unwrap().take();
+        let old_dispatcher_shutdown = self.dispatcher_shutdown.lock().unwrap().take();
+        if let Some(tx) = old_dispatcher_shutdown {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = old_dispatcher_handle {
+            let _ = handle.await;
+        }
+
+        // 2. Construct fresh components from the CURRENT (already-swapped)
+        //    settings. `construct_sidecar` reads `self.settings` which was
+        //    updated by `pi_sidecar_locator_update` BEFORE calling this.
+        let components = Self::construct_sidecar(&self.settings, &self.paths, &self.db, None);
+
+        // 3. Build the new SidecarRuntime (SubagentManager + completion hook).
+        //    Shared with `assemble_with_sidecar` so the wiring is identical.
+        let new_runtime = Self::build_sidecar_runtime(
+            components,
+            &self.db,
+            &self.settings,
+            &self.generation_manager,
+        );
+
+        // Capture the init_error for observability before the runtime is
+        // moved into the RwLock.
+        let new_init_error = new_runtime.sidecar_init_error.clone();
+
+        // 4. Spawn the new task dispatcher (only when a Tokio runtime is
+        //    active — mirrors `assemble_with_sidecar`). In practice this
+        //    is always true since `rebuild_sidecar_runtime` is called from
+        //    the async `pi_sidecar_locator_update` RPC handler.
+        let (new_handle, new_shutdown) = if tokio::runtime::Handle::try_current().is_ok() {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let handle = new_runtime
+                .subagent_manager
+                .spawn_task_dispatcher(shutdown_rx);
+            (Some(handle), Some(shutdown_tx))
+        } else {
+            (None, None)
+        };
+
+        // 5. Swap the runtime under the write lock. Extract the old runtime
+        //    so its sidecar supervisor can be shut down AFTER the lock is
+        //    released (never hold a `std::sync::RwLock` guard across `.await`).
+        let old_runtime = {
+            let mut guard = self.sidecar_runtime.write().unwrap();
+            std::mem::replace(&mut *guard, new_runtime)
+        };
+
+        // 6. Store the new dispatcher handle + shutdown sender (replacing
+        //    the `None` left by step 1's `take()`). Steps 2–6 are all
+        //    synchronous — no `.await` between draining the old dispatcher
+        //    and storing the new one, so no other async task can observe
+        //    the intermediate `None` state.
+        *self.task_dispatcher.lock().unwrap() = new_handle;
+        *self.dispatcher_shutdown.lock().unwrap() = new_shutdown;
+
+        // 7. Shut down the old sidecar supervisor (async, after lock
+        //    release). Best-effort: failures are logged but don't
+        //    propagate — the new runtime is already live.
+        if let Some(old_sup) = old_runtime.sidecar_supervisor {
+            if let Err(e) = old_sup.shutdown().await {
+                warn!(
+                    event_code = "subagent.sidecar.rebuild_old_shutdown_failed",
+                    error = %e,
+                    "failed to shut down old sidecar supervisor during rebuild (best-effort)"
+                );
+            }
+        }
+
+        info!(
+            event_code = "pi_sidecar.rebuild_complete",
+            degraded = new_init_error.is_some(),
+            init_error = ?new_init_error,
+            "sidecar runtime rebuild complete"
+        );
     }
 
     /// Discover log sources using current settings and user roots from DB.
@@ -695,30 +774,45 @@ impl BusytokSupervisor {
     }
 
     /// Returns the error message captured when `pi_sidecar.enabled = true`
-    /// but `resolve_sidecar_config` failed at construction time, OR `None`
-    /// when the sidecar initialized successfully or was not enabled.
+    /// but `resolve_sidecar_config` failed at construction time (or during a
+    /// mid-flight rebuild), OR `None` when the sidecar initialized
+    /// successfully or was not enabled.
     ///
     /// This lets Task 6 / status reporting surface sidecar config degradation
     /// without refactoring `build_with_settings` to return `Result<Self>`.
-    /// The service is still running in degraded mode (MockTaskExecutor) when
-    /// this returns `Some`; callers should treat a non-`None` value as a
+    /// The service is still running in degraded mode (FailingTaskExecutor)
+    /// when this returns `Some`; callers should treat a non-`None` value as a
     /// loud signal that the configured sidecar is NOT backing delegate calls.
-    pub fn sidecar_init_error(&self) -> Option<&str> {
-        self.sidecar_init_error.as_deref()
+    ///
+    /// Returns an owned `String` (not `&str`) because the runtime is behind a
+    /// `RwLock` — a reference into the guard would not outlive the lock.
+    pub fn sidecar_init_error(&self) -> Option<String> {
+        self.sidecar_runtime
+            .read()
+            .unwrap()
+            .sidecar_init_error
+            .clone()
     }
 
     /// §8.3 step 2: pressure gate shared with `SubagentManager`. `None` when
     /// the sidecar is disabled (no pressure response chain). Task 6 / status
     /// reporting can read this to expose the current pressure action via
     /// `gate.last_action()`.
-    pub fn pressure_gate(&self) -> Option<&Arc<busytok_subagent::PressureGate>> {
-        self.pressure_gate.as_ref()
+    ///
+    /// Returns an owned `Arc` (not `&Arc`) because the runtime is behind a
+    /// `RwLock` — callers clone the Arc out under a short read lock.
+    pub fn pressure_gate(&self) -> Option<Arc<busytok_subagent::PressureGate>> {
+        self.sidecar_runtime.read().unwrap().pressure_gate.clone()
     }
 
     /// §8.3 escalation chain driver. `None` when the sidecar is disabled.
     /// Task 6 / status reporting can read this to surface responder state.
-    pub fn pressure_responder(&self) -> Option<&Arc<busytok_subagent::PressureResponder>> {
-        self.pressure_responder.as_ref()
+    pub fn pressure_responder(&self) -> Option<Arc<busytok_subagent::PressureResponder>> {
+        self.sidecar_runtime
+            .read()
+            .unwrap()
+            .pressure_responder
+            .clone()
     }
 
     /// Pi sidecar supervisor handle. `None` when the sidecar is disabled.
@@ -727,8 +821,12 @@ impl BusytokSupervisor {
     /// cover the `WorkerState::Running` branch of `subagent_runtime_status`.
     pub fn sidecar_supervisor(
         &self,
-    ) -> Option<&Arc<busytok_subagent::sidecar::PiSidecarSupervisor>> {
-        self.sidecar_supervisor.as_ref()
+    ) -> Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>> {
+        self.sidecar_runtime
+            .read()
+            .unwrap()
+            .sidecar_supervisor
+            .clone()
     }
 
     /// Multi-provider worker pool handle. `None` when the sidecar is
@@ -736,8 +834,8 @@ impl BusytokSupervisor {
     /// `pool.ensure_worker(pid)` / `pool.remove_worker_and_kill(pid)` and
     /// read `pool.worker_snapshots()` to cover the multi-provider
     /// aggregation branch of `subagent_runtime_status` (Phase 3 Task 4).
-    pub fn worker_pool(&self) -> Option<&Arc<busytok_subagent::sidecar::WorkerPool>> {
-        self.worker_pool.as_ref()
+    pub fn worker_pool(&self) -> Option<Arc<busytok_subagent::sidecar::WorkerPool>> {
+        self.sidecar_runtime.read().unwrap().worker_pool.clone()
     }
 
     /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
@@ -753,7 +851,7 @@ impl BusytokSupervisor {
     /// If the sidecar is disabled (`worker_pool` is `None`), this is a
     /// logged no-op.
     pub async fn provider_changed(&self, provider_id: &str) {
-        if let Some(pool) = &self.worker_pool {
+        if let Some(pool) = self.worker_pool() {
             info!(
                 event_code = "subagent.provider_changed",
                 provider_id = %provider_id,
@@ -782,7 +880,7 @@ impl BusytokSupervisor {
     /// "changed" from "deleted". Called by `provider_delete` AFTER the
     /// settings + keychain deletes succeed.
     pub async fn provider_deleted(&self, provider_id: &str) {
-        if let Some(pool) = &self.worker_pool {
+        if let Some(pool) = self.worker_pool() {
             info!(
                 event_code = "subagent.provider_deleted",
                 provider_id = %provider_id,
@@ -897,15 +995,11 @@ impl BusytokSupervisor {
 
         // 3. Pi sidecar launchable — surface sidecar_init_error if present.
         //    When pi_sidecar.enabled=false, this is "ok" (feature off).
+        let init_error = self.sidecar_init_error();
         checks.push(DoctorCheckDto {
             name: "sidecar_launchable".into(),
-            status: if self.sidecar_init_error().is_some() {
-                "error"
-            } else {
-                "ok"
-            }
-            .into(),
-            detail: self.sidecar_init_error().map(|s| s.to_string()),
+            status: if init_error.is_some() { "error" } else { "ok" }.into(),
+            detail: init_error,
         });
 
         // 4-9. Bundled node arch, manifest, protocol version, model config,
@@ -958,50 +1052,53 @@ impl BusytokSupervisor {
         //    without a valid manifest.
         {
             let manifest_path = self.paths.sidecar_manifest_path(runtime_dir_ref);
-            let (status, detail) = match std::fs::read_to_string(&manifest_path) {
-                Ok(contents) => match serde_json::from_str::<busytok_config::SidecarManifest>(&contents) {
-                    Ok(m) => (
-                        "ok",
-                        format!(
+            let (status, detail) =
+                match std::fs::read_to_string(&manifest_path) {
+                    Ok(contents) => {
+                        match serde_json::from_str::<busytok_config::SidecarManifest>(&contents) {
+                            Ok(m) => (
+                                "ok",
+                                format!(
                             "manifest readable (version={}, protocol_version={}, node={}): {}",
                             m.version, m.protocol_version, m.node_runtime_version,
                             manifest_path.display()
                         ),
-                    ),
+                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    event_code = "subagent.doctor.manifest_invalid",
+                                    path = %manifest_path.display(),
+                                    error = %e,
+                                    "manifest at path is not a valid SidecarManifest"
+                                );
+                                (
+                                    "error",
+                                    format!(
+                                        "manifest at {} is not a valid SidecarManifest: {}",
+                                        manifest_path.display(),
+                                        e
+                                    ),
+                                )
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
-                            event_code = "subagent.doctor.manifest_invalid",
+                            event_code = "subagent.doctor.manifest_unreadable",
                             path = %manifest_path.display(),
                             error = %e,
-                            "manifest at path is not a valid SidecarManifest"
+                            "manifest not readable at path"
                         );
                         (
                             "error",
                             format!(
-                                "manifest at {} is not a valid SidecarManifest: {}",
+                                "manifest not readable at {}: {}",
                                 manifest_path.display(),
                                 e
                             ),
                         )
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        event_code = "subagent.doctor.manifest_unreadable",
-                        path = %manifest_path.display(),
-                        error = %e,
-                        "manifest not readable at path"
-                    );
-                    (
-                        "error",
-                        format!(
-                            "manifest not readable at {}: {}",
-                            manifest_path.display(),
-                            e
-                        ),
-                    )
-                }
-            };
+                };
             checks.push(DoctorCheckDto {
                 name: "bundle_manifest_readable".into(),
                 status: status.into(),
@@ -1017,14 +1114,16 @@ impl BusytokSupervisor {
         //    When `sidecar_supervisor` is None, distinguish three sub-cases:
         //      (a) `sidecar_init_error = Some` → "error" (enabled but broken).
         //      (b) `enabled = false` in settings → "warning" (disabled).
-        //      (c) `enabled = true` in settings but supervisor was not
-        //          (re)constructed → "warning, pending restart". This happens
-        //          when `pi_sidecar_locator_update` flips `enabled` to `true`
-        //          in-memory AFTER construction; the supervisor is built once
-        //          during `build_with_settings` and is not hot-reloaded.
+        //      (c) `enabled = true` but no supervisor (no providers configured
+        //          or rebuild produced no worker) → "warning".
+        //    Phase 5: the "pending restart" branch was removed —
+        //    `pi_sidecar_locator_update` now rebuilds the sidecar runtime
+        //    in-flight, so `enabled=true` always has a corresponding
+        //    supervisor (or an init_error explaining why not).
         {
             let expected_pv = busytok_subagent::sidecar::protocol::PROTOCOL_VERSION;
-            let (status, detail) = match &self.sidecar_supervisor {
+            let sidecar_sup = self.sidecar_supervisor();
+            let (status, detail) = match &sidecar_sup {
                 Some(sup) if sup.try_is_running() => (
                     "ok",
                     format!(
@@ -1059,31 +1158,18 @@ impl BusytokSupervisor {
                             format!("protocol probe failed — sidecar not constructed: {err}"),
                         )
                     } else {
-                        // Read `enabled` from the LIVE in-memory settings
-                        // (NOT the value captured at construction time).
-                        // `pi_sidecar_locator_update` mutates this Arc in-place;
-                        // `sidecar_supervisor` is NOT re-constructed mid-flight
-                        // (risky, out of scope), so `enabled=true` here means
-                        // the change is pending a service restart.
-                        let enabled = self
-                            .settings
-                            .lock()
-                            .unwrap()
-                            .subagent
-                            .pi_sidecar
-                            .enabled;
+                        let enabled = self.settings.lock().unwrap().subagent.pi_sidecar.enabled;
                         if enabled {
                             warn!(
-                                event_code =
-                                    "subagent.doctor.protocol_version_pending_restart",
-                                "pi_sidecar enabled in settings but supervisor not \
-                                 constructed (pending service restart) — cannot probe \
-                                 protocol version"
+                                event_code = "subagent.doctor.protocol_version_no_supervisor",
+                                "pi_sidecar enabled but no sidecar supervisor \
+                                 (no providers configured or worker spawn failed) — \
+                                 cannot probe protocol version"
                             );
                             (
                                 "warning",
-                                "pi_sidecar enabled but supervisor pending restart — \
-                                 cannot probe protocol version until service restart"
+                                "pi_sidecar enabled but no sidecar worker running \
+                                 — configure a provider first"
                                     .into(),
                             )
                         } else {
@@ -1697,9 +1783,16 @@ impl BusytokSupervisor {
     }
 
     /// Access the logical-subagent manager (for direct use outside the
-    /// `RuntimeControl` impl).
-    pub fn subagent_manager(&self) -> &busytok_subagent::SubagentManager {
-        &self.subagent_manager
+    /// `RuntimeControl` impl). Returns an owned `Arc` clone because the
+    /// manager lives behind `RwLock<SidecarRuntime>` — callers get a cheap
+    /// Arc clone under a short read lock, then use it freely without holding
+    /// the lock.
+    pub fn subagent_manager(&self) -> Arc<busytok_subagent::SubagentManager> {
+        self.sidecar_runtime
+            .read()
+            .unwrap()
+            .subagent_manager
+            .clone()
     }
 
     /// Phase 3 Task 5: bridge a subagent task's usage into the unified
@@ -1720,13 +1813,7 @@ impl BusytokSupervisor {
         cwd: &str,
     ) -> Result<()> {
         let gen_id = self.generation_manager.active_generation_id();
-        bridge_subagent_usage(
-            &self.db,
-            gen_id.as_deref(),
-            &self.settings,
-            result,
-            cwd,
-        )
+        bridge_subagent_usage(&self.db, gen_id.as_deref(), &self.settings, result, cwd)
     }
 
     /// Gracefully drain and stop the writer actor.
@@ -1772,7 +1859,7 @@ impl BusytokSupervisor {
     /// logged but do not propagate; service shutdown must continue so the
     /// writer actor flush and WAL checkpoint still run.
     pub async fn shutdown_sidecar(&self) {
-        if let Some(sup) = &self.sidecar_supervisor {
+        if let Some(sup) = self.sidecar_supervisor() {
             if let Err(e) = sup.shutdown().await {
                 warn!(event_code = "subagent.sidecar.shutdown_failed", error = %e);
             }
@@ -2503,6 +2590,60 @@ impl Drop for BusytokSupervisor {
 
 fn map_subagent_error(e: busytok_subagent::SubagentError) -> anyhow::Error {
     MethodDispatchError::from_read_error(e.code(), e.to_string(), serde_json::Value::Null).into()
+}
+
+/// Validate the `runtime_dir` for `pi_sidecar_locator_update` (P1 contract
+/// closure). Returns `Ok(())` when the path is a valid sidecar directory, or
+/// a `MethodDispatchError` (code=`validation_error`) when not. Called BEFORE
+/// the settings are persisted so a bad path never reaches `settings.toml`.
+///
+/// Checks:
+/// 1. Path is absolute (relative paths break the service-owned settings
+///    contract — the GUI always sends absolute app-bundle paths).
+/// 2. Directory exists (catches stale paths from uninstalled bundles).
+/// 3. Contains `pi-sidecar.bundle.js` (minimum viable bundle).
+/// 4. Contains `manifest.json` (protocol version + bundle metadata).
+fn validate_runtime_dir(runtime_dir: &str) -> Result<()> {
+    let path = Path::new(runtime_dir);
+    if !path.is_absolute() {
+        return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+            "validation_error",
+            "runtime_dir must be absolute".to_string(),
+            serde_json::json!({ "field": "runtime_dir", "value": runtime_dir }),
+        )));
+    }
+    if !path.is_dir() {
+        return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+            "validation_error",
+            format!("runtime_dir does not exist or is not a directory: {runtime_dir}"),
+            serde_json::json!({ "field": "runtime_dir", "value": runtime_dir }),
+        )));
+    }
+    let bundle = path.join("pi-sidecar.bundle.js");
+    if !bundle.exists() {
+        return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+            "validation_error",
+            "runtime_dir missing required file: pi-sidecar.bundle.js".to_string(),
+            serde_json::json!({
+                "field": "runtime_dir",
+                "missing": "pi-sidecar.bundle.js",
+                "path": runtime_dir,
+            }),
+        )));
+    }
+    let manifest = path.join("manifest.json");
+    if !manifest.exists() {
+        return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+            "validation_error",
+            "runtime_dir missing required file: manifest.json".to_string(),
+            serde_json::json!({
+                "field": "runtime_dir",
+                "missing": "manifest.json",
+                "path": runtime_dir,
+            }),
+        )));
+    }
+    Ok(())
 }
 
 fn delegate_request_from_dto(
@@ -5033,7 +5174,7 @@ impl RuntimeControl for BusytokSupervisor {
         // provider, AND `profile.model` must be in that provider's `models`
         // whitelist. Failures return a validation error BEFORE the manager
         // inserts a task row — so no DB write happens for rejected delegates.
-        if self.worker_pool.is_some() {
+        if self.worker_pool().is_some() {
             let (profile_provider, profile_model) = {
                 let settings = self.settings.lock().unwrap();
                 let profile_cfg = settings.subagent.profiles.get(&req.profile);
@@ -5087,7 +5228,7 @@ impl RuntimeControl for BusytokSupervisor {
         // best-effort observability).
         let cwd = req.cwd.clone();
         let r = self
-            .subagent_manager
+            .subagent_manager()
             .delegate(delegate_request_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
@@ -5129,7 +5270,7 @@ impl RuntimeControl for BusytokSupervisor {
     async fn subagent_list(&self, req: SubagentListRequestDto) -> Result<SubagentListResponseDto> {
         let status = req.status.as_deref().and_then(|s| s.parse().ok());
         let subs = self
-            .subagent_manager
+            .subagent_manager()
             .list(
                 status,
                 req.project.as_deref(),
@@ -5147,7 +5288,7 @@ impl RuntimeControl for BusytokSupervisor {
         req: busytok_protocol::dto::SubagentResolveRequestDto,
     ) -> Result<SubagentDetailDto> {
         let s = self
-            .subagent_manager
+            .subagent_manager()
             .show(resolve_params_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
@@ -5164,7 +5305,7 @@ impl RuntimeControl for BusytokSupervisor {
             cwd: req.cwd,
         };
         let tasks = self
-            .subagent_manager
+            .subagent_manager()
             .tasks(resolve, req.limit.unwrap_or(20))
             .await
             .map_err(map_subagent_error)?;
@@ -5178,7 +5319,7 @@ impl RuntimeControl for BusytokSupervisor {
         req: busytok_protocol::dto::SubagentResolveRequestDto,
     ) -> Result<SubagentAckDto> {
         let id = self
-            .subagent_manager
+            .subagent_manager()
             .hibernate(resolve_params_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
@@ -5195,7 +5336,7 @@ impl RuntimeControl for BusytokSupervisor {
             cwd: req.cwd,
         };
         let id = self
-            .subagent_manager
+            .subagent_manager()
             .delete(resolve, req.hard.unwrap_or(false))
             .await
             .map_err(map_subagent_error)?;
@@ -5226,13 +5367,13 @@ impl RuntimeControl for BusytokSupervisor {
         //    pairs under the pool's map lock, DROPS the lock, then calls
         //    `sup.worker_snapshot().await` on each OUTSIDE the lock — safe.
         let worker_snaps: Vec<(Option<String>, busytok_subagent::sidecar::WorkerSnapshot)> =
-            if let Some(pool) = &self.worker_pool {
+            if let Some(pool) = self.worker_pool() {
                 pool.worker_snapshots()
                     .await
                     .into_iter()
                     .map(|(pid, s)| (Some(pid), s))
                     .collect()
-            } else if let Some(sup) = &self.sidecar_supervisor {
+            } else if let Some(sup) = self.sidecar_supervisor() {
                 match sup.worker_snapshot().await {
                     Some(s) => vec![(None, s)],
                     None => Vec::new(),
@@ -5329,7 +5470,7 @@ impl RuntimeControl for BusytokSupervisor {
         //    the worker portion may be from a slightly earlier moment,
         //    exposed via `worker_sampled_at_ms`.
         let snapshot = self
-            .subagent_manager
+            .subagent_manager()
             .runtime_status_snapshot(20)
             .await
             .map_err(map_subagent_error)?;
@@ -5715,12 +5856,14 @@ impl RuntimeControl for BusytokSupervisor {
 
     // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update) ──
     //
-    // Mirrors `provider_update` (line 5434): clone → mutate → save → swap.
-    // The daemon holds settings in `Arc<Mutex<BusytokSettings>>` — a direct
-    // file write would leave the running daemon's in-memory state stale
+    // Mirrors `provider_update`: clone → validate → mutate → save → swap →
+    // rebuild. The daemon holds settings in `Arc<Mutex<BusytokSettings>>` — a
+    // direct file write would leave the running daemon's in-memory state stale
     // ("file fixed, current session still can't find sidecar"). This method
-    // atomically (1) persists to `settings.toml` AND (2) swaps the in-memory
-    // Arc so the worker pool / doctor checks see the new locator immediately.
+    // atomically (1) validates the path, (2) persists to `settings.toml`,
+    // (3) swaps the in-memory Arc, AND (4) rebuilds the sidecar runtime
+    // in-flight so `doctor`/`delegate` work in the CURRENT session (spec
+    // §472-475: fresh-install closed loop — no restart required).
     // The GUI calls this via the `pi_sidecar_locator_update` RPC on startup
     // (spec §371: refresh mechanism — the service owns the mutation).
 
@@ -5728,35 +5871,58 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: PiSidecarLocatorUpdateRequestDto,
     ) -> Result<PiSidecarLocatorUpdateResponseDto> {
+        // P1: validate runtime_dir BEFORE persisting. Don't write bad paths
+        // to settings — that would leave the service in a broken state that
+        // survives restart. Only validate when enabling (when disabling, the
+        // path may be stale and we don't care about its contents).
+        if req.enabled {
+            validate_runtime_dir(&req.runtime_dir)?;
+        }
+
         let mut pending_settings = {
             let settings = self.settings.lock().unwrap();
             settings.clone()
         };
 
+        let old_enabled = pending_settings.subagent.pi_sidecar.enabled;
         let changed = pending_settings.subagent.pi_sidecar.runtime_dir.as_deref()
             != Some(req.runtime_dir.as_str())
-            || pending_settings.subagent.pi_sidecar.enabled != req.enabled;
+            || old_enabled != req.enabled;
 
         pending_settings.subagent.pi_sidecar.runtime_dir = Some(req.runtime_dir.clone());
         pending_settings.subagent.pi_sidecar.enabled = req.enabled;
 
-        // Persist to disk BEFORE swapping in-memory (mirrors provider_update
-        // at line 5468: save first so a swap failure doesn't leave memory
-        // ahead of disk).
+        // Persist to disk BEFORE swapping in-memory (mirrors provider_update:
+        // save first so a swap failure doesn't leave memory ahead of disk).
         pending_settings.save(&self.paths)?;
 
-        // Swap the in-memory settings so the running daemon's worker pool /
-        // doctor checks see the new locator immediately.
+        // Swap the in-memory settings so `construct_sidecar` (called during
+        // rebuild below) sees the new locator.
         {
             let mut settings = self.settings.lock().unwrap();
             *settings = pending_settings;
         }
+
+        // P0: rebuild the sidecar runtime whenever `enabled` or `runtime_dir`
+        // changed. This closes the spec §472-475 fresh-install loop: GUI calls
+        // this RPC → service rebuilds sidecar in-flight → doctor/delegate work
+        // in the CURRENT session. When DISABLING (enabled=true → false), the
+        // rebuild swaps in a MockTaskExecutor runtime and shuts down the old
+        // supervisor — without this, the old Node subprocess stays alive and
+        // the doctor would misleadingly report "ok" (supervisor still running).
+        let rebuilt = if changed {
+            self.rebuild_sidecar_runtime().await;
+            true
+        } else {
+            false
+        };
 
         tracing::info!(
             event_code = "pi_sidecar.locator_updated",
             runtime_dir = %req.runtime_dir,
             enabled = req.enabled,
             changed = changed,
+            rebuilt = rebuilt,
             "pi_sidecar locator updated (in-memory + on-disk)"
         );
 
@@ -5773,14 +5939,23 @@ impl RuntimeControl for BusytokSupervisor {
         // Reject built-in profile names — they're reserved.
         if busytok_config::is_builtin_profile(&req.id) {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "reserved_name", "name is reserved for built-in profiles");
-            anyhow::bail!("cannot create profile '{}': name is reserved for built-in profiles", req.id);
+            anyhow::bail!(
+                "cannot create profile '{}': name is reserved for built-in profiles",
+                req.id
+            );
         }
         if req.id.is_empty() {
-            tracing::warn!(event_code = "profile.create.rejected", reason = "empty_id", "profile id must not be empty");
+            tracing::warn!(
+                event_code = "profile.create.rejected",
+                reason = "empty_id",
+                "profile id must not be empty"
+            );
             anyhow::bail!("profile id must not be empty");
         }
         // Validate id format: [a-z0-9/_-]+ (allows namespacing like "pi/my-profile").
-        if !req.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-') {
+        if !req.id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+        }) {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "invalid_id_format", "profile id must contain only [a-z0-9/_-]+");
             anyhow::bail!("profile id must contain only [a-z0-9/_-]+");
         }
@@ -5814,7 +5989,9 @@ impl RuntimeControl for BusytokSupervisor {
                 tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, model = %req.model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                 anyhow::bail!(
                     "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                    req.model, pid, provider.models
+                    req.model,
+                    pid,
+                    provider.models
                 );
             }
         }
@@ -5828,7 +6005,10 @@ impl RuntimeControl for BusytokSupervisor {
             timeout_seconds: req.timeout_seconds.unwrap_or(120),
         };
 
-        pending.subagent.profiles.insert(req.id.clone(), profile.clone());
+        pending
+            .subagent
+            .profiles
+            .insert(req.id.clone(), profile.clone());
         pending.save(&self.paths)?;
         {
             let mut settings = self.settings.lock().unwrap();
@@ -5872,13 +6052,19 @@ impl RuntimeControl for BusytokSupervisor {
             // model against that provider's whitelist (unless model is also
             // being updated this call — the model block below will validate).
             if let Some(ref new_pid) = new_provider_id {
-                let provider = pending.providers.iter().find(|p| &p.id == new_pid.as_str()).unwrap();
+                let provider = pending
+                    .providers
+                    .iter()
+                    .find(|p| &p.id == new_pid.as_str())
+                    .unwrap();
                 let effective_model = req.model.as_ref().unwrap_or(&profile.model);
                 if !provider.models.contains(effective_model) {
                     tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                     anyhow::bail!(
                         "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                        effective_model, new_pid, provider.models
+                        effective_model,
+                        new_pid,
+                        provider.models
                     );
                 }
             }
@@ -5899,7 +6085,9 @@ impl RuntimeControl for BusytokSupervisor {
                         tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                         anyhow::bail!(
                             "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                            model, pid, provider.models
+                            model,
+                            pid,
+                            provider.models
                         );
                     }
                 }
@@ -5907,10 +6095,18 @@ impl RuntimeControl for BusytokSupervisor {
             profile.model = model.clone();
         }
 
-        if let Some(tools) = req.tools { profile.tools = tools; }
-        if let Some(budget) = req.context_budget_tokens { profile.context_budget_tokens = budget; }
-        if let Some(timeout) = req.timeout_seconds { profile.timeout_seconds = timeout; }
-        if let Some(write_access) = req.write_access { profile.write_access = write_access; }
+        if let Some(tools) = req.tools {
+            profile.tools = tools;
+        }
+        if let Some(budget) = req.context_budget_tokens {
+            profile.context_budget_tokens = budget;
+        }
+        if let Some(timeout) = req.timeout_seconds {
+            profile.timeout_seconds = timeout;
+        }
+        if let Some(write_access) = req.write_access {
+            profile.write_access = write_access;
+        }
 
         let profile_snapshot = profile.clone();
         pending.save(&self.paths)?;
@@ -6061,10 +6257,7 @@ fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Optio
 /// `provider_id` is extracted via the existing `profile_provider_id()`
 /// helper (supervisor.rs:5719) — the single source of truth for provider
 /// extraction, already used by `provider_delete`'s reference check.
-fn profile_to_dto(
-    name: &str,
-    profile: &busytok_config::SubagentProfileConfig,
-) -> ProfileDto {
+fn profile_to_dto(name: &str, profile: &busytok_config::SubagentProfileConfig) -> ProfileDto {
     ProfileDto {
         id: name.to_string(),
         is_builtin: busytok_config::is_builtin_profile(name),

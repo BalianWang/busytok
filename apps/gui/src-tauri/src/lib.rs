@@ -62,10 +62,10 @@ mod prompt_palette_tests;
 #[cfg(test)]
 mod updater_tests;
 
+use crate::commands::invoke_busytok;
 use busytok_config::BusytokPaths;
 use desktop_service_status::{ServiceBootstrapState, ServiceStatusEvent};
 use host_application_services::{BusytokState, HostServices};
-use crate::commands::invoke_busytok;
 use palette_controller::PaletteController;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};

@@ -55,18 +55,32 @@ fn classifies_transport_vs_business_errors() {
     // bug and re-introduce in-memory/disk state drift.
 
     // Transport-unreachable → file fallback (true).
-    assert!(is_transport_unreachable("connect/bootstrap phase timed out"));
-    assert!(is_transport_unreachable("service unavailable: connection refused"));
-    assert!(is_transport_unreachable("service bootstrap failed: launchctl timeout"));
-    assert!(is_transport_unreachable("call to 'pi_sidecar_locator_update' timed out"));
+    assert!(is_transport_unreachable(
+        "connect/bootstrap phase timed out"
+    ));
+    assert!(is_transport_unreachable(
+        "service unavailable: connection refused"
+    ));
+    assert!(is_transport_unreachable(
+        "service bootstrap failed: launchctl timeout"
+    ));
+    assert!(is_transport_unreachable(
+        "call to 'pi_sidecar_locator_update' timed out"
+    ));
     assert!(is_transport_unreachable(
         "service bootstrap unavailable (coordinator not initialized)"
     ));
 
     // Service business errors → log + surface (false, NO fallback).
-    assert!(!is_transport_unreachable("[validation_error] runtime_dir must be absolute"));
-    assert!(!is_transport_unreachable("[internal_error] failed to serialize response"));
-    assert!(!is_transport_unreachable("dispatch error: method not found"));
+    assert!(!is_transport_unreachable(
+        "[validation_error] runtime_dir must be absolute"
+    ));
+    assert!(!is_transport_unreachable(
+        "[internal_error] failed to serialize response"
+    ));
+    assert!(!is_transport_unreachable(
+        "dispatch error: method not found"
+    ));
     // Edge: empty string is NOT transport-unreachable.
     assert!(!is_transport_unreachable(""));
 }

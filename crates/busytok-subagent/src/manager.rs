@@ -114,7 +114,10 @@ impl SubagentManager {
     /// same seam as synchronous `delegate()`. Must be called BEFORE
     /// `spawn_task_dispatcher` (set once by `BusytokSupervisor::assemble_with_sidecar`).
     pub fn set_task_completion_hook(&self, hook: TaskCompletionHook) {
-        let mut guard = self.task_completion_hook.lock().expect("task_completion_hook lock poisoned");
+        let mut guard = self
+            .task_completion_hook
+            .lock()
+            .expect("task_completion_hook lock poisoned");
         *guard = Some(hook);
     }
 
@@ -1115,9 +1118,7 @@ fn task_row_to_summary(r: SubagentTaskRow) -> SubagentTaskSummary {
 /// executor's structured `classify_sidecar_error` automatically: both
 /// reference the same protocol constants.
 fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind> {
-    use crate::sidecar::protocol::{
-        AUTH_FAILURE, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT,
-    };
+    use crate::sidecar::protocol::{AUTH_FAILURE, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT};
     match e {
         SubagentError::SidecarTimeout(_) | SubagentError::TaskTimeout => {
             Some(TaskErrorKind::Timeout)
