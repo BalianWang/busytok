@@ -6626,3 +6626,181 @@ async fn profile_create_applies_defaults_for_omitted_fields() {
     assert_eq!(dto.timeout_seconds, 120);
     sup.shutdown_writer().await.unwrap();
 }
+
+#[tokio::test]
+async fn profile_create_rejects_empty_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "".to_string(),
+            model: "some-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("profile id must not be empty"),
+        "expected empty-id rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_empty_model() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("model must not be empty"),
+        "expected empty-model rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_model_not_in_whitelist_on_model_only_patch() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create provider with model "model-a" only.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Bind profile to provider with the whitelisted model.
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch only the model to a value NOT in the provider whitelist.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: None,
+            model: Some("model-b".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
+        "expected whitelist rejection on model-only patch, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_empty_model_unbound() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Built-in profile ships unbound; patch model to empty string.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: None,
+            model: Some(String::new()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("model must not be empty"),
+        "expected empty-model rejection on unbound profile, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_empty_model_bound() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create provider + bind profile to it.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch model to empty string while provider is bound.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: None,
+            model: Some(String::new()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("model must not be empty"),
+        "expected empty-model rejection on bound profile, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}

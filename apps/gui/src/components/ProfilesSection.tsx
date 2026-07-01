@@ -45,6 +45,7 @@ function isBoundToDisabledProvider(
 interface ProfileRowProps {
   profile: ProfileDto;
   providers: ProviderDto[];
+  providersDegraded: boolean;
   isEditing: boolean;
   editProviderId: string;
   editModel: string;
@@ -60,6 +61,7 @@ interface ProfileRowProps {
 function ProfileRow({
   profile,
   providers,
+  providersDegraded,
   isEditing,
   editProviderId,
   editModel,
@@ -71,8 +73,10 @@ function ProfileRow({
   onDelete,
   isDeletePending,
 }: ProfileRowProps) {
-  const disabled = isBoundToDisabledProvider(profile, providers);
-  const stale = isStaleModel(profile, providers);
+  // When the providers query failed, we cannot reliably compute
+  // stale/disabled state — skip both to avoid false positives.
+  const disabled = providersDegraded ? false : isBoundToDisabledProvider(profile, providers);
+  const stale = providersDegraded ? false : isStaleModel(profile, providers);
   const enabledProvs = enabledProviders(providers);
 
   // Cascade-filtered models: only show models from the selected provider.
@@ -271,6 +275,7 @@ export function ProfilesSection() {
 
   const profiles = snapshotQuery.data?.data?.subagent?.profiles ?? [];
   const providers = providersQuery.data?.providers ?? [];
+  const providersDegraded = providersQuery.isError;
 
   const handleEdit = useCallback((profile: ProfileDto) => {
     setEditingId(profile.id);
@@ -367,6 +372,19 @@ export function ProfilesSection() {
   return (
     <section className="settings-section">
       <h2>Profiles</h2>
+      {providersDegraded && (
+        <div className="settings-panel">
+          <SettingsRow
+            label="⚠ Warning"
+            control={
+              <SettingsValue
+                value="Provider list unavailable — binding checks disabled. Retry by reloading."
+                tone="warning"
+              />
+            }
+          />
+        </div>
+      )}
       {mutationError && (
         <div className="settings-panel">
           <SettingsRow
@@ -385,6 +403,7 @@ export function ProfilesSection() {
             key={profile.id}
             profile={profile}
             providers={providers}
+            providersDegraded={providersDegraded}
             isEditing={editingId === profile.id}
             editProviderId={editProviderId}
             editModel={editModel}

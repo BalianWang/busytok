@@ -576,4 +576,44 @@ describe("ProfilesSection", () => {
     fireEvent.click(screen.getByRole("button", { name: /edit/i }));
     expect(screen.queryByText(/first error/i)).toBeNull();
   });
+
+  it("shows degraded banner and skips stale markers when providers query fails", () => {
+    // Profile is bound to a provider whose id is NOT in the (failed) providers
+    // list. Without the degraded guard, isStaleModel would return true and
+    // render a false "Stale Model" warning.
+    mockSnapshot.mockReturnValue({
+      data: {
+        data: {
+          subagent: {
+            enabled: true,
+            profiles: [makeProfile({ provider_id: "deepseek", model: "deepseek-chat" })],
+          },
+        } as ReadEnvelopeDto<SettingsSnapshotDto>,
+      },
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    // Providers query failed — data is undefined, isError is true.
+    mockProviders.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+    } as never);
+    mockMutations.mockReturnValue({
+      createProfile: { mutate: vi.fn(), isPending: false },
+      updateProfile: { mutate: vi.fn(), isPending: false },
+      deleteProfile: { mutate: vi.fn(), isPending: false },
+    } as never);
+
+    renderWithProviders(<ProfilesSection />);
+    // Degraded banner is shown.
+    expect(screen.getByText(/provider list unavailable/i)).toBeTruthy();
+    // No false stale marker (would have matched /stale|invalid model/i).
+    expect(screen.queryByText(/stale|invalid model/i)).toBeNull();
+    // No false disabled-provider warning.
+    expect(screen.queryByText(/disabled provider/i)).toBeNull();
+    // Profile row is still rendered.
+    expect(screen.getByText("pi/search-cheap")).toBeTruthy();
+  });
 });
