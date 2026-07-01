@@ -825,6 +825,7 @@ pub struct SettingsValidationErrorDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
 pub struct SettingsSubagentDto {
     pub enabled: bool,
     pub profiles: Vec<ProfileDto>,
