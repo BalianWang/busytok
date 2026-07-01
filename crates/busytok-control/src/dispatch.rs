@@ -210,6 +210,11 @@ pub trait RuntimeControl: Send + Sync {
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto>;
 
+    // Profiles (Phase 4: Profile/Model Configuration UI)
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto>;
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> Result<ProfileDto>;
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> Result<()>;
+
     // Events (kept from Phase 1)
     fn event_bus(&self) -> &AppEventBus;
 
@@ -546,6 +551,26 @@ impl ControlDispatcher {
                     })?;
                 let dto = self.runtime.provider_test_connection(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Profiles (Phase 4: Profile/Model Configuration UI)
+            "profile.create" => {
+                let req: ProfileCreateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for profile.create: {e}"))?;
+                let dto = self.runtime.profile_create(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "profile.update" => {
+                let req: ProfileUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for profile.update: {e}"))?;
+                let dto = self.runtime.profile_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "profile.delete" => {
+                let req: ProfileDeleteRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for profile.delete: {e}"))?;
+                self.runtime.profile_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
             }
 
             _ => {
@@ -956,6 +981,10 @@ impl RuntimeControl for TestRuntimeControl {
                 subagent: None,
             },
             recovery_actions: vec![],
+            subagent: SettingsSubagentDto {
+                enabled: true,
+                profiles: vec![],
+            },
         }))
     }
 
@@ -992,6 +1021,10 @@ impl RuntimeControl for TestRuntimeControl {
                 subagent: None,
             },
             recovery_actions: vec![],
+            subagent: SettingsSubagentDto {
+                enabled: true,
+                profiles: vec![],
+            },
         }))
     }
 
@@ -1198,6 +1231,18 @@ impl RuntimeControl for TestRuntimeControl {
             error: Some("not implemented".to_string()),
             models_detected: None,
         })
+    }
+
+    // ── Profiles (Phase 4: Profile/Model Configuration UI) ──────────
+
+    async fn profile_create(&self, _req: ProfileCreateRequestDto) -> Result<ProfileDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn profile_update(&self, _req: ProfileUpdateRequestDto) -> Result<ProfileDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn profile_delete(&self, _req: ProfileDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
     }
 
     fn event_bus(&self) -> &AppEventBus {
@@ -1410,6 +1455,15 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto> {
         (**self).provider_test_connection(req).await
+    }
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto> {
+        (**self).profile_create(req).await
+    }
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> Result<ProfileDto> {
+        (**self).profile_update(req).await
+    }
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> Result<()> {
+        (**self).profile_delete(req).await
     }
     fn event_bus(&self) -> &AppEventBus {
         (**self).event_bus()
