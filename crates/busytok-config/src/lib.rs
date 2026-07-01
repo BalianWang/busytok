@@ -3,12 +3,14 @@
 #![allow(dead_code)]
 #![cfg_attr(test, allow(clippy::all))]
 mod logging;
+mod manifest;
 mod paths;
 pub mod platform;
 pub mod providers;
 pub mod service_marker;
 
 pub use logging::{init_logging, prune_old_logs, LogSource, LoggingGuards};
+pub use manifest::SidecarManifest;
 pub use paths::BusytokPaths;
 pub use providers::{ProviderConfig, ProviderCredentialStore, ProviderKind};
 
@@ -249,8 +251,8 @@ pub struct SubagentPiSidecarConfig {
     /// or a Tauri-injected env var.
     ///
     /// Examples:
-    ///   - Packaged GUI (macOS): `/Applications/Busytok.app/Contents/Resources/sidecars/pi`
-    ///   - Service-only: `/usr/local/lib/busytok/sidecars/pi` (or wherever the
+    ///   - Packaged GUI (macOS): `/Applications/Busytok.app/Contents/Resources/pi-sidecar`
+    ///   - Service-only: `/usr/local/lib/busytok/pi-sidecar` (or wherever the
     ///     package manager installs it)
     ///   - Dev: unset (resolves to apps/pi-sidecar/dist/)
     #[serde(default)]

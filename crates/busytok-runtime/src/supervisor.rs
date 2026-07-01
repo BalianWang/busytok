@@ -936,35 +936,56 @@ impl BusytokSupervisor {
         }
 
         // 5. Bundle manifest readable (spec §7.1 line 866, §5.1 line 549).
-        //    Verifies manifest.json EXISTS, is READABLE (open succeeds), and
-        //    is PARSEABLE as JSON. A missing or malformed manifest is an
-        //    "error" — the sidecar cannot be launched without a valid
-        //    manifest.
+        //    Verifies manifest.json EXISTS, is READABLE, is PARSEABLE JSON, AND
+        //    conforms to the SidecarManifest schema (version/protocol_version/
+        //    bundle/node_runtime_version all present + correct types). A missing
+        //    or malformed manifest is an "error" — the sidecar cannot be launched
+        //    without a valid manifest.
         {
             let manifest_path = self.paths.sidecar_manifest_path(runtime_dir_ref);
             let (status, detail) = match std::fs::read_to_string(&manifest_path) {
-                Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
-                    Ok(_v) => (
+                Ok(contents) => match serde_json::from_str::<busytok_config::SidecarManifest>(&contents) {
+                    Ok(m) => (
                         "ok",
-                        format!("manifest readable ({})", manifest_path.display()),
+                        format!(
+                            "manifest readable (version={}, protocol_version={}, node={}): {}",
+                            m.version, m.protocol_version, m.node_runtime_version,
+                            manifest_path.display()
+                        ),
                     ),
-                    Err(e) => (
+                    Err(e) => {
+                        tracing::warn!(
+                            event_code = "subagent.doctor.manifest_invalid",
+                            path = %manifest_path.display(),
+                            error = %e,
+                            "manifest at path is not a valid SidecarManifest"
+                        );
+                        (
+                            "error",
+                            format!(
+                                "manifest at {} is not a valid SidecarManifest: {}",
+                                manifest_path.display(),
+                                e
+                            ),
+                        )
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        event_code = "subagent.doctor.manifest_unreadable",
+                        path = %manifest_path.display(),
+                        error = %e,
+                        "manifest not readable at path"
+                    );
+                    (
                         "error",
                         format!(
-                            "manifest at {} is not valid JSON: {}",
+                            "manifest not readable at {}: {}",
                             manifest_path.display(),
                             e
                         ),
-                    ),
-                },
-                Err(e) => (
-                    "error",
-                    format!(
-                        "manifest not readable at {}: {}",
-                        manifest_path.display(),
-                        e
-                    ),
-                ),
+                    )
+                }
             };
             checks.push(DoctorCheckDto {
                 name: "bundle_manifest_readable".into(),

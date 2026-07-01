@@ -914,10 +914,11 @@ async fn doctor_bundle_manifest_readable_check_validates_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("rt");
     std::fs::create_dir_all(&runtime_dir).unwrap();
-    // Write a valid manifest.json (spec §5.1 line 549).
+    // Write a valid manifest.json conforming to SidecarManifest schema
+    // (Task 1: version/protocol_version/bundle/node_runtime_version).
     std::fs::write(
         runtime_dir.join("manifest.json"),
-        br#"{"name":"pi-sidecar","version":"0.1.0"}"#,
+        br#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
     )
     .unwrap();
 

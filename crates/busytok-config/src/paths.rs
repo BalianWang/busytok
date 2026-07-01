@@ -154,7 +154,7 @@ impl BusytokPaths {
     ///    of the `busytok-config` crate. Dev-only; brittle if the binary is
     ///    relocated. Packaged builds MUST set `runtime_dir`.
     ///
-    /// NO hardcoded `data_dir/sidecars/pi` fallback — that path is neither the
+    /// NO hardcoded `data_dir/pi-sidecar` fallback — that path is neither the
     /// Tauri bundle location nor a service-only config entry, and silently
     /// falling back to it would mask a misconfigured packaged build.
     pub fn sidecar_runtime_dir(&self, runtime_dir: Option<&str>) -> std::path::PathBuf {
