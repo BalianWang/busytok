@@ -77,9 +77,9 @@ function ProfileRow({
 
   // Cascade-filtered models: only show models from the selected provider.
   const availableModels = useMemo(() => {
-    const selected = enabledProvs.find((p) => p.id === editProviderId);
+    const selected = providers.filter((p) => p.enabled).find((p) => p.id === editProviderId);
     return selected ? selected.models : [];
-  }, [enabledProvs, editProviderId]);
+  }, [providers, editProviderId]);
 
   // Disable Save when a provider is selected but the model is not in its
   // whitelist (stale or unselected) — spec: "requires re-selection before save".

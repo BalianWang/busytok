@@ -5660,6 +5660,10 @@ impl RuntimeControl for BusytokSupervisor {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "invalid_id_format", "profile id must contain only [a-z0-9/_-]+");
             anyhow::bail!("profile id must contain only [a-z0-9/_-]+");
         }
+        if req.model.is_empty() {
+            tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
+            anyhow::bail!("model must not be empty");
+        }
 
         let mut pending = {
             let settings = self.settings.lock().unwrap();
@@ -5740,8 +5744,9 @@ impl RuntimeControl for BusytokSupervisor {
                 }
                 Some(pid.clone())
             };
-            // If binding to a new provider, validate the CURRENT model is in the
-            // new provider's whitelist (unless model is also being updated this call).
+            // If binding to a provider (new or same), validate the effective
+            // model against that provider's whitelist (unless model is also
+            // being updated this call — the model block below will validate).
             if let Some(ref new_pid) = new_provider_id {
                 let provider = pending.providers.iter().find(|p| &p.id == new_pid.as_str()).unwrap();
                 let effective_model = req.model.as_ref().unwrap_or(&profile.model);
