@@ -44,6 +44,10 @@ generate_sidecar_manifest() {
   "node_runtime_version": "${SIDECAR_NODE_VERSION}"
 }
 EOF
+    if [ ! -f "$out_dir/manifest.json" ]; then
+        echo "  ERROR: manifest write failed"
+        return 1
+    fi
     echo "  generated manifest.json (protocol_version=${protocol_version}, node=${SIDECAR_NODE_VERSION})"
 }
 
@@ -58,7 +62,8 @@ download_node_binary() {
     local dest_dir="$staging/node/$app_dir"
     local cached="$staging/cache/node-v${version}-${upstream_token}.tar.gz"
 
-    mkdir -p "$dest_dir" "$staging/cache"
+    mkdir -p "$dest_dir" "$staging/cache" \
+        || { echo "  ERROR: mkdir failed"; return 1; }
 
     if [ -f "$cached" ]; then
         echo "  node v${version} ${upstream_token}: cached"
@@ -106,13 +111,15 @@ bundle_sidecar_resources_into_app() {
     # breaking release determinism (P1 review finding). The pi-sidecar
     # package is small (~100ms build); unconditional rebuild is cheap.
     echo "  building pi-sidecar bundle (unconditional, fresh from source)..."
-    ( cd "$PROJECT_ROOT/apps/pi-sidecar" && pnpm run build )
+    ( cd "$PROJECT_ROOT/apps/pi-sidecar" && pnpm run build ) \
+        || { echo "  ERROR: pi-sidecar build failed"; return 1; }
     if [ ! -f "$bundle_src" ]; then
         echo "  ERROR: pi-sidecar.bundle.js not produced by build"
         return 1
     fi
 
-    mkdir -p "$sidecar_dir/node/aarch64" "$sidecar_dir/node/x86_64"
+    mkdir -p "$sidecar_dir/node/aarch64" "$sidecar_dir/node/x86_64" \
+        || { echo "  ERROR: mkdir failed"; return 1; }
 
     # 2. Copy the JS bundle.
     cp "$bundle_src" "$sidecar_dir/pi-sidecar.bundle.js" || { echo "  ERROR: cp bundle failed"; return 1; }
@@ -124,7 +131,8 @@ bundle_sidecar_resources_into_app() {
     # 4. Download + extract both Node arches into staging, then copy.
     # Iterate NODE_ARCHES: each entry is "<upstream_token> <app_dir>".
     local staging
-    staging="$(mktemp -d "${TMPDIR:-/tmp}/busytok-node-staging.XXXXXX")"
+    staging="$(mktemp -d "${TMPDIR:-/tmp}/busytok-node-staging.XXXXXX")" \
+        || { echo "  ERROR: mktemp staging failed"; return 1; }
     # shellcheck disable=SC2064
     trap "rm -rf '$staging'" RETURN
 
