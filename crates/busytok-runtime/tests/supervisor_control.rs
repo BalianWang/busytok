@@ -5922,3 +5922,707 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
     // — readers can inspect the task row by subagent_id if the test fails).
     let _ = sub_id;
 }
+
+// ---------------------------------------------------------------------------
+// Profile CRUD (Phase 4 Task 4: Profile/Model Configuration UI)
+// ---------------------------------------------------------------------------
+//
+// Tests exercise the BusytokSupervisor's profile_create / profile_update /
+// profile_delete handlers via the RuntimeControl trait. Built-in profiles
+// (pi/search-cheap, pi/review-cheap, pi/plan-cheap) ship with default
+// settings — these tests verify CRUD on user profiles + validation paths.
+
+#[tokio::test]
+async fn profile_crud_round_trips() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Built-in profiles exist from default_settings.
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert_eq!(snapshot.data.subagent.profiles.len(), 3);
+    assert!(snapshot.data.subagent.profiles.iter().any(|p| p.id == "pi/search-cheap"));
+    assert!(snapshot.data.subagent.profiles.iter().all(|p| p.is_builtin));
+
+    // Create a user profile.
+    let created = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-reviewer".to_string(),
+            model: "deepseek-chat".to_string(),
+            provider_id: None,
+            tools: Some(vec!["read".to_string(), "grep".to_string()]),
+            context_budget_tokens: Some(4000),
+            timeout_seconds: Some(150),
+            write_access: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.id, "my-reviewer");
+    assert!(!created.is_builtin);
+    assert_eq!(created.model, "deepseek-chat");
+    assert_eq!(created.context_budget_tokens, 4000);
+
+    // Settings snapshot now shows 4 profiles.
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert_eq!(snapshot.data.subagent.profiles.len(), 4);
+
+    // Update model + provider_id (patch semantics).
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-reviewer".to_string(),
+            provider_id: Some("".to_string()), // unbind (empty string = None)
+            model: Some("qwen-coder".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.model, "qwen-coder");
+    // provider_id was Some("") → unbound → None.
+    assert_eq!(updated.provider_id, None);
+    // tools/context_budget_tokens unchanged (patch semantics).
+    assert_eq!(updated.tools, vec!["read", "grep"]);
+    assert_eq!(updated.context_budget_tokens, 4000);
+
+    // Delete the user profile.
+    sup.profile_delete(ProfileDeleteRequestDto {
+        id: "my-reviewer".to_string(),
+    })
+    .await
+    .unwrap();
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert_eq!(snapshot.data.subagent.profiles.len(), 3);
+
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_builtin_name() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            model: "deepseek-chat".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("reserved for built-in"),
+        "expected reserved-name error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_delete_rejects_builtin() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_delete(ProfileDeleteRequestDto {
+            id: "pi/search-cheap".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot delete built-in"),
+        "expected built-in rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_disabled_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a disabled provider.
+    sup.provider_create(provider_create_request("disabled-p", "Disabled"))
+        .await
+        .unwrap();
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "disabled-p".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: Some(vec!["some-model".to_string()]),
+        enabled: Some(false),
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Try to bind a profile to the disabled provider → rejected.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: Some("disabled-p".to_string()),
+            model: Some("some-model".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("disabled provider"),
+        "expected disabled-provider rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_stale_model_on_rebind() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a provider with model "model-a".
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Bind profile to provider with model-a.
+    sup.profile_update(ProfileUpdateRequestDto {
+        id: "pi/search-cheap".to_string(),
+        provider_id: Some("test-p".to_string()),
+        model: Some("model-a".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Provider updates model list to ["model-b"] only — model-a is now stale.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-p".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: Some(vec!["model-b".to_string()]),
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Re-bind to the same provider (provider_id = Some("test-p")) without
+    // changing the model → the rebind path validates the effective model
+    // (model-a) against the new whitelist (["model-b"]) and rejects.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: Some("test-p".to_string()), // re-bind same provider
+            model: None, // not changing model
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
+        "expected stale-model rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_patches_tools_without_triggering_stale_check() {
+    // Patching only `tools` (neither provider_id nor model) must NOT run
+    // the whitelist validation — the service trusts the existing binding
+    // and only the UI surfaces stale-model warnings for already-bound profiles.
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_update(ProfileUpdateRequestDto {
+        id: "pi/search-cheap".to_string(),
+        provider_id: Some("test-p".to_string()),
+        model: Some("model-a".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Shrink the provider's whitelist so model-a is no longer in it.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-p".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: Some(vec!["model-b".to_string()]),
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch ONLY tools — should succeed despite the stale model, because
+    // the service does not re-validate existing bindings on unrelated patches.
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: None, // unchanged
+            model: None, // unchanged
+            tools: Some(vec!["new-tool".to_string()]),
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.tools, vec!["new-tool".to_string()]);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn settings_snapshot_includes_subagent_profiles() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert!(snapshot.data.subagent.enabled);
+    assert_eq!(snapshot.data.subagent.profiles.len(), 3);
+    let search = snapshot.data.subagent.profiles.iter()
+        .find(|p| p.id == "pi/search-cheap")
+        .unwrap();
+    assert!(search.is_builtin);
+    assert_eq!(search.model, "deepseek-chat");
+    assert_eq!(search.provider_id, None);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_nonexistent_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "some-model".to_string(),
+            provider_id: Some("nonexistent-provider".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "expected provider-not-found error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_model_not_in_whitelist() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a provider with only "model-a".
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Try to create a profile bound to that provider with a model NOT in its whitelist.
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "model-b".to_string(),
+            provider_id: Some("test-p".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
+        "expected whitelist rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_nonexistent_profile() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "nonexistent-profile".to_string(),
+            provider_id: None,
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("profile not found"),
+        "expected not-found error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_delete_rejects_nonexistent_profile() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_delete(ProfileDeleteRequestDto {
+            id: "nonexistent-profile".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("profile not found"),
+        "expected not-found error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_duplicate_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // First create succeeds.
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "some-model".to_string(),
+        provider_id: None,
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Second create with the same id fails.
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "other-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "expected already-exists error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_unbinds_provider_with_empty_string() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a provider + bind a user profile to it.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Unbind via Some("").
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: Some("".to_string()),
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.provider_id, None);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_with_all_none_patch_is_noop() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Capture the built-in search profile's pre-state.
+    let before = sup.settings_snapshot().await.unwrap().data.subagent.profiles.iter()
+        .find(|p| p.id == "pi/search-cheap")
+        .cloned()
+        .unwrap();
+
+    // Patch everything as None (no-op).
+    let after = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: None,
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+
+    // Profile is returned unchanged.
+    assert_eq!(after.model, before.model);
+    assert_eq!(after.provider_id, before.provider_id);
+    assert_eq!(after.tools, before.tools);
+    assert_eq!(after.context_budget_tokens, before.context_budget_tokens);
+    assert_eq!(after.timeout_seconds, before.timeout_seconds);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_changes_provider_and_model_together() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create two providers, each with a different model.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "prov-a".to_string(),
+        name: "Prov A".to_string(),
+        base_url: "https://a.test/v1".to_string(),
+        api_key_env_name: "A_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "prov-b".to_string(),
+        name: "Prov B".to_string(),
+        base_url: "https://b.test/v1".to_string(),
+        api_key_env_name: "B_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-b".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    // Create a profile bound to prov-a/model-a.
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("prov-a".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Atomically switch to prov-b/model-b.
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: Some("prov-b".to_string()),
+            model: Some("model-b".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.provider_id, Some("prov-b".to_string()));
+    assert_eq!(updated.model, "model-b");
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_invalid_id_format() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Uppercase and spaces are not allowed.
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "My Profile".to_string(),
+            model: "some-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("[a-z0-9/_-]+") || err.to_string().contains("id format"),
+        "expected id-format rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_patches_only_model_on_bound_profile() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create provider + profile bound to it.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string(), "model-b".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch only the model (provider_id stays None = unchanged).
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: None,
+            model: Some("model-b".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    // Provider unchanged, model updated.
+    assert_eq!(updated.provider_id, Some("test-p".to_string()));
+    assert_eq!(updated.model, "model-b");
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_applies_defaults_for_omitted_fields() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a profile with tools/budget/timeout all None.
+    let dto = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "some-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+
+    // Defaults: write_access=false, tools=[], budget=3000, timeout=120.
+    assert_eq!(dto.write_access, false);
+    assert_eq!(dto.tools, Vec::<String>::new());
+    assert_eq!(dto.context_budget_tokens, 3000);
+    assert_eq!(dto.timeout_seconds, 120);
+    sup.shutdown_writer().await.unwrap();
+}

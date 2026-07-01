@@ -4195,6 +4195,18 @@ impl RuntimeControl for BusytokSupervisor {
                         PromptActionDto::CopyAndPaste
                     }
                 },
+                subagent: {
+                    let profiles: Vec<ProfileDto> = settings
+                        .subagent
+                        .profiles
+                        .iter()
+                        .map(|(name, cfg)| profile_to_dto(name, cfg))
+                        .collect();
+                    SettingsSubagentDto {
+                        enabled: settings.subagent.enabled,
+                        profiles,
+                    }
+                },
                 diagnostics,
                 recovery_actions: vec![
                     SettingsRecoveryActionDto {
@@ -5631,6 +5643,180 @@ impl RuntimeControl for BusytokSupervisor {
         }
     }
 
+    // ── Profiles (Phase 4: Profile/Model Configuration UI) ──────────
+
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto> {
+        // Reject built-in profile names — they're reserved.
+        if busytok_config::is_builtin_profile(&req.id) {
+            tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "reserved_name", "name is reserved for built-in profiles");
+            anyhow::bail!("cannot create profile '{}': name is reserved for built-in profiles", req.id);
+        }
+        if req.id.is_empty() {
+            tracing::warn!(event_code = "profile.create.rejected", reason = "empty_id", "profile id must not be empty");
+            anyhow::bail!("profile id must not be empty");
+        }
+        // Validate id format: [a-z0-9/_-]+ (allows namespacing like "pi/my-profile").
+        if !req.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-') {
+            tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "invalid_id_format", "profile id must contain only [a-z0-9/_-]+");
+            anyhow::bail!("profile id must contain only [a-z0-9/_-]+");
+        }
+
+        let mut pending = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+        if pending.subagent.profiles.contains_key(&req.id) {
+            tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "already_exists", "profile already exists");
+            anyhow::bail!("profile already exists: {}", req.id);
+        }
+
+        // If provider_id is specified, validate the provider exists and is enabled.
+        if let Some(ref pid) = req.provider_id {
+            let provider = pending.providers.iter().find(|p| &p.id == pid.as_str())
+                .ok_or_else(|| {
+                    tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
+                    anyhow::anyhow!("provider not found: {}", pid)
+                })?;
+            if !provider.enabled {
+                tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
+                anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
+            }
+            // Validate model is in provider's whitelist.
+            if !provider.models.contains(&req.model) {
+                tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, model = %req.model, reason = "model_not_in_whitelist", "model not in provider whitelist");
+                anyhow::bail!(
+                    "model '{}' is not in provider '{}'s model whitelist: {:?}",
+                    req.model, pid, provider.models
+                );
+            }
+        }
+
+        let profile = busytok_config::SubagentProfileConfig {
+            write_access: req.write_access.unwrap_or(false),
+            tools: req.tools.unwrap_or_default(),
+            model: req.model,
+            provider_id: req.provider_id,
+            context_budget_tokens: req.context_budget_tokens.unwrap_or(3000),
+            timeout_seconds: req.timeout_seconds.unwrap_or(120),
+        };
+
+        pending.subagent.profiles.insert(req.id.clone(), profile.clone());
+        pending.save(&self.paths)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending;
+        }
+
+        let dto = profile_to_dto(&req.id, &profile);
+        tracing::info!(event_code = "profile.created", profile_id = %req.id, "profile created");
+        Ok(dto)
+    }
+
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> Result<ProfileDto> {
+        let mut pending = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+        let profile = pending.subagent.profiles.get_mut(&req.id)
+            .ok_or_else(|| {
+                tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, reason = "not_found", "profile not found");
+                anyhow::anyhow!("profile not found: {}", req.id)
+            })?;
+
+        // Handle provider_id patch: Some("") = unbind, Some("x") = bind, None = unchanged.
+        if let Some(ref pid) = req.provider_id {
+            let new_provider_id = if pid.is_empty() {
+                None
+            } else {
+                // Validate the new provider exists and is enabled.
+                let provider = pending.providers.iter().find(|p| &p.id == pid.as_str())
+                    .ok_or_else(|| {
+                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
+                        anyhow::anyhow!("provider not found: {}", pid)
+                    })?;
+                if !provider.enabled {
+                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
+                    anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
+                }
+                Some(pid.clone())
+            };
+            // If binding to a new provider, validate the CURRENT model is in the
+            // new provider's whitelist (unless model is also being updated this call).
+            if let Some(ref new_pid) = new_provider_id {
+                let provider = pending.providers.iter().find(|p| &p.id == new_pid.as_str()).unwrap();
+                let effective_model = req.model.as_ref().unwrap_or(&profile.model);
+                if !provider.models.contains(effective_model) {
+                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
+                    anyhow::bail!(
+                        "model '{}' is not in provider '{}'s model whitelist: {:?}",
+                        effective_model, new_pid, provider.models
+                    );
+                }
+            }
+            profile.provider_id = new_provider_id;
+        }
+
+        // Handle model patch: if updating model and provider is bound, validate.
+        if let Some(ref model) = req.model {
+            if let Some(ref pid) = profile.provider_id {
+                let provider = pending.providers.iter().find(|p| &p.id == pid.as_str());
+                if let Some(provider) = provider {
+                    if !provider.models.contains(model) {
+                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
+                        anyhow::bail!(
+                            "model '{}' is not in provider '{}'s model whitelist: {:?}",
+                            model, pid, provider.models
+                        );
+                    }
+                }
+            }
+            profile.model = model.clone();
+        }
+
+        if let Some(tools) = req.tools { profile.tools = tools; }
+        if let Some(budget) = req.context_budget_tokens { profile.context_budget_tokens = budget; }
+        if let Some(timeout) = req.timeout_seconds { profile.timeout_seconds = timeout; }
+        if let Some(write_access) = req.write_access { profile.write_access = write_access; }
+
+        let profile_snapshot = profile.clone();
+        pending.save(&self.paths)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending;
+        }
+
+        let dto = profile_to_dto(&req.id, &profile_snapshot);
+        tracing::info!(event_code = "profile.updated", profile_id = %req.id, "profile updated");
+        Ok(dto)
+    }
+
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> Result<()> {
+        // Reject deletion of built-in profiles.
+        if busytok_config::is_builtin_profile(&req.id) {
+            tracing::warn!(event_code = "profile.delete.rejected", profile_id = %req.id, reason = "builtin", "cannot delete built-in profile");
+            anyhow::bail!("cannot delete built-in profile: {}", req.id);
+        }
+
+        let mut pending = {
+            let settings = self.settings.lock().unwrap();
+            settings.clone()
+        };
+        if !pending.subagent.profiles.contains_key(&req.id) {
+            tracing::warn!(event_code = "profile.delete.rejected", profile_id = %req.id, reason = "not_found", "profile not found");
+            anyhow::bail!("profile not found: {}", req.id);
+        }
+
+        pending.subagent.profiles.remove(&req.id);
+        pending.save(&self.paths)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            *settings = pending;
+        }
+
+        tracing::info!(event_code = "profile.deleted", profile_id = %req.id, "profile deleted");
+        Ok(())
+    }
+
     // ── Events ───────────────────────────────────────────────────────
 
     fn event_bus(&self) -> &AppEventBus {
@@ -5729,6 +5915,32 @@ fn provider_to_dto(provider: &ProviderConfig) -> ProviderDto {
 /// `None` is an error (delegate path: yes; delete path: just skip).
 fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Option<String> {
     profile.provider_id.clone()
+}
+
+/// Maps a `SubagentProfileConfig` (settings-layer type) to a `ProfileDto`
+/// (wire type). Mirrors `provider_to_dto` pattern.
+///
+/// `is_builtin` is derived from the profile name via `is_builtin_profile()`
+/// — not stored in config. This is the single mapping point; both
+/// `settings_snapshot` and `profile_create`/`profile_update` use it.
+///
+/// `provider_id` is extracted via the existing `profile_provider_id()`
+/// helper (supervisor.rs:5719) — the single source of truth for provider
+/// extraction, already used by `provider_delete`'s reference check.
+fn profile_to_dto(
+    name: &str,
+    profile: &busytok_config::SubagentProfileConfig,
+) -> ProfileDto {
+    ProfileDto {
+        id: name.to_string(),
+        is_builtin: busytok_config::is_builtin_profile(name),
+        provider_id: profile_provider_id(profile),
+        model: profile.model.clone(),
+        tools: profile.tools.clone(),
+        context_budget_tokens: profile.context_budget_tokens,
+        timeout_seconds: profile.timeout_seconds,
+        write_access: profile.write_access,
+    }
 }
 
 /// Try to spawn a background task that periodically reloads the price catalog.
