@@ -2,18 +2,45 @@ import { type TurnAutoParams, type TurnAutoResult } from '../types.js';
 import type { RequestHandler } from '../rpc.js';
 import { SidecarError } from '../errors.js';
 import type { SessionPool } from '../session_pool.js';
+import { PiSdkSession, type SdkSession, type SessionFactory } from '../pi_session.js';
 
+// Mock session id generator (used only when BUSYTOK_USE_MOCK_SIDECAR=1).
 let sessionCounter = 0;
-function nextSessionId(): string {
+function nextMockSessionId(): string {
   sessionCounter++;
   return `pi_sess_mock_${sessionCounter}`;
 }
 
 /**
+ * Mock factory: produces a no-op `PiSdkSession` whose `sendTurn` is never
+ * invoked (mockTurnAuto returns hardcoded usage). Exists purely so the pool's
+ * reuse/limit logic can run in mock mode without touching the real SDK.
+ */
+const mockSessionFactory: SessionFactory = async (logical_subagent_id) => {
+  const sid = nextMockSessionId();
+  return new PiSdkSession(noopSdkSession(sid), logical_subagent_id, sid);
+};
+
+function noopSdkSession(id: string): SdkSession {
+  return {
+    sessionId: id,
+    prompt: async () => {},
+    subscribe: () => () => {},
+    getLastAssistantText: () => '',
+    getSessionStats: () => ({
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+    }),
+    abort: async () => {},
+    dispose: () => {},
+  };
+}
+
+/**
  * turn_auto handler factory — takes a SessionPool so the pool is shared
- * across requests. The pool.ensure() call either reuses an existing
- * session or creates a new one; if the pool is full, it throws
- * HOT_SESSION_LIMIT_REACHED (-32002) with data.candidate.
+ * across requests. Routes to the real SDK path by default, or to the mock
+ * path when `BUSYTOK_USE_MOCK_SIDECAR=1` (keeps e2e tests working without
+ * real Pi credentials).
  */
 export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
   return async (params) => {
@@ -21,36 +48,78 @@ export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
     if (!p.logical_subagent_id || !p.prompt) {
       throw new SidecarError('missing required fields', -32602);
     }
-    const { adapter_session_id, reused } = pool.ensure(p.logical_subagent_id, nextSessionId);
-    const now = Date.now();
-    const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
-      ? {
-          current_state_summary: 'Investigated context; produced memory update.',
-          key_files: [{ path: 'src/auth/token.ts', reason: 'refresh logic', last_seen_at_ms: now, score: 3 }],
-          decisions: ['Focus on read-only analysis'],
-          open_questions: [{ question: 'Concurrent refresh handled?', status: 'open' as const, created_at_ms: now, last_seen_at_ms: now }],
-        }
-      : undefined;
-    // task_summary is a REAL summary, NOT an echo of compact_context.
-    // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
-    const result: TurnAutoResult = {
-      adapter_session_id,
-      session_reused: reused,
-      status: 'completed',
-      result: {
-        task_summary: `[mock] turn completed for: ${p.prompt.slice(0, 80)}`,
-        ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
-      },
-      usage: {
-        model: p.model ?? 'deepseek-chat',
-        provider: 'deepseek',
-        input_tokens: p.prompt.length,
-        output_tokens: 50,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        cost_usd: 0.001,
-      },
-    };
-    return result;
+    const useMock = process.env.BUSYTOK_USE_MOCK_SIDECAR === '1';
+    if (useMock) {
+      return mockTurnAuto(p, pool);
+    }
+    return realTurnAuto(p, pool);
+  };
+}
+
+/**
+ * Mock path — preserves the Phase 1 mock behavior (hardcoded usage, mock
+ * adapter_session_ids) so Rust-side e2e tests run without credentials.
+ */
+async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
+  const { session, reused } = await pool.ensure(
+    p.logical_subagent_id,
+    { cwd: p.cwd, model: p.model, tools: p.tools },
+    mockSessionFactory,
+  );
+  const now = Date.now();
+  const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
+    ? {
+        current_state_summary: 'Investigated context; produced memory update.',
+        key_files: [{ path: 'src/auth/token.ts', reason: 'refresh logic', last_seen_at_ms: now, score: 3 }],
+        decisions: ['Focus on read-only analysis'],
+        open_questions: [{ question: 'Concurrent refresh handled?', status: 'open' as const, created_at_ms: now, last_seen_at_ms: now }],
+      }
+    : undefined;
+  // task_summary is a REAL summary, NOT an echo of compact_context.
+  // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
+  return {
+    adapter_session_id: session.adapter_session_id,
+    session_reused: reused,
+    status: 'completed',
+    result: {
+      task_summary: `[mock] turn completed for: ${p.prompt.slice(0, 80)}`,
+      ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
+    },
+    usage: {
+      model: p.model ?? 'deepseek-chat',
+      provider: 'deepseek',
+      input_tokens: p.prompt.length,
+      output_tokens: 50,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      cost_usd: 0.001,
+    },
+  };
+}
+
+/**
+ * Real path — drives the Pi SDK session via `sendTurn` and maps the result to
+ * the sidecar's `TurnAutoResult`. SDK errors are classified into JSON-RPC
+ * error codes by `PiSdkSession.sendTurn` (auth/rate-limit/network/timeout).
+ */
+async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
+  const { session, reused } = await pool.ensure(p.logical_subagent_id, {
+    cwd: p.cwd,
+    model: p.model,
+    tools: p.tools,
+  });
+  const result = await session.sendTurn(p.prompt, {
+    model: p.model,
+    tools: p.tools,
+    timeout_ms: p.timeout_ms,
+  });
+  return {
+    adapter_session_id: session.adapter_session_id,
+    session_reused: reused,
+    status: result.status,
+    result: {
+      task_summary: result.task_summary,
+    },
+    usage: result.usage,
   };
 }

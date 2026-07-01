@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { initializeHandler } from '../src/handlers/initialize.js';
 import { healthHandlerWithPool } from '../src/handlers/health.js';
 import { shutdownHandler } from '../src/handlers/shutdown.js';
@@ -6,9 +6,34 @@ import { turnAutoHandlerWithPool } from '../src/handlers/turn_auto.js';
 import { prepareHibernateHandlerWithPool } from '../src/handlers/prepare_hibernate.js';
 import { closeHandlerWithPool } from '../src/handlers/close.js';
 import { SessionPool } from '../src/session_pool.js';
+import { PiSdkSession, type SdkSession, type SessionFactory } from '../src/pi_session.js';
 import type { HandlerContext } from '../src/rpc.js';
 
 const noopCtx: HandlerContext = { stop: () => {} };
+
+function stubSdk(id: string): SdkSession {
+  return {
+    sessionId: id,
+    prompt: async () => {},
+    subscribe: () => () => {},
+    getLastAssistantText: () => '',
+    getSessionStats: () => ({
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+    }),
+    abort: async () => {},
+    dispose: () => {},
+  };
+}
+function fakeSession(adapterId: string, subagent: string): PiSdkSession {
+  return new PiSdkSession(stubSdk(adapterId), subagent, adapterId);
+}
+function fakeFactory(...ids: string[]): SessionFactory {
+  let i = 0;
+  return async (subagent: string) => fakeSession(ids[i++] ?? `fallback_${i}`, subagent);
+}
+
+const OPTS = { cwd: '/tmp' };
 
 describe('initialize handler', () => {
   it('returns protocol version on match', async () => {
@@ -41,7 +66,7 @@ describe('health handler', () => {
     expect(result.rss_mb).toBeGreaterThan(0);
 
     // Ensure a session and confirm health reflects the new count.
-    pool.ensure('sub-a', () => 'sess-1');
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
     const result2 = await handler({}, noopCtx) as { sessions: number };
     expect(result2.sessions).toBe(1);
   });
@@ -57,7 +82,14 @@ describe('shutdown handler', () => {
   });
 });
 
-describe('turn_auto handler', () => {
+describe('turn_auto handler (mock path)', () => {
+  const PREV = process.env.BUSYTOK_USE_MOCK_SIDECAR;
+  beforeAll(() => { process.env.BUSYTOK_USE_MOCK_SIDECAR = '1'; });
+  afterAll(() => {
+    if (PREV === undefined) delete process.env.BUSYTOK_USE_MOCK_SIDECAR;
+    else process.env.BUSYTOK_USE_MOCK_SIDECAR = PREV;
+  });
+
   it('returns completed result with usage', async () => {
     const pool = new SessionPool(3);
     const handler = turnAutoHandlerWithPool(pool);
@@ -90,7 +122,7 @@ describe('turn_auto handler', () => {
 describe('prepare_hibernate handler', () => {
   it('compacts a single session by adapter_session_id', async () => {
     const pool = new SessionPool(3);
-    pool.ensure('sub-a', () => 'sess-1');
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
     const handler = prepareHibernateHandlerWithPool(pool);
     const result = await handler({ adapter_session_id: 'sess-1' }, noopCtx) as {
       memory_delta: { hot_summary?: string } | null;
@@ -102,8 +134,8 @@ describe('prepare_hibernate handler', () => {
 
   it('compacts all sessions when all:true', async () => {
     const pool = new SessionPool(3);
-    pool.ensure('sub-a', () => 'sess-1');
-    pool.ensure('sub-b', () => 'sess-2');
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
     const handler = prepareHibernateHandlerWithPool(pool);
     const result = await handler({ all: true }, noopCtx) as {
       stats: { sessions_compacted: number };
@@ -138,7 +170,7 @@ describe('prepare_hibernate handler', () => {
 describe('close handler', () => {
   it('closes an existing session and returns ok', async () => {
     const pool = new SessionPool(3);
-    pool.ensure('sub-a', () => 'sess-1');
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
     const handler = closeHandlerWithPool(pool);
     const result = await handler({ adapter_session_id: 'sess-1' }, noopCtx) as { ok: boolean };
     expect(result.ok).toBe(true);

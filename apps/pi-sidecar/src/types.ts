@@ -139,3 +139,12 @@ export interface CloseParams {
 export interface CloseResult {
   ok: boolean;
 }
+
+// New error codes start at -32010 to avoid collisions with existing
+// protocol constants -32001..-32008 (SESSION_NOT_FOUND through
+// PROTOCOL_MISMATCH) in Rust protocol.rs.
+export const ERROR_CODE_AUTH_FAILURE = -32010;
+export const ERROR_CODE_RATE_LIMIT = -32011;
+export const ERROR_CODE_NETWORK = -32012;
+// -32003 remains TASK_TIMEOUT (reused for timeout classification)
+// -32002 remains HOT_SESSION_LIMIT_REACHED
