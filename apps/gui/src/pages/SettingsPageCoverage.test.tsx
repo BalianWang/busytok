@@ -127,6 +127,10 @@ function snapshot(overrides: Partial<SettingsSnapshotDto> = {}): SettingsSnapsho
     prompt_palette_default_action: "OnlyCopy",
     recovery_actions: [],
     diagnostics: diagnostics(),
+    subagent: {
+      enabled: true,
+      profiles: [],
+    },
     ...overrides,
   };
 }

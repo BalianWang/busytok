@@ -278,6 +278,10 @@ beforeEach(() => {
       },
       recovery_actions: [],
       prompt_palette_default_action: "OnlyCopy",
+      subagent: {
+        enabled: true,
+        profiles: [],
+      },
     }),
   );
   vi.spyOn(busytokClient, "settingsDiagnostics").mockResolvedValue(
