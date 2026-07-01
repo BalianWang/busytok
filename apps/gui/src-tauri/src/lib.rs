@@ -511,6 +511,11 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         if let Some(state) = refresh_app.try_state::<BusytokState>() {
                             refresh_sidecar_locator(sidecar_dir, &state, &refresh_app).await;
+                        } else {
+                            tracing::warn!(
+                                event_code = "gui.sidecar_locator_refresh_skipped_no_state",
+                                "BusytokState not registered with Tauri — sidecar locator refresh skipped"
+                            );
                         }
                     });
                 }

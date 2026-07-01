@@ -84,3 +84,55 @@ fn classifies_transport_vs_business_errors() {
     // Edge: empty string is NOT transport-unreachable.
     assert!(!is_transport_unreachable(""));
 }
+
+/// Canary: assert the source files still produce the exact error-string
+/// prefixes that `is_transport_unreachable` matches. If anyone changes a
+/// format string in `host_application_services.rs`, `service_recovery.rs`,
+/// or `commands.rs`, this test breaks and forces them to update
+/// `is_transport_unreachable` (or refactor to a typed error — the proper
+/// fix). Without this canary, a format drift would silently break the
+/// cold-start file fallback path.
+///
+/// `include_str!` embeds the source at compile time, so the assertion runs
+/// against the EXACT source compiled into the test binary — no path
+/// resolution, no runtime file read.
+#[test]
+fn canary_transport_error_prefixes_match_source_files() {
+    let has = include_str!("host_application_services.rs");
+    let srec = include_str!("service_recovery.rs");
+    let cmds = include_str!("commands.rs");
+
+    // "connect/bootstrap phase timed out" — host_application_services.rs:67
+    assert!(
+        has.contains("\"connect/bootstrap phase timed out\""),
+        "host_application_services.rs no longer emits the 'connect/bootstrap phase timed out' prefix"
+    );
+    // "call to '{method}' timed out" — host_application_services.rs:74,134
+    assert!(
+        has.contains("\"call to '{method}' timed out\""),
+        "host_application_services.rs no longer emits the 'call to {{method}} timed out' prefix"
+    );
+    // "service unavailable: {e}" — host_application_services.rs:129 + service_recovery.rs:45
+    assert!(
+        has.contains("\"service unavailable: {e}\""),
+        "host_application_services.rs no longer emits the 'service unavailable: {{e}}' prefix"
+    );
+    assert!(
+        srec.contains("\"service unavailable: {e}\""),
+        "service_recovery.rs no longer emits the 'service unavailable: {{e}}' prefix"
+    );
+    // "service bootstrap failed: {e}" — service_recovery.rs:85 + commands.rs:57
+    assert!(
+        srec.contains("\"service bootstrap failed: {e}\""),
+        "service_recovery.rs no longer emits the 'service bootstrap failed: {{e}}' prefix"
+    );
+    assert!(
+        cmds.contains("\"service bootstrap failed: {e}\""),
+        "commands.rs no longer emits the 'service bootstrap failed: {{e}}' prefix"
+    );
+    // "service bootstrap unavailable (coordinator not initialized)" — commands.rs:60
+    assert!(
+        cmds.contains("\"service bootstrap unavailable (coordinator not initialized)\""),
+        "commands.rs no longer emits the 'service bootstrap unavailable' prefix"
+    );
+}

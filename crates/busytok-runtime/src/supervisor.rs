@@ -678,6 +678,26 @@ impl BusytokSupervisor {
     /// RPCs can't leak dispatcher tasks (one call takes the handle, the
     /// other gets `None`, and the second call's new dispatcher overwrites
     /// the first's — leaking it as a detached task).
+    ///
+    /// # Invariants (lock ordering + async safety)
+    ///
+    /// 1. **`rebuild_lock` acquired first** (line below) — held for the
+    ///    entire rebuild. Without it, two concurrent RPCs would race: one
+    ///    takes the dispatcher handle, the other gets `None`, the second's
+    ///    new dispatcher overwrites the first's — leaking a detached task.
+    /// 2. **`rebuild_lock` is `tokio::sync::Mutex<()>`** — NOT `std::sync`
+    ///    because we hold the guard across `.await` points (steps 1 and 7
+    ///    below). `std::sync::Mutex` would deadlock under Tokio.
+    /// 3. **`sidecar_runtime` write lock held only for the pointer swap**
+    ///    (step 5) — released BEFORE step 7's `old_sup.shutdown().await`.
+    ///    Never hold `std::sync::RwLock` guard across `.await`.
+    /// 4. **Dispatcher handle stored before old supervisor shut down**
+    ///    (step 6 before step 7) — synchronous steps 2–6 have no `.await`
+    ///    between draining the old dispatcher and storing the new one, so
+    ///    no other async task observes the intermediate `None` state.
+    /// 5. **Old supervisor shut down AFTER lock release** (step 7) —
+    ///    best-effort; failures are logged but don't propagate (the new
+    ///    runtime is already live).
     async fn rebuild_sidecar_runtime(&self) {
         let _rebuild_guard = self.rebuild_lock.lock().await;
 
