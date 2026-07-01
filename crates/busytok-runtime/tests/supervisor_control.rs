@@ -4846,6 +4846,196 @@ async fn provider_deleted_removes_worker() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
+/// `provider_update_with_api_key_removes_worker_then_respawns` (Phase 3 Task 7):
+/// key rotation — when `provider_update` is called with
+/// `req.api_key = Some(...)`, the runtime must rotate the credential (writing
+/// the new key to the keychain) AND remove the worker so the next
+/// `ensure_worker` respawns with the rotated key. Complements the
+/// metadata-only `provider_changed_removes_worker_then_respawns` test by
+/// exercising the credential-bearing code path. Covers Phase 3 Task 7.
+#[tokio::test]
+async fn provider_update_with_api_key_removes_worker_then_respawns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Initially, construct_sidecar auto-spawned ONE worker for test-provider.
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 1, "initial state: one worker");
+    assert_eq!(snaps[0].0, "test-provider");
+
+    // Key rotation: api_key = Some(...) instead of None. This writes the
+    // new key to the OS keychain (via ProviderCredentialStore::set_key) AND
+    // triggers provider_changed -> remove_worker_and_kill.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: None,
+        enabled: None,
+        api_key: Some("rotated-new-key".to_string()),
+    })
+    .await
+    .expect("provider_update with api_key rotation must succeed");
+
+    // Worker must be gone from the pool (remove_worker_and_kill ran).
+    let snaps_after = pool.worker_snapshots().await;
+    assert!(
+        snaps_after.is_empty(),
+        "provider_update with api_key rotation must remove the worker from the pool, got: {snaps_after:?}"
+    );
+
+    // Re-spawn: ensure_worker creates a NEW worker (with the rotated key
+    // injected into its env map).
+    let re_spawned = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker must re-spawn the worker after key rotation");
+    assert!(
+        re_spawned.worker_snapshot().await.is_some(),
+        "re-spawned worker must produce a snapshot"
+    );
+    let snaps_final = pool.worker_snapshots().await;
+    assert_eq!(
+        snaps_final.len(),
+        1,
+        "re-spawned worker must be in the pool"
+    );
+    assert_eq!(snaps_final[0].0, "test-provider");
+
+    // Clean up the keychain entry written by provider_update so the test
+    // doesn't leave state behind.
+    let _ = busytok_config::ProviderCredentialStore::delete_key("test-provider");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// Check whether a process with the given PID is currently alive. Used by
+/// `provider_update_kills_old_process` (Phase 3 Task 7) to verify the P1b
+/// guarantee: `remove_worker_and_kill` actually kills the sidecar child,
+/// rather than just dropping the worker from the pool map (which would
+/// orphan the bash child). Uses sysinfo's targeted refresh to avoid a full
+/// process scan.
+fn is_process_alive(pid: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        false,
+        ProcessRefreshKind::everything(),
+    );
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+/// `provider_update_kills_old_process` (Phase 3 Task 7, P1b fix): the
+/// existing `provider_changed_removes_worker_then_respawns` test only checks
+/// that the worker is removed from the pool map — it does NOT verify the
+/// underlying sidecar child process is actually dead. This test captures the
+/// child PID (after `ensure_started` spawns it) and asserts it is NO LONGER
+/// alive after `provider_update`, proving `remove_worker_and_kill` actually
+/// killed the process (not just dropped the entry — a plain `remove_worker`
+/// without `force_kill` would orphan the bash child).
+#[tokio::test]
+async fn provider_update_kills_old_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // The auto-spawned worker is Stopped (no child). Start the sidecar child
+    // so we have a real OS PID to verify kill.
+    let sidecar = sup
+        .sidecar_supervisor()
+        .expect("sidecar supervisor must be configured for the first enabled provider");
+    let _handle = sidecar
+        .ensure_started()
+        .await
+        .expect("ensure_started must spawn the child");
+
+    // Capture the initial sidecar child PID.
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 1, "one worker before provider_update");
+    let old_pid = snaps[0]
+        .1
+        .pid
+        .expect("worker must have a PID after ensure_started");
+    assert!(
+        is_process_alive(old_pid),
+        "old sidecar child (pid={old_pid}) must be alive before provider_update"
+    );
+
+    // Trigger provider_changed via provider_update (metadata-only change).
+    // This calls remove_worker_and_kill -> force_kill -> child.start_kill() +
+    // child.wait().await (SIGKILL on Unix).
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: Some("Updated".to_string()),
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: None,
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .expect("provider_update must succeed");
+
+    // Give the kill (SIGKILL via child.start_kill()) time to take effect.
+    // `force_kill` already awaits `child.wait()` (reaps the process), but
+    // sysinfo's process table may lag by a tick. Poll up to 2s to avoid
+    // flakiness on slow CI runners.
+    let mut killed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !is_process_alive(old_pid) {
+            killed = true;
+            break;
+        }
+    }
+    assert!(
+        killed,
+        "old sidecar child (pid={old_pid}) must be DEAD after provider_update — \
+         remove_worker_and_kill must have force-killed it"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_changed_no_op_when_pool_none` (Phase 3 Task 7): when the sidecar
+/// is disabled (`worker_pool == None`), `provider_changed` and
+/// `provider_deleted` must be safe no-ops — no panic, no error. The
+/// `if let Some(pool) = &self.worker_pool` guard in both methods routes to a
+/// `debug!` log + return on the None arm. Covers Phase 3 Task 7.
+#[tokio::test]
+async fn provider_changed_no_op_when_pool_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // make_supervisor uses BusytokSupervisor::new (sidecar disabled) —
+    // worker_pool is None.
+    let sup = make_supervisor(db, &tmp);
+    assert!(
+        sup.worker_pool().is_none(),
+        "worker_pool must be None when sidecar is disabled"
+    );
+
+    // Both must be safe no-ops regardless of whether the provider_id refers
+    // to a real provider (the None arm doesn't look it up).
+    sup.provider_changed("test-provider").await;
+    sup.provider_deleted("test-provider").await;
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3 Task 5: subagent usage bridge (usage_events + rollups)
 // ---------------------------------------------------------------------------
