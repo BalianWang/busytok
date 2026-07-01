@@ -49,8 +49,10 @@ pub struct BusytokSupervisor {
     event_bus: Arc<AppEventBus>,
     /// Source discovery orchestrator.
     source_registry: crate::source_registry::SourceRegistry,
-    /// Generation and readiness state manager.
-    generation_manager: crate::generation_manager::GenerationManager,
+    /// Generation and readiness state manager. Wrapped in `Arc` so the
+    /// background dispatcher's task-completion hook (P1 #2 fix) can share
+    /// the same `active_generation_id` cache as `write_subagent_usage_event`.
+    generation_manager: Arc<crate::generation_manager::GenerationManager>,
     /// Adapter list wrapped in Mutex for thread safety.
     adapters: Mutex<Vec<BoxedAdapter>>,
     /// Resolved filesystem paths.
@@ -213,18 +215,14 @@ impl BusytokSupervisor {
         let event_bus = AppEventBus::new(64);
 
         let db = Arc::new(Mutex::new(db));
-        // Plan 2 Task 5: gate on `subagent.pi_sidecar.enabled`. When enabled,
-        // construct `SidecarTaskExecutor`; otherwise fall back to `MockTaskExecutor`
-        // (Plan 1 behavior). If `resolve_sidecar_config` fails (e.g. bundled node
-        // binary missing in dev/test), log at `error!` with event_code
-        // `subagent.sidecar.config_resolve_failed`, capture the message in
-        // `sidecar_init_error` (surfaced via `sidecar_init_error()`), and fall
-        // back to the mock executor so the supervisor still starts —
-        // `build_with_settings` returns `Self`, not `Result<Self>`, so the
-        // error cannot propagate. Production deployments with
-        // `pi_sidecar.enabled = true` must ensure the bundle is installed; a
-        // missing bundle surfaces as an `error!` log + queryable init error
-        // and degraded (mock) execution rather than a panic.
+        // Wrap settings in `Arc<Mutex>` ONCE here so the WorkerPool's
+        // provider-lookup closure and the supervisor's `settings` field share
+        // the SAME live store. Without this, the closure would capture a
+        // snapshot of `settings.providers` taken at construction time, so
+        // `provider_update` (which mutates `self.settings`) would NOT be
+        // visible to `ensure_worker` when it re-spawns a worker — the respawned
+        // supervisor would run with stale `base_url` / `base_url_env_name`.
+        let settings = Arc::new(Mutex::new(settings));
         let (
             executor,
             sidecar_supervisor,
@@ -264,6 +262,9 @@ impl BusytokSupervisor {
     ) -> Self {
         let event_bus = AppEventBus::new(64);
         let db = Arc::new(Mutex::new(db));
+        // See `build_with_settings`: wrap settings so the pool's provider
+        // lookup reads live settings (provider_update visibility fix).
+        let settings = Arc::new(Mutex::new(settings));
         let (
             executor,
             sidecar_supervisor,
@@ -312,7 +313,7 @@ impl BusytokSupervisor {
     /// to a provider"). The full multi-provider runtime status (showing all
     /// workers) is Task 4's scope.
     fn construct_sidecar(
-        settings: &BusytokSettings,
+        settings: &Arc<Mutex<BusytokSettings>>,
         paths: &BusytokPaths,
         db: &Arc<Mutex<Database>>,
         sidecar_config_override: Option<busytok_subagent::sidecar::SidecarConfig>,
@@ -325,7 +326,13 @@ impl BusytokSupervisor {
         Option<Arc<busytok_subagent::PressureResponder>>,
         Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
     ) {
-        if !settings.subagent.pi_sidecar.enabled {
+        // Lock settings briefly for the reads below. `settings` is the SAME
+        // `Arc<Mutex<BusytokSettings>>` shared with the supervisor's
+        // `self.settings` field (constructed in `build_with_settings`), so
+        // mutations made by `provider_update` are visible to the pool's
+        // provider-lookup closure (which captures an `Arc::clone`).
+        let pi_sidecar_enabled = settings.lock().unwrap().subagent.pi_sidecar.enabled;
+        if !pi_sidecar_enabled {
             return (
                 Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
                     as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
@@ -344,22 +351,32 @@ impl BusytokSupervisor {
         // supervisor.
         let config_result = match sidecar_config_override {
             Some(cfg) => Ok(cfg),
-            None => busytok_subagent::sidecar::config::resolve_base_sidecar_config(
-                &settings.subagent.pi_sidecar,
-                paths,
-            ),
+            None => {
+                let pi_sidecar = settings.lock().unwrap().subagent.pi_sidecar.clone();
+                busytok_subagent::sidecar::config::resolve_base_sidecar_config(
+                    &pi_sidecar,
+                    paths,
+                )
+            }
         };
         match config_result {
             Ok(sidecar_config) => {
                 let gate = Arc::new(busytok_subagent::PressureGate::new());
 
-                // Build the providers lookup closure from `settings.providers`.
-                // Returns `None` for unknown providers, `Some(disabled)` for
-                // disabled providers (the pool's `ensure_worker` handles the
-                // enabled check).
-                let providers_vec = settings.providers.clone();
+                // Build the providers lookup closure that reads LIVE settings
+                // (not a startup snapshot). Captures an `Arc::clone` of the
+                // shared settings store; each invocation locks briefly, finds
+                // the provider by id, and clones it out. This ensures that
+                // `provider_update` (which mutates `self.settings` under the
+                // same lock) is visible to `ensure_worker` when it re-spawns a
+                // worker — the respawned supervisor picks up the updated
+                // `base_url` / `base_url_env_name` / `models` / `enabled`.
+                let settings_for_providers = Arc::clone(settings);
                 let providers: busytok_subagent::sidecar::ProviderLookup =
-                    Arc::new(move |pid: &str| providers_vec.iter().find(|p| p.id == pid).cloned());
+                    Arc::new(move |pid: &str| {
+                        let s = settings_for_providers.lock().unwrap();
+                        s.providers.iter().find(|p| p.id == pid).cloned()
+                    });
 
                 // Build the credential reader closure from
                 // `ProviderCredentialStore` (OS keychain). E2E tests set
@@ -376,13 +393,14 @@ impl BusytokSupervisor {
                 // Build the pool. The base config is cloned per-provider by
                 // `ensure_worker`, with env overridden (API key + base URL
                 // injected).
+                let resource_policy = settings.lock().unwrap().subagent.resource_policy.clone();
                 let pool = Arc::new(busytok_subagent::sidecar::WorkerPool::new(
                     sidecar_config,
                     Some(Arc::clone(db)),
                     providers,
                     credential_reader,
                     Some(Arc::clone(&gate)),
-                    settings.subagent.resource_policy.clone(),
+                    resource_policy,
                 ));
 
                 // Two-phase bootstrap step 1: construct the executor
@@ -429,21 +447,27 @@ impl BusytokSupervisor {
                 // missing), `sidecar_supervisor` stays `None` — delegate
                 // calls will fail with "profile not bound to a provider"
                 // or "no API key" (surfaced via the executor's error path).
-                let sidecar_supervisor =
-                    settings.providers.iter().find(|p| p.enabled).and_then(|p| {
-                        match pool.ensure_worker(&p.id) {
-                            Ok(sup) => Some(sup),
-                            Err(e) => {
-                                error!(
-                                    event_code = "subagent.sidecar.ensure_worker_failed",
-                                    provider_id = %p.id,
-                                    error = %e,
-                                    "ensure_worker failed for first provider during construction"
-                                );
-                                None
-                            }
+                let first_enabled_provider = settings
+                    .lock()
+                    .unwrap()
+                    .providers
+                    .iter()
+                    .find(|p| p.enabled)
+                    .map(|p| p.id.clone());
+                let sidecar_supervisor = first_enabled_provider.and_then(|pid| {
+                    match pool.ensure_worker(&pid) {
+                        Ok(sup) => Some(sup),
+                        Err(e) => {
+                            error!(
+                                event_code = "subagent.sidecar.ensure_worker_failed",
+                                provider_id = %pid,
+                                error = %e,
+                                "ensure_worker failed for first provider during construction"
+                            );
+                            None
                         }
-                    });
+                    }
+                });
 
                 // Get the first responder from the holder (if ensure_worker
                 // succeeded). This is stored in `BusytokSupervisor.pressure_responder`
@@ -505,7 +529,7 @@ impl BusytokSupervisor {
         db: Arc<Mutex<Database>>,
         paths: BusytokPaths,
         adapters: Vec<BoxedAdapter>,
-        settings: BusytokSettings,
+        settings: Arc<Mutex<BusytokSettings>>,
         event_bus: AppEventBus,
         executor: Arc<dyn busytok_subagent::mock_executor::TaskExecutor>,
         sidecar_supervisor: Option<Arc<busytok_subagent::sidecar::PiSidecarSupervisor>>,
@@ -515,9 +539,12 @@ impl BusytokSupervisor {
         pressure_responder: Option<Arc<busytok_subagent::PressureResponder>>,
         worker_pool: Option<Arc<busytok_subagent::sidecar::WorkerPool>>,
     ) -> Self {
+        // `settings` is already the shared `Arc<Mutex<BusytokSettings>>` (shared
+        // with the pool's provider-lookup closure) — no need to wrap it here.
+        let subagent_settings = settings.lock().unwrap().subagent.clone();
         let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
             Arc::clone(&db),
-            settings.subagent.clone(),
+            subagent_settings,
             "pi",
             executor,
             pressure_gate.clone(),
@@ -535,7 +562,9 @@ impl BusytokSupervisor {
 
         let event_bus = Arc::new(event_bus);
         let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
-        let settings = Arc::new(Mutex::new(settings));
+        // `settings` is already the shared `Arc<Mutex<BusytokSettings>>` —
+        // shared with the WorkerPool's provider-lookup closure (live settings
+        // visibility fix) and the supervisor's `self.settings` field.
 
         let source_registry = crate::source_registry::SourceRegistry::new(
             Arc::clone(&settings),
@@ -543,8 +572,9 @@ impl BusytokSupervisor {
             Arc::clone(&event_bus),
         );
 
-        let generation_manager =
-            crate::generation_manager::GenerationManager::new(Arc::clone(&db), Arc::clone(&status));
+        let generation_manager = Arc::new(
+            crate::generation_manager::GenerationManager::new(Arc::clone(&db), Arc::clone(&status)),
+        );
 
         let (writer_handle, writer_join) = writer::try_spawn_writer(
             Arc::clone(&db),
@@ -578,6 +608,37 @@ impl BusytokSupervisor {
         // `spawn_task_dispatcher` is a sync fn that calls `tokio::spawn`
         // internally; we guard the call with `Handle::try_current()` so the
         // sync-context path skips the spawn instead of panicking.
+        //
+        // P1 #2 fix: register a post-task completion hook BEFORE spawning the
+        // dispatcher. The dispatcher invokes it after `execute_task()` succeeds
+        // so queued tasks' usage flows into `usage_events` + rollups via the
+        // SAME `bridge_subagent_usage` seam as synchronous `delegate()`.
+        // Without this, queued tasks (pressure-gated or busy-queued work) are
+        // invisible in Overview / Activity / receipt reads.
+        let hook_db = Arc::clone(&db);
+        let hook_gen = Arc::clone(&generation_manager);
+        let hook_settings = Arc::clone(&settings);
+        subagent_manager.set_task_completion_hook(Arc::new(
+            move |result: &busytok_subagent::models::DelegateResult, cwd: &str| {
+                // Read the active generation ID fresh on each invocation so a
+                // later promotion is picked up by queued-task completion events.
+                let gen_id = hook_gen.active_generation_id();
+                if let Err(e) = bridge_subagent_usage(
+                    &hook_db,
+                    gen_id.as_deref(),
+                    &hook_settings,
+                    result,
+                    cwd,
+                ) {
+                    tracing::warn!(
+                        event_code = "subagent.usage_write_failed",
+                        task_id = %result.task_id,
+                        error = %e,
+                        "dispatcher: failed to write subagent usage event to unified usage_events"
+                    );
+                }
+            },
+        ));
         let (dispatcher_handle, dispatcher_shutdown) =
             if tokio::runtime::Handle::try_current().is_ok() {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1588,85 +1649,14 @@ impl BusytokSupervisor {
         result: &busytok_subagent::models::DelegateResult,
         cwd: &str,
     ) -> Result<()> {
-        use busytok_aggregator::{
-            build_scan_mutations, model_rollups_to_rows, project_rollups_to_rows,
-            session_rollups_to_rows, RollupOptions,
-        };
-        use busytok_domain::UsageWritePolicy;
-        use busytok_store::StoreWriteBatch;
-
-        // P0: resolve the active generation_id. Events written with any other
-        // generation_id are invisible to Overview/Activity read paths.
-        let generation_id = self
-            .generation_manager
-            .active_generation_id()
-            .ok_or_else(|| {
-                anyhow::anyhow!("no active generation — cannot bridge subagent usage")
-            })?;
-
-        // Load the global PriceCatalog snapshot (same accessor scan/tail paths use).
-        let catalog = busytok_pricing::load_catalog();
-
-        let event = crate::subagent_usage::normalize_task_usage(
-            &result.task_id,
-            &result.subagent_id,
+        let gen_id = self.generation_manager.active_generation_id();
+        bridge_subagent_usage(
+            &self.db,
+            gen_id.as_deref(),
+            &self.settings,
+            result,
             cwd,
-            &result.usage,
-            Some(&catalog),
-        );
-
-        let input_tokens = event.input_tokens;
-        let output_tokens = event.output_tokens;
-        let model = event.model.clone();
-        let cost_usd = event.cost_usd;
-
-        let batch = StoreWriteBatch::for_test("subagent", &result.task_id)
-            .usage_event(event, UsageWritePolicy::InsertOnce);
-
-        // P1a: build REAL rollup rows via build_scan_mutations (NOT
-        // RollupRows::default()). This mirrors tail.rs:570-581 — same closure
-        // shape, same build_scan_mutations call, same RollupRows assembly.
-        let timezone = self.settings.lock().unwrap().timezone.clone();
-        let rtz = busytok_domain::ReportingTimezone::parse(&timezone).unwrap_or_else(|e| {
-            tracing::warn!(
-                event_code = "subagent.usage_tz_fallback",
-                timezone = %timezone,
-                error = %e,
-                "timezone parse failed, falling back to UTC for subagent usage rollup"
-            );
-            busytok_domain::ReportingTimezone::utc()
-        });
-        let ro = RollupOptions {
-            timezone: rtz.clone(),
-        };
-
-        let db = self.db.lock().expect("subagent db lock poisoned");
-        db.ingest_store_batch(batch, &generation_id, |effective_events, gen_id| {
-            if effective_events.is_empty() {
-                return Ok(busytok_store::RollupRows::default());
-            }
-            let mutations = build_scan_mutations(effective_events, ro.clone(), gen_id)
-                .context("failed to build subagent usage rollup mutations")?;
-            Ok(busytok_store::RollupRows {
-                daily_usage_rows: mutations.daily_usage,
-                model_usage_rows: Vec::new(),
-                session_rows: session_rollups_to_rows(&mutations.session_rollups),
-                project_rows: project_rollups_to_rows(&mutations.project_rollups),
-                model_summary_rows: model_rollups_to_rows(&mutations.model_rollups),
-            })
-        })?;
-
-        tracing::info!(
-            event_code = "subagent.usage_recorded",
-            task_id = %result.task_id,
-            model = ?model,
-            input_tokens,
-            output_tokens,
-            cost_usd = ?cost_usd,
-            generation_id = %generation_id,
-            "recorded subagent usage in unified usage_events"
-        );
-        Ok(())
+        )
     }
 
     /// Gracefully drain and stop the writer actor.
@@ -1872,6 +1862,103 @@ impl BusytokSupervisor {
 const PROMPT_LIST_DEFAULT_LIMIT: i64 = 100;
 
 // ── Module-level helpers ─────────────────────────────────────────────
+
+/// Bridge a subagent task's usage into the unified `usage_events` pipeline +
+/// rollup tables. Extracted as a free function so BOTH the synchronous
+/// `subagent_delegate()` path AND the background dispatcher (which runs
+/// queued tasks) flow through the SAME seam — without this, queued tasks'
+/// usage is invisible in Overview / Activity / receipt reads (P1 #2 fix).
+///
+/// `db` is the shared DB, `active_generation_id` is the current generation
+/// (events written with any other generation_id are invisible to read paths),
+/// `settings` provides the reporting timezone.
+///
+/// Best-effort: the caller logs failures at `warn` but does NOT fail the
+/// task — the task result is already persisted; usage is best-effort
+/// observability.
+pub fn bridge_subagent_usage(
+    db: &Arc<Mutex<Database>>,
+    active_generation_id: Option<&str>,
+    settings: &Arc<Mutex<BusytokSettings>>,
+    result: &busytok_subagent::models::DelegateResult,
+    cwd: &str,
+) -> Result<()> {
+    use busytok_aggregator::{
+        build_scan_mutations, model_rollups_to_rows, project_rollups_to_rows,
+        session_rollups_to_rows, RollupOptions,
+    };
+    use busytok_domain::UsageWritePolicy;
+    use busytok_store::StoreWriteBatch;
+
+    // P0: resolve the active generation_id. Events written with any other
+    // generation_id are invisible to Overview/Activity read paths.
+    let generation_id = active_generation_id
+        .ok_or_else(|| anyhow::anyhow!("no active generation — cannot bridge subagent usage"))?;
+
+    // Load the global PriceCatalog snapshot (same accessor scan/tail paths use).
+    let catalog = busytok_pricing::load_catalog();
+
+    let event = crate::subagent_usage::normalize_task_usage(
+        &result.task_id,
+        &result.subagent_id,
+        cwd,
+        &result.usage,
+        Some(&catalog),
+    );
+
+    let input_tokens = event.input_tokens;
+    let output_tokens = event.output_tokens;
+    let model = event.model.clone();
+    let cost_usd = event.cost_usd;
+
+    let batch = StoreWriteBatch::for_test("subagent", &result.task_id)
+        .usage_event(event, UsageWritePolicy::InsertOnce);
+
+    // P1a: build REAL rollup rows via build_scan_mutations (NOT
+    // RollupRows::default()). This mirrors tail.rs:570-581 — same closure
+    // shape, same build_scan_mutations call, same RollupRows assembly.
+    let timezone = settings.lock().unwrap().timezone.clone();
+    let rtz = busytok_domain::ReportingTimezone::parse(&timezone).unwrap_or_else(|e| {
+        tracing::warn!(
+            event_code = "subagent.usage_tz_fallback",
+            timezone = %timezone,
+            error = %e,
+            "timezone parse failed, falling back to UTC for subagent usage rollup"
+        );
+        busytok_domain::ReportingTimezone::utc()
+    });
+    let ro = RollupOptions {
+        timezone: rtz.clone(),
+    };
+
+    let db_guard = db.lock().expect("subagent db lock poisoned");
+    db_guard.ingest_store_batch(batch, &generation_id, |effective_events, gen_id| {
+        if effective_events.is_empty() {
+            return Ok(busytok_store::RollupRows::default());
+        }
+        let mutations = build_scan_mutations(effective_events, ro.clone(), gen_id)
+            .context("failed to build subagent usage rollup mutations")?;
+        Ok(busytok_store::RollupRows {
+            daily_usage_rows: mutations.daily_usage,
+            model_usage_rows: Vec::new(),
+            session_rows: session_rollups_to_rows(&mutations.session_rollups),
+            project_rows: project_rollups_to_rows(&mutations.project_rollups),
+            model_summary_rows: model_rollups_to_rows(&mutations.model_rollups),
+        })
+    })?;
+
+    tracing::info!(
+        event_code = "subagent.usage_recorded",
+        task_id = %result.task_id,
+        model = ?model,
+        input_tokens,
+        output_tokens,
+        cost_usd = ?cost_usd,
+        generation_id = %generation_id,
+        "recorded subagent usage in unified usage_events"
+    );
+    Ok(())
+}
 
 fn to_store_exact_windows(
     windows: &[range::TrendBucketWindow],

@@ -4790,6 +4790,91 @@ async fn provider_changed_removes_worker_then_respawns() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
+/// `provider_update_respawn_picks_up_live_config` (P1 fix): the
+/// `WorkerPool`'s provider-lookup closure must read LIVE settings (not a
+/// startup snapshot), so when `provider_update` changes `base_url` /
+/// `base_url_env_name`, the respawned supervisor's config reflects the new
+/// values. Without the live-settings fix, the closure would return the stale
+/// provider snapshot captured at `construct_sidecar` time, and `ensure_worker`
+/// would build the config with the OLD `base_url` / `base_url_env_name` —
+/// silently running the sidecar against the wrong endpoint.
+#[tokio::test]
+async fn provider_update_respawn_picks_up_live_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Initial worker: base_url_env_name defaults to OPENAI_BASE_URL (provider
+    // has base_url_env_name: None in make_sidecar_settings).
+    let initial = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker (initial)");
+    let initial_cfg = initial.config();
+    assert_eq!(initial_cfg.base_url_env_name, "OPENAI_BASE_URL");
+    assert_eq!(
+        initial_cfg.env.get("OPENAI_BASE_URL"),
+        Some(&"https://api.test-provider.example.com/v1".to_string()),
+        "initial worker env should have the original base_url"
+    );
+
+    // Update BOTH base_url and base_url_env_name via provider_update. This
+    // mutates `self.settings` (the shared `Arc<Mutex<BusytokSettings>>`) and
+    // calls `provider_changed` to kill + remove the worker.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: None,
+        base_url: Some("https://api.updated.example.com/v1".to_string()),
+        api_key_env_name: None,
+        base_url_env_name: Some("UPDATED_BASE_URL".to_string()),
+        models: None,
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .expect("provider_update must succeed");
+
+    // Worker must be gone (provider_changed killed + removed it).
+    assert!(
+        pool.worker_snapshots().await.is_empty(),
+        "provider_update must remove the worker from the pool"
+    );
+
+    // Re-spawn: ensure_worker builds a NEW supervisor. The pool's
+    // provider-lookup closure must read the LIVE (post-update) settings, so
+    // the new supervisor's config has the updated base_url / env name.
+    let respawned = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker must re-spawn the worker");
+    let respawned_cfg = respawned.config();
+
+    // The fix: base_url_env_name MUST be the updated value, not the original
+    // "OPENAI_BASE_URL" (which would indicate the closure read a stale snapshot).
+    assert_eq!(
+        respawned_cfg.base_url_env_name, "UPDATED_BASE_URL",
+        "respawned worker must use the updated base_url_env_name \
+         (live settings), not the startup snapshot"
+    );
+    // OPENAI_BASE_URL is always set (canonical name) and must reflect the new base_url.
+    assert_eq!(
+        respawned_cfg.env.get("OPENAI_BASE_URL"),
+        Some(&"https://api.updated.example.com/v1".to_string()),
+        "respawned worker env[OPENAI_BASE_URL] must be the updated base_url"
+    );
+    // The provider-specific alias (UPDATED_BASE_URL) must also be set to the new base_url.
+    assert_eq!(
+        respawned_cfg.env.get("UPDATED_BASE_URL"),
+        Some(&"https://api.updated.example.com/v1".to_string()),
+        "respawned worker env[UPDATED_BASE_URL] must be the updated base_url"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
 /// `provider_deleted_removes_worker` (P1b fix): calling `provider_delete`
 /// must kill + remove the deleted provider's worker from the pool. Other
 /// providers' workers are unaffected. Covers Phase 3 Task 4 Step 5.
@@ -5629,4 +5714,211 @@ async fn e2e_usage_events_agent_kind_is_codex() {
     );
 
     sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `queued_task_bridges_usage_events_through_dispatcher_hook` (P1 #2 fix):
+/// when a task is queued (because the pressure gate is paused) and later
+/// executed by the background `TaskDispatcher` after the gate clears, the
+/// post-task completion hook MUST bridge the queued task's usage into the
+/// unified `usage_events` + rollup tables — the SAME seam synchronous
+/// `delegate()` uses. Without the hook, queued tasks' usage is invisible in
+/// Overview / Activity / receipt reads.
+///
+/// Sequence:
+/// 1. Pause the gate → delegate returns `Queued`.
+/// 2. Assert NO usage_events / daily_usage / model_summary rows exist yet
+///    (proves the queued task hasn't been bridged — guards against tests
+///    that pass simply because the sync seam wrote events before queueing).
+/// 3. Resume the gate → dispatcher picks up + executes the queued task.
+/// 4. Assert usage_events has a row tagged with the active generation_id,
+///    and daily_usage / model_summary have rollup rows.
+///
+/// NOTE: spawns a real sidecar child (mock-sidecar.sh) — `#[serial]`.
+#[tokio::test]
+#[serial]
+async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-queued-bridge", 1000);
+    let mut settings = make_sidecar_settings();
+    // The default profile model ("deepseek-chat") is NOT in the test
+    // provider's whitelist (["test-model"]). Set it to "test-model" so the
+    // delegate passes whitelist validation and the dispatcher can execute it.
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .model = "test-model".to_string();
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+    let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
+    sup.hydrate_status_from_db().unwrap();
+
+    let gate = sup
+        .pressure_gate()
+        .expect("pressure_gate must be Some when sidecar is enabled")
+        .clone();
+
+    // 1. Pause the gate → next delegate must queue.
+    gate.set_action(busytok_subagent::PressureAction::PauseNewTasks);
+    assert!(gate.is_paused(), "gate must be paused before delegate");
+
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "queued-bridge".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "queued bridge work".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status, "queued",
+        "delegate must return Queued when gate is paused, got: {:?}",
+        resp.status
+    );
+    let sub_id = resp.subagent_id.clone();
+    let task_id = resp.task_id.clone();
+
+    // 2. Pre-condition: NO usage_events / rollups for this task yet.
+    //    This proves the queued task hasn't been bridged (the sync seam
+    //    didn't fire — only the dispatcher hook can produce these rows).
+    {
+        let db_ref = sup.db_handle().lock().unwrap();
+        let event_count = count_rows(
+            &db_ref,
+            "usage_events",
+            &format!("client_kind = 'subagent' AND dedupe_key = '{task_id}'"),
+        );
+        assert_eq!(
+            event_count, 0,
+            "no usage_event row should exist for the queued task before dispatcher runs"
+        );
+        let daily_count = count_rows(&db_ref, "daily_usage", "generation_id = 'gen-queued-bridge'");
+        assert_eq!(
+            daily_count, 0,
+            "no daily_usage rollup should exist before dispatcher runs"
+        );
+        let model_count = count_rows(&db_ref, "model_summary", "1=1");
+        assert_eq!(
+            model_count, 0,
+            "no model_summary rollup should exist before dispatcher runs"
+        );
+        // Sanity: the task row itself is queued.
+        let task_status: String = db_ref
+            .conn()
+            .query_row(
+                "SELECT status FROM subagent_tasks WHERE id = ?1",
+                rusqlite::params![&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_status, "queued", "task row must be in 'queued' status");
+    }
+
+    // 3. Resume the gate → dispatcher should pick up + execute the queued
+    //    task. Poll for up to 10s for the task to complete (the dispatcher
+    //    ticks at 200ms, and the mock sidecar needs to spawn a bash child).
+    gate.set_action(busytok_subagent::PressureAction::Resume);
+    assert!(!gate.is_paused(), "gate must be resumed before polling");
+
+    let mut completed = false;
+    for _ in 0..100 {
+        let status_now = {
+            let db_ref = sup.db_handle().lock().unwrap();
+            db_ref
+                .conn()
+                .query_row(
+                    "SELECT status FROM subagent_tasks WHERE id = ?1",
+                    rusqlite::params![&task_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_default()
+        };
+        if status_now == "completed" {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        completed,
+        "queued task must be executed by the dispatcher after gate clears"
+    );
+
+    // 4. Post-condition: usage_events + rollups are NOW present (the
+    //    dispatcher's post-task completion hook bridged them through the
+    //    same `bridge_subagent_usage` seam as synchronous `delegate()`).
+    let db_ref = sup.db_handle().lock().unwrap();
+
+    // Diagnostic: collect all subagent usage_events so an assertion failure
+    // message shows whether the hook wrote ANYTHING (and with what
+    // dedupe_key / generation_id), instead of just "left: None, right: Some".
+    let all_subagent_events: Vec<(String, String)> = db_ref
+        .conn()
+        .prepare("SELECT dedupe_key, generation_id FROM usage_events WHERE client_kind = 'subagent'")
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let event_gen = db_ref
+        .conn()
+        .query_row(
+            "SELECT generation_id FROM usage_events WHERE client_kind = 'subagent' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    assert_eq!(
+        event_gen.as_deref(),
+        Some("gen-queued-bridge"),
+        "queued task's usage_event must use the active generation_id \
+         (proves the dispatcher hook sourced it from generation_manager, \
+         not a synthetic placeholder). All subagent events: {all_subagent_events:?}"
+    );
+
+    let daily_count = count_rows(
+        &db_ref,
+        "daily_usage",
+        "agent = 'codex' AND generation_id = 'gen-queued-bridge'",
+    );
+    assert!(
+        daily_count >= 1,
+        "daily_usage should have >=1 row for agent='codex' after dispatcher runs, got {daily_count}"
+    );
+
+    // The mock sidecar always returns model="deepseek-chat" in its canned
+    // response (regardless of the profile model the runtime requested).
+    // Assert against the sidecar's reported model, not the profile model.
+    let model_count = count_rows(&db_ref, "model_summary", "model = 'deepseek-chat'");
+    assert!(
+        model_count >= 1,
+        "model_summary should have >=1 row for model='deepseek-chat' after dispatcher runs, got {model_count}"
+    );
+
+    // Drop the db guard before awaiting shutdown (clippy::await_holding_lock).
+    drop(db_ref);
+
+    // Graceful shutdown: stop the sidecar child + drain the dispatcher +
+    // flush the writer. Order matters: shutdown_sidecar first so the child
+    // is dead, then shutdown_writer so the dispatcher is drained before the
+    // writer's final flush + WAL checkpoint.
+    sup.shutdown_sidecar().await;
+    sup.shutdown_writer().await.expect("writer shutdown");
+
+    // Suppress unused-variable warning for `sub_id` (kept for debuggability
+    // — readers can inspect the task row by subagent_id if the test fails).
+    let _ = sub_id;
 }

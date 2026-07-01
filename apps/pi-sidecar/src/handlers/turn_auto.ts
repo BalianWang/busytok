@@ -105,10 +105,12 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
   const { session, reused } = await pool.ensure(p.logical_subagent_id, {
     cwd: p.cwd,
     model: p.model,
+    provider_id: p.provider_id,
     tools: p.tools,
   });
   const result = await session.sendTurn(p.prompt, {
     model: p.model,
+    provider_id: p.provider_id,
     tools: p.tools,
     timeout_ms: p.timeout_ms,
   });

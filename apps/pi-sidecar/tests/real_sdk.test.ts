@@ -19,6 +19,11 @@ interface FakeConfig {
   assistantText?: string;
   /** Stats returned by getSessionStats(). */
   stats?: Partial<SessionStatsLike>;
+  /**
+   * The model the SDK reports via the `session.model` getter (for usage
+   * attribution). Defaults to `{ id: 'deepseek-chat', provider: 'deepseek' }`.
+   */
+  sdkModel?: { id: string; provider: string };
   /** If true, prompt() hangs until abort() is called (for timeout tests). */
   hang?: boolean;
 }
@@ -28,6 +33,7 @@ function makeFakeSdk(id: string, config: FakeConfig): SdkSession {
   const abortPromise = new Promise<void>((r) => { abortResolve = r; });
   return {
     sessionId: id,
+    model: 'sdkModel' in config ? config.sdkModel : { id: 'deepseek-chat', provider: 'deepseek' },
     prompt: async () => {
       if (config.hang) {
         await abortPromise;
@@ -52,7 +58,6 @@ function makeFakeSdk(id: string, config: FakeConfig): SdkSession {
         total: config.stats?.tokens?.total ?? 142,
       },
       cost: config.stats?.cost ?? 0.0099,
-      model: config.stats?.model ?? 'deepseek-chat',
     }),
     abort: async () => { abortResolve(); },
     dispose: () => {},
@@ -105,7 +110,7 @@ describe('turn_auto real SDK path', () => {
     expect(result.usage.cache_write_tokens).toBe(7);
     expect(result.usage.cost_usd).toBe(0.0099);
     expect(result.usage.model).toBe('deepseek-chat');
-    expect(result.usage.provider).toBe('pi');
+    expect(result.usage.provider).toBe('deepseek');
   });
 
   it('classifies a 401 SDK error as auth failure (-32010)', async () => {
@@ -219,18 +224,33 @@ describe('turn_auto real SDK path', () => {
 });
 
 describe('PiSdkSession unit', () => {
-  it('sendTurn returns completed status and maps usage', async () => {
+  it('sendTurn returns completed status and maps usage from SDK model', async () => {
     const sdk = makeFakeSdk('s1', {
       assistantText: 'done',
-      stats: { tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 }, cost: 0.5, model: 'm' },
+      stats: { tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 }, cost: 0.5 },
+      sdkModel: { id: 'm', provider: 'test-provider' },
     });
     const session = new PiSdkSession(sdk, 'sub', 's1');
-    const result = await session.sendTurn('hi', { model: 'm' });
+    const result = await session.sendTurn('hi', { model: 'fallback-model' });
     expect(result.status).toBe('completed');
     expect(result.task_summary).toBe('done');
+    // model/provider sourced from SDK's session.model, NOT options.model
     expect(result.usage).toMatchObject({
-      input_tokens: 1, output_tokens: 2, cache_read_tokens: 3, cache_write_tokens: 4, cost_usd: 0.5, model: 'm', provider: 'pi',
+      input_tokens: 1, output_tokens: 2, cache_read_tokens: 3, cache_write_tokens: 4, cost_usd: 0.5, model: 'm', provider: 'test-provider',
     });
+  });
+
+  it('sendTurn falls back to options.model when SDK model is undefined', async () => {
+    const sdk = makeFakeSdk('s1', {
+      assistantText: 'done',
+      sdkModel: undefined,
+    });
+    // Override the default model by removing it
+    (sdk as { model?: unknown }).model = undefined;
+    const session = new PiSdkSession(sdk, 'sub', 's1', 'resolved-provider');
+    const result = await session.sendTurn('hi', { model: 'fallback-model', provider_id: 'pid' });
+    expect(result.usage.model).toBe('fallback-model');
+    expect(result.usage.provider).toBe('resolved-provider');
   });
 
   it('close() is idempotent and marks the session closed', async () => {

@@ -66,6 +66,8 @@ export interface TurnAutoParams {
   cwd: string;
   profile: string;
   model?: string;
+  /** Provider ID (from the Rust-side WorkerPool) for model resolution + usage attribution. */
+  provider_id?: string;
   tools?: string[];
   prompt: string;
   prompt_artifact_ref?: string | null;

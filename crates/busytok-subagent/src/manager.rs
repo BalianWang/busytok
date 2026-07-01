@@ -34,7 +34,22 @@ pub struct SubagentManager {
     /// instead of executing synchronously. The background `TaskDispatcher`
     /// (Task 7) picks up queued tasks when the gate clears.
     pressure_gate: Option<Arc<PressureGate>>,
+    /// Post-task completion hook (P1 #2 fix). When `Some`, the background
+    /// dispatcher invokes it after `execute_task()` succeeds so the runtime
+    /// can bridge the queued task's usage into the unified `usage_events`
+    /// pipeline — the SAME seam as synchronous `delegate()`. Without this,
+    /// queued tasks' usage is invisible in Overview / Activity / receipt reads.
+    /// The closure receives `(&DelegateResult, cwd)`. Best-effort: the hook
+    /// logs failures internally and does NOT propagate errors to the dispatcher.
+    /// Set ONCE by `BusytokSupervisor::assemble_with_sidecar` after the
+    /// generation manager is constructed.
+    task_completion_hook: Mutex<Option<TaskCompletionHook>>,
 }
+
+/// Hook invoked by the background dispatcher after a queued task completes
+/// successfully. The runtime registers one that calls `bridge_subagent_usage`
+/// so queued tasks' usage flows into `usage_events` + rollups.
+pub type TaskCompletionHook = Arc<dyn Fn(&DelegateResult, &str) + Send + Sync>;
 
 /// Combined snapshot for `subagent.runtime_status` — all DB reads occur under
 /// a single `SubagentManager` lock acquisition to preserve single-read
@@ -89,7 +104,18 @@ impl SubagentManager {
             context_builder,
             memory_updater,
             pressure_gate,
+            task_completion_hook: Mutex::new(None),
         }
+    }
+
+    /// Register a post-task completion hook (P1 #2 fix). The background
+    /// dispatcher invokes it after `execute_task()` succeeds so the runtime
+    /// can bridge the queued task's usage into `usage_events` + rollups — the
+    /// same seam as synchronous `delegate()`. Must be called BEFORE
+    /// `spawn_task_dispatcher` (set once by `BusytokSupervisor::assemble_with_sidecar`).
+    pub fn set_task_completion_hook(&self, hook: TaskCompletionHook) {
+        let mut guard = self.task_completion_hook.lock().expect("task_completion_hook lock poisoned");
+        *guard = Some(hook);
     }
 
     /// Create-or-continue a subagent and run one task (mock execution in this plan).
@@ -693,20 +719,42 @@ impl SubagentManager {
                         subagent_id = %subagent.id,
                         "dispatcher executing queued task"
                     );
-                    if let Err(e) = manager.execute_task(&task, &subagent).await {
-                        warn!(
-                            event_code = "subagent.queue.execute_failed",
-                            task_id = %task.id,
-                            error = %e,
-                            "dispatcher execute_task failed; marking task failed"
-                        );
-                        let db = manager.db.lock().expect("subagent db lock poisoned");
-                        let _ = db.subagent_set_task_status(
-                            &task.id,
-                            "failed",
-                            None,
-                            Some(e.to_string()),
-                        );
+                    match manager.execute_task(&task, &subagent).await {
+                        Ok(result) => {
+                            // P1 #2 fix: invoke the post-task completion hook
+                            // so the runtime bridges the queued task's usage
+                            // into `usage_events` + rollups — the SAME seam as
+                            // synchronous `delegate()`. The hook is best-effort:
+                            // it logs failures internally and does NOT propagate
+                            // errors to the dispatcher. `cwd` is the subagent's
+                            // canonical `repo_path` (the cwd `execute_task`
+                            // used).
+                            let hook = {
+                                let guard = manager
+                                    .task_completion_hook
+                                    .lock()
+                                    .expect("task_completion_hook lock poisoned");
+                                guard.as_ref().map(Arc::clone)
+                            };
+                            if let Some(hook) = hook {
+                                hook(&result, &subagent.repo_path);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                event_code = "subagent.queue.execute_failed",
+                                task_id = %task.id,
+                                error = %e,
+                                "dispatcher execute_task failed; marking task failed"
+                            );
+                            let db = manager.db.lock().expect("subagent db lock poisoned");
+                            let _ = db.subagent_set_task_status(
+                                &task.id,
+                                "failed",
+                                None,
+                                Some(e.to_string()),
+                            );
+                        }
                     }
                 }
             }

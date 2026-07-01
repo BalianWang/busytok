@@ -5,23 +5,14 @@
  * `@earendil-works/pi-coding-agent` and adapts its event-driven API to the
  * synchronous `sendTurn() → result` shape the sidecar handler expects.
  *
- * ---------------------------------------------------------------------------
- * SDK API deviations from the Task 6 brief (verified against
- * `@earendil-works/pi-coding-agent@0.80.2`):
- *
- * - Brief assumed `createAgentSession({ model: <string>, workingDir })`.
- *   Actual signature (dist/core/sdk.d.ts):
- *     `createAgentSession(options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult>`
- *   where `options.cwd` is the working directory (NOT `workingDir`), and
- *   `options.model` is a `Model<any>` object (NOT a string). Resolving a
- *   string model name to `Model<any>` requires `@earendil-works/pi-ai`'s
- *   `getModel`, which is out of scope for this task; we therefore omit
- *   `model` at creation time and let the SDK pick its default.
- * - Brief assumed `sendTurn(prompt, options)` returning a result. No such
- *   method exists. The real API is `prompt(text, options?): Promise<void>`
- *   (event-driven, resolves when the turn completes), with the assistant
- *   text read via `getLastAssistantText()` and usage via `getSessionStats()`.
- * - Brief assumed `close()`. The actual cleanup method is `dispose()`.
+ * Model resolution: the profile's `provider_id` + `model` (string) are
+ * resolved to a real `Model<any>` object via the SDK's own `ModelRegistry`
+ * (exported from `@earendil-works/pi-coding-agent`, same package — no new
+ * dependency). The resolved model is passed into `createAgentSession({ model })`
+ * so the SDK uses the configured model instead of picking its default.
+ * Usage attribution (`usage.model`/`provider`) is sourced from the SDK's
+ * `session.model` getter (the actual model used) with `profile.model`/
+ * `provider_id` as fallback only.
  *
  * `SdkSession` is a minimal structural view of the methods we depend on so
  * tests can supply a fake without `vi.mock` and the type surface stays small.
@@ -36,6 +27,12 @@ import { SidecarError } from './errors.js';
 /** Minimal structural view of `AgentSession` methods used by the wrapper. */
 export interface SdkSession {
   readonly sessionId: string;
+  /**
+   * The current model the SDK resolved (verified against
+   * `AgentSession.get model(): Model<any> | undefined`). Used for usage
+   * attribution — sourced from the SDK result, not the requested option.
+   */
+  readonly model?: { readonly id: string; readonly provider: string } | undefined;
   prompt(text: string): Promise<void>;
   getLastAssistantText(): string | undefined;
   getSessionStats(): SessionStatsLike;
@@ -52,11 +49,11 @@ export interface SessionStatsLike {
     total: number;
   };
   cost: number;
-  model?: unknown;
 }
 
 export interface SendTurnOptions {
   model?: string;
+  provider_id?: string;
   tools?: string[];
   timeout_ms?: number;
 }
@@ -79,30 +76,83 @@ export interface SendTurnResult {
 export interface CreateSessionOpts {
   cwd: string;
   model?: string;
+  provider_id?: string;
   tools?: string[];
 }
 
 /**
  * Factory that creates a real `PiSdkSession`. Lazily imports the SDK so that
  * tests injecting a fake factory never load the (heavy) SDK module.
+ *
+ * Model resolution: `opts.provider_id` + `opts.model` (strings) are resolved
+ * to a `Model<any>` object via the SDK's `ModelRegistry`. The resolved model
+ * is passed into `createAgentSession({ model })` so the SDK uses the
+ * configured model instead of its default. If resolution fails (model not in
+ * the catalog), the SDK picks its default and a warning is logged.
  */
 export const defaultSessionFactory = async (
   logical_subagent_id: string,
   opts: CreateSessionOpts,
 ): Promise<PiSdkSession> => {
   const { createAgentSession } = await import('@earendil-works/pi-coding-agent');
-  const { session } = await createAgentSession({
+  const modelObj = await resolveModelObject(opts.provider_id, opts.model);
+  // `model` is typed `Model<any> | undefined` in the SDK; we cast our resolved
+  // object to satisfy the type without importing the (heavy) SDK type graph.
+  const sessionOpts: { cwd: string; tools?: string[]; model?: unknown } = {
     cwd: opts.cwd,
     ...(opts.tools ? { tools: opts.tools } : {}),
-  });
+    ...(modelObj ? { model: modelObj } : {}),
+  };
+  const { session } = await createAgentSession(
+    sessionOpts as Parameters<typeof createAgentSession>[0],
+  );
   return new PiSdkSession(
     session as unknown as SdkSession,
     logical_subagent_id,
     session.sessionId,
+    (modelObj as { provider?: string } | undefined)?.provider,
   );
 };
 
 export type SessionFactory = typeof defaultSessionFactory;
+
+/**
+ * Resolve a model string to a `Model<any>` object via the SDK's
+ * `ModelRegistry`. The registry is created once and cached (the built-in
+ * catalog is static). Uses `AuthStorage.inMemory()` — the registry only
+ * needs auth for `getAvailable()`, not for `find()`/`getAll()` which we use.
+ *
+ * Lookup order:
+ * 1. If `providerId` is known: exact `registry.find(providerId, modelId)`.
+ * 2. Fallback: search all models for a matching `id` (handles aliases).
+ * Returns `undefined` if the model is not in the catalog (SDK picks default).
+ */
+let cachedRegistry: unknown = null;
+async function resolveModelObject(
+  providerId?: string,
+  modelId?: string,
+): Promise<unknown | undefined> {
+  if (!modelId) return undefined;
+  try {
+    const { ModelRegistry, AuthStorage } = await import('@earendil-works/pi-coding-agent');
+    if (!cachedRegistry) {
+      cachedRegistry = ModelRegistry.create(AuthStorage.inMemory());
+    }
+    const registry = cachedRegistry as {
+      find(p: string, m: string): unknown | undefined;
+      getAll(): unknown[];
+    };
+    if (providerId) {
+      const m = registry.find(providerId, modelId);
+      if (m) return m;
+    }
+    const all = registry.getAll() as Array<{ id?: string }>;
+    return all.find((m) => m.id === modelId);
+  } catch {
+    // ModelRegistry creation or lookup failed — SDK picks its default.
+    return undefined;
+  }
+}
 
 /**
  * Wraps an SDK `AgentSession`, tracking the metadata the hot pool needs and
@@ -115,16 +165,19 @@ export class PiSdkSession {
   readonly created_at_ms: number;
   last_used_at_ms: number;
   private readonly sdk: SdkSession;
+  private readonly resolvedProvider: string | undefined;
   private closed = false;
 
   constructor(
     sdk: SdkSession,
     logical_subagent_id: string,
     adapter_session_id: string,
+    resolvedProvider?: string,
   ) {
     this.sdk = sdk;
     this.logical_subagent_id = logical_subagent_id;
     this.adapter_session_id = adapter_session_id;
+    this.resolvedProvider = resolvedProvider;
     const now = Date.now();
     this.created_at_ms = now;
     this.last_used_at_ms = now;
@@ -161,12 +214,15 @@ export class PiSdkSession {
 
     const text = this.sdk.getLastAssistantText() ?? '';
     const stats = this.sdk.getSessionStats();
+    // Source model/provider from the SDK result (session.model — the actual
+    // model the SDK used) with the requested option as fallback only.
+    const sdkModel = this.sdk.model;
     return {
       status: 'completed',
       task_summary: text,
       usage: {
-        model: options.model ?? String(stats.model ?? 'unknown'),
-        provider: 'pi',
+        model: sdkModel?.id ?? options.model ?? 'unknown',
+        provider: sdkModel?.provider ?? this.resolvedProvider ?? options.provider_id ?? 'pi',
         input_tokens: stats.tokens.input,
         output_tokens: stats.tokens.output,
         cache_read_tokens: stats.tokens.cacheRead,
