@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use busytok_config::{ProviderConfig, SubagentResourcePolicyConfig};
 
@@ -222,6 +222,11 @@ impl WorkerPool {
         {
             let workers = self.workers.lock().expect("workers map lock poisoned");
             if let Some(sup) = workers.get(provider_id) {
+                debug!(
+                    event_code = "subagent.worker_pool.worker_reused",
+                    provider_id = %provider_id,
+                    "ensure_worker: returning existing supervisor (fast path)"
+                );
                 return Ok(Arc::clone(sup));
             }
         }
@@ -303,9 +308,19 @@ impl WorkerPool {
             // Race lost — another caller inserted first. Drop ours (the
             // supervisor hasn't been started, so no kill is needed), and
             // return theirs.
+            debug!(
+                event_code = "subagent.worker_pool.worker_race_lost",
+                provider_id = %provider_id,
+                "ensure_worker: race lost, returning existing supervisor"
+            );
             return Ok(Arc::clone(existing));
         }
         workers.insert(provider_id.to_string(), Arc::clone(&sup));
+        debug!(
+            event_code = "subagent.worker_pool.worker_created",
+            provider_id = %provider_id,
+            "ensure_worker: created and inserted new supervisor"
+        );
         Ok(sup)
     }
 
@@ -330,7 +345,23 @@ impl WorkerPool {
             workers.remove(provider_id)
         };
         if let Some(sup) = sup {
+            debug!(
+                event_code = "subagent.worker_pool.remove_and_kill",
+                provider_id = %provider_id,
+                "remove_worker_and_kill: force-killing supervisor"
+            );
             sup.force_kill().await;
+            debug!(
+                event_code = "subagent.worker_pool.remove_and_kill_done",
+                provider_id = %provider_id,
+                "remove_worker_and_kill: supervisor killed and removed"
+            );
+        } else {
+            debug!(
+                event_code = "subagent.worker_pool.remove_and_kill_noop",
+                provider_id = %provider_id,
+                "remove_worker_and_kill: no worker found (already removed?)"
+            );
         }
         Ok(())
     }
@@ -368,9 +399,21 @@ impl WorkerPool {
             let mut workers = self.workers.lock().expect("workers map lock poisoned");
             workers.drain().map(|(_, v)| v).collect()
         };
+        let count = supervisors.len();
+        debug!(
+            event_code = "subagent.worker_pool.shutdown_all_start",
+            worker_count = count,
+            "shutdown_all: force-killing {} supervisor(s)",
+            count
+        );
         for sup in supervisors {
             sup.force_kill().await;
         }
+        debug!(
+            event_code = "subagent.worker_pool.shutdown_all_done",
+            worker_count = count,
+            "shutdown_all: all supervisors killed"
+        );
     }
 
     /// Iterate over all supervisors (sync). For `evict_lru` iteration

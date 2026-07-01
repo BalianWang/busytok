@@ -42,7 +42,6 @@ function makeFakeSdk(id: string, config: FakeConfig): SdkSession {
         throw err;
       }
     },
-    subscribe: () => () => {},
     getLastAssistantText: () => config.assistantText ?? 'real assistant summary',
     getSessionStats: (): SessionStatsLike => ({
       tokens: {

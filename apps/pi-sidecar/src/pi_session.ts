@@ -37,7 +37,6 @@ import { SidecarError } from './errors.js';
 export interface SdkSession {
   readonly sessionId: string;
   prompt(text: string): Promise<void>;
-  subscribe(listener: (event: { type: string }) => void): () => void;
   getLastAssistantText(): string | undefined;
   getSessionStats(): SessionStatsLike;
   abort(): Promise<void>;
