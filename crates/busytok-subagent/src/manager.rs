@@ -15,7 +15,7 @@ use crate::memory::MemoryUpdater;
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
     DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
-    SubagentTaskSummary, TaskStatus, TaskUsage,
+    SubagentTaskSummary, TaskErrorKind, TaskStatus, TaskUsage,
 };
 use crate::pressure::PressureGate;
 use crate::resolver::{resolve_by_id, resolve_by_name, row_to_model, Resolved};
@@ -417,7 +417,7 @@ impl SubagentManager {
                 profile_cfg.cloned(),
             )
         };
-        let out = self.executor.execute(&input).await.map_err(|e| {
+        let out = match self.executor.execute(&input).await.map_err(|e| {
             match e.downcast::<SubagentError>() {
                 Ok(se) => se,
                 Err(other) => {
@@ -425,7 +425,37 @@ impl SubagentManager {
                     SubagentError::Store(other)
                 }
             }
-        })?;
+        }) {
+            Ok(out) => out,
+            Err(e) => {
+                // Persist failure state before propagating. The executor
+                // classified the error (auth/rate_limit/network/timeout) and
+                // already killed the worker on auth-fail — but since
+                // execute() returns Err, the success-path block below
+                // (which persists error_kind) is unreachable. Persist
+                // status="failed" + best-effort error_kind here so the UI
+                // can surface the failure reason (spec §3.4, Task 5).
+                let error_kind = subagent_error_to_task_error_kind(&e);
+                {
+                    let db = self.db.lock().expect("subagent db lock poisoned");
+                    db.subagent_set_task_status(&task.id, "failed", None, None)
+                        .ok();
+                    if let Some(kind) = error_kind {
+                        if let Err(persist_err) =
+                            db.subagent_set_task_error_kind(&task.id, Some(kind.as_str()))
+                        {
+                            warn!(
+                                event_code = "subagent.error_kind_persist_failed",
+                                task_id = %task.id,
+                                error = %persist_err,
+                                "failed to persist error_kind on Err path"
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
         let duration_ms = busytok_domain::now_ms().saturating_sub(started);
 
         // 4. persist results: task status, usage, memory, status.
@@ -1024,5 +1054,36 @@ fn task_row_to_summary(r: SubagentTaskRow) -> SubagentTaskSummary {
         error: r.error,
         created_at_ms: r.created_at_ms,
         completed_at_ms: r.completed_at_ms,
+    }
+}
+
+/// Best-effort classification of a `SubagentError` (from the executor's Err
+/// path) into a `TaskErrorKind` for persistence on the task row. Mirrors the
+/// executor's `classify_sidecar_error` but operates on the already-converted
+/// `SubagentError` (the executor returns `Err(anyhow::Error)` which loses the
+/// structured `SidecarError`). The `SidecarRpc` variant embeds the numeric
+/// code as `"[code] msg"` (see `error.rs`), so we match on the code prefix.
+fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind> {
+    match e {
+        SubagentError::SidecarTimeout(_) | SubagentError::TaskTimeout => {
+            Some(TaskErrorKind::Timeout)
+        }
+        SubagentError::SidecarCrashed(_) => Some(TaskErrorKind::Crash),
+        SubagentError::SidecarRpc(msg) => {
+            // The RPC error message embeds the numeric code as "[code] msg"
+            // (error.rs:114). Match on the code prefix to classify.
+            if msg.contains("[-32010]") {
+                Some(TaskErrorKind::Auth)
+            } else if msg.contains("[-32011]") {
+                Some(TaskErrorKind::RateLimit)
+            } else if msg.contains("[-32012]") {
+                Some(TaskErrorKind::Network)
+            } else if msg.contains("[-32003]") {
+                Some(TaskErrorKind::Timeout)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }

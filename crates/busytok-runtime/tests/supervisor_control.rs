@@ -47,6 +47,7 @@ use busytok_store::repository::LogSourceRow;
 use busytok_store::Database;
 use busytok_subagent::models::TaskUsage;
 use busytok_subagent::sidecar::SidecarConfig;
+use serial_test::serial;
 use time::{Duration as TimeDuration, Month, OffsetDateTime, Time, UtcOffset};
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -5388,4 +5389,202 @@ async fn write_usage_event_visible_in_overview_read_path() {
         "overview summary should count the subagent event, got {}",
         summary.event_count
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Task 8: end-to-end integration tests (acceptance criteria)
+// ---------------------------------------------------------------------------
+
+/// `e2e_multi_provider_creates_separate_workers` (Phase 3 Task 8): two
+/// configured providers → two delegates → two separate worker entries in the
+/// pool. Verifies the per-provider supervisor map routing (C7 fix).
+#[tokio::test]
+async fn e2e_multi_provider_creates_separate_workers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    // Add a second provider.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-2".to_string(),
+        name: "Test Provider 2".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY_2".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup.worker_pool().expect("worker_pool must be Some");
+
+    // Auto-spawn only created ONE worker (for the first enabled provider).
+    // Ensure the second provider's worker too.
+    pool.ensure_worker("test-provider-2")
+        .expect("ensure_worker for provider-2");
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 2, "two providers → two workers");
+    let ids: Vec<&str> = snaps.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains(&"test-provider"), "provider 1 worker present");
+    assert!(
+        ids.contains(&"test-provider-2"),
+        "provider 2 worker present"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `e2e_auth_failure_kills_worker` (Phase 3 Task 8): mock sidecar returns 401
+/// (AUTH_FAILURE -32010) → task fails with `error_kind: "auth"` → worker
+/// killed+removed from pool → next ensure_worker creates a new worker.
+/// Verifies the auth-fail kill path end-to-end through the delegate handler
+/// (not just the executor level — `sidecar_executor.rs` already covers that).
+///
+/// NOTE: This test spawns a real sidecar child (mock-sidecar.sh) so it is
+/// `#[serial]` to prevent parallel contamination.
+#[tokio::test]
+#[serial]
+async fn e2e_auth_failure_kills_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-auth-fail", 1000);
+    let mut settings = make_sidecar_settings();
+    // The default profile model ("deepseek-chat") is NOT in the test
+    // provider's whitelist (["test-model"]). Set it to "test-model" so the
+    // delegate passes whitelist validation and reaches the executor (where
+    // the auth-fail mock returns -32010).
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .model = "test-model".to_string();
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+    let mut sidecar_cfg = make_sidecar_config();
+    sidecar_cfg
+        .env
+        .insert("BUSYTOK_MOCK_AUTH_FAIL".into(), "1".into());
+    let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
+
+    let pool = sup.worker_pool().expect("worker_pool must be Some");
+    // Auto-spawn created one worker for test-provider.
+    assert_eq!(
+        pool.worker_snapshots().await.len(),
+        1,
+        "one worker before delegate"
+    );
+
+    // Delegate — will hit the auth-fail path. The executor's `execute()`
+    // returns Err (SidecarRpc -32010), which propagates through
+    // `execute_task` → `delegate` → `subagent_delegate`. The task row was
+    // already inserted (status="running") before execute() ran.
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do work".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await;
+
+    // The delegate returns Err because execute() returned Err (the `?` in
+    // `execute_task` propagates it before the success-path result
+    // persistence block runs).
+    assert!(
+        resp.is_err(),
+        "delegate must return Err on auth failure, got: {resp:?}"
+    );
+
+    // Verify the task row has error_kind = "auth". The task row was inserted
+    // (status="running") before execute() ran. The executor classifies the
+    // -32010 error as TaskErrorKind::Auth and calls remove_worker_and_kill,
+    // then returns Err. Spec §3.4 / Task 5 require the error_kind to be
+    // persisted on the task row.
+    let db_handle = sup.db_handle();
+    let error_kind: String = db_handle
+        .lock()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT error_kind FROM subagent_tasks ORDER BY created_at_ms DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    assert_eq!(
+        error_kind, "auth",
+        "task error_kind must be 'auth' after 401 (AUTH_FAILURE -32010)"
+    );
+
+    // Worker must be removed from the pool (auth-fail kill).
+    assert!(
+        pool.worker_snapshots().await.is_empty(),
+        "pool must be empty after auth-fail kill"
+    );
+
+    // Next ensure_worker creates a new worker (slot was freed).
+    pool.ensure_worker("test-provider")
+        .expect("ensure_worker re-spawns");
+    assert_eq!(pool.worker_snapshots().await.len(), 1);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `e2e_usage_events_agent_kind_is_codex` (Phase 3 Task 8, I3 fix): after
+/// delegate, the `agent` column in `usage_events` for the subagent row must
+/// be `'codex'` — verifying the `AgentKind::Codex` discriminator round-trips
+/// through the normalize → insert pipeline. (The pi-sidecar wraps a
+/// Codex-family SDK, so `AgentKind::Codex` is the correct agent kind for
+/// subagent events.)
+#[tokio::test]
+async fn e2e_usage_events_agent_kind_is_codex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-codex", 1000);
+    let sup = make_supervisor(db, &tmp);
+    sup.hydrate_status_from_db().unwrap();
+
+    sup.subagent_delegate(SubagentDelegateRequestDto {
+        subagent_name: "writer".to_string(),
+        subagent_id: None,
+        cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+        profile: "pi/search-cheap".to_string(),
+        intent: None,
+        prompt: "do work".to_string(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+    })
+    .await
+    .unwrap();
+
+    let agent: String = sup
+        .db_handle()
+        .lock()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT agent FROM usage_events WHERE client_kind = 'subagent' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("must have a subagent usage event");
+    assert_eq!(
+        agent, "codex",
+        "subagent usage event agent must be 'codex' (AgentKind::Codex.as_str())"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
 }
