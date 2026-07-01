@@ -9,6 +9,8 @@ import type {
 vi.mock("../api/useBusytokData", () => ({
   useProviders: vi.fn(),
   useProviderMutations: vi.fn(),
+  useSettingsSnapshot: vi.fn(),
+  useProfileMutations: vi.fn(),
 }));
 
 // Mock the reporter so telemetry emission does not trip jsdom/Tauri invoke paths.
@@ -19,12 +21,14 @@ vi.mock("../logging/safeReporter", () => ({
   reportFrontendEventSafely: vi.fn(),
 }));
 
-import { useProviders, useProviderMutations } from "../api/useBusytokData";
+import { useProviders, useProviderMutations, useSettingsSnapshot, useProfileMutations } from "../api/useBusytokData";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 import { ProvidersPage } from "./ProvidersPage";
 
 const mockUseProviders = vi.mocked(useProviders);
 const mockUseProviderMutations = vi.mocked(useProviderMutations);
+const mockUseSettingsSnapshot = vi.mocked(useSettingsSnapshot);
+const mockUseProfileMutations = vi.mocked(useProfileMutations);
 
 function makeProvider(overrides: Partial<ProviderDto> = {}): ProviderDto {
   return {
@@ -109,6 +113,24 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockUseProviders.mockReturnValue(mockProvidersQuery(makeListResponse([])));
   mockUseProviderMutations.mockReturnValue(mockMutations());
+  mockUseSettingsSnapshot.mockReturnValue({
+    data: {
+      data: {
+        subagent: {
+          enabled: true,
+          profiles: [],
+        },
+      },
+    },
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+  } as never);
+  mockUseProfileMutations.mockReturnValue({
+    createProfile: { mutate: vi.fn(), isPending: false },
+    updateProfile: { mutate: vi.fn(), isPending: false },
+    deleteProfile: { mutate: vi.fn(), isPending: false },
+  } as never);
 });
 
 afterEach(() => cleanup());

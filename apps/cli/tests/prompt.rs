@@ -510,6 +510,15 @@ impl RuntimeControl for AliasConflictRuntime {
     ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
         self.inner.provider_test_connection(req).await
     }
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> anyhow::Result<ProfileDto> {
+        self.inner.profile_create(req).await
+    }
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> anyhow::Result<ProfileDto> {
+        self.inner.profile_update(req).await
+    }
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.profile_delete(req).await
+    }
 }
 
 #[tokio::test]

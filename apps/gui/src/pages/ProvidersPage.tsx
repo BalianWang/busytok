@@ -6,6 +6,7 @@ import type {
 } from "@busytok/protocol-types";
 import { useProviderMutations, useProviders } from "../api/useBusytokData";
 import { PageState } from "../components/PageState";
+import { ProfilesSection } from "../components/ProfilesSection";
 import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
 import { SettingsRow } from "../components/desktop/SettingsRow";
 import { SettingsValue } from "../components/desktop/SettingsValue";
@@ -715,6 +716,7 @@ export function ProvidersPage() {
             ))}
           </section>
         )}
+        <ProfilesSection />
       </div>
     </div>
   );
