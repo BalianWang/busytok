@@ -17,6 +17,7 @@
 
 use busytok_config::{BusytokPaths, BusytokSettings, SidecarManifest};
 use busytok_control::dispatch::RuntimeControl;
+use busytok_protocol::dto::PiSidecarLocatorUpdateRequestDto;
 use busytok_runtime::BusytokSupervisor;
 use busytok_store::Database;
 use serial_test::serial;
@@ -209,6 +210,86 @@ async fn doctor_manifest_rejects_missing_node_runtime_version_field() {
         .unwrap();
     assert_eq!(check.status, "error");
     assert!(check.detail.as_deref().unwrap_or("").contains("SidecarManifest"));
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+/// Phase 5 final-review fix (I-1): after `pi_sidecar_locator_update` flips
+/// `enabled` to `true` in-memory, the `sidecar_supervisor` field (constructed
+/// once during `build_with_settings` with `enabled=false`) is NOT re-built.
+/// The `protocol_version` doctor check must distinguish:
+///   - `enabled=false` → "pi_sidecar disabled — cannot probe protocol version"
+///   - `enabled=true` but `sidecar_supervisor=None` → "pending restart" detail
+/// This test constructs a supervisor with `enabled=false`, calls
+/// `pi_sidecar_locator_update` to set `enabled=true`, then asserts the
+/// `protocol_version` check surfaces the "pending restart" detail (NOT the
+/// stale "disabled" message).
+#[tokio::test]
+#[serial]
+async fn doctor_protocol_version_pending_restart_after_locator_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    // Start with enabled=false so construct_sidecar returns sidecar_supervisor=None.
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = false;
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor =
+        BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // Pre-condition: the protocol_version check reports "disabled" before the
+    // locator update (sanity check that we're starting in the expected state).
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "protocol_version")
+        .unwrap();
+    assert_eq!(check.status, "warning");
+    assert!(
+        check.detail.as_deref().unwrap_or("").contains("disabled"),
+        "pre-update detail should mention disabled: {:?}",
+        check.detail
+    );
+
+    // Flip enabled=true in-memory via the service-owned RPC (mirrors the GUI
+    // startup path). sidecar_supervisor is NOT re-constructed.
+    let fake_dir = tmp.path().join("pi-sidecar");
+    fs::create_dir_all(&fake_dir).unwrap();
+    supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: fake_dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    // Post-condition: the check now reports "pending restart" (enabled=true
+    // in settings, but supervisor not constructed until service restart).
+    let envelope = supervisor.settings_diagnostics().await.unwrap();
+    let sub = envelope.data.subagent.unwrap();
+    let check = sub
+        .checks
+        .iter()
+        .find(|c| c.name == "protocol_version")
+        .unwrap();
+    assert_eq!(
+        check.status, "warning",
+        "enabled-but-pending-restart => warning (no supervisor to probe yet)"
+    );
+    let detail = check.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("pending restart"),
+        "post-update detail should mention pending restart: {detail:?}"
+    );
+    assert!(
+        !detail.contains("disabled"),
+        "post-update detail must NOT say 'disabled' (enabled is true): {detail:?}"
+    );
 
     supervisor.shutdown_writer().await.unwrap();
 }

@@ -1014,9 +1014,14 @@ impl BusytokSupervisor {
         //    `adapter.initialize` in `ensure_started` → "ok". If not running,
         //    do a SHORT-LIVED PROBE: `ensure_started()` (spawns + verifies
         //    protocol via adapter.initialize), then `shutdown_internal()`.
-        //    When `sidecar_supervisor` is None, distinguish "pi_sidecar
-        //    disabled" (warning) from "enabled but config resolve failed"
-        //    (error via `sidecar_init_error`).
+        //    When `sidecar_supervisor` is None, distinguish three sub-cases:
+        //      (a) `sidecar_init_error = Some` → "error" (enabled but broken).
+        //      (b) `enabled = false` in settings → "warning" (disabled).
+        //      (c) `enabled = true` in settings but supervisor was not
+        //          (re)constructed → "warning, pending restart". This happens
+        //          when `pi_sidecar_locator_update` flips `enabled` to `true`
+        //          in-memory AFTER construction; the supervisor is built once
+        //          during `build_with_settings` and is not hot-reloaded.
         {
             let expected_pv = busytok_subagent::sidecar::protocol::PROTOCOL_VERSION;
             let (status, detail) = match &self.sidecar_supervisor {
@@ -1054,10 +1059,39 @@ impl BusytokSupervisor {
                             format!("protocol probe failed — sidecar not constructed: {err}"),
                         )
                     } else {
-                        (
-                            "warning",
-                            "pi_sidecar disabled — cannot probe protocol version".into(),
-                        )
+                        // Read `enabled` from the LIVE in-memory settings
+                        // (NOT the value captured at construction time).
+                        // `pi_sidecar_locator_update` mutates this Arc in-place;
+                        // `sidecar_supervisor` is NOT re-constructed mid-flight
+                        // (risky, out of scope), so `enabled=true` here means
+                        // the change is pending a service restart.
+                        let enabled = self
+                            .settings
+                            .lock()
+                            .unwrap()
+                            .subagent
+                            .pi_sidecar
+                            .enabled;
+                        if enabled {
+                            warn!(
+                                event_code =
+                                    "subagent.doctor.protocol_version_pending_restart",
+                                "pi_sidecar enabled in settings but supervisor not \
+                                 constructed (pending service restart) — cannot probe \
+                                 protocol version"
+                            );
+                            (
+                                "warning",
+                                "pi_sidecar enabled but supervisor pending restart — \
+                                 cannot probe protocol version until service restart"
+                                    .into(),
+                            )
+                        } else {
+                            (
+                                "warning",
+                                "pi_sidecar disabled — cannot probe protocol version".into(),
+                            )
+                        }
                     }
                 }
             };

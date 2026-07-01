@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// required — a manifest missing any field is invalid and must cause the
 /// `bundle_manifest_readable` doctor check to return `"error"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SidecarManifest {
     /// Manifest schema version. Currently `"1"`.
     pub version: String,
@@ -94,5 +95,15 @@ mod tests {
         let json = manifest.to_json_string();
         assert!(json.contains('\n'), "pretty-printed JSON has newlines");
         assert!(json.contains("\"protocol_version\": 1"));
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_field() {
+        // A typo'd field (e.g. "extra") must be rejected so generation bugs
+        // are surfaced instead of silently ignored. With `deny_unknown_fields`,
+        // any field not in the struct is a deserialize error.
+        let json = r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0","extra":"unknown"}"#;
+        let result: Result<SidecarManifest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown field must be rejected");
     }
 }

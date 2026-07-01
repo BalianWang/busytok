@@ -274,6 +274,8 @@ async fn refresh_sidecar_locator(
 /// - `service_recovery.rs:45` — `"service unavailable: {e}"`
 /// - `service_recovery.rs:85` — `"service bootstrap failed: {e}"`
 /// - `host_application_services.rs:74` — `"call to '{method}' timed out"`
+/// - `commands.rs:60` — `"service bootstrap unavailable (coordinator not initialized)"`
+///   (cold-start race: `LifecycleCoordinator` not yet registered)
 ///
 /// Service business errors come from:
 /// - `host_application_services.rs:80-86` — `"[{code}] {message}"` (RPC Err)
@@ -284,6 +286,7 @@ fn is_transport_unreachable(err: &str) -> bool {
     err.starts_with("connect/bootstrap phase timed out")
         || err.starts_with("service unavailable:")
         || err.starts_with("service bootstrap failed:")
+        || err.starts_with("service bootstrap unavailable")
         || err.starts_with("call to '")
 }
 

@@ -59,6 +59,9 @@ fn classifies_transport_vs_business_errors() {
     assert!(is_transport_unreachable("service unavailable: connection refused"));
     assert!(is_transport_unreachable("service bootstrap failed: launchctl timeout"));
     assert!(is_transport_unreachable("call to 'pi_sidecar_locator_update' timed out"));
+    assert!(is_transport_unreachable(
+        "service bootstrap unavailable (coordinator not initialized)"
+    ));
 
     // Service business errors → log + surface (false, NO fallback).
     assert!(!is_transport_unreachable("[validation_error] runtime_dir must be absolute"));
