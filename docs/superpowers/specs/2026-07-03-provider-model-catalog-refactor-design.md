@@ -563,9 +563,9 @@ error!(event_code = "model.sql_read_failed", error = %e, "SQL read failed");
 
 | 阶段 | 内容 | 性质 |
 |------|------|------|
-| P1 | 新 domain model + v6 schema + store repository | 纯增量，不碰旧代码 |
-| P2 | supervisor RPC 切到新 store + sidecar 固定 env + 删 keychain + 删旧字段 | "翻转"点 |
-| P3 | CLI catalog 命令 + GUI ProvidersPage/ModelsSection 改造 | 消费层 |
+| P1 | 新 domain model + v6 schema + store repository + `ProviderKind` 从 `busytok-config` 迁移到 `busytok-domain`（`busytok-config` 不再 re-export，`busytok-protocol` 新增对 `busytok-domain` 依赖） | 增量为主，但含 `ProviderKind` 类型迁移（跨 crate 改动，非纯增量） |
+| P2 | supervisor RPC 切到新 store + sidecar 固定 env + 删 keychain + 删旧字段（`ProviderConfig` 整体删除、`BusytokSettings.providers` 字段删除、`SidecarConfig` env name 字段删除） + `RuntimeControl` trait + dispatch 路由 + CLI stub 同步 | "翻转"点 |
+| P3 | CLI catalog 命令 + GUI ProvidersPage/ModelsSection 改造 + 前端 API client | 消费层 |
 | P4 | 日志事件 + 残留 grep 清理 + 测试补全 | 收尾 |
 
 ## 14. 验收标准
