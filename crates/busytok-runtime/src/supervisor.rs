@@ -249,10 +249,9 @@ impl BusytokSupervisor {
         // Wrap settings in `Arc<Mutex>` ONCE here so the WorkerPool's
         // provider-lookup closure and the supervisor's `settings` field share
         // the SAME live store. Without this, the closure would capture a
-        // snapshot of `settings.providers` taken at construction time, so
-        // `provider_update` (which mutates `self.settings`) would NOT be
-        // visible to `ensure_worker` when it re-spawns a worker — the respawned
-        // supervisor would run with stale `base_url` / `base_url_env_name`.
+        // snapshot taken at construction time, so `provider_update` (which
+        // mutates `self.settings`) would NOT be visible to `ensure_worker`
+        // when it re-spawns a worker.
         let settings = Arc::new(Mutex::new(settings));
         let sidecar = Self::construct_sidecar(&settings, &paths, &db, None);
         Self::assemble_with_sidecar(db, paths, adapters, settings, event_bus, sidecar)
@@ -292,8 +291,8 @@ impl BusytokSupervisor {
     /// **Phase 3 Task 3:** the executor is rewired from a single
     /// `PiSidecarSupervisor` to `Arc<WorkerPool>`. The pool is constructed
     /// with a `HashMap<String, ProviderRuntimeEntry>` populated from SQL
-    /// (the SQL-backed provider catalog — Task 7: the sidecar no longer
-    /// reads from `settings.providers` TOML or a `ProviderCredentialStore`).
+    /// (the SQL-backed provider catalog — Task 7: the sidecar reads from
+    /// SQL, not from settings TOML).
     /// Two-phase bootstrap:
     /// pool → executor → responder factory → `set_responder_factory` →
     /// `ensure_worker(first enabled provider)` → supervisor for the
@@ -346,11 +345,11 @@ impl BusytokSupervisor {
             Ok(sidecar_config) => {
                 let gate = Arc::new(busytok_subagent::PressureGate::new());
 
-                // Build the providers map from SQL (Task 7: sidecar no longer
-                // reads from `settings.providers` TOML — it reads from the
-                // SQL-backed provider catalog). Only enabled providers with a
-                // non-None api_key are included; `provider_changed` updates
-                // this map at runtime via `update_provider_and_kill_old`.
+                // Build the providers map from SQL (Task 7: sidecar reads
+                // from the SQL-backed provider catalog). Only enabled
+                // providers with a non-None api_key are included;
+                // `provider_changed` updates this map at runtime via
+                // `update_provider_and_kill_old`.
                 let providers: std::collections::HashMap<
                     String,
                     busytok_subagent::sidecar::ProviderRuntimeEntry,
@@ -5792,7 +5791,7 @@ impl RuntimeControl for BusytokSupervisor {
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
         // id 由 store 层生成（UUID v4），不再校验用户输入。api_key 直接
-        // 存入 SQL providers 表（不再走 OS keychain）。
+        // 存入 SQL providers 表。
         let provider = {
             let db = self.db.lock().unwrap();
             db.create_provider(busytok_store::CreateProviderReq {
@@ -5801,6 +5800,10 @@ impl RuntimeControl for BusytokSupervisor {
                 base_url: req.base_url,
                 enabled: true,
                 api_key: req.api_key,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "provider.sql_write_failed", error = %e, "create_provider failed");
+                e
             })?
         };
         tracing::info!(event_code = "provider.created", provider_id = %provider.id, "provider created");
@@ -5819,7 +5822,10 @@ impl RuntimeControl for BusytokSupervisor {
         // settings.toml.
         let summaries = {
             let db = self.db.lock().unwrap();
-            db.list_providers()?
+            db.list_providers().map_err(|e| {
+                tracing::error!(event_code = "provider.sql_read_failed", error = %e, "list_providers failed");
+                e
+            })?
         };
         let providers: Vec<ProviderDto> = summaries.iter().map(provider_summary_to_dto).collect();
         tracing::debug!(count = providers.len(), "listed providers");
@@ -5832,7 +5838,7 @@ impl RuntimeControl for BusytokSupervisor {
         //   Some(None)        → clear
         //   Some(Some(k))     → update
         // The store layer handles all three branches atomically under a
-        // transaction. No keychain access.
+        // transaction.
         let provider = {
             let db = self.db.lock().unwrap();
             db.update_provider(&req.id, busytok_store::UpdateProviderPatch {
@@ -5840,6 +5846,10 @@ impl RuntimeControl for BusytokSupervisor {
                 base_url: req.base_url,
                 enabled: req.enabled,
                 api_key: req.api_key,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "provider.sql_write_failed", provider_id = %req.id, error = %e, "update_provider failed");
+                e
             })?
         };
         tracing::info!(event_code = "provider.updated", provider_id = %provider.id, "provider updated");
@@ -5859,7 +5869,10 @@ impl RuntimeControl for BusytokSupervisor {
         let profile_refs = self.collect_profile_refs();
         {
             let db = self.db.lock().unwrap();
-            db.delete_provider(&req.id, &profile_refs)?;
+            db.delete_provider(&req.id, &profile_refs).map_err(|e| {
+                tracing::error!(event_code = "provider.sql_write_failed", provider_id = %req.id, error = %e, "delete_provider failed");
+                e
+            })?;
         }
         tracing::info!(event_code = "provider.deleted", provider_id = %req.id, "provider deleted");
         // Kill + remove the worker for the deleted provider so its sidecar
@@ -5878,7 +5891,11 @@ impl RuntimeControl for BusytokSupervisor {
         // the future `!Send` and breaks the `RuntimeControl` trait bound.
         let provider = {
             let db = self.db.lock().unwrap();
-            db.get_provider_with_secret(&req.id)?
+            db.get_provider_with_secret(&req.id)
+                .map_err(|e| {
+                    tracing::error!(event_code = "provider.sql_read_failed", provider_id = %req.id, error = %e, "get_provider_with_secret failed");
+                    e
+                })?
                 .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?
         };
         let provider_id = provider.id.clone();
@@ -5937,6 +5954,10 @@ impl RuntimeControl for BusytokSupervisor {
                             provider_id: Some(provider_id.clone()),
                             tags: vec![],
                             include_disabled: false,
+                        })
+                        .map_err(|e| {
+                            tracing::error!(event_code = "model.sql_read_failed", provider_id = %provider_id, error = %e, "list_models_filtered for probe failed");
+                            e
                         })?
                     };
                     let probe_model = probe_model.into_iter().next()
@@ -6036,6 +6057,10 @@ impl RuntimeControl for BusytokSupervisor {
                 model_id: req.model_id.clone(),
                 enabled: req.enabled.unwrap_or(true),
                 tags: req.tags.clone(),
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_write_failed", provider_id = %req.provider_id, model_id = %req.model_id, error = %e, "create_model failed");
+                e
             })?
         };
         tracing::info!(
@@ -6054,6 +6079,10 @@ impl RuntimeControl for BusytokSupervisor {
                 provider_id: Some(model.provider_id.clone()),
                 tags: vec![],
                 include_disabled: true,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_read_failed", provider_id = %model.provider_id, model_db_id = %model.id, error = %e, "list_models_filtered re-fetch after create failed");
+                e
             })?
         };
         entries
@@ -6072,6 +6101,10 @@ impl RuntimeControl for BusytokSupervisor {
                 provider_id: req.provider_id,
                 tags: req.tags,
                 include_disabled: req.include_disabled,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_read_failed", error = %e, "list_models_filtered failed");
+                e
             })?
         };
         tracing::info!(
@@ -6092,6 +6125,10 @@ impl RuntimeControl for BusytokSupervisor {
             let db = self.db.lock().unwrap();
             db.update_model(&req.id, busytok_store::UpdateModelPatch {
                 enabled: req.enabled,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "update_model failed");
+                e
             })?
         };
         tracing::info!(
@@ -6112,7 +6149,10 @@ impl RuntimeControl for BusytokSupervisor {
         let profile_refs = self.collect_profile_refs();
         {
             let db = self.db.lock().unwrap();
-            db.delete_model(&req.id, &profile_refs)?;
+            db.delete_model(&req.id, &profile_refs).map_err(|e| {
+                tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "delete_model failed");
+                e
+            })?;
         }
         tracing::info!(
             event_code = "model.deleted",
@@ -6128,7 +6168,10 @@ impl RuntimeControl for BusytokSupervisor {
         // transaction. `model_id` here is the models.id (DB PK), not the
         // immutable model_id string — same param name, different meaning.
         let db = self.db.lock().unwrap();
-        db.set_model_tags(&req.model_id, &req.tags)?;
+        db.set_model_tags(&req.model_id, &req.tags).map_err(|e| {
+            tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.model_id, error = %e, "set_model_tags failed");
+            e
+        })?;
         tracing::info!(
             event_code = "model.tags_updated",
             model_db_id = %req.model_id,

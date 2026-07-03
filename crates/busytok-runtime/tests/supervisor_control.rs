@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use busytok_adapters::AgentLogAdapter;
 use busytok_config::{
-    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig, ProviderConfig,
+    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig,
     ProviderKind,
 };
 use busytok_control::dispatch::RuntimeControl;
@@ -224,35 +224,95 @@ fn make_sidecar_config() -> SidecarConfig {
     }
 }
 
+/// In-memory description of a provider to seed into SQL for sidecar-wired
+/// tests. Replaces the old `settings.providers.push(ProviderConfig{...})`
+/// pattern after Task 10 removed `BusytokSettings.providers`. Tests that need
+/// a provider in the WorkerPool's map push a `TestProviderSeed` here and
+/// `seed_test_providers` writes them to SQL before the supervisor is built.
+#[derive(Clone)]
+struct TestProviderSeed {
+    id: &'static str,
+    name: &'static str,
+    base_url: &'static str,
+    api_key_env_name: &'static str,
+    models: &'static [&'static str],
+    enabled: bool,
+}
+
+const TEST_PROVIDER_SEED: TestProviderSeed = TestProviderSeed {
+    id: "test-provider",
+    name: "Test Provider",
+    base_url: "https://api.test-provider.example.com/v1",
+    api_key_env_name: "TEST_API_KEY",
+    models: &["test-model"],
+    enabled: true,
+};
+
+const TEST_PROVIDER_2_SEED: TestProviderSeed = TestProviderSeed {
+    id: "test-provider-2",
+    name: "Test Provider 2",
+    base_url: "https://api.test-provider-2.example.com/v1",
+    api_key_env_name: "TEST_API_KEY_2",
+    models: &["test-model"],
+    enabled: true,
+};
+
+/// Seed a list of `TestProviderSeed` into SQL. Mirrors the old
+/// `seed_providers_from_settings` flow but reads from a `[TestProviderSeed]`
+/// instead of `settings.providers` (which no longer exists). Models are NOT
+/// seeded here (use `seed_model_to_sql` / `seed_model_to_db` for that — they
+/// use plain INSERT and would conflict with a duplicate (provider_id, model_id)
+/// row). Uses `INSERT OR REPLACE` so re-seeding overwrites cleanly.
+fn seed_test_providers(db: &Database, seeds: &[TestProviderSeed]) {
+    use rusqlite::params;
+    let now = busytok_domain::now_ms();
+    for p in seeds {
+        let api_key = std::env::var(format!("BUSYTOK_{}", p.api_key_env_name))
+            .or_else(|_| std::env::var(p.api_key_env_name))
+            .ok();
+        db.conn()
+            .execute(
+                "INSERT OR REPLACE INTO providers \
+                 (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    p.id,
+                    p.name,
+                    serde_json::to_string(&ProviderKind::OpenAiCompatible).unwrap(),
+                    p.base_url,
+                    p.enabled as i64,
+                    api_key,
+                    now,
+                ],
+            )
+            .expect("seed provider to SQL");
+    }
+}
+
 /// Settings with `pi_sidecar.enabled = true` so `new_with_sidecar_config`
 /// takes the sidecar wiring path. The injected `SidecarConfig` means
 /// `resolve_sidecar_config` is skipped, so `node_runtime`/`system_node_path`
 /// are irrelevant here.
-fn make_sidecar_settings() -> BusytokSettings {
+///
+/// Returns the settings plus the list of `TestProviderSeed`s that must be
+/// seeded into SQL before constructing the supervisor (so `construct_sidecar`
+/// finds the provider and builds the WorkerPool's map). Callers pass the
+/// seeds to `make_sidecar_stopped_supervisor_with_settings` or
+/// `seed_test_providers` directly.
+fn make_sidecar_settings() -> (BusytokSettings, Vec<TestProviderSeed>) {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
 
-    // Add a test provider + bind profiles so the WorkerPool can route.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider".to_string(),
-        name: "Test Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
+    // Bind profiles so the WorkerPool can route.
     for profile in settings.subagent.profiles.values_mut() {
         profile.provider_id = Some("test-provider".to_string());
     }
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
-    // Pre-set the second-provider env var so tests that push a
-    // `test-provider-2` (with `api_key_env_name: "TEST_API_KEY_2"`) don't
-    // need to remember to set it. Harmless if no second provider is added.
+    // Pre-set the second-provider env var so tests that add a `test-provider-2`
+    // seed don't need to remember to set it. Harmless if unused.
     std::env::set_var("BUSYTOK_TEST_API_KEY_2", "test-key-2");
 
-    settings
+    (settings, vec![TEST_PROVIDER_SEED.clone()])
 }
 
 /// Construct a supervisor with `pi_sidecar.enabled = true` and the mock sidecar
@@ -263,8 +323,8 @@ fn make_sidecar_settings() -> BusytokSettings {
 /// `construct_sidecar` (Task 7: reads from SQL, not TOML) can build the
 /// `WorkerPool`'s provider map.
 fn make_sidecar_stopped_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
-    let settings = make_sidecar_settings();
-    seed_providers_from_settings(&db, &settings);
+    let (settings, seeds) = make_sidecar_settings();
+    seed_test_providers(&db, &seeds);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -3543,17 +3603,16 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// providers.* (Phase 1: Credential Foundation)
+// providers.* (SQL-backed provider/model catalog)
 // ---------------------------------------------------------------------------
 //
 // The settings-CRUD code paths (create without api_key, list, update without
-// api_key, delete) never touch the OS keychain and are safe to run in CI on
-// every platform. `provider_to_dto` calls `ProviderCredentialStore::has_key`,
-// which is a read that returns `false` on `NoEntry` — also safe for CI.
+// api_key, delete) never touch credentials and are safe to run in CI on
+// every platform. `provider_to_dto` derives `has_api_key` from the SQL row's
+// `api_key` column (NULL → false, non-NULL → true) — no OS keychain involved.
 //
-// Tests that exercise the api_key flow (create/update with a non-empty key,
-// or delete of a provider that has a key) touch the real macOS Keychain and
-// are gated behind `#[cfg(target_os = "macos")] #[ignore]`.
+// Tests that exercise the api_key flow (create/update with a non-empty key)
+// store the key directly in SQL, not the OS keychain.
 
 fn provider_create_request(name: &str) -> ProviderCreateRequestDto {
     ProviderCreateRequestDto {
@@ -3566,9 +3625,8 @@ fn provider_create_request(name: &str) -> ProviderCreateRequestDto {
 
 /// Seed a provider row directly into SQL with a SPECIFIC id (bypassing the
 /// store's UUID v4 generation). Used by sidecar-coupled tests where the
-/// worker-pool provider-lookup closure still reads from `settings.providers`
-/// (which uses hardcoded ids like "test-provider"). Task 7 will unify the
-/// sidecar to read from SQL, at which point this helper can be removed.
+/// worker-pool provider-lookup closure reads from SQL and tests need
+/// hardcoded ids like "test-provider" to match profile bindings.
 fn seed_provider_to_sql(
     sup: &BusytokSupervisor,
     id: &str,
@@ -4359,70 +4417,31 @@ async fn subagent_runtime_status_tasks_recent_shows_display_name_for_deleted_sub
 /// Build sidecar-enabled settings with a single test provider whose model
 /// whitelist is `["test-model"]`. Profiles are NOT bound by default (caller
 /// binds per-test). Used by the delegate validation tests.
-fn make_unbound_sidecar_settings() -> BusytokSettings {
+///
+/// Returns the settings plus the list of `TestProviderSeed`s that must be
+/// seeded into SQL before constructing the supervisor.
+fn make_unbound_sidecar_settings() -> (BusytokSettings, Vec<TestProviderSeed>) {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
-    settings.providers.push(ProviderConfig {
-        id: "test-provider".to_string(),
-        name: "Test Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
     // Pre-set the second-provider env var (see make_sidecar_settings).
     std::env::set_var("BUSYTOK_TEST_API_KEY_2", "test-key-2");
-    settings
+    (settings, vec![TEST_PROVIDER_SEED.clone()])
 }
 
-/// Seed all providers from `settings.providers` into the SQL store so
-/// `construct_sidecar` (which reads from SQL, not TOML — Task 7) finds them
-/// when building the `WorkerPool`'s provider map. Resolves `api_key` from
-/// the `BUSYTOK_{api_key_env_name}` env var (the convention used by
-/// `make_sidecar_settings` / `make_unbound_sidecar_settings`). Uses
-/// `INSERT OR REPLACE` so tests that re-seed a provider with updated values
-/// (e.g. via `seed_provider_to_sql`) overwrite the initial row.
-fn seed_providers_from_settings(db: &Database, settings: &BusytokSettings) {
-    use rusqlite::params;
-    let now = busytok_domain::now_ms();
-    for p in &settings.providers {
-        let api_key = std::env::var(format!("BUSYTOK_{}", p.api_key_env_name))
-            .or_else(|_| std::env::var(&p.api_key_env_name))
-            .ok();
-        db.conn()
-            .execute(
-                "INSERT OR REPLACE INTO providers \
-                 (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                params![
-                    p.id,
-                    p.name,
-                    serde_json::to_string(&p.provider_kind).unwrap(),
-                    p.base_url,
-                    p.enabled as i64,
-                    api_key,
-                    now,
-                ],
-            )
-            .expect("seed provider to SQL");
-    }
-}
-
-/// Build a sidecar-stopped supervisor from arbitrary settings. Mirrors
-/// `make_sidecar_stopped_supervisor` but accepts custom settings so the
-/// delegate validation tests can configure provider/profile bindings.
-/// Providers from `settings.providers` are seeded into SQL before
-/// construction so `construct_sidecar` can build the `WorkerPool`'s provider
-/// map (Task 7: pool reads from SQL, not TOML).
+/// Build a sidecar-stopped supervisor from arbitrary settings + provider
+/// seeds. Mirrors `make_sidecar_stopped_supervisor` but accepts custom
+/// settings + seeds so the delegate validation tests can configure
+/// provider/profile bindings. Seeds are written to SQL before construction
+/// so `construct_sidecar` can build the `WorkerPool`'s provider map
+/// (Task 7: pool reads from SQL, not TOML).
 fn make_sidecar_stopped_supervisor_with_settings(
     db: Database,
     tmp: &tempfile::TempDir,
     settings: BusytokSettings,
+    seeds: Vec<TestProviderSeed>,
 ) -> BusytokSupervisor {
-    seed_providers_from_settings(&db, &settings);
+    seed_test_providers(&db, &seeds);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -4439,8 +4458,8 @@ async fn delegate_fails_for_unbound_profile() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     // Built-in profiles ship unbound (`provider_id: None`).
-    let settings = make_unbound_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_unbound_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let err = sup
         .subagent_delegate(SubagentDelegateRequestDto {
@@ -4468,12 +4487,12 @@ async fn delegate_fails_for_unbound_profile() {
 }
 
 /// `delegate_fails_for_unknown_provider`: profile bound to a provider_id that
-/// doesn't exist in `settings.providers` → "provider not found: ...".
+/// doesn't exist in the SQL catalog → "provider not found: ...".
 #[tokio::test]
 async fn delegate_fails_for_unknown_provider() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (mut settings, seeds) = make_unbound_sidecar_settings();
     // Bind the profile to a provider that doesn't exist.
     settings
         .subagent
@@ -4481,7 +4500,7 @@ async fn delegate_fails_for_unknown_provider() {
         .get_mut("pi/search-cheap")
         .unwrap()
         .provider_id = Some("nonexistent".to_string());
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let err = sup
         .subagent_delegate(SubagentDelegateRequestDto {
@@ -4514,16 +4533,14 @@ async fn delegate_fails_for_unknown_provider() {
 async fn delegate_fails_for_disabled_provider() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (mut settings, mut seeds) = make_unbound_sidecar_settings();
     // Add a disabled provider + bind the profile to it.
-    settings.providers.push(ProviderConfig {
-        id: "disabled-prov".to_string(),
-        name: "Disabled Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.disabled.example.com/v1".to_string(),
-        api_key_env_name: "DISABLED_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
+    seeds.push(TestProviderSeed {
+        id: "disabled-prov",
+        name: "Disabled Provider",
+        base_url: "https://api.disabled.example.com/v1",
+        api_key_env_name: "DISABLED_API_KEY",
+        models: &["test-model"],
         enabled: false,
     });
     settings
@@ -4532,7 +4549,7 @@ async fn delegate_fails_for_disabled_provider() {
         .get_mut("pi/search-cheap")
         .unwrap()
         .provider_id = Some("disabled-prov".to_string());
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     // Seed SQL with the disabled provider so the SQL-backed delegate handler
     // can find it. The delegate validates provider existence + enabled flag
@@ -4579,7 +4596,7 @@ async fn delegate_fails_for_disabled_provider() {
 async fn delegate_fails_for_model_not_in_whitelist() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (mut settings, seeds) = make_unbound_sidecar_settings();
     // Bind the profile to the valid test-provider, but set its model to
     // something NOT in the provider's `["test-model"]` whitelist.
     {
@@ -4591,7 +4608,7 @@ async fn delegate_fails_for_model_not_in_whitelist() {
         profile.provider_id = Some("test-provider".to_string());
         profile.model = "wrong-model".to_string();
     }
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     // Seed SQL with test-provider (enabled) + test-model (enabled) so the
     // delegate's SQL-backed validation finds the provider but rejects the
@@ -4640,19 +4657,10 @@ async fn delegate_fails_for_model_not_in_whitelist() {
 async fn runtime_status_aggregates_multiple_workers() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (settings, mut seeds) = make_unbound_sidecar_settings();
     // Add a second enabled provider so the pool can spawn two workers.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-2".to_string(),
-        name: "Test Provider 2".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY_2".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    seeds.push(TEST_PROVIDER_2_SEED.clone());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     // construct_sidecar auto-spawns the FIRST enabled provider's worker.
     // Spawn the SECOND provider's worker via the pool to exercise the
@@ -4735,8 +4743,8 @@ async fn runtime_status_workers_empty_when_pool_none() {
 async fn provider_changed_removes_worker_then_respawns() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -4808,7 +4816,7 @@ async fn provider_update_respawn_picks_up_live_config() {
     // the provider must NOT exist in SQL before `provider_create`.
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, vec![]);
 
     let pool = sup
         .worker_pool()
@@ -4900,20 +4908,11 @@ async fn provider_update_respawn_picks_up_live_config() {
 async fn provider_deleted_removes_worker() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (settings, mut seeds) = make_unbound_sidecar_settings();
     // Add a second provider that NO profile references — `provider_delete`
     // rejects if any profile still references the provider.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-2".to_string(),
-        name: "Test Provider 2".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY_2".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    seeds.push(TEST_PROVIDER_2_SEED.clone());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -4966,8 +4965,8 @@ async fn provider_deleted_removes_worker() {
 async fn provider_update_with_api_key_removes_worker_then_respawns() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -5058,8 +5057,8 @@ fn is_process_alive(pid: u32) -> bool {
 async fn provider_update_kills_old_process() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -5522,19 +5521,10 @@ async fn write_usage_event_visible_in_overview_read_path() {
 async fn e2e_multi_provider_creates_separate_workers() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
+    let (settings, mut seeds) = make_sidecar_settings();
     // Add a second provider.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-2".to_string(),
-        name: "Test Provider 2".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY_2".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    seeds.push(TEST_PROVIDER_2_SEED.clone());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup.worker_pool().expect("worker_pool must be Some");
 
@@ -5568,7 +5558,7 @@ async fn e2e_auth_failure_kills_worker() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-auth-fail", 1000);
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     // The default profile model ("deepseek-chat") is NOT in the test
     // provider's whitelist (["test-model"]). Set it to "test-model" so the
     // delegate passes whitelist validation and reaches the executor (where
@@ -5583,7 +5573,7 @@ async fn e2e_auth_failure_kills_worker() {
     // (Task 7: reads from SQL) finds the provider, adds it to the pool's map,
     // and auto-spawns a worker. The api_key must be non-None so the pool
     // includes the provider.
-    seed_providers_from_settings(&db, &settings);
+    seed_test_providers(&db, &seeds);
     seed_model_to_db(&db, "test-provider", "test-model", true);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
@@ -5787,7 +5777,7 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-queued-bridge", 1000);
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     // The default profile model ("deepseek-chat") is NOT in the test
     // provider's whitelist (["test-model"]). Set it to "test-model" so the
     // delegate passes whitelist validation and the dispatcher can execute it.
@@ -5801,7 +5791,7 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
     // (Task 7: reads from SQL) finds the provider, adds it to the pool's map,
     // and auto-spawns a worker. The api_key must be non-None so the pool
     // includes the provider.
-    seed_providers_from_settings(&db, &settings);
+    seed_test_providers(&db, &seeds);
     seed_model_to_db(&db, "test-provider", "test-model", true);
     let paths = BusytokPaths::for_test(tmp.path());
     settings

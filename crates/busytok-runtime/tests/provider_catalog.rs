@@ -24,7 +24,7 @@
 //! backed by an in-memory SQLite database and a temp config dir.
 
 use busytok_config::{
-    BusytokPaths, BusytokSettings, ProviderConfig, ProviderKind, SubagentProfileConfig,
+    BusytokPaths, BusytokSettings, ProviderKind, SubagentProfileConfig,
 };
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
@@ -115,20 +115,6 @@ fn make_sidecar_config_for_tests() -> SidecarConfig {
 fn make_sidecar_settings() -> BusytokSettings {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
-    // Add a placeholder provider so the WorkerPool can construct. The actual
-    // provider catalog used by delegate validation is the SQL table — this
-    // settings entry just keeps the pool wiring happy.
-    settings.providers.push(ProviderConfig {
-        id: "pool-placeholder".to_string(),
-        name: "Pool Placeholder".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.placeholder.example.com/v1".to_string(),
-        api_key_env_name: "POOL_PLACEHOLDER_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["placeholder-model".to_string()],
-        enabled: true,
-    });
-    std::env::set_var("BUSYTOK_POOL_PLACEHOLDER_KEY", "placeholder");
     settings
 }
 
