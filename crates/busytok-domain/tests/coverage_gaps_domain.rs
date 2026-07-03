@@ -133,6 +133,7 @@ fn normalize_relative_path_returns_not_absolute_error() {
 }
 
 #[test]
+#[cfg(unix)]
 fn normalize_absolute_path_succeeds() {
     let result = normalize_project_path("/home/user/project").unwrap();
     assert_eq!(result, "/home/user/project");
@@ -141,6 +142,7 @@ fn normalize_absolute_path_succeeds() {
 // ── expand_tilde ("~" and "~/") ─────────────────────────────────────────
 
 #[test]
+#[cfg(unix)]
 fn normalize_tilde_only_expands_to_home() {
     // "~" alone should expand to the home directory (or remain "~" if
     // home_dir is unavailable).
@@ -161,6 +163,7 @@ fn normalize_tilde_only_expands_to_home() {
 }
 
 #[test]
+#[cfg(unix)]
 fn normalize_tilde_slash_path_expands() {
     // "~/foo" should expand to "$HOME/foo".
     let result = normalize_project_path("~/foo").unwrap();
@@ -181,6 +184,7 @@ fn normalize_tilde_slash_path_expands() {
 }
 
 #[test]
+#[cfg(unix)]
 fn normalize_tilde_backslash_path_expands_on_unix() {
     // "~\\foo" starts with "~\" which also triggers expansion.
     // On Unix, the backslash is a normal path character.
@@ -192,6 +196,7 @@ fn normalize_tilde_backslash_path_expands_on_unix() {
 // ── normalize_path_components CurDir / ParentDir ────────────────────────
 
 #[test]
+#[cfg(unix)]
 fn normalize_resolves_current_dir_segments() {
     // "/foo/./bar" → "/foo/bar" (CurDir is skipped).
     let result = normalize_project_path("/foo/./bar").unwrap();
@@ -199,6 +204,7 @@ fn normalize_resolves_current_dir_segments() {
 }
 
 #[test]
+#[cfg(unix)]
 fn normalize_resolves_parent_dir_segments() {
     // "/foo/bar/../baz" → "/foo/baz" (ParentDir pops the last component).
     let result = normalize_project_path("/foo/bar/../baz").unwrap();
@@ -206,6 +212,7 @@ fn normalize_resolves_parent_dir_segments() {
 }
 
 #[test]
+#[cfg(unix)]
 fn normalize_resolves_multiple_parent_dirs() {
     // "/a/b/c/../../d" → "/a/d".
     let result = normalize_project_path("/a/b/c/../../d").unwrap();
@@ -213,6 +220,7 @@ fn normalize_resolves_multiple_parent_dirs() {
 }
 
 #[test]
+#[cfg(unix)]
 fn normalize_preserves_double_slash_as_curdir() {
     // "//foo" on Unix has a RootDir followed by "foo" — the empty
     // component between slashes is treated as CurDir and skipped.
