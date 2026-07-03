@@ -2383,38 +2383,50 @@ export function useModelMutations() {
 
 **3e. 删除 `modelsLabel` 辅助函数（第 25-27 行）**——models 不再在 provider 上。
 
-- [ ] **Step 4: 创建 ModelsSection 组件**
+- [ ] **Step 4: 创建 ModelsSection 组件（必须基于 Step 2 的 hooks）**
+
+> **强制约束：** `ModelsSection` 必须基于 Step 2 新增的 `useModels` / `useModelMutations` hooks 实现，**不允许**在组件内直接调用 `busytokClient.modelList` / `modelCreate` 等裸 RPC，也不允许手写 `useEffect` + 本地 `models` state 来管理查询缓存。查询缓存/失效/加载态/错误态全部由 React Query（通过 hooks）托管，与 `ProvidersPage` / `ProfilesSection` 的现有模式一致——这是 spec §1"复用现有基础设施"的硬性要求。手写 RPC fetch 状态机会重新引入一套与仓库其他页面不一致的查询模型，属于被禁止的反模式。
 
 `apps/gui/src/components/ModelsSection.tsx`:
 
 ```tsx
-import { useEffect, useState } from "react";
-import { busytokClient } from "../api/busytokClient";
-import type { ModelCatalogEntryDto } from "@busytok/protocol-types";
+import { useState } from "react";
+import { useModels, useModelMutations } from "../api/useBusytokData";
 
 export function ModelsSection() {
-  const [models, setModels] = useState<ModelCatalogEntryDto[]>([]);
+  // 本地 state 只放 filter UI 输入值——不放查询结果。
   const [filterProvider, setFilterProvider] = useState<string>("");
   const [filterTag, setFilterTag] = useState<string>("");
   const [showAll, setShowAll] = useState(false);
 
-  const refresh = async () => {
-    const tags = filterTag ? filterTag.split(",").map(t => t.trim()).filter(Boolean) : [];
-    const resp = await busytokClient.modelList({
-      provider_id: filterProvider || null,
-      tags,
-      include_disabled: showAll,
-    });
-    setModels(resp.models);
-  };
+  const tags = filterTag
+    ? filterTag.split(",").map((t) => t.trim()).filter(Boolean)
+    : [];
 
-  useEffect(() => { refresh(); }, [filterProvider, filterTag, showAll]);
+  // 查询缓存、加载态、错误态、失效全部由 React Query 托管。
+  const modelsQuery = useModels({
+    providerId: filterProvider || undefined,
+    tags,
+    includeDisabled: showAll,
+  });
+  const { create, update, delete: del, tagsUpdate } = useModelMutations();
+
+  if (modelsQuery.isLoading) return <PageState kind="loading" title="Models" message="Loading models..." />;
+  if (modelsQuery.isError) return <PageState kind="error" title="Models" message="Failed to load models" />;
+
+  const models = modelsQuery.data?.models ?? [];
 
   // ... render table with: provider_name, model_id, enabled, tags, delete/toggle buttons
+  //     - toggle enabled → update.mutate({ id, enabled: !current })
+  //     - delete → del.mutate(id)
+  //     - tags edit → tagsUpdate.mutate(modelId, newTags)
   // ... render create form: provider select, model_id input, tags input
-  // ... render tag edit inline
+  //     - submit → create.mutate({ provider_id, model_id, enabled: true, tags })
+  //     - onSuccess 由 useModelMutations 内部 invalidate ["models"] 自动刷新
 }
 ```
+
+> **关键点：** 组件内没有 `useEffect`、没有 `models` state、没有 `busytokClient.*` 直接调用。mutation 的 `onSuccess` invalidate 已在 `useModelMutations` 内部处理（Step 2），组件无需手动 `refetch()`。
 
 - [ ] **Step 5: 重写 ProfilesSection —— 5 条旧逻辑全切换到 SQL catalog**
 
@@ -2677,13 +2689,24 @@ grep 确认以下 event_code 在代码库中存在：
 
 对于缺失的 `provider.sql_read_failed` / `provider.sql_write_failed` / `model.sql_read_failed` / `model.sql_write_failed`，在 supervisor handler 的 error path 中添加 `tracing::error!` 日志（在 `?` 之前）。
 
-- [ ] **Step 6: 运行全部测试 + 覆盖率**
+- [ ] **Step 6: 运行全部测试 + 覆盖率（Rust + GUI 双门禁）**
+
+> **总收尾门禁必须同时跑 Rust 和 GUI 两条覆盖率命令**，不能只跑 Rust。中途门禁（Task 9 Step 7）已经把 GUI 收紧到 `test:coverage`，最终收尾必须保持一致，否则只跑最后一步的人会漏掉 GUI 90% 线覆盖验证。两条命令均为仓库现成脚本（见根 `package.json:12-13`）。
+
+**6a. Rust 全量测试 + 覆盖率：**
 
 Run: `cargo test --workspace -- --nocapture`
 Expected: 全部 PASS
 
-Run: `cargo llvm-cov --workspace --html`（或仓库现有覆盖率命令）
-Expected: 变更文件覆盖率 ≥ 90%
+Run: `pnpm coverage:rust`（= `cargo llvm-cov --workspace --fail-under-lines 90`，见根 `package.json:13`）
+Expected: 变更文件覆盖率 ≥ 90%，命令退出码 0
+
+**6b. GUI 全量测试 + 覆盖率：**
+
+Run: `pnpm coverage:gui`（= `pnpm --filter @busytok/gui test -- --coverage.enabled true --coverage.thresholds.lines 90`，见根 `package.json:12`）
+Expected: vitest 全部 PASS，coverage lines ≥ 90%，命令退出码 0
+
+> 两条命令任一失败即视为 Task 10 未完成，必须修复后重新跑。`cargo llvm-cov --workspace --html`（无 `--fail-under-lines`）或 `pnpm run build` 均不构成验收。
 
 - [ ] **Step 7: Commit**
 
@@ -2716,7 +2739,8 @@ git commit -m "chore: remove ProviderConfig/keychain/env-name remnants + add gre
 | include_disabled 过滤 provider + model | Task 2 (SQL + 测试) |
 | 日志事件 | Task 2/5/6 (info!) + Task 10 (error! + 审计) |
 | grep 断言（walkdir，不依赖 rg） | Task 10 Step 4 |
-| 覆盖率 ≥ 90% | Task 10 Step 6 |
+| 覆盖率 ≥ 90%（Rust + GUI 双门禁） | Task 9 Step 7 (GUI 中途门禁) + Task 10 Step 6 (Rust + GUI 总收尾门禁，`pnpm coverage:rust` + `pnpm coverage:gui`) |
+| ModelsSection 基于 hooks（禁止手写 RPC fetch） | Task 9 Step 4 (强制 `useModels` / `useModelMutations`，无 `useEffect` / 本地 state / `busytokClient.*` 裸调用) |
 | provider id 系统生成（UUID v4，不由用户提供） | Task 1 (注释) + Task 2 (CreateProviderReq 无 id + create_provider 生成 UUID) + Task 3 (ProviderCreateRequestDto 无 id) + Task 5 (provider_create 不校验 id) + Task 5 Step 4 (supervisor_control.rs 删除 id 校验测试) |
 | ProviderCreateRequestDto 含 provider_kind 字段 | Task 3 (DTO) + Task 5 (provider_create 用 req.provider_kind) |
 | api_key 三态 Option<Option<String>> | Task 2 (UpdateProviderPatch + update_provider) + Task 3 (ProviderUpdateRequestDto) + Task 5 (provider_update 透传) |
@@ -2878,4 +2902,35 @@ git commit -m "chore: remove ProviderConfig/keychain/env-name remnants + add gre
 - Self-Review 检查表新增 4 行覆盖 R2 修复项。
 - Task 9 Files 列表新增 `useBusytokData.ts` + 3 个测试文件。
 - Task 9 步骤数从 6 增至 9（Step 2 hooks / Step 5 ProfilesSection 5 条 / Step 6 测试 / Step 7 coverage / Step 8 typecheck+build）。
+
+---
+
+## Review Fix Log (R3 — 用户两点打磨)
+
+> 本节记录用户在 R2 修复后指出的 2 个 P2 问题（2026-07-03），全部已修复。
+
+### P2-1: Task 9 Step 4 ModelsSection 必须基于 hooks（禁止手写 RPC）
+
+- **问题：** R2 plan 在 Task 9 Step 2 专门新增了 `useModels` / `useModelMutations` hooks（正确），但 Step 4 的 `ModelsSection` 示例又退回 `busytokClient.modelList` + `useEffect` + 本地 `models` state 的手写 RPC fetch 状态机。这与 spec §1"复用现有基础设施"自相矛盾——`ProvidersPage` / `ProfilesSection` 都走 React Query hooks，唯独 `ModelsSection` 手写一套，查询缓存/失效/加载态/错误态各写一遍，工程师容易照抄示例。
+- **修复：**
+  - Task 9 Step 4 标题改为"创建 ModelsSection 组件（必须基于 Step 2 的 hooks）"。
+  - 顶部加"强制约束"callout：禁止直接调用 `busytokClient.*` 裸 RPC、禁止手写 `useEffect` + 本地 `models` state；查询缓存/失效/加载态/错误态全部由 React Query（通过 hooks）托管。
+  - 示例代码重写：本地 state 只放 filter UI 输入值；查询走 `useModels({...})`；mutation 走 `useModelMutations()` 的 `create` / `update` / `delete` / `tagsUpdate`；加载态/错误态用 `modelsQuery.isLoading` / `isError`。
+  - 末尾加"关键点"说明：组件内无 `useEffect` / 无 `models` state / 无 `busytokClient.*` 直接调用；mutation `onSuccess` invalidate 已在 `useModelMutations` 内部处理。
+
+### P2-2: Task 10 Step 6 总收尾加入 GUI coverage 门禁
+
+- **问题：** R2 plan 在 Task 9 已经把 GUI 中途门禁收紧到 `pnpm --filter @busytok/gui test:coverage`，但 Task 10 Step 6 总收尾仍只有 `cargo test --workspace` + `cargo llvm-cov --workspace --html`（无 `--fail-under-lines`）。最终验收和中途门禁脱节，只跑最后一步的人会漏掉 GUI 90% 线覆盖验证。
+- **修复：**
+  - Task 10 Step 6 标题改为"运行全部测试 + 覆盖率（Rust + GUI 双门禁）"。
+  - 顶部加 callout 说明必须同时跑 Rust 和 GUI 两条命令，引用根 `package.json:12-13`。
+  - 拆为 6a（Rust）和 6b（GUI）两个子步骤：
+    - 6a：`cargo test --workspace -- --nocapture` + `pnpm coverage:rust`（= `cargo llvm-cov --workspace --fail-under-lines 90`）
+    - 6b：`pnpm coverage:gui`（= `pnpm --filter @busytok/gui test -- --coverage.enabled true --coverage.thresholds.lines 90`）
+  - 末尾说明：两条命令任一失败即视为 Task 10 未完成；`cargo llvm-cov --workspace --html`（无 `--fail-under-lines`）或 `pnpm run build` 均不构成验收。
+
+### R3 内部一致性同步
+
+- Self-Review 检查表更新："覆盖率 ≥ 90%" 行改为"覆盖率 ≥ 90%（Rust + GUI 双门禁）"，覆盖 Task 9 Step 7 + Task 10 Step 6。
+- Self-Review 检查表新增一行："ModelsSection 基于 hooks（禁止手写 RPC fetch）" 覆盖 Task 9 Step 4。
 
