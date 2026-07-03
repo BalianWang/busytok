@@ -8,6 +8,10 @@
 //! `Default` impl — neither of which is reached by the existing
 //! `platform_paths.rs` integration tests.
 
+// All tests in this file exercise macOS-only methods (`with_home_dir`,
+// `resolve_home_dir`) that don't exist on the `unsupported` or `windows`
+// PlatformPaths. The entire binary is skipped on non-macOS targets.
+#![cfg(target_os = "macos")]
 #![allow(
     clippy::await_holding_lock,
     clippy::too_many_arguments,
