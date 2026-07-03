@@ -14,6 +14,7 @@ pub mod generation_queries;
 pub mod live_queries;
 pub mod outbox_queries;
 pub mod prompt_entries;
+pub mod provider_catalog;
 pub mod read_models;
 pub mod read_queries;
 pub mod repository;
@@ -28,6 +29,12 @@ pub use prompt_entries::{
     PromptSortRow, PromptUseFailureReasonRow, PromptUseOutcomeRow, PromptUseResultRow,
     PromptUseRow, PromptUseSurfaceRow, UpdatePromptEntryRow,
 };
+pub use provider_catalog::{
+    CreateModelReq, CreateProviderReq, ModelCatalogEntry, ModelCatalogFilter, UpdateModelPatch,
+    UpdateProviderPatch,
+};
+// Re-export domain types that store consumers need
+pub use busytok_domain::{Model, ModelTag, ProfileModelRef, Provider, ProviderKind, ProviderSummary};
 pub use read_models::DailyUsageTrendRow;
 pub use repository::{
     CodexTokenSnapshotRow, DailyUsageRow, DiagnosticEventRow, LogFileRow, LogSourceRow,

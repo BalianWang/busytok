@@ -2,7 +2,7 @@
 ///
 /// The baseline schema is applied as a single migration when a new database
 /// is created. Future schema changes will increment from v1.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// SQL to create the schema version tracking table.
 pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
@@ -35,6 +35,11 @@ const SUBAGENT_TASK_FIELDS_SQL: &str = include_str!("../migrations/0004_subagent
 const SUBAGENT_TASK_ERROR_KIND_SQL: &str =
     include_str!("../migrations/0005_subagent_task_error_kind.sql");
 
+/// v6 provider-catalog migration SQL — creates the `providers`, `models`, and
+/// `model_tags` tables that replace settings.toml provider persistence +
+/// keychain credential storage.
+const PROVIDER_CATALOG_SQL: &str = include_str!("../migrations/0006_provider_catalog.sql");
+
 /// All migrations in order, from the v1 baseline through the latest version.
 pub fn migrations() -> Vec<(u32, &'static str)> {
     vec![
@@ -43,5 +48,6 @@ pub fn migrations() -> Vec<(u32, &'static str)> {
         (3, SUBAGENT_SQL),
         (4, SUBAGENT_TASK_FIELDS_SQL),
         (5, SUBAGENT_TASK_ERROR_KIND_SQL),
+        (6, PROVIDER_CATALOG_SQL),
     ]
 }
