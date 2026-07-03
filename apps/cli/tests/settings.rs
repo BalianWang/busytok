@@ -48,10 +48,16 @@ fn settings_snapshot_is_recognized() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Should either succeed or fail with a connection error (not a clap error).
+    // Should either succeed or fail with a connection/RPC error (not a clap
+    // parse error). A read_timeout occurs when a stale service socket exists
+    // but the service is unresponsive — still proof the subcommand was
+    // recognized and dispatched to the RPC layer.
     if !output.status.success() {
         assert!(
-            stderr.contains("connecting to Busytok service") || stderr.contains("is it running?"),
+            stderr.contains("connecting to Busytok service")
+                || stderr.contains("is it running?")
+                || stderr.contains("RPC error")
+                || stderr.contains("read_timeout"),
             "unexpected error: {stderr}"
         );
     }
