@@ -307,10 +307,10 @@ export function ProfilesSection() {
       id: editingId,
       provider_id: editProviderId, // empty string = unbind
       model: editModel,
-      tools: undefined,
-      context_budget_tokens: undefined,
-      timeout_seconds: undefined,
-      write_access: undefined,
+      tools: null,
+      context_budget_tokens: null,
+      timeout_seconds: null,
+      write_access: null,
     };
     updateProfile.mutate(req, {
       onSuccess: () => {

@@ -260,6 +260,18 @@ fn atomic_write_overwrites_existing_file() {
 
 // ── prune_old_logs branches ─────────────────────────────────────────────
 
+/// Sets a file's modification time. On Windows, `File::open` (read-only)
+/// cannot set file times — `SetFileTime` requires write access. This helper
+/// opens with `write(true)` so `set_modified` works on all platforms.
+/// Returns `false` if setting mtime is unsupported (test should skip).
+fn set_mtime(path: &std::path::Path, time: SystemTime) -> bool {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(time))
+        .is_ok()
+}
+
 #[test]
 fn prune_removes_old_rotated_file() {
     // Cover the `mtime < cutoff` branch + `remove_file` call.
@@ -269,8 +281,12 @@ fn prune_removes_old_rotated_file() {
 
     // Set mtime to 30 days ago so prune (keep_days=7) removes it.
     let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 86400);
-    let f = fs::File::open(&old).unwrap();
-    f.set_modified(thirty_days_ago).ok();
+    // set_modified can fail on some platforms; skip the test if it does —
+    // the test's premise depends on an old mtime.
+    if !set_mtime(&old, thirty_days_ago) {
+        eprintln!("skip: cannot set file mtime on this platform");
+        return;
+    }
 
     prune_old_logs(dir.path(), 7);
     assert!(!old.exists(), "old rotated log should be removed");
@@ -285,8 +301,12 @@ fn prune_keeps_file_without_dot_extension() {
     // Force an old mtime so the file would qualify for removal if it matched
     // the rotated-file pattern.
     let old = SystemTime::now() - Duration::from_secs(30 * 86400);
-    let f = fs::File::open(&no_dot).unwrap();
-    f.set_modified(old).ok();
+    // If set_mtime fails, the file is kept as recent — the test still passes
+    // but doesn't cover the intended branch. Skip for coverage correctness.
+    if !set_mtime(&no_dot, old) {
+        eprintln!("skip: cannot set file mtime on this platform");
+        return;
+    }
 
     prune_old_logs(dir.path(), 7);
     assert!(no_dot.exists(), "file without dot must be kept");
@@ -299,8 +319,10 @@ fn prune_keeps_file_with_short_date_suffix() {
     let short = dir.path().join("service.log.2020");
     fs::write(&short, "test").unwrap();
     let old = SystemTime::now() - Duration::from_secs(30 * 86400);
-    let f = fs::File::open(&short).unwrap();
-    f.set_modified(old).ok();
+    if !set_mtime(&short, old) {
+        eprintln!("skip: cannot set file mtime on this platform");
+        return;
+    }
 
     prune_old_logs(dir.path(), 7);
     assert!(short.exists(), "file with short date suffix must be kept");
@@ -313,8 +335,10 @@ fn prune_keeps_file_with_invalid_date_format() {
     let bad = dir.path().join("service.log.abcdefghij");
     fs::write(&bad, "test").unwrap();
     let old = SystemTime::now() - Duration::from_secs(30 * 86400);
-    let f = fs::File::open(&bad).unwrap();
-    f.set_modified(old).ok();
+    if !set_mtime(&bad, old) {
+        eprintln!("skip: cannot set file mtime on this platform");
+        return;
+    }
 
     prune_old_logs(dir.path(), 7);
     assert!(bad.exists(), "file with non-date suffix must be kept");
@@ -475,12 +499,22 @@ fn sidecar_bundled_node_path_includes_arch() {
 
     let got = paths.sidecar_bundled_node_path(Some("/custom"));
     let s = got.to_string_lossy().into_owned();
-    assert!(s.starts_with("/custom/node/"));
+    // Path components: <runtime_dir>/node/<arch>/node — verify each piece using
+    // Path methods (not string comparison) so it works on Windows where the
+    // separator is `\` and the prefix becomes `\custom\node\...`.
+    assert!(
+        got.starts_with(PathBuf::from("/custom").join("node")),
+        "path must start with /custom/node: {s}"
+    );
     assert!(
         s.contains(std::env::consts::ARCH),
         "path must include current arch: {s}"
     );
-    assert!(s.ends_with("/node"), "path must end with /node: {s}");
+    assert_eq!(
+        got.file_name(),
+        Some(std::ffi::OsStr::new("node")),
+        "path must end with node component: {s}"
+    );
 }
 
 // ── init_logging smoke test ─────────────────────────────────────────────

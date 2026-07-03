@@ -571,7 +571,7 @@ describe("SettingsPage additional coverage", () => {
       failure_reason: "platform_restriction",
       retry_count: 0,
     });
-    setPromptPaletteShortcutStatus({ state: "failed" });
+    setPromptPaletteShortcutStatus({ state: "failed", message: "platform_restriction" });
     mockPage();
 
     render(<SettingsPage />);
