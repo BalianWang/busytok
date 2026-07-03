@@ -28,6 +28,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serial_test::serial;
 use busytok_config::BusytokPaths;
 use busytok_domain::{
     now_ms, AgentKind, NormalizedUsageEvent, OperationalDiagnosticEvent, ToolEvent,
@@ -1289,6 +1290,7 @@ async fn read_service_read_outcome_with_row_count_logs_count() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn service_app_run_setup_executes_and_can_be_aborted() {
     // Boot the service, spawn run() in a LocalSet task, sleep briefly to let
     // the setup stages execute, then abort the task.
@@ -1334,6 +1336,7 @@ async fn service_app_run_setup_executes_and_can_be_aborted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn service_app_boot_then_run_quickly_aborts_covers_setup() {
     // Additional coverage: verify that boot() + run() setup completes
     // without panicking even when aborted quickly. This is a second
@@ -1372,6 +1375,7 @@ async fn service_app_boot_then_run_quickly_aborts_covers_setup() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn service_app_run_timeout_covers_setup_stages_5_to_9() {
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = BusytokPaths::for_test(dir.path());
