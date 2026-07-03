@@ -1,12 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { RangePresetDto, ReadinessStateDto } from "@busytok/protocol-types";
 
-const { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, mockClient } = vi.hoisted(() => {
+const { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, invalidateQueriesSpy, mockClient } = vi.hoisted(() => {
   const useQuerySpy = vi.fn();
   const useMutationSpy = vi.fn();
   const prefetchQuerySpy = vi.fn();
+  const invalidateQueriesSpy = vi.fn();
+  // Return a shared `invalidateQueries` so tests can assert against it
+  // regardless of how many times `useQueryClient()` is called.
   const useQueryClientSpy = vi.fn(() => ({
-    invalidateQueries: vi.fn(),
+    invalidateQueries: invalidateQueriesSpy,
     prefetchQuery: prefetchQuerySpy,
   }));
   const mockClient = {
@@ -31,8 +34,13 @@ const { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, mockCl
     promptsDelete: vi.fn(),
     promptsUse: vi.fn(),
     liveWindow: vi.fn(),
+    modelList: vi.fn(),
+    modelCreate: vi.fn(),
+    modelUpdate: vi.fn(),
+    modelDelete: vi.fn(),
+    modelTagsUpdate: vi.fn(),
   };
-  return { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, mockClient };
+  return { useQuerySpy, useMutationSpy, prefetchQuerySpy, useQueryClientSpy, invalidateQueriesSpy, mockClient };
 });
 
 vi.mock("@tanstack/react-query", () => ({
@@ -62,12 +70,20 @@ import {
   useOverviewHeatmap,
   useOverviewRankings,
   useShellStatus,
+  useModels,
+  useModelMutations,
 } from "./useBusytokData";
+import { queryKeys } from "./queryKeys";
 
 describe("useBusytokData", () => {
   beforeEach(() => {
     useQuerySpy.mockReset();
     prefetchQuerySpy.mockReset();
+    useMutationSpy.mockReset();
+    invalidateQueriesSpy.mockReset();
+    // Clear call history on mockClient methods so tests that invoke
+    // queryFn/mutationFn start from a clean slate.
+    vi.clearAllMocks();
   });
 
   it("exports shared envelope query options that retain stale data and skip polling", () => {
@@ -232,5 +248,74 @@ describe("useBusytokData", () => {
     expect(options.queryKey[0]).toBe("breakdown");
     expect(options.queryKey[1]).toBe("detail");
     expect("refetchInterval" in options).toBe(false);
+  });
+
+  // ── Models (SQL catalog, Task 9 Step 2) ──────────────────────────
+
+  it("useModels builds the request from the filter and gates on `enabled`", () => {
+    useModels({ providerId: "deepseek", tags: ["chat"], includeDisabled: true, enabled: true });
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.queryKey).toEqual(
+      queryKeys.modelsList({ provider_id: "deepseek", tags: ["chat"], include_disabled: true }),
+    );
+    expect(options.enabled).toBe(true);
+    expect(options.staleTime).toBe(30_000);
+    // queryFn invokes client.modelList with the assembled request.
+    expect(mockClient.modelList).not.toHaveBeenCalled();
+    options.queryFn();
+    expect(mockClient.modelList).toHaveBeenCalledWith({
+      provider_id: "deepseek",
+      tags: ["chat"],
+      include_disabled: true,
+    });
+  });
+
+  it("useModels defaults: no providerId → null, empty tags → [], includeDisabled → false, enabled → true", () => {
+    useModels();
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.enabled).toBe(true);
+    options.queryFn();
+    expect(mockClient.modelList).toHaveBeenCalledWith({
+      provider_id: null,
+      tags: [],
+      include_disabled: false,
+    });
+  });
+
+  it("useModels respects enabled=false (no fetch)", () => {
+    useModels({ providerId: "deepseek", enabled: false });
+    const options = useQuerySpy.mock.calls[0][0];
+    expect(options.enabled).toBe(false);
+  });
+
+  it("useModelMutations wires four mutations that each call the right client method and invalidate the catalog", () => {
+    useModelMutations();
+
+    expect(useMutationSpy).toHaveBeenCalledTimes(4);
+    const calls = useMutationSpy.mock.calls.map((c) => c[0]);
+
+    // createModel
+    calls[0].mutationFn({ provider_id: "p", model_id: "m", enabled: true, tags: [] });
+    expect(mockClient.modelCreate).toHaveBeenCalledWith({ provider_id: "p", model_id: "m", enabled: true, tags: [] });
+    calls[0].onSuccess();
+    expect(invalidateQueriesSpy).toHaveBeenCalledWith({ queryKey: queryKeys.models() });
+
+    // updateModel
+    calls[1].mutationFn({ id: "m-1", enabled: false });
+    expect(mockClient.modelUpdate).toHaveBeenCalledWith({ id: "m-1", enabled: false });
+    calls[1].onSuccess();
+
+    // deleteModel
+    calls[2].mutationFn("m-1");
+    expect(mockClient.modelDelete).toHaveBeenCalledWith("m-1");
+    calls[2].onSuccess();
+
+    // tagsUpdate
+    calls[3].mutationFn({ modelId: "deepseek-chat", tags: ["chat"] });
+    expect(mockClient.modelTagsUpdate).toHaveBeenCalledWith("deepseek-chat", ["chat"]);
+    calls[3].onSuccess();
+
+    // All four onSuccess callbacks invalidate the models catalog.
+    expect(invalidateQueriesSpy).toHaveBeenCalledTimes(4);
   });
 });

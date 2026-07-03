@@ -9,6 +9,7 @@ import type {
   ActivityDetailRequestDto,
   BreakdownListRequestDto,
   BreakdownDetailRequestDto,
+  ModelListRequestDto,
   PromptGetRequestDto,
   PromptListQueryDto,
 } from "@busytok/protocol-types";
@@ -47,6 +48,14 @@ export const queryKeys = {
 
   // ── Providers ─────────────────────────────────────────────────────
   providers: () => ["providers"] as const,
+
+  // ── Models (SQL catalog) ──────────────────────────────────────────
+  // `models()` is the invalidation root; `modelsList(request)` is the
+  // per-filter read key. Both must be used together so mutations
+  // invalidate every cached list regardless of filter.
+  models: () => ["models"] as const,
+  modelsList: (request: ModelListRequestDto) =>
+    ["models", "list", request] as const,
 
   // ── Subagent runtime status (envelope) ────────────────────────────
   subagentRuntimeStatus: () => ["subagents", "runtime_status"] as const,

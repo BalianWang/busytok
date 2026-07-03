@@ -44,6 +44,11 @@ import type {
   ProviderUpdateRequestDto,
   ProfileCreateRequestDto,
   ProfileUpdateRequestDto,
+  ModelCatalogEntryDto,
+  ModelCreateRequestDto,
+  ModelListRequestDto,
+  ModelListResponseDto,
+  ModelUpdateRequestDto,
   ReceiptDailyDto,
   SettingsSnapshotDto,
   SettingsDiagnosticsDto,
@@ -401,6 +406,79 @@ export function useProviderMutations() {
   });
 
   return { createProvider, updateProvider, deleteProvider, testConnection };
+}
+
+// ── Models (SQL catalog) ────────────────────────────────────────────
+
+/**
+ * Filter argument for `useModels`. `providerId` is optional; when omitted
+ * the query lists models across all providers. The query is gated on
+ * `providerId` being a non-empty string so the catalog page can mount
+ * the hook unconditionally without firing a useless cross-provider fetch
+ * when only a single provider's models are wanted.
+ */
+export interface UseModelsFilter {
+  providerId?: string;
+  tags?: string[];
+  includeDisabled?: boolean;
+  /**
+   * When `false` (default), the query is disabled entirely (no fetch).
+   * Callers that always want the query active can pass `true`; callers
+   * that need to skip fetches when the filter is empty (e.g. ProfilesSection
+   * has no selected provider) pass `false`.
+   */
+  enabled?: boolean;
+}
+
+export function useModels(filter: UseModelsFilter = {}) {
+  const client = useBusytokClient();
+  const request: ModelListRequestDto = {
+    provider_id: filter.providerId ? filter.providerId : null,
+    tags: filter.tags ?? [],
+    include_disabled: filter.includeDisabled ?? false,
+  };
+  // `enabled` defaults to true; ProfilesSection passes `!!providerId` so
+  // an unbound editing row does not trigger a fetch.
+  const isEnabled = filter.enabled ?? true;
+  return useQuery<ModelListResponseDto>({
+    queryKey: queryKeys.modelsList(request),
+    queryFn: () => client.modelList(request),
+    enabled: isEnabled,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * Model CRUD + tag mutations. All four invalidate `queryKeys.models()`
+ * (the catalog root) so every cached list refetches on change. Provider
+ * cache is NOT invalidated — `ProviderDto` no longer carries `models[]`
+ * (Task 3 removed it), so a provider mutation is never a side-effect of
+ * a model write.
+ */
+export function useModelMutations() {
+  const client = useBusytokClient();
+  const queryClient = useQueryClient();
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: queryKeys.models() });
+
+  const createModel = useMutation<ModelCatalogEntryDto, Error, ModelCreateRequestDto>({
+    mutationFn: (req) => client.modelCreate(req),
+    onSuccess: invalidate,
+  });
+  const updateModel = useMutation<void, Error, ModelUpdateRequestDto>({
+    mutationFn: (req) => client.modelUpdate(req),
+    onSuccess: invalidate,
+  });
+  const deleteModel = useMutation<void, Error, string>({
+    mutationFn: (id) => client.modelDelete(id),
+    onSuccess: invalidate,
+  });
+  const tagsUpdate = useMutation<void, Error, { modelId: string; tags: string[] }>({
+    mutationFn: (req) => client.modelTagsUpdate(req.modelId, req.tags),
+    onSuccess: invalidate,
+  });
+
+  return { createModel, updateModel, deleteModel, tagsUpdate };
 }
 
 // ── Profiles (Phase 4) ───────────────────────────────────────────────

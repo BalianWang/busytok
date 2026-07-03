@@ -44,6 +44,11 @@ import type {
   ProfileCreateRequestDto,
   ProfileDto,
   ProfileUpdateRequestDto,
+  ModelCatalogEntryDto,
+  ModelCreateRequestDto,
+  ModelListRequestDto,
+  ModelListResponseDto,
+  ModelUpdateRequestDto,
   ReceiptDailyDto,
   ReceiptDailyRequestDto,
   ReadEnvelopeDto,
@@ -184,6 +189,20 @@ export function createBusytokClient(deps: { invoke: InvokeFn }) {
       call<void>("provider.delete", { id }),
     providerTestConnection: (id: string) =>
       call<ProviderTestConnectionResponseDto>("provider.test_connection", { id }),
+
+    // Models — bare DTOs (not wrapped). `modelDelete` and `modelTagsUpdate`
+    // take primitive args and build the wire payload inline; the other three
+    // accept the canonical request DTOs.
+    modelList: (request: ModelListRequestDto) =>
+      call<ModelListResponseDto>("model.list", { ...request }),
+    modelCreate: (request: ModelCreateRequestDto) =>
+      call<ModelCatalogEntryDto>("model.create", { ...request }),
+    modelUpdate: (request: ModelUpdateRequestDto) =>
+      call<void>("model.update", { ...request }),
+    modelDelete: (id: string) =>
+      call<void>("model.delete", { id }),
+    modelTagsUpdate: (modelId: string, tags: string[]) =>
+      call<void>("model.tags.update", { model_id: modelId, tags }),
 
     // Profiles (Phase 4) — bare DTOs (not envelope-wrapped), mirroring provider pattern.
     // Read path: profiles come via settings.snapshot (subagent.profiles[]).
