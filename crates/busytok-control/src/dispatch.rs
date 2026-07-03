@@ -193,6 +193,33 @@ pub trait RuntimeControl: Send + Sync {
         &self,
         req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto>;
+    async fn subagent_runtime_status(
+        &self,
+        req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    >;
+
+    // Providers (Phase 1: Credential Foundation)
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto>;
+    async fn provider_list(&self) -> Result<ProviderListResponseDto>;
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto>;
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()>;
+    async fn provider_test_connection(
+        &self,
+        req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto>;
+
+    // Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto>;
+
+    // Profiles (Phase 4: Profile/Model Configuration UI)
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto>;
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> Result<ProfileDto>;
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> Result<()>;
 
     // Events (kept from Phase 1)
     fn event_bus(&self) -> &AppEventBus;
@@ -490,6 +517,76 @@ impl ControlDispatcher {
                     .map_err(|e| anyhow::anyhow!("invalid params for subagent.delete: {e}"))?;
                 let dto = self.runtime.subagent_delete(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.runtime_status" => {
+                let req: SubagentRuntimeStatusRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| {
+                    anyhow::anyhow!("invalid params for subagent.runtime_status: {e}")
+                })?;
+                let dto = self.runtime.subagent_runtime_status(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Providers (Phase 1: Credential Foundation)
+            "provider.create" => {
+                let req: ProviderCreateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for provider.create: {e}"))?;
+                let dto = self.runtime.provider_create(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "provider.list" => {
+                let dto = self.runtime.provider_list().await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "provider.update" => {
+                let req: ProviderUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for provider.update: {e}"))?;
+                let dto = self.runtime.provider_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "provider.delete" => {
+                let req: ProviderDeleteRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for provider.delete: {e}"))?;
+                self.runtime.provider_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
+            }
+            "provider.test_connection" => {
+                let req: ProviderTestConnectionRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid params for provider.test_connection: {e}")
+                    })?;
+                let dto = self.runtime.provider_test_connection(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
+            "pi_sidecar_locator_update" => {
+                let req: PiSidecarLocatorUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid params for pi_sidecar_locator_update: {e}")
+                    })?;
+                let dto = self.runtime.pi_sidecar_locator_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Profiles (Phase 4: Profile/Model Configuration UI)
+            "profile.create" => {
+                let req: ProfileCreateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for profile.create: {e}"))?;
+                let dto = self.runtime.profile_create(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "profile.update" => {
+                let req: ProfileUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for profile.update: {e}"))?;
+                let dto = self.runtime.profile_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "profile.delete" => {
+                let req: ProfileDeleteRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for profile.delete: {e}"))?;
+                self.runtime.profile_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
             }
 
             _ => {
@@ -900,6 +997,10 @@ impl RuntimeControl for TestRuntimeControl {
                 subagent: None,
             },
             recovery_actions: vec![],
+            subagent: SettingsSubagentDto {
+                enabled: true,
+                profiles: vec![],
+            },
         }))
     }
 
@@ -936,6 +1037,10 @@ impl RuntimeControl for TestRuntimeControl {
                 subagent: None,
             },
             recovery_actions: vec![],
+            subagent: SettingsSubagentDto {
+                enabled: true,
+                profiles: vec![],
+            },
         }))
     }
 
@@ -1096,6 +1201,77 @@ impl RuntimeControl for TestRuntimeControl {
         _req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto> {
         Ok(Default::default())
+    }
+    async fn subagent_runtime_status(
+        &self,
+        _req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    > {
+        Ok(stub_envelope(
+            busytok_protocol::dto::SubagentRuntimeStatusDto {
+                pressure_gate: busytok_protocol::dto::SubagentPressureGateDto {
+                    level: "normal".to_string(),
+                    memory_used_pct: 0,
+                    hot_sessions_total: 0,
+                    hot_sessions_limit: 3,
+                    worker_sampled_at_ms: None,
+                },
+                subagents: Vec::new(),
+                tasks_recent: Vec::new(),
+                workers: Vec::new(),
+            },
+        ))
+    }
+
+    // ── Providers (Phase 1: Credential Foundation) ───────────────────
+
+    async fn provider_create(&self, _req: ProviderCreateRequestDto) -> Result<ProviderDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_list(&self) -> Result<ProviderListResponseDto> {
+        Ok(ProviderListResponseDto { providers: vec![] })
+    }
+    async fn provider_update(&self, _req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_delete(&self, _req: ProviderDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn provider_test_connection(
+        &self,
+        _req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        Ok(ProviderTestConnectionResponseDto {
+            ok: false,
+            error: Some("not implemented".to_string()),
+            models_detected: None,
+        })
+    }
+
+    // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
+
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto> {
+        Ok(PiSidecarLocatorUpdateResponseDto {
+            runtime_dir: req.runtime_dir,
+            enabled: req.enabled,
+            in_memory_updated: true,
+        })
+    }
+
+    // ── Profiles (Phase 4: Profile/Model Configuration UI) ──────────
+
+    async fn profile_create(&self, _req: ProfileCreateRequestDto) -> Result<ProfileDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn profile_update(&self, _req: ProfileUpdateRequestDto) -> Result<ProfileDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn profile_delete(&self, _req: ProfileDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
     }
 
     fn event_bus(&self) -> &AppEventBus {
@@ -1282,6 +1458,47 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: busytok_protocol::dto::SubagentDeleteRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentAckDto> {
         (**self).subagent_delete(req).await
+    }
+    async fn subagent_runtime_status(
+        &self,
+        req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    > {
+        (**self).subagent_runtime_status(req).await
+    }
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
+        (**self).provider_create(req).await
+    }
+    async fn provider_list(&self) -> Result<ProviderListResponseDto> {
+        (**self).provider_list().await
+    }
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
+        (**self).provider_update(req).await
+    }
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()> {
+        (**self).provider_delete(req).await
+    }
+    async fn provider_test_connection(
+        &self,
+        req: ProviderTestConnectionRequestDto,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        (**self).provider_test_connection(req).await
+    }
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> Result<PiSidecarLocatorUpdateResponseDto> {
+        (**self).pi_sidecar_locator_update(req).await
+    }
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> Result<ProfileDto> {
+        (**self).profile_create(req).await
+    }
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> Result<ProfileDto> {
+        (**self).profile_update(req).await
+    }
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> Result<()> {
+        (**self).profile_delete(req).await
     }
     fn event_bus(&self) -> &AppEventBus {
         (**self).event_bus()

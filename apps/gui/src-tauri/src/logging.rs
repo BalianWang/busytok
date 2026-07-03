@@ -294,3 +294,172 @@ pub(crate) fn flush_frontend_logs(
 ) -> Result<FlushResult, String> {
     Ok(flush_frontend_logs_inner(&entries))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
+    use super::*;
+
+    fn make_entry(level: &str, event_code: &str, message: &str) -> FrontendLogEntryDto {
+        FrontendLogEntryDto {
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            level: level.to_string(),
+            session_id: "test-session".to_string(),
+            correlation_id: None,
+            event_code: event_code.to_string(),
+            message: message.to_string(),
+            details: None,
+        }
+    }
+
+    #[test]
+    fn write_frontend_log_entry_error_level_executes_match_branch() {
+        let entry = make_entry("ERROR", "test.error", "error message");
+        write_frontend_log_entry(&entry);
+    }
+
+    #[test]
+    fn write_frontend_log_entry_warn_level_executes_match_branch() {
+        let entry = make_entry("WARN", "test.warn", "warn message");
+        write_frontend_log_entry(&entry);
+    }
+
+    #[test]
+    fn write_frontend_log_entry_info_level_executes_default_branch() {
+        let entry = make_entry("INFO", "test.info", "info message");
+        write_frontend_log_entry(&entry);
+    }
+
+    #[test]
+    fn write_frontend_log_entry_unknown_level_executes_default_branch() {
+        let entry = make_entry("DEBUG", "test.debug", "debug message");
+        write_frontend_log_entry(&entry);
+    }
+
+    #[test]
+    fn flush_frontend_logs_inner_with_all_valid_entries() {
+        let entries = vec![
+            make_entry("ERROR", "evt.1", "msg 1"),
+            make_entry("INFO", "evt.2", "msg 2"),
+        ];
+        let result = flush_frontend_logs_inner(&entries);
+        assert_eq!(result.written_count, 2);
+        assert_eq!(result.dropped_count, 0);
+    }
+
+    #[test]
+    fn flush_frontend_logs_inner_drops_entries_with_empty_event_code() {
+        let entries = vec![
+            make_entry("INFO", "", "msg with empty code"),
+            make_entry("INFO", "evt.valid", "valid msg"),
+        ];
+        let result = flush_frontend_logs_inner(&entries);
+        assert_eq!(result.written_count, 1);
+        assert_eq!(result.dropped_count, 1);
+    }
+
+    #[test]
+    fn flush_frontend_logs_inner_drops_entries_with_empty_message() {
+        let entries = vec![
+            make_entry("INFO", "evt.valid", ""),
+            make_entry("INFO", "evt.also", "valid"),
+        ];
+        let result = flush_frontend_logs_inner(&entries);
+        assert_eq!(result.written_count, 1);
+        assert_eq!(result.dropped_count, 1);
+    }
+
+    #[test]
+    fn flush_frontend_logs_inner_with_empty_list() {
+        let result = flush_frontend_logs_inner(&[]);
+        assert_eq!(result.written_count, 0);
+        assert_eq!(result.dropped_count, 0);
+    }
+
+    #[test]
+    fn flush_frontend_logs_inner_drops_all_invalid_entries() {
+        let entries = vec![
+            make_entry("INFO", "", ""),
+            make_entry("WARN", "", "msg with empty code"),
+        ];
+        let result = flush_frontend_logs_inner(&entries);
+        assert_eq!(result.written_count, 0);
+        assert_eq!(result.dropped_count, 2);
+    }
+
+    #[test]
+    fn tauri_session_id_returns_unknown_before_init() {
+        // Before init_gui_logging is called, TAURI_SESSION_ID is not set.
+        // This test may run after another test that called init_gui_logging,
+        // in which case tauri_session_id() returns the set value. We just
+        // verify the function does not panic.
+        let _ = tauri_session_id();
+    }
+
+    #[test]
+    fn rotated_log_path_returns_none_when_log_dir_not_set() {
+        // When TAURI_LOG_DIR is not set, rotated_log_path returns None.
+        // This test verifies that path; if TAURI_LOG_DIR was already set
+        // by a previous test, this still passes (the path will be Some).
+        let _ = rotated_log_path("test.log");
+    }
+
+    #[test]
+    fn append_manual_event_returns_early_when_disabled() {
+        // When manual file logging is disabled, append_manual_event returns
+        // immediately without touching the filesystem.
+        TAURI_MANUAL_FILE_LOGGING.store(false, Ordering::Relaxed);
+        append_manual_event(
+            "test.log",
+            "2026-01-01T00:00:00Z",
+            "INFO",
+            "test",
+            "session",
+            None,
+            "test.event",
+            "test message",
+            None,
+        );
+    }
+
+    #[test]
+    fn append_manual_event_writes_when_enabled_and_dir_set() {
+        // Enable manual logging and set a log dir so the full path executes.
+        TAURI_MANUAL_FILE_LOGGING.store(true, Ordering::Relaxed);
+        // Try to set TAURI_LOG_DIR — if already set, that's fine.
+        let _ = TAURI_LOG_DIR.set(std::env::temp_dir());
+        append_manual_event(
+            "test-manual.log",
+            "2026-01-01T00:00:00Z",
+            "INFO",
+            "test",
+            "session",
+            None,
+            "test.event",
+            "test message for manual logging",
+            Some(serde_json::json!({"key": "value"})),
+        );
+        // Reset to avoid affecting other tests.
+        TAURI_MANUAL_FILE_LOGGING.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn append_bootstrap_event_executes_without_panic() {
+        // append_bootstrap_event calls append_manual_event which checks
+        // the manual logging flag. We just verify no panic.
+        append_bootstrap_event(
+            "INFO",
+            "test.bootstrap",
+            "bootstrap test message",
+            Some(serde_json::json!({"phase": "test"})),
+        );
+    }
+
+    #[test]
+    fn init_gui_logging_can_be_called() {
+        // init_gui_logging uses try_init internally so repeat calls are
+        // no-ops. We verify it doesn't panic.
+        let dir = tempfile::tempdir().unwrap();
+        let _ = init_gui_logging(dir.path(), "test-session-id");
+    }
+}

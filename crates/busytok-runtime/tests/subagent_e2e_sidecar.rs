@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use busytok_config::{BusytokPaths, BusytokSettings};
+use busytok_config::{BusytokPaths, BusytokSettings, ProviderConfig, ProviderKind};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
@@ -71,6 +71,10 @@ fn mock_sidecar_bundle_path() -> PathBuf {
 
 /// Settings with pi_sidecar enabled, using system bash as the "node"
 /// binary (mock-sidecar.sh is a bash script, not a Node bundle).
+/// Configures a test provider + binds the "pi/search-cheap" profile to it
+/// so the WorkerPool can route delegate calls. The API key is injected via
+/// `BUSYTOK_TEST_API_KEY` env var (checked by `construct_sidecar`'s
+/// credential reader before falling back to the OS keychain).
 fn make_sidecar_settings() -> BusytokSettings {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
@@ -79,6 +83,32 @@ fn make_sidecar_settings() -> BusytokSettings {
         sidecar_shell_path().to_string_lossy().to_string();
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
     settings.subagent.pi_sidecar.task_timeout_seconds = 30;
+
+    // Add a test provider + bind profiles to it.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider".to_string(),
+        name: "Test Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    // Bind all built-in profiles to the test provider. Also set the
+    // profile model to "test-model" (matches the provider's whitelist) so
+    // Phase 3 Task 4's whitelist validation (spec §3.4) doesn't reject
+    // delegate calls. The default profile model ("deepseek-chat") is NOT
+    // in the test-provider's whitelist.
+    for profile in settings.subagent.profiles.values_mut() {
+        profile.provider_id = Some("test-provider".to_string());
+        profile.model = "test-model".to_string();
+    }
+
+    // Inject a fake API key via env var so `construct_sidecar`'s credential
+    // reader returns it without touching the OS keychain.
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+
     settings
 }
 
@@ -99,6 +129,9 @@ fn make_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     }
 }
 
@@ -881,10 +914,11 @@ async fn doctor_bundle_manifest_readable_check_validates_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_dir = tmp.path().join("rt");
     std::fs::create_dir_all(&runtime_dir).unwrap();
-    // Write a valid manifest.json (spec §5.1 line 549).
+    // Write a valid manifest.json conforming to SidecarManifest schema
+    // (Task 1: version/protocol_version/bundle/node_runtime_version).
     std::fs::write(
         runtime_dir.join("manifest.json"),
-        br#"{"name":"pi-sidecar","version":"0.1.0"}"#,
+        br#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
     )
     .unwrap();
 
@@ -2330,6 +2364,313 @@ async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
     assert!(
         gate_cleared,
         "gate must be cleared (Resume) after GracefulRestart completes"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+// --- Phase 5 Task 3: service-owned pi_sidecar locator update (in-memory + disk) ---
+//
+// P1 regression guard: the service-owned update must mutate the in-memory
+// Arc<Mutex<BusytokSettings>> (so the running daemon's worker pool sees the
+// new locator immediately) AND persist to settings.toml (so a cold-start
+// service reads it on its own startup). A direct file write would leave the
+// in-memory state stale — the "file fixed, current session still can't find
+// sidecar" state-drift bug.
+//
+// Mirrors the provider_update pattern (supervisor.rs): clone → mutate →
+// save → swap. The pi_sidecar_state() test accessor reads from the SAME
+// Arc<Mutex<BusytokSettings>> that pi_sidecar_locator_update swapped — if
+// the swap didn't happen, the post-condition assertion fails.
+
+#[tokio::test]
+#[serial]
+async fn pi_sidecar_locator_update_mutates_in_memory_and_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let settings = BusytokSettings::default();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor =
+        BusytokSupervisor::with_adapters_and_settings(db, paths.clone(), vec![], settings);
+
+    // Pre-condition: read the in-memory state via the test accessor
+    // (the `settings` field is private; `settings_snapshot` RPC returns a
+    // DTO that omits pi_sidecar.runtime_dir).
+    let (pre_dir, pre_enabled) = supervisor.pi_sidecar_state();
+    assert!(pre_dir.is_none());
+    assert!(!pre_enabled);
+
+    // Call the service-owned update (the method the GUI invokes via RPC).
+    // Stage a COMPLETE sidecar dir (bundle.js + valid manifest.json + node
+    // binary stub) so P2 validation passes (default node_runtime="bundled"
+    // now requires node/<arch>/node to exist). The stub node binary is an
+    // empty file — it's never executed because no providers are configured
+    // (BusytokSettings::default() has empty providers list), so
+    // construct_sidecar's `ensure_worker` is never called.
+    let fake_dir = tmp.path().join("fake-pi-sidecar");
+    std::fs::create_dir_all(&fake_dir).unwrap();
+    std::fs::write(fake_dir.join("pi-sidecar.bundle.js"), "// stub").unwrap();
+    let manifest = busytok_config::SidecarManifest {
+        version: "1".to_string(),
+        protocol_version: busytok_subagent::sidecar::protocol::PROTOCOL_VERSION,
+        bundle: "pi-sidecar.bundle.js".to_string(),
+        node_runtime_version: "22.6.0".to_string(),
+    };
+    std::fs::write(fake_dir.join("manifest.json"), manifest.to_json_string()).unwrap();
+    // Stage stub node binary so P2 validation's node-arch + executability
+    // checks pass (default node_runtime="bundled" requires node/<arch>/node
+    // to exist AND be executable on Unix).
+    let node_arch_dir = fake_dir.join("node").join(std::env::consts::ARCH);
+    std::fs::create_dir_all(&node_arch_dir).unwrap();
+    let node_path = node_arch_dir.join("node");
+    std::fs::write(&node_path, "#!/bin/sh\n# stub\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&node_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&node_path, perms).unwrap();
+    }
+    let resp = supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: fake_dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(resp.in_memory_updated);
+    assert_eq!(resp.runtime_dir, fake_dir.to_string_lossy());
+    assert!(resp.enabled);
+
+    // Verify in-memory state was updated (the P1 guard — no state drift).
+    // pi_sidecar_state reads from the SAME Arc<Mutex<BusytokSettings>> that
+    // pi_sidecar_locator_update swapped — if the swap didn't happen, this
+    // assertion fails.
+    let (post_dir, post_enabled) = supervisor.pi_sidecar_state();
+    assert_eq!(post_dir.as_deref(), Some(fake_dir.to_str().unwrap()));
+    assert!(post_enabled);
+
+    // Verify the file was also persisted (cold-start path).
+    let reloaded = BusytokSettings::load(&paths).unwrap();
+    assert_eq!(
+        reloaded.subagent.pi_sidecar.runtime_dir.as_deref(),
+        Some(fake_dir.to_str().unwrap())
+    );
+    assert!(reloaded.subagent.pi_sidecar.enabled);
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+/// Multi-provider P1 regression: when 2+ provider workers are lazily
+/// spawned via delegate, `rebuild_sidecar_runtime` (triggered by
+/// `pi_sidecar_locator_update` flipping `enabled=true → false`) must drain
+/// ALL workers via `pool.shutdown_all()`, not just the single
+/// "first enabled provider" supervisor. Without this fix, the second
+/// provider's Node subprocess would be orphaned with stale credentials
+/// after a config flip.
+///
+/// This test spawns 2 workers (via 2 delegate calls with different
+/// profiles bound to different providers), captures the OLD pool Arc,
+/// triggers a rebuild (disable), and asserts the old pool is drained to
+/// 0 (proving `shutdown_all` was called, not just single-supervisor
+/// shutdown which would leave the second worker alive in the old pool).
+#[tokio::test]
+#[serial]
+async fn multi_provider_workers_die_after_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    // Add a SECOND provider + bind a different built-in profile to it.
+    // make_sidecar_settings already binds ALL profiles to "test-provider";
+    // rebind "pi/review-cheap" to the second provider so delegates with
+    // that profile route to a different worker.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-b".to_string(),
+        name: "Test Provider B".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-b.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    // Rebind "pi/review-cheap" to provider B (was bound to test-provider
+    // by make_sidecar_settings's blanket loop).
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/review-cheap")
+        .expect("pi/review-cheap must exist in built-in profiles")
+        .provider_id = Some("test-provider-b".to_string());
+
+    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
+
+    // Issue 2 delegate calls with different profiles → 2 workers spawn
+    // (one per provider). Both use mock-sidecar.sh so both succeed.
+    for (name, profile) in [
+        ("worker-a", "pi/search-cheap"),
+        ("worker-b", "pi/review-cheap"),
+    ] {
+        supervisor
+            .subagent_delegate(SubagentDelegateRequestDto {
+                subagent_name: name.to_string(),
+                subagent_id: None,
+                cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+                profile: profile.to_string(),
+                intent: None,
+                prompt: "probe".to_string(),
+                prompt_artifact_ref: None,
+                timeout_seconds: None,
+                model_override: None,
+                source_harness: None,
+                source_session_id: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("delegate {name} ({profile}) failed: {e}"));
+    }
+
+    // Capture the OLD pool Arc BEFORE rebuild so we can inspect it after
+    // the rebuild swaps in a new (disabled) runtime. The Arc keeps the
+    // old pool alive even after the runtime swap drops its reference.
+    let old_pool = supervisor
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+    let snaps = old_pool.worker_snapshots().await;
+    assert_eq!(
+        snaps.len(),
+        2,
+        "2 provider workers must be running before rebuild (got {}): {:?}",
+        snaps.len(),
+        snaps.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+
+    // Trigger rebuild by disabling (enabled=true → false). The rebuild
+    // swaps in a disabled runtime (no pool) + shuts down the OLD pool
+    // via `shutdown_all()`.
+    supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            // Path doesn't matter when disabling (validation skipped).
+            runtime_dir: tmp.path().join("disabled").to_string_lossy().to_string(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+
+    // The NEW runtime is disabled → no pool.
+    assert!(
+        supervisor.worker_pool().is_none(),
+        "worker_pool must be None after disable rebuild"
+    );
+
+    // The OLD pool must be drained to 0 — `shutdown_all()` called
+    // `drain()` on the workers map. If only the single-supervisor
+    // shutdown path ran (the bug), the old pool would still have 2
+    // entries (the second provider's worker would be orphaned).
+    let old_snaps = old_pool.worker_snapshots().await;
+    assert_eq!(
+        old_snaps.len(),
+        0,
+        "old pool must be drained to 0 after rebuild (shutdown_all was called) — \
+         {} worker(s) survived: {:?}",
+        old_snaps.len(),
+        old_snaps.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+
+    supervisor.shutdown_sidecar().await;
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+/// Multi-provider P1 regression: when 2+ provider workers are lazily
+/// spawned, `shutdown_sidecar` (the normal service-exit path) must drain
+/// ALL workers via `pool.shutdown_all()`, not just the single
+/// "first enabled provider" supervisor. Without this fix, service exit
+/// would orphan Node subprocesses for any provider that was delegated to
+/// but wasn't the "first enabled" one.
+///
+/// Same setup as `multi_provider_workers_die_after_rebuild` but triggers
+/// `shutdown_sidecar()` directly (the service-exit path) instead of a
+/// rebuild. Asserts the pool is drained to 0 after shutdown.
+#[tokio::test]
+#[serial]
+async fn multi_provider_workers_die_after_shutdown_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    // Same 2-provider setup as the rebuild test.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-b".to_string(),
+        name: "Test Provider B".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-b.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/review-cheap")
+        .expect("pi/review-cheap must exist in built-in profiles")
+        .provider_id = Some("test-provider-b".to_string());
+
+    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
+
+    // Spawn 2 workers via 2 delegate calls (one per provider).
+    for (name, profile) in [
+        ("worker-a", "pi/search-cheap"),
+        ("worker-b", "pi/review-cheap"),
+    ] {
+        supervisor
+            .subagent_delegate(SubagentDelegateRequestDto {
+                subagent_name: name.to_string(),
+                subagent_id: None,
+                cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+                profile: profile.to_string(),
+                intent: None,
+                prompt: "probe".to_string(),
+                prompt_artifact_ref: None,
+                timeout_seconds: None,
+                model_override: None,
+                source_harness: None,
+                source_session_id: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("delegate {name} ({profile}) failed: {e}"));
+    }
+
+    let pool = supervisor
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+    assert_eq!(
+        pool.worker_snapshots().await.len(),
+        2,
+        "2 provider workers must be running before shutdown"
+    );
+
+    // Call the service-exit shutdown path. This must call
+    // `pool.shutdown_all()` (not single-supervisor shutdown), draining
+    // ALL workers.
+    supervisor.shutdown_sidecar().await;
+
+    // The pool is still Some (shutdown_sidecar doesn't swap the runtime),
+    // but its workers map must be drained to 0.
+    let pool_after = supervisor
+        .worker_pool()
+        .expect("worker_pool still Some after shutdown_sidecar (runtime not swapped)");
+    let snaps = pool_after.worker_snapshots().await;
+    assert_eq!(
+        snaps.len(),
+        0,
+        "pool must be drained to 0 after shutdown_sidecar — \
+         {} worker(s) survived (shutdown_all was NOT called): {:?}",
+        snaps.len(),
+        snaps.iter().map(|(p, _)| p).collect::<Vec<_>>()
     );
 
     supervisor.shutdown_writer().await.unwrap();

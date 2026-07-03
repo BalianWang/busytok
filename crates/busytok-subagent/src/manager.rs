@@ -15,7 +15,7 @@ use crate::memory::MemoryUpdater;
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
     DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
-    SubagentTaskSummary, TaskStatus, TaskUsage,
+    SubagentTaskSummary, TaskErrorKind, TaskStatus, TaskUsage,
 };
 use crate::pressure::PressureGate;
 use crate::resolver::{resolve_by_id, resolve_by_name, row_to_model, Resolved};
@@ -34,6 +34,44 @@ pub struct SubagentManager {
     /// instead of executing synchronously. The background `TaskDispatcher`
     /// (Task 7) picks up queued tasks when the gate clears.
     pressure_gate: Option<Arc<PressureGate>>,
+    /// Post-task completion hook (P1 #2 fix). When `Some`, the background
+    /// dispatcher invokes it after `execute_task()` succeeds so the runtime
+    /// can bridge the queued task's usage into the unified `usage_events`
+    /// pipeline — the SAME seam as synchronous `delegate()`. Without this,
+    /// queued tasks' usage is invisible in Overview / Activity / receipt reads.
+    /// The closure receives `(&DelegateResult, cwd)`. Best-effort: the hook
+    /// logs failures internally and does NOT propagate errors to the dispatcher.
+    /// Set ONCE by `BusytokSupervisor::assemble_with_sidecar` after the
+    /// generation manager is constructed.
+    task_completion_hook: Mutex<Option<TaskCompletionHook>>,
+}
+
+/// Hook invoked by the background dispatcher after a queued task completes
+/// successfully. The runtime registers one that calls `bridge_subagent_usage`
+/// so queued tasks' usage flows into `usage_events` + rollups.
+pub type TaskCompletionHook = Arc<dyn Fn(&DelegateResult, &str) + Send + Sync>;
+
+/// Combined snapshot for `subagent.runtime_status` — all DB reads occur under
+/// a single `SubagentManager` lock acquisition to preserve single-read
+/// aggregate semantics (spec §4 line 213). The worker sample (collected
+/// separately by the supervisor from `PiSidecarSupervisor::worker_snapshot`)
+/// is NOT part of this struct — it is stamped with `worker_sampled_at_ms` at
+/// the handler layer so consumers know its freshness.
+pub struct RuntimeStatusSnapshot {
+    /// Active (non-deleted) logical subagents, mapped from raw rows.
+    pub subagents: Vec<LogicalSubagent>,
+    /// `subagent_id → task_count` (only subagents with ≥1 task appear).
+    pub task_counts: std::collections::HashMap<String, u32>,
+    /// `subagent_id → (created_at_ms, status_string)` for each subagent's
+    /// latest task (only subagents with ≥1 task appear).
+    pub last_tasks: std::collections::HashMap<String, (i64, String)>,
+    /// Most recent tasks across ALL subagents, newest first (limit-clamped).
+    pub recent_tasks: Vec<SubagentTaskSummary>,
+    /// `subagent_id → display_name` for ALL subagents (including deleted).
+    /// Used by the handler to resolve `tasks_recent[].subagent_name` so the
+    /// task history shows display names even for deleted subagents (reviewer
+    /// P1-2: decouple display name from delete filtering).
+    pub name_lookup: std::collections::HashMap<String, String>,
 }
 
 impl SubagentManager {
@@ -66,7 +104,21 @@ impl SubagentManager {
             context_builder,
             memory_updater,
             pressure_gate,
+            task_completion_hook: Mutex::new(None),
         }
+    }
+
+    /// Register a post-task completion hook (P1 #2 fix). The background
+    /// dispatcher invokes it after `execute_task()` succeeds so the runtime
+    /// can bridge the queued task's usage into `usage_events` + rollups — the
+    /// same seam as synchronous `delegate()`. Must be called BEFORE
+    /// `spawn_task_dispatcher` (set once by `BusytokSupervisor::assemble_with_sidecar`).
+    pub fn set_task_completion_hook(&self, hook: TaskCompletionHook) {
+        let mut guard = self
+            .task_completion_hook
+            .lock()
+            .expect("task_completion_hook lock poisoned");
+        *guard = Some(hook);
     }
 
     /// Create-or-continue a subagent and run one task (mock execution in this plan).
@@ -193,6 +245,7 @@ impl SubagentManager {
                 // dispatcher reads them from the row (single source of truth).
                 timeout_seconds: req.timeout_seconds.map(|t| t as i64),
                 model_override: req.model_override.clone(),
+                error_kind: None,
             })
             .map_err(SubagentError::Store)?;
             should_queue
@@ -265,6 +318,7 @@ impl SubagentManager {
             completed_at_ms: None,
             timeout_seconds: req.timeout_seconds.map(|t| t as i64),
             model_override: req.model_override.clone(),
+            error_kind: None,
         };
         let mut result = self.execute_task(&task_row, &subagent).await?;
         // `execute_task` returns the model it actually used (which may differ
@@ -377,6 +431,13 @@ impl SubagentManager {
                 memory: snapshot,
                 context: compact,
                 write_access,
+                // Phase 3: thread the profile's `provider_id` so the
+                // WorkerPool (Task 2) can route to the correct per-provider
+                // supervisor. `None` here means the profile is unbound —
+                // Task 2 will reject this at the pool boundary. We read
+                // `profile_cfg.provider_id` (already fetched above) rather
+                // than re-resolving from settings.
+                provider_id: profile_cfg.and_then(|p| p.provider_id.clone()),
             };
             (
                 input,
@@ -385,7 +446,7 @@ impl SubagentManager {
                 profile_cfg.cloned(),
             )
         };
-        let out = self.executor.execute(&input).await.map_err(|e| {
+        let out = match self.executor.execute(&input).await.map_err(|e| {
             match e.downcast::<SubagentError>() {
                 Ok(se) => se,
                 Err(other) => {
@@ -393,7 +454,37 @@ impl SubagentManager {
                     SubagentError::Store(other)
                 }
             }
-        })?;
+        }) {
+            Ok(out) => out,
+            Err(e) => {
+                // Persist failure state before propagating. The executor
+                // classified the error (auth/rate_limit/network/timeout) and
+                // already killed the worker on auth-fail — but since
+                // execute() returns Err, the success-path block below
+                // (which persists error_kind) is unreachable. Persist
+                // status="failed" + best-effort error_kind here so the UI
+                // can surface the failure reason (spec §3.4, Task 5).
+                let error_kind = subagent_error_to_task_error_kind(&e);
+                {
+                    let db = self.db.lock().expect("subagent db lock poisoned");
+                    db.subagent_set_task_status(&task.id, "failed", None, None)
+                        .ok();
+                    if let Some(kind) = error_kind {
+                        if let Err(persist_err) =
+                            db.subagent_set_task_error_kind(&task.id, Some(kind.as_str()))
+                        {
+                            warn!(
+                                event_code = "subagent.error_kind_persist_failed",
+                                task_id = %task.id,
+                                error = %persist_err,
+                                "failed to persist error_kind on Err path"
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
         let duration_ms = busytok_domain::now_ms().saturating_sub(started);
 
         // 4. persist results: task status, usage, memory, status.
@@ -410,6 +501,17 @@ impl SubagentManager {
                 None,
             )
             .map_err(SubagentError::Store)?;
+            // Task 5: persist classified error_kind on the task row.
+            if let Some(kind) = &out.error_kind {
+                if let Err(e) = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str())) {
+                    tracing::warn!(
+                        event_code = "subagent.error_kind_persist_failed",
+                        task_id = %task.id,
+                        error = %e,
+                        "failed to persist error_kind"
+                    );
+                }
+            }
             // Re-fetch recent_tasks AFTER the task result is persisted so the
             // snapshot includes the just-completed task's result_summary. The
             // pre-execution snapshot (used only for context building above)
@@ -620,20 +722,42 @@ impl SubagentManager {
                         subagent_id = %subagent.id,
                         "dispatcher executing queued task"
                     );
-                    if let Err(e) = manager.execute_task(&task, &subagent).await {
-                        warn!(
-                            event_code = "subagent.queue.execute_failed",
-                            task_id = %task.id,
-                            error = %e,
-                            "dispatcher execute_task failed; marking task failed"
-                        );
-                        let db = manager.db.lock().expect("subagent db lock poisoned");
-                        let _ = db.subagent_set_task_status(
-                            &task.id,
-                            "failed",
-                            None,
-                            Some(e.to_string()),
-                        );
+                    match manager.execute_task(&task, &subagent).await {
+                        Ok(result) => {
+                            // P1 #2 fix: invoke the post-task completion hook
+                            // so the runtime bridges the queued task's usage
+                            // into `usage_events` + rollups — the SAME seam as
+                            // synchronous `delegate()`. The hook is best-effort:
+                            // it logs failures internally and does NOT propagate
+                            // errors to the dispatcher. `cwd` is the subagent's
+                            // canonical `repo_path` (the cwd `execute_task`
+                            // used).
+                            let hook = {
+                                let guard = manager
+                                    .task_completion_hook
+                                    .lock()
+                                    .expect("task_completion_hook lock poisoned");
+                                guard.as_ref().map(Arc::clone)
+                            };
+                            if let Some(hook) = hook {
+                                hook(&result, &subagent.repo_path);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                event_code = "subagent.queue.execute_failed",
+                                task_id = %task.id,
+                                error = %e,
+                                "dispatcher execute_task failed; marking task failed"
+                            );
+                            let db = manager.db.lock().expect("subagent db lock poisoned");
+                            let _ = db.subagent_set_task_status(
+                                &task.id,
+                                "failed",
+                                None,
+                                Some(e.to_string()),
+                            );
+                        }
                     }
                 }
             }
@@ -690,6 +814,105 @@ impl SubagentManager {
             .subagent_list_tasks(&sub.id, limit)
             .map_err(SubagentError::Store)?;
         Ok(rows.into_iter().map(task_row_to_summary).collect())
+    }
+
+    /// Returns the most recent tasks across ALL subagents, newest first
+    /// (spec §4 Phase 2 `tasks_recent`). `limit` is passed through to the
+    /// store layer; callers (e.g. Task 6's `runtime_status_snapshot`) are
+    /// responsible for clamping. The mapping reuses `task_row_to_summary`
+    /// so the shape matches `tasks()`.
+    pub async fn recent_tasks_all(&self, limit: i64) -> Result<Vec<SubagentTaskSummary>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let rows = db
+            .subagent_list_recent_tasks_all(limit)
+            .map_err(SubagentError::Store)?;
+        Ok(rows.into_iter().map(task_row_to_summary).collect())
+    }
+
+    /// Returns a map of `subagent_id → task_count` (spec §4 Phase 2
+    /// `subagents[].task_count`). Only subagents with at least one task
+    /// appear; the underlying query groups by `subagent_id`.
+    pub async fn task_counts_by_subagent(&self) -> Result<std::collections::HashMap<String, u32>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let counts = db
+            .subagent_count_tasks_by_subagent()
+            .map_err(SubagentError::Store)?;
+        Ok(counts.into_iter().collect())
+    }
+
+    /// Returns a map of `subagent_id → (created_at_ms, status)` for each
+    /// subagent's latest task (spec §4 Phase 2 `subagents[].last_task_{created_at,
+    /// status}`). Only subagents with at least one task appear.
+    pub async fn last_task_by_subagent(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (i64, String)>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let lasts = db
+            .subagent_last_task_by_subagent()
+            .map_err(SubagentError::Store)?;
+        Ok(lasts
+            .into_iter()
+            .map(|(sub_id, created_at, status)| (sub_id, (created_at, status)))
+            .collect())
+    }
+
+    /// Combined snapshot for `subagent.runtime_status` — performs all 4 DB
+    /// reads (`subagent_list_filtered`, `subagent_count_tasks_by_subagent`,
+    /// `subagent_last_task_by_subagent`, `subagent_list_recent_tasks_all`)
+    /// under a single DB lock acquisition to preserve single-read aggregate
+    /// semantics (spec §4 line 213). Avoids 4 separate lock acquisitions that
+    /// could observe inconsistent DB state.
+    ///
+    /// `recent_limit` is passed through to the store layer; callers are
+    /// responsible for clamping. The `subagents` vector excludes deleted
+    /// rows (filtered in Rust after querying with `include_deleted=true`
+    /// so `name_lookup` can include deleted subagent names), matching the
+    /// `list()` default for the `subagents[]` DTO.
+    pub async fn runtime_status_snapshot(
+        &self,
+        recent_limit: i64,
+    ) -> Result<RuntimeStatusSnapshot> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        // Query ALL subagents (include_deleted=true) once, then split:
+        //  - `name_lookup` from ALL rows (id → name) so tasks_recent can
+        //    resolve display names even for deleted subagents (reviewer P1-2).
+        //  - `subagents` DTO from non-deleted rows only.
+        let all_rows = db
+            .subagent_list_filtered(None, None, true)
+            .map_err(SubagentError::Store)?;
+        let name_lookup: std::collections::HashMap<String, String> = all_rows
+            .iter()
+            .map(|r| (r.id.clone(), r.name.clone()))
+            .collect();
+        let subagents: Vec<LogicalSubagent> = all_rows
+            .iter()
+            .filter(|r| r.status != "deleted")
+            .map(row_to_model)
+            .collect();
+        let task_counts: std::collections::HashMap<String, u32> = db
+            .subagent_count_tasks_by_subagent()
+            .map_err(SubagentError::Store)?
+            .into_iter()
+            .collect();
+        let last_tasks: std::collections::HashMap<String, (i64, String)> = db
+            .subagent_last_task_by_subagent()
+            .map_err(SubagentError::Store)?
+            .into_iter()
+            .map(|(sub_id, created_at, status)| (sub_id, (created_at, status)))
+            .collect();
+        let recent_tasks: Vec<SubagentTaskSummary> = db
+            .subagent_list_recent_tasks_all(recent_limit)
+            .map_err(SubagentError::Store)?
+            .into_iter()
+            .map(task_row_to_summary)
+            .collect();
+        Ok(RuntimeStatusSnapshot {
+            subagents,
+            task_counts,
+            last_tasks,
+            recent_tasks,
+            name_lookup,
+        })
     }
 
     /// Release any hot binding for this subagent; keep DB state (warm/cold).
@@ -882,5 +1105,32 @@ fn task_row_to_summary(r: SubagentTaskRow) -> SubagentTaskSummary {
         error: r.error,
         created_at_ms: r.created_at_ms,
         completed_at_ms: r.completed_at_ms,
+    }
+}
+
+/// Best-effort classification of a `SubagentError` (from the executor's Err
+/// path) into a `TaskErrorKind` for persistence on the task row. Mirrors the
+/// executor's `classify_sidecar_error` but operates on the already-converted
+/// `SubagentError`. The `SidecarRpc` variant carries a structured `code`
+/// field (preserved from `SidecarError::Application(code, ...)` at
+/// conversion time), so we match on the numeric code directly — no string
+/// parsing. This keeps the manager's classification in sync with the
+/// executor's structured `classify_sidecar_error` automatically: both
+/// reference the same protocol constants.
+fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind> {
+    use crate::sidecar::protocol::{AUTH_FAILURE, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT};
+    match e {
+        SubagentError::SidecarTimeout(_) | SubagentError::TaskTimeout => {
+            Some(TaskErrorKind::Timeout)
+        }
+        SubagentError::SidecarCrashed(_) => Some(TaskErrorKind::Crash),
+        SubagentError::SidecarRpc { code, .. } => match *code {
+            Some(AUTH_FAILURE) => Some(TaskErrorKind::Auth),
+            Some(RATE_LIMIT) => Some(TaskErrorKind::RateLimit),
+            Some(NETWORK_ERROR) => Some(TaskErrorKind::Network),
+            Some(TASK_TIMEOUT) => Some(TaskErrorKind::Timeout),
+            _ => None,
+        },
+        _ => None,
     }
 }

@@ -922,6 +922,7 @@ mod tests {
         stop_calls: AtomicU32,
         ensure_response: StdMutex<Option<Result<EnsureRunningOutcome>>>,
         stop_response: StdMutex<Option<Result<()>>>,
+        status_response: StdMutex<Option<Result<LifecycleStatus>>>,
         stop_slow: AtomicBool,
     }
 
@@ -932,6 +933,7 @@ mod tests {
                 stop_calls: AtomicU32::new(0),
                 ensure_response: StdMutex::new(Some(Ok(EnsureRunningOutcome::AlreadyRunning))),
                 stop_response: StdMutex::new(Some(Ok(()))),
+                status_response: StdMutex::new(Some(Ok(LifecycleStatus::Running))),
                 stop_slow: AtomicBool::new(false),
             }
         }
@@ -950,6 +952,10 @@ mod tests {
 
         fn set_stop_response(&self, r: Result<()>) {
             *self.stop_response.lock().unwrap() = Some(r);
+        }
+
+        fn set_status_response(&self, r: Result<LifecycleStatus>) {
+            *self.status_response.lock().unwrap() = Some(r);
         }
     }
 
@@ -974,7 +980,12 @@ mod tests {
         }
 
         fn status(&self) -> Result<LifecycleStatus> {
-            Ok(LifecycleStatus::Running)
+            // Take the current response, then re-fill with default so
+            // subsequent calls work without panicking.
+            let mut guard = self.status_response.lock().unwrap();
+            let response = guard.take().unwrap_or(Ok(LifecycleStatus::Running));
+            *guard = Some(Ok(LifecycleStatus::Running));
+            response
         }
 
         fn stop_for_current_session(&self) -> Result<()> {
@@ -1583,5 +1594,742 @@ mod tests {
             !store.load().suppressed_for_session,
             "disk must reflect the cleared state after persist"
         );
+    }
+
+    // ── Coverage: LifecycleCause::as_str for every variant ───────────
+
+    #[test]
+    fn cause_as_str_covers_all_variants() {
+        // Cover the previously-uncovered arms (LoginItemLaunch,
+        // AppMoveDetected, VersionSkewDetected, SettingsToggle, Repair).
+        assert_eq!(LifecycleCause::SettingsToggle.as_str(), "settings_toggle");
+        assert_eq!(LifecycleCause::Repair.as_str(), "repair");
+        assert_eq!(
+            LifecycleCause::LoginItemLaunch.as_str(),
+            "login_item_launch"
+        );
+        assert_eq!(
+            LifecycleCause::AppMoveDetected.as_str(),
+            "app_move_detected"
+        );
+        assert_eq!(
+            LifecycleCause::VersionSkewDetected.as_str(),
+            "version_skew_detected"
+        );
+    }
+
+    // ── Coverage: LifecycleLogRecord constructors ───────────────────
+
+    #[test]
+    fn repair_failure_with_launchctl_exit_builds_expected_record() {
+        let record = LifecycleLogRecord::repair_failure_with_launchctl_exit(42);
+        assert_eq!(record.event_code, "service_lifecycle.repair_failed");
+        assert_eq!(record.cause, None);
+        assert_eq!(record.from_state, "active");
+        assert_eq!(record.to_state, "active");
+        assert_eq!(record.result, "retryable_failure");
+        assert_eq!(record.launchctl_exit_code, Some(42));
+        assert_eq!(record.sm_status, None);
+    }
+
+    #[test]
+    fn approval_needed_maps_each_sm_status_variant() {
+        use crate::service_lifecycle::smappservice_bridge::SMServiceStatus;
+
+        for (status, expected_sm_str) in [
+            (SMServiceStatus::NotRegistered, "not_registered"),
+            (SMServiceStatus::Enabled, "enabled"),
+            (SMServiceStatus::EnabledNotRunning, "enabled_not_running"),
+            (SMServiceStatus::RequiresApproval, "requires_approval"),
+            (SMServiceStatus::NotFound, "not_found"),
+        ] {
+            let record = LifecycleLogRecord::approval_needed(status);
+            assert_eq!(
+                record.event_code, "service_lifecycle.approval_required",
+                "event_code mismatch for {status:?}"
+            );
+            assert_eq!(record.cause, None);
+            assert_eq!(record.from_state, "active");
+            assert_eq!(record.to_state, "active");
+            assert_eq!(record.result, "non_retryable");
+            assert_eq!(record.launchctl_exit_code, None);
+            assert_eq!(
+                record.sm_status.as_deref(),
+                Some(expected_sm_str),
+                "sm_status mismatch for {status:?}"
+            );
+        }
+    }
+
+    // ── Coverage: production constructor + accessors ────────────────
+
+    #[tokio::test]
+    async fn production_constructor_has_no_log_recorder_and_default_phase() {
+        // Use the production `LifecycleCoordinator::new` constructor (not
+        // for_test). It must NOT panic, must default to Active, and must
+        // not collect log records (no recorder).
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let coordinator = LifecycleCoordinator::new(lifecycle, login_start);
+
+        // phase_snapshot returns Active when the mutex is uncontested.
+        assert_eq!(coordinator.phase_snapshot(), LifecyclePhase::Active);
+        assert!(!coordinator.is_suppressed().await);
+
+        // Ensure the lifecycle / login_start accessors return the same Arc.
+        let lc: &Arc<dyn ServiceLifecycle> = coordinator.lifecycle();
+        let _ = lc.ensure_running().unwrap();
+        let ls: &Arc<dyn DesktopLoginStart> = coordinator.login_start();
+        let _ = ls.enable_for_future_logins().unwrap();
+    }
+
+    #[test]
+    fn phase_snapshot_returns_active_when_lock_uncontested() {
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let coordinator = LifecycleCoordinator::new(lifecycle, login_start);
+        assert_eq!(coordinator.phase_snapshot(), LifecyclePhase::Active);
+    }
+
+    // ── Coverage: stop_for_current_session error path ───────────────
+
+    #[tokio::test]
+    async fn stop_for_current_session_logs_failure_and_propagates_error() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        lifecycle.set_stop_response(Err(anyhow::anyhow!("launchctl bootout failed")));
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let result = coordinator
+            .stop_for_current_session(LifecycleCause::SettingsToggle)
+            .await;
+        assert!(
+            result.is_err(),
+            "stop_for_current_session must propagate the inner lifecycle error"
+        );
+
+        let stop_logs = logs_matching(&recorder, "lifecycle.stop_for_session");
+        assert_eq!(
+            stop_logs.len(),
+            1,
+            "exactly one stop_for_session log expected"
+        );
+        let log = &stop_logs[0];
+        assert_eq!(log.cause.as_deref(), Some("settings_toggle"));
+        assert_eq!(log.result, "retryable_failure");
+    }
+
+    #[tokio::test]
+    async fn stop_for_current_session_logs_ok_on_success() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        coordinator
+            .stop_for_current_session(LifecycleCause::Quit)
+            .await
+            .expect("stop should succeed");
+
+        let stop_logs = logs_matching(&recorder, "lifecycle.stop_for_session");
+        assert_eq!(stop_logs.len(), 1);
+        assert_eq!(stop_logs[0].result, "ok");
+        assert_eq!(stop_logs[0].cause.as_deref(), Some("quit"));
+    }
+
+    // ── Coverage: suppress_and_persist ───────────────────────────────
+
+    #[tokio::test]
+    async fn suppress_and_persist_records_suppression_in_store() {
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let (coordinator, _recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let boot_time = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000));
+        let boot_time_clone = std::sync::Arc::clone(&boot_time);
+        let boot_secs_fn = move || Some(boot_time_clone.load(std::sync::atomic::Ordering::SeqCst));
+
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            boot_secs_fn,
+        );
+
+        assert!(!coordinator.is_suppressed().await);
+        coordinator
+            .suppress_and_persist(LifecycleCause::Quit, &store)
+            .await;
+        assert!(coordinator.is_suppressed().await);
+        assert!(
+            store.suppression_active_for_current_session(),
+            "suppress_and_persist must record suppression in the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_suppression_and_persist_is_noop_when_already_active() {
+        // If the coordinator is already Active, clear_suppression_and_persist
+        // must NOT emit a phase_transition log (no-op).
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::new(DesktopLifecycleSettings::default(), paths);
+
+        assert!(!coordinator.is_suppressed().await);
+        coordinator
+            .clear_suppression_and_persist(LifecycleCause::ManualReopen, &store)
+            .await;
+        assert!(!coordinator.is_suppressed().await);
+        let transitions = logs_matching(&recorder, "lifecycle.phase_transition");
+        assert!(
+            transitions.is_empty(),
+            "must not emit phase_transition when already Active"
+        );
+    }
+
+    // ── Coverage: restore_from_settings with stale suppression ──────
+
+    #[tokio::test]
+    async fn restore_from_settings_clears_stale_suppression() {
+        // When the persisted suppression was recorded under a DIFFERENT
+        // boot time, restore_from_settings must clear it (the user
+        // rebooted / logged out / logged back in).
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let (coordinator, _recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        // boot_time_fn returns 1_700_000_000; store has suppression at
+        // 1_800_000_000 → mismatched boot time → stale.
+        let boot_secs_fn = move || Some(1_700_000_000u64);
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let mut settings = DesktopLifecycleSettings::default();
+        settings.suppressed_for_session = true;
+        settings.suppressed_at_boot_secs = Some(1_800_000_000);
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(settings, paths, boot_secs_fn);
+
+        assert!(
+            !store.suppression_active_for_current_session(),
+            "stale suppression must NOT be active for the current session"
+        );
+        assert!(
+            store.load().suppressed_for_session,
+            "store must still have the persisted flag set before restore"
+        );
+
+        coordinator.restore_from_settings(&store).await;
+        assert!(
+            !coordinator.is_suppressed().await,
+            "coordinator must NOT be suppressed after restoring stale state"
+        );
+        assert!(
+            !store.load().suppressed_for_session,
+            "store must clear stale suppression on restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_from_settings_noop_when_no_suppression_recorded() {
+        // When the store has no recorded suppression, restore_from_settings
+        // must be a no-op (coordinator stays Active).
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let (coordinator, _recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let boot_secs_fn = move || Some(1_700_000_000u64);
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            boot_secs_fn,
+        );
+
+        coordinator.restore_from_settings(&store).await;
+        assert!(!coordinator.is_suppressed().await);
+    }
+
+    // ── Coverage: repair() method ───────────────────────────────────
+
+    #[tokio::test]
+    async fn repair_invokes_status_then_ensure_running() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        let lifecycle_for_assert = Arc::clone(&lifecycle);
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) =
+            LifecycleCoordinator::for_test(lifecycle.clone(), login_start);
+
+        coordinator
+            .repair(LifecycleCause::Repair)
+            .await
+            .expect("repair must succeed when ensure_running succeeds");
+
+        // repair calls lifecycle.status() for diagnostics, then ensure_running.
+        assert!(
+            lifecycle_for_assert.ensure_count() >= 1,
+            "repair must invoke ensure_running on the lifecycle"
+        );
+
+        // Should emit a lifecycle.ensure_already_running log.
+        let ensure_logs = logs_matching(&recorder, "lifecycle.ensure_already_running");
+        assert!(!ensure_logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_propagates_ensure_running_error() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        lifecycle.set_ensure_response(Err(anyhow::anyhow!("launchctl kickstart failed")));
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, _recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let result = coordinator.repair(LifecycleCause::Repair).await;
+        assert!(
+            result.is_err(),
+            "repair must propagate the ensure_running error"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_tolerates_status_check_error_and_proceeds_to_ensure() {
+        // When lifecycle.status() returns Err, repair() must log a warning
+        // but NOT abort — it should still call ensure_running and succeed.
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        lifecycle.set_status_response(Err(anyhow::anyhow!("launchctl print timeout")));
+        let lifecycle_for_assert = Arc::clone(&lifecycle);
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, _recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        coordinator
+            .repair(LifecycleCause::Repair)
+            .await
+            .expect("repair must succeed when ensure_running succeeds despite status error");
+
+        assert!(
+            lifecycle_for_assert.ensure_count() >= 1,
+            "repair must still invoke ensure_running after a status-check error"
+        );
+    }
+
+    // ── Coverage: extract_launchctl_exit ────────────────────────────
+
+    #[test]
+    fn extract_launchctl_exit_finds_exit_code_prefix() {
+        // "exit code: N" is the prefix produced by CommandRunner errors.
+        assert_eq!(
+            extract_launchctl_exit("launchctl bootout failed exit code: 17: boom"),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn extract_launchctl_exit_parses_exit_code_prefix() {
+        // The "exit code: N" prefix is what CommandRunner errors produce.
+        assert_eq!(
+            extract_launchctl_exit("launchctl bootstrap failed (exit code: 42): oops"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn extract_launchctl_exit_parses_exit_equals_prefix() {
+        assert_eq!(extract_launchctl_exit("bootstrap failed exit=7"), Some(7));
+    }
+
+    #[test]
+    fn extract_launchctl_exit_parses_status_prefix() {
+        assert_eq!(extract_launchctl_exit("error: status: 19"), Some(19));
+    }
+
+    #[test]
+    fn extract_launchctl_exit_returns_none_for_no_match() {
+        assert_eq!(extract_launchctl_exit("totally unrelated error"), None);
+    }
+
+    #[test]
+    fn extract_launchctl_exit_returns_none_for_non_numeric() {
+        assert_eq!(extract_launchctl_exit("exit code: not-a-number"), None);
+    }
+
+    #[test]
+    fn extract_launchctl_exit_handles_negative_codes() {
+        assert_eq!(extract_launchctl_exit("exit=-5"), Some(-5));
+    }
+
+    // ── Coverage: quit_desktop_host_with success path ───────────────
+
+    #[tokio::test]
+    async fn quit_desktop_host_with_succeeds_when_stops_succeed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordingCtx {
+            exit_calls: Arc<AtomicUsize>,
+            exit_codes: Arc<StdMutex<Vec<i32>>>,
+        }
+        impl QuitContext for RecordingCtx {
+            fn exit_app(&self, code: i32) {
+                self.exit_calls.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut v) = self.exit_codes.lock() {
+                    v.push(code);
+                }
+            }
+        }
+
+        let exit_calls = Arc::new(AtomicUsize::new(0));
+        let exit_codes = Arc::new(StdMutex::new(Vec::new()));
+        let ctx = RecordingCtx {
+            exit_calls: Arc::clone(&exit_calls),
+            exit_codes: Arc::clone(&exit_codes),
+        };
+
+        let lifecycle = Arc::new(FakeServiceLifecycle::new());
+        let login_start = Arc::new(FakeLoginStart::new());
+
+        let result = quit_desktop_host_with(&*lifecycle, &*login_start, &ctx);
+        assert!(result.is_ok());
+
+        // Both stops attempted (both succeed).
+        assert!(lifecycle
+            .recorded_actions()
+            .contains(&"stop_for_current_session".to_string()));
+        assert!(login_start
+            .recorded_actions()
+            .contains(&"stop_for_current_session".to_string()));
+
+        // exit_app called exactly once with code 0.
+        assert_eq!(exit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*exit_codes.lock().unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn quit_desktop_host_with_swallows_login_start_failure() {
+        // Only login_start.stop fails; lifecycle.stop succeeds.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordingCtx {
+            exit_calls: Arc<AtomicUsize>,
+        }
+        impl QuitContext for RecordingCtx {
+            fn exit_app(&self, _code: i32) {
+                self.exit_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let exit_calls = Arc::new(AtomicUsize::new(0));
+        let ctx = RecordingCtx {
+            exit_calls: Arc::clone(&exit_calls),
+        };
+
+        let lifecycle = Arc::new(FakeServiceLifecycle::new());
+        let login_start = Arc::new(FakeLoginStart::new());
+        login_start.set_stop_response(Err(anyhow::anyhow!("settings save failed")));
+
+        let result = quit_desktop_host_with(&*lifecycle, &*login_start, &ctx);
+        assert!(
+            result.is_ok(),
+            "quit must return Ok even when login_start.stop fails"
+        );
+        assert_eq!(exit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn quit_desktop_host_with_swallows_lifecycle_failure() {
+        // Only lifecycle.stop fails; login_start.stop succeeds.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordingCtx {
+            exit_calls: Arc<AtomicUsize>,
+        }
+        impl QuitContext for RecordingCtx {
+            fn exit_app(&self, _code: i32) {
+                self.exit_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let exit_calls = Arc::new(AtomicUsize::new(0));
+        let ctx = RecordingCtx {
+            exit_calls: Arc::clone(&exit_calls),
+        };
+
+        let lifecycle = Arc::new(FakeServiceLifecycle::new());
+        lifecycle.set_stop_response(Err(anyhow::anyhow!("launchctl bootout failed")));
+        let login_start = Arc::new(FakeLoginStart::new());
+
+        let result = quit_desktop_host_with(&*lifecycle, &*login_start, &ctx);
+        assert!(result.is_ok());
+        assert_eq!(exit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Coverage: exercise unused FakeServiceLifecycle methods ───────
+
+    #[tokio::test]
+    async fn fake_service_lifecycle_methods_record_and_return() {
+        // Drive every method of FakeServiceLifecycle so the test helper
+        // itself is fully covered (the trait-impl bodies record into the
+        // actions vec).
+        let lc = FakeServiceLifecycle::new();
+
+        // ensure_registered
+        let outcome = lc.ensure_registered().unwrap();
+        assert_eq!(outcome, InstallOutcome::AlreadyPresent);
+
+        // ensure_running returns the configured default (AlreadyRunning).
+        let outcome = lc.ensure_running().unwrap();
+        assert_eq!(outcome, EnsureRunningOutcome::AlreadyRunning);
+
+        // status returns Running (default response).
+        let status = lc.status().unwrap();
+        assert_eq!(status, LifecycleStatus::Running);
+
+        // stop_for_current_session succeeds (default).
+        lc.stop_for_current_session().expect("stop succeeds");
+
+        // uninstall succeeds.
+        lc.uninstall().expect("uninstall succeeds");
+
+        // set_ensure_running lets us reconfigure the response.
+        lc.set_ensure_running(Ok(EnsureRunningOutcome::Started {
+            install_outcome: InstallOutcome::NewlyInstalled,
+        }));
+        let outcome = lc.ensure_running().unwrap();
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::NewlyInstalled,
+            }
+        );
+
+        // All actions recorded.
+        let actions = lc.recorded_actions();
+        assert!(actions.contains(&"ensure_registered".to_string()));
+        assert!(actions.contains(&"ensure_running".to_string()));
+        assert!(actions.contains(&"status".to_string()));
+        assert!(actions.contains(&"stop_for_current_session".to_string()));
+        assert!(actions.contains(&"uninstall".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fake_service_lifecycle_set_stop_response_propagates_error() {
+        let lc = FakeServiceLifecycle::new();
+        lc.set_stop_response(Err(anyhow::anyhow!("bootout failed")));
+        let result = lc.stop_for_current_session();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fake_service_lifecycle_ensure_block_releases_barrier() {
+        // set_ensure_block installs a barrier that ensure_running waits on.
+        use std::sync::Arc;
+        let lc = Arc::new(FakeServiceLifecycle::new());
+        // 2 parties: the test thread + the ensure_running call.
+        let barrier = Arc::new(SyncBarrier::new(2));
+        lc.set_ensure_block(Arc::clone(&barrier));
+
+        let lc_clone = Arc::clone(&lc);
+        let handle = std::thread::spawn(move || lc_clone.ensure_running());
+        // Release the barrier so ensure_running proceeds.
+        barrier.wait();
+        let result = handle.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    // ── Coverage: CountingLifecycle stop_slow path ───────────────────
+
+    #[tokio::test]
+    async fn counting_lifecycle_slow_stop_sleeps_then_responds() {
+        let lc = Arc::new(CountingLifecycle::new());
+        lc.stop_slow.store(true, Ordering::SeqCst);
+        lc.set_stop_response(Ok(()));
+
+        let start = std::time::Instant::now();
+        lc.stop_for_current_session().expect("stop succeeds");
+        let elapsed = start.elapsed();
+        // stop_slow sleeps 50ms — verify it actually took time.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "stop_slow must introduce a delay, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn counting_lifecycle_slow_ensure_sleeps_then_responds() {
+        let lc = Arc::new(CountingLifecycle::new());
+        lc.stop_slow.store(true, Ordering::SeqCst);
+
+        let start = std::time::Instant::now();
+        let _ = lc.ensure_running();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "stop_slow must introduce a delay on ensure, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn counting_lifecycle_ensure_count_increments() {
+        let lc = CountingLifecycle::new();
+        assert_eq!(lc.ensure_count(), 0);
+        let _ = lc.ensure_running();
+        assert_eq!(lc.ensure_count(), 1);
+        let _ = lc.ensure_running();
+        assert_eq!(lc.ensure_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn counting_lifecycle_stop_count_increments() {
+        let lc = CountingLifecycle::new();
+        assert_eq!(lc.stop_count(), 0);
+        let _ = lc.stop_for_current_session();
+        assert_eq!(lc.stop_count(), 1);
+    }
+
+    // ── Coverage: ensure_running success emits lifecycle.ensure_started ─
+
+    #[tokio::test]
+    async fn ensure_started_logs_when_lifecycle_returns_started_outcome() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        lifecycle.set_ensure_response(Ok(EnsureRunningOutcome::Started {
+            install_outcome: InstallOutcome::NewlyInstalled,
+        }));
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let outcome = coordinator
+            .ensure_running(LifecycleCause::Startup)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EnsureRunningOutcome::Started { .. }));
+
+        let started_logs = logs_matching(&recorder, "lifecycle.ensure_started");
+        assert_eq!(started_logs.len(), 1);
+        assert_eq!(started_logs[0].cause.as_deref(), Some("startup"));
+        assert_eq!(started_logs[0].result, "ok");
+    }
+
+    // ── Coverage: ensure_running with retryable failure (non-approval) ─
+
+    #[tokio::test]
+    async fn ensure_running_classifies_non_approval_error_as_retryable() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        lifecycle.set_ensure_response(Err(anyhow::anyhow!("launchctl timeout")));
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        let result = coordinator.ensure_running(LifecycleCause::Repair).await;
+        assert!(result.is_err());
+
+        let fail_logs = logs_matching(&recorder, "lifecycle.ensure_failed");
+        assert_eq!(fail_logs.len(), 1);
+        assert_eq!(fail_logs[0].result, "retryable_failure");
+        assert_eq!(fail_logs[0].cause.as_deref(), Some("repair"));
+        assert_eq!(fail_logs[0].launchctl_exit_code, None);
+        assert_eq!(fail_logs[0].sm_status, None);
+    }
+
+    // ── Coverage: ManualReopen clears suppression then proceeds ─────
+
+    #[tokio::test]
+    async fn manual_reopen_clears_suppression_and_proceeds_to_lifecycle() {
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let (coordinator, recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
+
+        coordinator.suppress_for_session(LifecycleCause::Quit).await;
+        assert!(coordinator.is_suppressed().await);
+
+        // ManualReopen clears suppression and runs ensure_running.
+        let outcome = coordinator
+            .ensure_running(LifecycleCause::ManualReopen)
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnsureRunningOutcome::AlreadyRunning);
+        assert!(!coordinator.is_suppressed().await);
+
+        // Should emit a phase_transition log (suppressed → active) then
+        // an ensure_already_running log.
+        let transition_logs = logs_matching(&recorder, "lifecycle.phase_transition");
+        assert_eq!(transition_logs.len(), 1);
+        assert_eq!(transition_logs[0].from_state, "suppressed_for_session");
+        assert_eq!(transition_logs[0].to_state, "active");
+    }
+
+    // ── Coverage: emit_log_internal with no recorder (production) ────
+
+    #[tokio::test]
+    async fn production_coordinator_emits_logs_without_recorder() {
+        // The production `LifecycleCoordinator::new` constructor has
+        // log_recorder = None. emit_log_internal must not panic.
+        let lifecycle = Arc::new(CountingLifecycle::new());
+        let login_start = Arc::new(RecordingLoginStart::new());
+        let coordinator = LifecycleCoordinator::new(lifecycle, login_start);
+
+        // request_quit, suppress_for_session, and ensure_running all
+        // call emit_log_internal. None should panic.
+        coordinator.request_quit().await;
+        coordinator.suppress_for_session(LifecycleCause::Quit).await;
+        let _ = coordinator.ensure_running(LifecycleCause::Startup).await;
+        // No assertions beyond "did not panic" — the production path
+        // skips the recorder branch entirely.
+    }
+
+    // ── Coverage: lifecycle + login_start accessors through coordinator ─
+
+    #[tokio::test]
+    async fn coordinator_lifecycle_and_login_start_accessors_return_arcs() {
+        let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
+        let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
+        let coordinator =
+            LifecycleCoordinator::new(Arc::clone(&lifecycle), Arc::clone(&login_start));
+
+        // The accessor returns &Arc<dyn ...> referencing the same Arc.
+        assert!(
+            Arc::ptr_eq(coordinator.lifecycle(), &lifecycle),
+            "lifecycle accessor must return the same Arc"
+        );
+        assert!(
+            Arc::ptr_eq(coordinator.login_start(), &login_start),
+            "login_start accessor must return the same Arc"
+        );
+    }
+
+    // ── Coverage: RecordingLoginStart records every method ──────────
+
+    #[test]
+    fn recording_login_start_records_all_methods() {
+        let ls = RecordingLoginStart::new();
+        ls.enable_for_future_logins().unwrap();
+        ls.disable().unwrap();
+        ls.enable_for_current_session().unwrap();
+        ls.adopt_current_session().unwrap();
+        ls.stop_for_current_session().unwrap();
+        assert!(ls.host_mode_active());
+
+        let actions = ls.recorded_actions();
+        assert!(actions.contains(&"enable_for_future_logins".to_string()));
+        assert!(actions.contains(&"disable".to_string()));
+        assert!(actions.contains(&"enable_for_current_session".to_string()));
+        assert!(actions.contains(&"adopt_current_session".to_string()));
+        assert!(actions.contains(&"stop_for_current_session".to_string()));
+    }
+
+    // ── Coverage: FakeLoginStart non-stop methods ────────────────────
+
+    #[test]
+    fn fake_login_start_records_non_stop_methods() {
+        let ls = FakeLoginStart::new();
+        ls.enable_for_future_logins().unwrap();
+        ls.disable().unwrap();
+        ls.enable_for_current_session().unwrap();
+        ls.adopt_current_session().unwrap();
+        assert!(ls.host_mode_active());
+
+        let actions = ls.recorded_actions();
+        assert!(actions.contains(&"enable_for_future_logins".to_string()));
+        assert!(actions.contains(&"disable".to_string()));
+        assert!(actions.contains(&"enable_for_current_session".to_string()));
+        assert!(actions.contains(&"adopt_current_session".to_string()));
     }
 }

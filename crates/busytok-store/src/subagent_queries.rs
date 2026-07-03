@@ -316,8 +316,8 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
              (id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
               prompt_artifact_ref, output_schema_name, output_schema_version, status, \
               result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-              timeout_seconds, model_override) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+              timeout_seconds, model_override, error_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             row.id,
             row.subagent_id,
@@ -338,6 +338,7 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
             row.completed_at_ms,
             row.timeout_seconds,
             row.model_override,
+            row.error_kind,
         ],
     )
     .map(|_| ())
@@ -349,7 +350,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override \
+                timeout_seconds, model_override, error_kind \
          FROM subagent_tasks WHERE id = ?1",
     )?;
     let row_opt = stmt
@@ -374,6 +375,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
                 completed_at_ms: row.get(16)?,
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
+                error_kind: row.get(19)?,
             })
         })
         .ok();
@@ -389,7 +391,7 @@ pub fn list_tasks(
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override \
+                timeout_seconds, model_override, error_kind \
          FROM subagent_tasks WHERE subagent_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
     )?;
     let rows = stmt
@@ -414,6 +416,7 @@ pub fn list_tasks(
                 completed_at_ms: row.get(16)?,
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
+                error_kind: row.get(19)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -438,6 +441,20 @@ pub fn set_task_status(
     )
     .map(|_| ())
     .with_context(|| format!("set task {} status {}", id, status))
+}
+
+/// Set the classified `error_kind` on a task row (Task 5). Called by
+/// `SubagentManager::execute_task` after `executor.execute()` returns a
+/// failed/timeout `ExecutorOutput` with `error_kind: Some(...)`. The
+/// `error_kind` string is the snake_case serialization of `TaskErrorKind`
+/// (see `busytok-subagent::models::TaskErrorKind`); `None` clears it.
+pub fn set_task_error_kind(conn: &Connection, id: &str, error_kind: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE subagent_tasks SET error_kind = ?2 WHERE id = ?1",
+        params![id, error_kind],
+    )
+    .map(|_| ())
+    .with_context(|| format!("set task {} error_kind {:?}", id, error_kind))
 }
 
 /// Count tasks for a subagent with `created_at_ms > since_ms`.
@@ -534,7 +551,7 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
             "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                     prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                     result_summary, result_json, error, created_at_ms, started_at_ms, \
-                    completed_at_ms, timeout_seconds, model_override \
+                    completed_at_ms, timeout_seconds, model_override, error_kind \
              FROM subagent_tasks WHERE id = ?1",
             rusqlite::params![id],
             |r| {
@@ -558,6 +575,7 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
                     completed_at_ms: r.get(16)?,
                     timeout_seconds: r.get(17)?,
                     model_override: r.get(18)?,
+                    error_kind: r.get(19)?,
                 })
             },
         )
@@ -1222,4 +1240,247 @@ pub fn release_hot_bindings_for_shutdown(
 pub struct ShutdownReconciliationCounts {
     pub bindings_released: usize,
     pub status_rolled_back: usize,
+}
+
+// --- Phase 2: aggregate task queries (no subagent_id filter) --------------
+//
+// These three functions feed the Subagent Monitoring Page (spec §4 Phase 2):
+//   * `list_recent_tasks_all`   — `tasks_recent` (fixed limit 20, all subagents)
+//   * `count_tasks_by_subagent` — `subagents[].task_count`
+//   * `last_task_by_subagent`   — `subagents[].last_task_{created_at,status}`
+
+/// Most recent tasks across ALL subagents, ordered by `created_at_ms` desc
+/// with `id` desc as a deterministic tie-break (spec §4 Phase 2: `tasks_recent`
+/// fixed limit 20, no subagent_id filter).
+pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<SubagentTaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
+                prompt_artifact_ref, output_schema_name, output_schema_version, status, \
+                result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
+                timeout_seconds, model_override, error_kind \
+         FROM subagent_tasks \
+         ORDER BY created_at_ms DESC, id DESC \
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(SubagentTaskRow {
+                id: row.get(0)?,
+                subagent_id: row.get(1)?,
+                source_harness: row.get(2)?,
+                source_session_id: row.get(3)?,
+                intent: row.get(4)?,
+                profile: row.get(5)?,
+                prompt: row.get(6)?,
+                prompt_artifact_ref: row.get(7)?,
+                output_schema_name: row.get(8)?,
+                output_schema_version: row.get(9)?,
+                status: row.get(10)?,
+                result_summary: row.get(11)?,
+                result_json: row.get(12)?,
+                error: row.get(13)?,
+                created_at_ms: row.get(14)?,
+                started_at_ms: row.get(15)?,
+                completed_at_ms: row.get(16)?,
+                timeout_seconds: row.get(17)?,
+                model_override: row.get(18)?,
+                error_kind: row.get(19)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `(subagent_id, task_count)` for every subagent that has at least one task.
+/// Spec §4 Phase 2: `subagents[].task_count`.
+pub fn count_tasks_by_subagent(conn: &Connection) -> Result<Vec<(String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT subagent_id, COUNT(*) AS cnt \
+         FROM subagent_tasks \
+         GROUP BY subagent_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `(subagent_id, created_at_ms, status)` for the most recent task of each
+/// subagent that has at least one task. Spec §4 Phase 2:
+/// `subagents[].last_task_{created_at,status}`. Uses `ROW_NUMBER()` with
+/// `id DESC` tie-break for deterministic output when multiple tasks share
+/// the same `created_at_ms`.
+pub fn last_task_by_subagent(conn: &Connection) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT subagent_id, created_at_ms, status \
+         FROM ( \
+             SELECT subagent_id, created_at_ms, status, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY subagent_id \
+                        ORDER BY created_at_ms DESC, id DESC \
+                    ) AS rn \
+             FROM subagent_tasks \
+         ) ranked \
+         WHERE rn = 1",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::repository::SubagentTaskRow;
+
+    fn seed_subagent(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO subagent_logical_subagents \
+                 (id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
+                  default_model, status, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 'proj', '/repo', 'hash', NULL, NULL, 'pi/review-cheap', NULL, \
+                     'warm', 1000, 1000)",
+            rusqlite::params![id, id],
+        )
+        .unwrap();
+    }
+
+    fn seed_task(conn: &Connection, id: &str, subagent_id: &str, status: &str, created_at_ms: i64) {
+        let mut row = SubagentTaskRow::for_test(id, subagent_id, "pi/review-cheap", "prompt");
+        row.status = status.to_string();
+        row.created_at_ms = created_at_ms;
+        insert_task(conn, &row).unwrap();
+    }
+
+    #[test]
+    fn list_recent_tasks_all_returns_across_all_subagents() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_subagent(conn, "sub-b");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-b", "failed", 2000);
+        seed_task(conn, "t3", "sub-a", "completed", 3000);
+
+        let tasks = list_recent_tasks_all(conn, 20).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "t3"); // desc order
+        assert_eq!(tasks[1].id, "t2");
+        assert_eq!(tasks[2].id, "t1");
+    }
+
+    #[test]
+    fn list_recent_tasks_all_respects_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        for i in 0..10 {
+            seed_task(conn, &format!("t{i}"), "sub-a", "completed", 1000 + i);
+        }
+        let tasks = list_recent_tasks_all(conn, 3).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "t9");
+    }
+
+    #[test]
+    fn list_recent_tasks_all_empty_when_no_tasks() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tasks = list_recent_tasks_all(conn, 20).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn count_tasks_by_subagent_groups_correctly() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_subagent(conn, "sub-b");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "failed", 2000);
+        seed_task(conn, "t3", "sub-b", "completed", 3000);
+
+        let counts = count_tasks_by_subagent(conn).unwrap();
+        let mut map: std::collections::HashMap<String, u32> = counts.into_iter().collect();
+        assert_eq!(map.remove("sub-a").unwrap(), 2);
+        assert_eq!(map.remove("sub-b").unwrap(), 1);
+    }
+
+    #[test]
+    fn count_tasks_by_subagent_empty_when_no_tasks() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let counts = count_tasks_by_subagent(conn).unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn last_task_by_subagent_returns_latest() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "failed", 2000);
+
+        let lasts = last_task_by_subagent(conn).unwrap();
+        assert_eq!(lasts.len(), 1);
+        let (sub_id, created_at, status) = &lasts[0];
+        assert_eq!(sub_id, "sub-a");
+        assert_eq!(*created_at, 2000);
+        assert_eq!(status, "failed");
+    }
+
+    #[test]
+    fn last_task_by_subagent_empty_when_no_tasks() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        let lasts = last_task_by_subagent(conn).unwrap();
+        assert!(lasts.is_empty());
+    }
+
+    /// Tie-break determinism: when two tasks share the same `created_at_ms`,
+    /// `list_recent_tasks_all` must order by `id DESC` so pagination is stable.
+    #[test]
+    fn list_recent_tasks_all_tiebreak_deterministic() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "completed", 1000);
+
+        let tasks = list_recent_tasks_all(conn, 20).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "t2", "higher id wins tie-break");
+        assert_eq!(tasks[1].id, "t1");
+    }
+
+    /// Tie-break determinism: when two tasks for the same subagent share the
+    /// same `created_at_ms`, `last_task_by_subagent` must return exactly one
+    /// row (the higher `id`) — not duplicates.
+    #[test]
+    fn last_task_by_subagent_tiebreak_deterministic() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_task(conn, "t1", "sub-a", "completed", 1000);
+        seed_task(conn, "t2", "sub-a", "failed", 1000);
+
+        let lasts = last_task_by_subagent(conn).unwrap();
+        assert_eq!(lasts.len(), 1, "exactly one row despite tied created_at_ms");
+        let (sub_id, created_at, status) = &lasts[0];
+        assert_eq!(sub_id, "sub-a");
+        assert_eq!(*created_at, 1000);
+        assert_eq!(status, "failed", "higher id wins tie-break");
+    }
 }

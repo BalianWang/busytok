@@ -9,6 +9,12 @@ license.workspace = true
 anyhow = { workspace = true }
 busytok-domain = { path = "../busytok-domain" }
 dirs = { workspace = true }
+# keyring 4.x: default features enable the `v1` API (Entry::new/set_password/...)
+# which uses macOS Keychain via `apple-native-keyring-store` and Windows
+# Credential Manager via `windows-native-keyring-store` on those platforms.
+# (The brief's `apple-native`/`windows-native` feature names were renamed
+# during the v4.0 stable release; the defaults now provide the same behavior.)
+keyring = "4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

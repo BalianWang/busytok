@@ -47,6 +47,12 @@
 #                                current_state_summary, key_files, decisions,
 #                                and open_questions. 0/unset = no memory_update
 #                                (hot_summary preserved — no destructive clear).
+#   BUSYTOK_MOCK_AUTH_FAIL=1     session.turn_auto returns a JSON-RPC error
+#                                with code -32010 (AUTH_FAILURE) and message
+#                                "401 Unauthorized" instead of the normal
+#                                success response. Used to test the
+#                                SidecarTaskExecutor auth-fail kill path
+#                                (pool.remove_worker_and_kill).
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
@@ -60,6 +66,7 @@ NULL_MEMORY_DELTA="${BUSYTOK_MOCK_NULL_MEMORY_DELTA:-0}"
 TURN_AUTO_FAILS_AFTER_CLOSE="${BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE:-0}"
 HOT_LIMIT_NO_CANDIDATE="${BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE:-0}"
 MEMORY_UPDATE="${BUSYTOK_MOCK_MEMORY_UPDATE:-0}"
+AUTH_FAIL="${BUSYTOK_MOCK_AUTH_FAIL:-0}"
 COUNT=0
 # Number of successful session.close responses sent. Used by
 # BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE to fail the retry turn_auto issued
@@ -140,7 +147,12 @@ while IFS= read -r line; do
       exit 0
       ;;
     session.turn_auto)
-      if [[ "$TURN_AUTO_FAILS_AFTER_CLOSE" == "1" && "$CLOSES" -gt 0 ]]; then
+      if [[ "$AUTH_FAIL" == "1" ]]; then
+        # Simulate a 401 from the upstream provider — exercises the
+        # SidecarTaskExecutor auth-fail kill path (classify_sidecar_error
+        # maps -32010 to TaskErrorKind::Auth -> pool.remove_worker_and_kill).
+        printf '{"jsonrpc":"2.0","error":{"code":-32010,"message":"401 Unauthorized"},"id":%s}\n' "$ID"
+      elif [[ "$TURN_AUTO_FAILS_AFTER_CLOSE" == "1" && "$CLOSES" -gt 0 ]]; then
         # Simulate a sidecar that fails the turn_auto retry issued AFTER a
         # successful session.close (eviction released the slot, but the retry
         # turn itself errors). Exercises executor.rs lines 92-98.

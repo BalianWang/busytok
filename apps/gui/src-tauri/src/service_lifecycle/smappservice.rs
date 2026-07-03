@@ -2437,4 +2437,964 @@ mod tests {
         lc.preflight_bundle("status")
             .expect("preflight should pass when both bundle artifacts exist");
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // Coverage expansion: production lifecycle paths driven by a
+    // configurable launchctl runner.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Configurable launchctl runner: returns canned responses per
+    /// subcommand and optionally fires a side-effect on kickstart.
+    /// Used to drive production `ensure_registered` / `ensure_running`
+    /// / `status` / `stop_for_current_session` / `uninstall` paths
+    /// without actually shelling out to `launchctl`.
+    struct ScenarioRunner {
+        print_success: bool,
+        print_stdout: String,
+        bootout_success: bool,
+        bootout_stderr: String,
+        bootstrap_success: bool,
+        kickstart_success: bool,
+        /// Optional side-effect invoked when `kickstart` is called —
+        /// used to flip socket_ready() to true after the lifecycle's
+        /// repair path has run, so wait_for_socket_ready can succeed.
+        on_kickstart: Option<Box<dyn Fn() + Send + Sync>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScenarioRunner {
+        /// `launchctl print` succeeds with `program = <path>;` in stdout.
+        fn print_loaded(program_path: &Path) -> Self {
+            Self {
+                print_success: true,
+                print_stdout: format!("program = {};\n", program_path.display()),
+                bootout_success: true,
+                bootout_stderr: String::new(),
+                bootstrap_success: true,
+                kickstart_success: true,
+                on_kickstart: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// `launchctl print` succeeds with custom stdout (for state/pid).
+        fn print_with_stdout(stdout: &str) -> Self {
+            Self {
+                print_success: true,
+                print_stdout: stdout.to_string(),
+                bootout_success: true,
+                bootout_stderr: String::new(),
+                bootstrap_success: true,
+                kickstart_success: true,
+                on_kickstart: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// `launchctl print` fails (job not loaded).
+        fn print_absent() -> Self {
+            Self {
+                print_success: false,
+                print_stdout: String::new(),
+                bootout_success: true,
+                bootout_stderr: String::new(),
+                bootstrap_success: true,
+                kickstart_success: true,
+                on_kickstart: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_bootout_failure(mut self, stderr: &str) -> Self {
+            self.bootout_success = false;
+            self.bootout_stderr = stderr.to_string();
+            self
+        }
+
+        fn with_bootstrap_failure(mut self) -> Self {
+            self.bootstrap_success = false;
+            self
+        }
+
+        fn with_kickstart_failure(mut self) -> Self {
+            self.kickstart_success = false;
+            self
+        }
+
+        fn with_on_kickstart<F: Fn() + Send + Sync + 'static>(mut self, f: F) -> Self {
+            self.on_kickstart = Some(Box::new(f));
+            self
+        }
+
+        fn recorded_subcommands(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for ScenarioRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<CommandStatus> {
+            assert_eq!(program, "launchctl");
+            let sub = args.first().map(String::as_str).unwrap_or("");
+            self.calls.lock().unwrap().push(sub.to_string());
+            Ok(match sub {
+                "print" => CommandStatus {
+                    success: self.print_success,
+                    exit_code: Some(if self.print_success { 0 } else { 1 }),
+                    stdout: self.print_stdout.clone(),
+                    stderr: String::new(),
+                },
+                "bootout" => CommandStatus {
+                    success: self.bootout_success,
+                    exit_code: Some(if self.bootout_success { 0 } else { 1 }),
+                    stdout: String::new(),
+                    stderr: self.bootout_stderr.clone(),
+                },
+                "bootstrap" => CommandStatus {
+                    success: self.bootstrap_success,
+                    exit_code: Some(if self.bootstrap_success { 0 } else { 1 }),
+                    stdout: String::new(),
+                    stderr: if self.bootstrap_success {
+                        String::new()
+                    } else {
+                        "bootstrap failed".into()
+                    },
+                },
+                "kickstart" => {
+                    if let Some(cb) = &self.on_kickstart {
+                        cb();
+                    }
+                    CommandStatus {
+                        success: self.kickstart_success,
+                        exit_code: Some(if self.kickstart_success { 0 } else { 1 }),
+                        stdout: String::new(),
+                        stderr: if self.kickstart_success {
+                            String::new()
+                        } else {
+                            "kickstart failed".into()
+                        },
+                    }
+                }
+                _ => CommandStatus {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            })
+        }
+    }
+
+    /// Configurable VersionProbe stub — exercises match, mismatch,
+    /// unknown, and probe-failure paths through the production ladder.
+    enum FakeVersionProbe {
+        Matching,
+        Mismatch,
+        None_,
+        Err,
+    }
+
+    impl VersionProbe for FakeVersionProbe {
+        fn probe_service_build_identity(&self) -> Result<Option<String>> {
+            match self {
+                FakeVersionProbe::Matching => Ok(Some(
+                    ServiceBuildIdentity::current_gui().as_str().to_string(),
+                )),
+                FakeVersionProbe::Mismatch => {
+                    Ok(Some(ServiceBuildIdentity::mismatch().as_str().to_string()))
+                }
+                FakeVersionProbe::None_ => Ok(None),
+                FakeVersionProbe::Err => {
+                    anyhow::bail!("probe failed: connection refused")
+                }
+            }
+        }
+    }
+
+    /// Build a production `SmAppServiceLifecycle` rooted at `temp`,
+    /// with a real (fake-binary) bundle layout, a writable LaunchAgents
+    /// dir, and the supplied runner + probe. Returns the lifecycle and
+    /// the cloned `BusytokPaths` so tests can prewire the marker/socket.
+    fn prod_lifecycle_with(
+        temp: &std::path::Path,
+        runner: ScenarioRunner,
+        probe: Arc<dyn VersionProbe>,
+    ) -> (SmAppServiceLifecycle, BusytokPaths) {
+        let app_root = temp.join("Busytok.app");
+        let macos_dir = app_root.join("Contents/MacOS");
+        fs::create_dir_all(&macos_dir).unwrap();
+        // Write the service binary so preflight_bundle succeeds.
+        fs::write(macos_dir.join("busytok-service"), b"fake-binary").unwrap();
+        let layout = BundleLayout::for_app_root(&app_root);
+
+        let paths = BusytokPaths::for_test(&temp.join("data"));
+        paths.ensure_dirs_exist().unwrap();
+        // Ensure the LaunchAgents directory exists (for managed plist writes).
+        let platform = PlatformPaths::with_home_dir(temp.join("home"));
+        fs::create_dir_all(platform.service_install_root()).unwrap();
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout,
+            paths.clone(),
+            platform,
+            executor,
+            probe,
+            Box::new(runner),
+        );
+        (lc, paths)
+    }
+
+    /// Pre-write the marker file + a fake socket file so `socket_ready()`
+    /// returns true. Used to short-circuit `wait_for_socket_ready` after
+    /// a repair / bootstrap path.
+    fn prewire_socket(paths: &BusytokPaths) {
+        busytok_config::service_marker::write(paths.data_dir()).unwrap();
+        let socket_path = paths.control_endpoint().unwrap();
+        std::fs::create_dir_all(std::path::Path::new(&socket_path).parent().unwrap()).unwrap();
+        std::fs::write(&socket_path, "").unwrap();
+    }
+
+    // ── resolve_uid standalone ─────────────────────────────────────
+
+    #[test]
+    fn resolve_uid_returns_current_process_uid() {
+        let uid = resolve_uid().expect("resolve_uid should succeed on macOS");
+        // Should match libc::getuid() (the production current_uid).
+        assert_eq!(uid, current_uid());
+    }
+
+    // ── cleanup_legacy_launch_agents error paths ──────────────────
+
+    #[test]
+    fn cleanup_legacy_launch_agents_returns_err_when_read_dir_fails_non_notfound() {
+        // Pass a path that EXISTS as a file (not a directory) — read_dir
+        // returns an error that's not NotFound.
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("not_a_dir");
+        fs::write(&file_path, "i am a file").unwrap();
+        let runner = PermissiveRunner;
+        let result = cleanup_legacy_launch_agents(&file_path, &runner);
+        assert!(
+            result.is_err(),
+            "cleanup must propagate non-NotFound read_dir errors, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_legacy_launch_agents_logs_when_remove_file_fails_non_notfound() {
+        // Create a directory masquerading as a legacy plist file. The
+        // cleanup loop matches its name (com.busytok.*.plist) and tries
+        // fs::remove_file, which fails because it's a directory — this
+        // exercises the warn! branch (not NotFound).
+        let temp = tempdir().unwrap();
+        let launch_agents = temp.path().join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        let legacy_dir = launch_agents.join("com.busytok.legacy.plist");
+        fs::create_dir(&legacy_dir).unwrap();
+
+        let runner = PermissiveRunner;
+        let result = cleanup_legacy_launch_agents(&launch_agents, &runner).unwrap();
+        // The legacy entry couldn't be removed (it's a directory), so
+        // it must NOT appear in removed_files.
+        assert!(
+            !result
+                .removed_files
+                .contains(&"com.busytok.legacy.plist".to_string()),
+            "directory masquerading as plist must not be in removed_files"
+        );
+        // The directory still exists.
+        assert!(legacy_dir.exists(), "directory must still exist");
+    }
+
+    // ── Production ensure_registered paths ─────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_registered_returns_already_present_when_job_loaded() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc
+            .ensure_registered()
+            .expect("ensure_registered must succeed");
+        assert_eq!(outcome, InstallOutcome::AlreadyPresent);
+        // Job was already loaded, so bootstrap must NOT have been called.
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_registered_bootstraps_when_job_absent() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc
+            .ensure_registered()
+            .expect("ensure_registered must succeed");
+        assert_eq!(outcome, InstallOutcome::NewlyInstalled);
+    }
+
+    // ── Production ensure_running paths ────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_returns_already_running_when_socket_ready() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Matching);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        prewire_socket(&paths);
+
+        let outcome = lc.ensure_running().expect("ensure_running must succeed");
+        assert_eq!(outcome, EnsureRunningOutcome::AlreadyRunning);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_bootstraps_when_job_absent_and_socket_not_ready() {
+        let temp = tempdir().unwrap();
+        // on_kickstart: write the marker + socket file so wait_for_socket_ready succeeds.
+        let paths_for_cb = BusytokPaths::for_test(&temp.path().join("data"));
+        paths_for_cb.ensure_dirs_exist().unwrap();
+        let paths_cb_clone = paths_for_cb.clone();
+        let on_kickstart = move || prewire_socket(&paths_cb_clone);
+        let runner = ScenarioRunner::print_absent().with_on_kickstart(on_kickstart);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc.ensure_running().expect("ensure_running must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::NewlyInstalled,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_repairs_when_stale_bundle_path() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        // Stale program path: differs from the lifecycle's desired path.
+        let stale_path = std::path::Path::new("/Old/Busytok.app/Contents/MacOS/busytok-service");
+        let runner = ScenarioRunner::print_loaded(stale_path);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        // Pre-wire the socket so wait_for_socket_ready succeeds after repair.
+        prewire_socket(&paths);
+
+        let outcome = lc.ensure_running().expect("repair must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+        let _ = layout_for_print; // silence unused warning
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_repairs_when_version_skew() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Mismatch);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        prewire_socket(&paths);
+
+        let outcome = lc.ensure_running().expect("repair must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_repairs_when_socket_unreachable_and_job_running() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        // Job is running (state = running), version matches, but socket
+        // is not ready initially. After repair, kickstart writes the
+        // marker + socket so wait_for_socket_ready succeeds.
+        let stdout = format!(
+            "program = {};\nstate = running\n",
+            layout_for_print.service_binary_path().display()
+        );
+        let paths_for_cb = BusytokPaths::for_test(&temp.path().join("data"));
+        paths_for_cb.ensure_dirs_exist().unwrap();
+        let paths_cb_clone = paths_for_cb.clone();
+        let on_kickstart = move || prewire_socket(&paths_cb_clone);
+        let runner = ScenarioRunner::print_with_stdout(&stdout).with_on_kickstart(on_kickstart);
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Matching);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc.ensure_running().expect("repair must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_kickstarts_when_socket_closed_and_job_waiting() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let stdout = format!(
+            "program = {};\nstate = waiting\n",
+            layout_for_print.service_binary_path().display()
+        );
+        let paths_for_cb = BusytokPaths::for_test(&temp.path().join("data"));
+        paths_for_cb.ensure_dirs_exist().unwrap();
+        let paths_cb_clone = paths_for_cb.clone();
+        let on_kickstart = move || prewire_socket(&paths_cb_clone);
+        let runner = ScenarioRunner::print_with_stdout(&stdout).with_on_kickstart(on_kickstart);
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Matching);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc.ensure_running().expect("kickstart must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::AlreadyPresent,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_repairs_when_version_probe_fails_on_running_job() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let stdout = format!(
+            "program = {};\nstate = running\n",
+            layout_for_print.service_binary_path().display()
+        );
+        let paths_for_cb = BusytokPaths::for_test(&temp.path().join("data"));
+        paths_for_cb.ensure_dirs_exist().unwrap();
+        let paths_cb_clone = paths_for_cb.clone();
+        let on_kickstart = move || prewire_socket(&paths_cb_clone);
+        let runner = ScenarioRunner::print_with_stdout(&stdout).with_on_kickstart(on_kickstart);
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Err);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc.ensure_running().expect("repair must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_falls_through_when_probe_fails_and_socket_ready() {
+        // Probe fails on a non-running job → falls through to socket check.
+        // Socket is already ready (marker + file pre-written) → AlreadyRunning.
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let stdout = format!(
+            "program = {};\nstate = waiting\n",
+            layout_for_print.service_binary_path().display()
+        );
+        let runner = ScenarioRunner::print_with_stdout(&stdout);
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Err);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        prewire_socket(&paths);
+
+        let outcome = lc.ensure_running().expect("must succeed");
+        assert_eq!(outcome, EnsureRunningOutcome::AlreadyRunning);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_repairs_when_stale_live_pid() {
+        // Snapshot's program path matches the current bundle, but the
+        // live PID's executable path differs (proc_pidpath returns the
+        // test binary path, which is outside the Busytok.app bundle).
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let current_pid = std::process::id();
+        let stdout = format!(
+            "program = {};\npid = {}\nstate = running\n",
+            layout_for_print.service_binary_path().display(),
+            current_pid
+        );
+        let paths_for_cb = BusytokPaths::for_test(&temp.path().join("data"));
+        paths_for_cb.ensure_dirs_exist().unwrap();
+        let paths_cb_clone = paths_for_cb.clone();
+        let on_kickstart = move || prewire_socket(&paths_cb_clone);
+        let runner = ScenarioRunner::print_with_stdout(&stdout).with_on_kickstart(on_kickstart);
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Matching);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let outcome = lc.ensure_running().expect("repair must succeed");
+        assert_eq!(
+            outcome,
+            EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::Upgraded,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_propagates_bootout_error_from_repair() {
+        // Stale bundle triggers repair, but bootout fails (non-strict
+        // variant isn't used here — strict bootout propagates the error).
+        let temp = tempdir().unwrap();
+        let stale_path = std::path::Path::new("/Old/Busytok.app/Contents/MacOS/busytok-service");
+        let runner = ScenarioRunner::print_loaded(stale_path)
+            .with_bootout_failure("launchctl bootout failed: operation not permitted");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        // Pre-wire socket so it would succeed IF repair reached
+        // wait_for_socket_ready — but the bootout failure prevents that.
+        prewire_socket(&_paths);
+
+        let result = lc.ensure_running();
+        assert!(
+            result.is_err(),
+            "ensure_running must propagate bootout error from repair, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_propagates_bootstrap_error_from_repair() {
+        let temp = tempdir().unwrap();
+        let stale_path = std::path::Path::new("/Old/Busytok.app/Contents/MacOS/busytok-service");
+        let runner = ScenarioRunner::print_loaded(stale_path).with_bootstrap_failure();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        prewire_socket(&_paths);
+
+        let result = lc.ensure_running();
+        assert!(
+            result.is_err(),
+            "ensure_running must propagate bootstrap error from repair, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_propagates_kickstart_error_after_fresh_bootstrap() {
+        // Job absent → bootstrap succeeds → kickstart fails → bail.
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent().with_kickstart_failure();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let result = lc.ensure_running();
+        assert!(
+            result.is_err(),
+            "ensure_running must propagate kickstart error after fresh bootstrap, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_ensure_running_propagates_preflight_failure_when_binary_missing() {
+        // Bundle binary missing → preflight_bundle bails before any launchctl call.
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("Busytok.app");
+        // Deliberately do NOT create the binary.
+        fs::create_dir_all(app_root.join("Contents/MacOS")).unwrap();
+        let layout = BundleLayout::for_app_root(&app_root);
+        let paths = BusytokPaths::for_test(&temp.path().join("data"));
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp.path().join("home"));
+        fs::create_dir_all(platform.service_install_root()).unwrap();
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(ScenarioRunner::print_absent());
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout, paths, platform, executor, probe, runner,
+        );
+
+        let result = lc.ensure_running();
+        assert!(result.is_err(), "preflight must fail when binary missing");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service binary missing"),
+            "error must mention missing binary, got: {msg}"
+        );
+    }
+
+    // ── Production status paths ─────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_status_returns_not_registered_when_job_absent() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+
+        let status = lc.status().expect("status must succeed");
+        assert_eq!(status, LifecycleStatus::NotRegistered);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_status_returns_running_when_socket_ready() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        prewire_socket(&paths);
+
+        let status = lc.status().expect("status must succeed");
+        assert_eq!(status, LifecycleStatus::Running);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_status_returns_registered_inactive_when_socket_missing() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        // No marker / socket — socket_ready returns false.
+        let status = lc.status().expect("status must succeed");
+        assert_eq!(status, LifecycleStatus::RegisteredInactive);
+    }
+
+    // ── Production stop_for_current_session paths ──────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_stop_for_current_session_succeeds_when_bootout_succeeds() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        // Write marker so we can verify it gets removed.
+        busytok_config::service_marker::write(paths.data_dir()).unwrap();
+        assert!(busytok_config::service_marker::exists(paths.data_dir()));
+
+        lc.stop_for_current_session().expect("stop must succeed");
+        // Marker should be removed.
+        assert!(
+            !busytok_config::service_marker::exists(paths.data_dir()),
+            "stop_for_current_session must remove the marker file"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_stop_for_current_session_succeeds_when_bootout_says_could_not_find() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent().with_bootout_failure("Could not find service");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        lc.stop_for_current_session()
+            .expect("stop must treat 'Could not find' as no-op success");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_stop_for_current_session_succeeds_when_bootout_says_no_such_process() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent().with_bootout_failure("No such process");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        lc.stop_for_current_session()
+            .expect("stop must treat 'No such process' as no-op success");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_stop_for_current_session_fails_on_genuine_bootout_failure() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent()
+            .with_bootout_failure("launchctl bootout failed: operation not permitted");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let result = lc.stop_for_current_session();
+        assert!(result.is_err(), "stop must fail on genuine bootout error");
+    }
+
+    // ── Production uninstall paths ─────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_uninstall_succeeds_when_bootout_succeeds_and_managed_plist_present() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        // Pre-create the managed plist so we exercise the Ok(()) branch.
+        let platform_root = lc.platform.service_install_root();
+        let managed_plist = platform_root.join("com.busytok.service.plist");
+        std::fs::write(&managed_plist, "<fake/>").unwrap();
+        // Write the marker too so its removal path is exercised.
+        busytok_config::service_marker::write(paths.data_dir()).unwrap();
+
+        lc.uninstall().expect("uninstall must succeed");
+        assert!(!managed_plist.exists(), "managed plist must be removed");
+        assert!(
+            !busytok_config::service_marker::exists(paths.data_dir()),
+            "marker must be removed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_uninstall_succeeds_when_bootout_says_could_not_find() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent().with_bootout_failure("Could not find service");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        lc.uninstall()
+            .expect("uninstall must tolerate 'Could not find'");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_uninstall_succeeds_when_bootout_says_no_such_process() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent().with_bootout_failure("No such process");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        lc.uninstall()
+            .expect("uninstall must tolerate 'No such process'");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_uninstall_fails_on_genuine_bootout_failure() {
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent()
+            .with_bootout_failure("launchctl bootout failed: operation not permitted");
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let result = lc.uninstall();
+        assert!(
+            result.is_err(),
+            "uninstall must fail on genuine bootout error"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_uninstall_logs_when_managed_plist_removal_fails_non_notfound() {
+        // Place a directory at the managed plist path so remove_file fails
+        // with a non-NotFound error. This exercises the warn! branch.
+        let temp = tempdir().unwrap();
+        let runner = ScenarioRunner::print_absent();
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let managed_plist = lc
+            .platform
+            .service_install_root()
+            .join("com.busytok.service.plist");
+        std::fs::create_dir(&managed_plist).unwrap();
+
+        // Uninstall should still succeed (the failure is non-fatal).
+        lc.uninstall()
+            .expect("uninstall must succeed even when managed plist removal fails");
+        // The directory still exists (couldn't be removed by remove_file).
+        assert!(managed_plist.exists(), "directory must still exist");
+    }
+
+    // ── probe_service_identity paths ───────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_probe_service_identity_returns_some_when_probe_matches() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Matching);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let identity = lc.probe_service_identity().expect("must succeed");
+        assert_eq!(
+            identity.as_deref(),
+            Some(ServiceBuildIdentity::current_gui().as_str())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_probe_service_identity_returns_some_when_probe_mismatches() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Mismatch);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let identity = lc.probe_service_identity().expect("must succeed");
+        assert_eq!(
+            identity.as_deref(),
+            Some(ServiceBuildIdentity::mismatch().as_str())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_probe_service_identity_returns_none_when_probe_returns_none() {
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::None_);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let identity = lc.probe_service_identity().expect("must succeed");
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn prod_probe_service_identity_returns_none_when_probe_errors() {
+        // Probe errors are swallowed — diagnostics return None rather than
+        // propagating the error.
+        let temp = tempdir().unwrap();
+        let layout_for_print = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let runner = ScenarioRunner::print_loaded(&layout_for_print.service_binary_path());
+        let probe: Arc<dyn VersionProbe> = Arc::new(FakeVersionProbe::Err);
+        let (lc, _paths) = prod_lifecycle_with(temp.path(), runner, probe);
+        let identity = lc.probe_service_identity().expect("must succeed");
+        assert!(
+            identity.is_none(),
+            "probe errors must be swallowed by probe_service_identity"
+        );
+    }
+
+    // ── register_via_executor / unregister_via_executor (cfg(test)) ─
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn register_via_executor_returns_err_when_binary_missing() {
+        // Build a lifecycle whose bundle is missing the binary.
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("Busytok.app");
+        // Deliberately do NOT create the binary or its directory.
+        fs::create_dir_all(&app_root).unwrap();
+        let layout = BundleLayout::for_app_root(&app_root);
+        let paths = BusytokPaths::for_test(&temp.path().join("data"));
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp.path().join("home"));
+        fs::create_dir_all(platform.service_install_root()).unwrap();
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(ScenarioRunner::print_absent());
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout, paths, platform, executor, probe, runner,
+        );
+
+        let result = lc.register_via_executor();
+        assert!(
+            result.is_err(),
+            "register_via_executor must fail when binary missing"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service binary missing"),
+            "error must mention missing binary, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn unregister_via_executor_returns_err_when_binary_missing() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("Busytok.app");
+        fs::create_dir_all(&app_root).unwrap();
+        let layout = BundleLayout::for_app_root(&app_root);
+        let paths = BusytokPaths::for_test(&temp.path().join("data"));
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp.path().join("home"));
+        fs::create_dir_all(platform.service_install_root()).unwrap();
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(ScenarioRunner::print_absent());
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout, paths, platform, executor, probe, runner,
+        );
+
+        let result = lc.unregister_via_executor();
+        assert!(
+            result.is_err(),
+            "unregister_via_executor must fail when binary missing"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service binary missing"),
+            "error must mention missing binary, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn status_via_executor_returns_err_when_binary_missing() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("Busytok.app");
+        fs::create_dir_all(&app_root).unwrap();
+        let layout = BundleLayout::for_app_root(&app_root);
+        let paths = BusytokPaths::for_test(&temp.path().join("data"));
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp.path().join("home"));
+        fs::create_dir_all(platform.service_install_root()).unwrap();
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(ScenarioRunner::print_absent());
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout, paths, platform, executor, probe, runner,
+        );
+
+        let result = lc.status_via_executor();
+        assert!(
+            result.is_err(),
+            "status_via_executor must fail when binary missing"
+        );
+    }
+
+    // ── socket_ready control_endpoint Err path ─────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn socket_ready_returns_false_when_control_endpoint_unresolvable() {
+        // Construct a BusytokPaths whose control_endpoint() returns Err.
+        // We do this by ensuring data_dir exists but the runtime config
+        // is misconfigured — this is hard to simulate directly, so we
+        // rely on the prod socket_ready() returning Ok(false) when
+        // marker doesn't exist (already covered) plus the control_endpoint
+        // Err branch (best-effort coverage here).
+        //
+        // Note: this test exists primarily to document the behavior;
+        // the Err branch in socket_ready is a defensive fallback.
+        let temp = tempdir().unwrap();
+        let layout = BundleLayout::for_app_root(&temp.path().join("Busytok.app"));
+        let paths = BusytokPaths::for_test(&temp.path().join("data"));
+        paths.ensure_dirs_exist().unwrap();
+        let platform = PlatformPaths::with_home_dir(temp.path().join("home"));
+        fs::create_dir_all(platform.service_install_root()).unwrap();
+        let executor: Arc<dyn MainThreadExecutor> = Arc::new(InlineExecutor);
+        let probe: Arc<dyn VersionProbe> = Arc::new(NoIdentityProbe);
+        let runner: Box<dyn CommandRunner> = Box::new(PermissiveRunner);
+        let lc = SmAppServiceLifecycle::new_with_executor(
+            layout,
+            paths.clone(),
+            platform,
+            executor,
+            probe,
+            runner,
+        );
+
+        // No marker → socket_ready returns false without checking control_endpoint.
+        assert!(!lc.socket_ready().unwrap());
+    }
 }

@@ -1,13 +1,134 @@
-#![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::uninlined_format_args,
+    clippy::type_complexity
+)]
+use busytok_config::{ProviderConfig, ProviderKind, SubagentResourcePolicyConfig};
 use busytok_store::Database;
 use busytok_subagent::pressure::{PressureAction, PressureGate, PressureResponder};
-use busytok_subagent::sidecar::{PiSidecarSupervisor, SidecarConfig, SidecarTaskExecutor};
+use busytok_subagent::sidecar::{
+    CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, SidecarConfig,
+    SidecarTaskExecutor, WorkerPool,
+};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[path = "support/mod.rs"]
 mod support;
+
+/// The test provider ID used by pool-based tests.
+const TEST_PROVIDER_ID: &str = "test-prov";
+
+fn test_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: TEST_PROVIDER_ID.to_string(),
+        name: "Test".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://test.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    }
+}
+
+fn make_providers() -> ProviderLookup {
+    Arc::new(|pid: &str| -> Option<ProviderConfig> {
+        match pid {
+            TEST_PROVIDER_ID => Some(test_provider()),
+            _ => None,
+        }
+    })
+}
+
+fn canned_credential_reader() -> CredentialReader {
+    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+}
+
+/// Build a responder factory that keeps responders alive in a shared holder
+/// (mirrors production wiring).
+fn make_responder_factory(
+    gate: Arc<PressureGate>,
+    executor_weak: Weak<SidecarTaskExecutor>,
+) -> (ResponderFactory, Arc<Mutex<Vec<Arc<PressureResponder>>>>) {
+    let holder: Arc<Mutex<Vec<Arc<PressureResponder>>>> = Arc::new(Mutex::new(Vec::new()));
+    let holder_for_closure = Arc::clone(&holder);
+    let factory: ResponderFactory = Arc::new(
+        move |sup_weak: Weak<PiSidecarSupervisor>| -> Arc<PressureResponder> {
+            let responder = Arc::new(PressureResponder::new(
+                sup_weak,
+                executor_weak.clone(),
+                Arc::clone(&gate),
+            ));
+            holder_for_closure
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&responder));
+            responder
+        },
+    );
+    (factory, holder)
+}
+
+/// Build a pool + executor + supervisor from the given config + DB.
+/// The executor is strong-owned by the caller so the `Weak<SidecarTaskExecutor>`
+/// in each responder stays upgradeable (mirrors production wiring).
+fn make_pool_executor_sup(
+    config: SidecarConfig,
+    db: Arc<Mutex<Database>>,
+) -> (
+    Arc<WorkerPool>,
+    Arc<SidecarTaskExecutor>,
+    Arc<PiSidecarSupervisor>,
+    Arc<Mutex<Vec<Arc<PressureResponder>>>>,
+) {
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        config,
+        Some(Arc::clone(&db)),
+        make_providers(),
+        canned_credential_reader(),
+        Some(Arc::clone(&gate)),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = Arc::new(SidecarTaskExecutor::with_pool(
+        Arc::clone(&pool),
+        Some(Arc::clone(&db)),
+    ));
+    let (factory, holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
+    pool.set_responder_factory(factory);
+    let supervisor = pool
+        .ensure_worker(TEST_PROVIDER_ID)
+        .expect("ensure_worker test-prov");
+    (pool, executor, supervisor, holder)
+}
+
+/// Build a dummy executor (pool with `/usr/bin/true` config) for tests that
+/// construct a supervisor directly with a custom policy. The executor just
+/// needs to exist so the `Weak<SidecarTaskExecutor>` in the responder stays
+/// upgradeable — `execute()` / `evict_lru()` are never called on it.
+fn make_dummy_executor(db: Arc<Mutex<Database>>) -> Arc<SidecarTaskExecutor> {
+    let config = SidecarConfig {
+        node_binary: std::path::PathBuf::from("/usr/bin/true"),
+        bundle_path: std::path::PathBuf::from("/dev/null"),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(300),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
+    };
+    let (_pool, executor, _sup, _holder) = make_pool_executor_sup(config, db);
+    executor
+}
 
 #[test]
 fn gate_starts_unpaused_with_resume_action() {
@@ -83,12 +204,12 @@ async fn evict_lru_hibernates_oldest_hot_binding() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
-    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let _exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&sup),
-        Arc::clone(&db),
-    ));
+    let _sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let _exec = make_dummy_executor(Arc::clone(&db));
 
     // Seed 2 subagents with hot bindings, oldest first.
     {
@@ -190,6 +311,9 @@ fn mock_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     (config, db)
 }
@@ -209,6 +333,9 @@ fn live_sidecar_config_and_db() -> (SidecarConfig, Arc<Mutex<Database>>) {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     (config, db)
 }
@@ -229,11 +356,7 @@ fn mock_responder() -> (
     Arc<SidecarTaskExecutor>,
 ) {
     let (config, db) = mock_config_and_db();
-    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&sup),
-        Arc::clone(&db),
-    ));
+    let (_pool, exec, sup, _holder) = make_pool_executor_sup(config, db);
     let gate = Arc::new(PressureGate::new());
     let responder = PressureResponder::new(
         Arc::downgrade(&sup),
@@ -269,7 +392,7 @@ async fn respond_hibernate_lru_does_not_pause() {
 async fn respond_hibernate_lru_failure_still_sets_action() {
     let (config, db) = mock_config_and_db();
     let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let exec = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let exec = make_dummy_executor(Arc::clone(&db));
     let gate = Arc::new(PressureGate::new());
     let responder = PressureResponder::new(
         Arc::downgrade(&sup),
@@ -311,10 +434,7 @@ async fn respond_force_kill_clears_gate() {
 async fn respond_force_kill_with_live_sidecar_writes_crash_event() {
     let (config, db) = live_sidecar_config_and_db();
     let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&sup),
-        Arc::clone(&db),
-    ));
+    let exec = make_dummy_executor(Arc::clone(&db));
     let gate = Arc::new(PressureGate::new());
     let responder = PressureResponder::new(
         Arc::downgrade(&sup),
@@ -360,10 +480,7 @@ async fn respond_graceful_restart_clears_gate() {
 async fn respond_graceful_restart_with_live_sidecar_restarts_cleanly() {
     let (config, db) = live_sidecar_config_and_db();
     let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&sup),
-        Arc::clone(&db),
-    ));
+    let exec = make_dummy_executor(Arc::clone(&db));
     let gate = Arc::new(PressureGate::new());
     let responder = PressureResponder::new(
         Arc::downgrade(&sup),
@@ -395,10 +512,7 @@ async fn respond_graceful_restart_with_live_sidecar_restarts_cleanly() {
 async fn respond_graceful_restart_when_spawn_fails_still_resumes() {
     let (config, db) = missing_node_config_and_db();
     let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&sup),
-        Arc::clone(&db),
-    ));
+    let exec = make_dummy_executor(Arc::clone(&db));
     let gate = Arc::new(PressureGate::new());
     let responder = PressureResponder::new(
         Arc::downgrade(&sup),
@@ -432,10 +546,7 @@ async fn respond_executor_dropped_is_noop() {
     // early at the executor check, leaving the gate unchanged (Resume).
     let (config, db) = mock_config_and_db();
     let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
-    let exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&sup),
-        Arc::clone(&db),
-    ));
+    let exec = make_dummy_executor(Arc::clone(&db));
     let gate = Arc::new(PressureGate::new());
     let sup_weak = Arc::downgrade(&sup);
     let exec_weak = Arc::downgrade(&exec);
@@ -453,12 +564,8 @@ async fn respond_supervisor_dropped_is_noop() {
     let dead_sup_weak = Arc::downgrade(&dead_sup);
     drop(dead_sup);
 
-    let (live_config, live_db) = mock_config_and_db();
-    let live_sup = PiSidecarSupervisor::new(live_config, Some(Arc::clone(&live_db)));
-    let live_exec = Arc::new(SidecarTaskExecutor::with_db(
-        Arc::clone(&live_sup),
-        Arc::clone(&live_db),
-    ));
+    let (_live_config, live_db) = mock_config_and_db();
+    let live_exec = make_dummy_executor(Arc::clone(&live_db));
 
     let gate = Arc::new(PressureGate::new());
     let responder =

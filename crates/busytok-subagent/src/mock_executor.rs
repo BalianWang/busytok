@@ -4,7 +4,7 @@
 use crate::context::CompactContext;
 use crate::context::MemorySnapshot;
 use crate::memory::MemoryUpdate;
-use crate::models::{TaskStatus, TaskUsage};
+use crate::models::{TaskErrorKind, TaskStatus, TaskUsage};
 
 /// Input to a task executor — everything needed to run one turn.
 #[derive(Clone)]
@@ -23,6 +23,11 @@ pub struct ExecutorInput {
     pub memory: MemorySnapshot,
     pub context: CompactContext,
     pub write_access: bool,
+    /// Phase 3: provider this task should run on. Threads the profile's
+    /// `provider_id` through the execution path so the WorkerPool (Task 2)
+    /// can route to the correct per-provider supervisor. `None` means
+    /// "no provider bound" — Task 2 treats this as an error (cannot route).
+    pub provider_id: Option<String>,
 }
 
 /// Output from a task executor — mapped into `DelegateResult` by the manager.
@@ -33,6 +38,10 @@ pub struct ExecutorOutput {
     pub summary: String,
     pub usage: TaskUsage,
     pub memory_update: MemoryUpdate,
+    /// Phase 3: classified error kind for failed/timeout tasks. `None` on
+    /// success or when the executor couldn't classify the failure (treated
+    /// as `Unknown` by Task 3's error handler).
+    pub error_kind: Option<TaskErrorKind>,
 }
 
 /// Executor trait — `SubagentManager` calls this to run a task.
@@ -63,6 +72,7 @@ impl TaskExecutor for MockTaskExecutor {
                 ..Default::default()
             },
             memory_update: MemoryUpdate::default(),
+            error_kind: None,
         })
     }
 }

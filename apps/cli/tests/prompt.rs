@@ -484,6 +484,47 @@ impl RuntimeControl for AliasConflictRuntime {
     ) -> anyhow::Result<busytok_protocol::dto::SubagentAckDto> {
         self.inner.subagent_delete(req).await
     }
+    async fn subagent_runtime_status(
+        &self,
+        req: busytok_protocol::dto::SubagentRuntimeStatusRequestDto,
+    ) -> anyhow::Result<
+        busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
+    > {
+        self.inner.subagent_runtime_status(req).await
+    }
+    async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
+        self.inner.provider_create(req).await
+    }
+    async fn provider_list(&self) -> anyhow::Result<ProviderListResponseDto> {
+        self.inner.provider_list().await
+    }
+    async fn provider_update(&self, req: ProviderUpdateRequestDto) -> anyhow::Result<ProviderDto> {
+        self.inner.provider_update(req).await
+    }
+    async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.provider_delete(req).await
+    }
+    async fn provider_test_connection(
+        &self,
+        req: ProviderTestConnectionRequestDto,
+    ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
+        self.inner.provider_test_connection(req).await
+    }
+    async fn pi_sidecar_locator_update(
+        &self,
+        req: PiSidecarLocatorUpdateRequestDto,
+    ) -> anyhow::Result<PiSidecarLocatorUpdateResponseDto> {
+        self.inner.pi_sidecar_locator_update(req).await
+    }
+    async fn profile_create(&self, req: ProfileCreateRequestDto) -> anyhow::Result<ProfileDto> {
+        self.inner.profile_create(req).await
+    }
+    async fn profile_update(&self, req: ProfileUpdateRequestDto) -> anyhow::Result<ProfileDto> {
+        self.inner.profile_update(req).await
+    }
+    async fn profile_delete(&self, req: ProfileDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.profile_delete(req).await
+    }
 }
 
 #[tokio::test]

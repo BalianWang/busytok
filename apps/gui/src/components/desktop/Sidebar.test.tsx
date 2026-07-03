@@ -16,6 +16,8 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: "Overview" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Usage" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Prompt Palette" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Providers" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Subagents" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Settings" })).toBeDefined();
   });
 

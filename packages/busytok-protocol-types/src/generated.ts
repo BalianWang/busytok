@@ -173,7 +173,9 @@ export type SettingsRecoveryActionResponseDto = { id: SettingsRecoveryActionIdDt
 
 export type SettingsValidationErrorDto = { code: SettingsValidationErrorCodeDto, field_path: string, message: string, };
 
-export type SettingsSnapshotDto = { timezone: string, week_starts_on: WeekdayIndexDto, discovery: SettingsDiscoveryDto, privacy: SettingsPrivacyDto, diagnostics: SettingsDiagnosticsDto, recovery_actions: Array<SettingsRecoveryActionDto>, prompt_palette_default_action: PromptActionDto, };
+export type SettingsSubagentDto = { enabled: boolean, profiles: Array<ProfileDto>, };
+
+export type SettingsSnapshotDto = { timezone: string, week_starts_on: WeekdayIndexDto, discovery: SettingsDiscoveryDto, privacy: SettingsPrivacyDto, diagnostics: SettingsDiagnosticsDto, recovery_actions: Array<SettingsRecoveryActionDto>, prompt_palette_default_action: PromptActionDto, subagent: SettingsSubagentDto, };
 
 export type SettingsUpdateRequestDto = { timezone: string | null, week_starts_on: WeekdayIndexDto | null, discovery: SettingsDiscoveryDto | null, privacy: SettingsPrivacyDto | null, prompt_palette_default_action: PromptActionDto | null, };
 
@@ -320,6 +322,29 @@ export type SubagentDeleteRequestDto = { name: string | null, id: string | null,
 
 export type SubagentAckDto = { id: string, status: string, };
 
+export type SubagentRuntimeStatusRequestDto = { 
+/**
+ * Reserved for future filtering; Phase 2 ignores this field.
+ */
+project: string | null, };
+
+export type SubagentRuntimeStatusDto = { pressure_gate: SubagentPressureGateDto, subagents: Array<SubagentRuntimeSubagentDto>, tasks_recent: Array<SubagentRuntimeTaskDto>, workers: Array<SubagentWorkerDto>, };
+
+export type SubagentPressureGateDto = { level: string, memory_used_pct: number, hot_sessions_total: number, hot_sessions_limit: number, 
+/**
+ * Absolute ms when the worker ResourceSample was taken (via
+ * `busytok_domain::now_ms()`). `None` if no sample has been taken yet.
+ * Enables frontend freshness display. This is NOT the same as
+ * `ReadEnvelopeDto.generated_at_ms` (response construction time).
+ */
+worker_sampled_at_ms: number | null, };
+
+export type SubagentRuntimeSubagentDto = { name: string, status: string, task_count: number, last_task_at_ms: number | null, last_task_status: string | null, };
+
+export type SubagentRuntimeTaskDto = { task_id: string, subagent_name: string, status: string, created_at_ms: number, error: string | null, };
+
+export type SubagentWorkerDto = { provider_id: string | null, state: string, pid: number | null, uptime_seconds: number | null, hot_sessions: number, };
+
 export type ReceiptPeakHourDto = { 
 /**
  * Reporting-TZ wall-clock hour, e.g. "14:00".
@@ -350,3 +375,58 @@ export type ReceiptDailyDto = { date: string,
  * server-side so the future Rust render path can share the ViewModel.
  */
 date_label: string, timezone: string, metrics: ReceiptMetricsDto, top_models: Array<ReceiptModelSliceDto>, brand: ReceiptBrandDto, };
+
+export type ProviderDto = { id: string, name: string, base_url: string, api_key_env_name: string, base_url_env_name: string | null, models: Array<string>, enabled: boolean, 
+/**
+ * True if an API key is stored in the keychain for this provider.
+ */
+has_api_key: boolean, };
+
+export type ProviderCreateRequestDto = { id: string, name: string, base_url: string, api_key_env_name: string, base_url_env_name: string | null, models: Array<string>, 
+/**
+ * The actual API key. Stored in keychain, never persisted to settings.toml.
+ */
+api_key: string | null, };
+
+export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, 
+/**
+ * Env var name the sidecar reads for the API key. Editable provider field.
+ */
+api_key_env_name: string | null, 
+/**
+ * Optional env var name for base URL override. Editable provider field.
+ */
+base_url_env_name: string | null, models: Array<string> | null, enabled: boolean | null, 
+/**
+ * If provided, replaces the stored key. If None, key is unchanged.
+ */
+api_key: string | null, };
+
+export type ProviderListResponseDto = { providers: Array<ProviderDto>, };
+
+export type ProviderDeleteRequestDto = { id: string, };
+
+export type ProviderTestConnectionRequestDto = { id: string, };
+
+export type ProviderTestConnectionResponseDto = { ok: boolean, error: string | null, models_detected: Array<string> | null, };
+
+export type ProfileDto = { id: string, 
+/**
+ * True if this is one of the 3 built-in profiles (pi/search-cheap, etc.).
+ * Derived by the service from `is_builtin_profile()` — not stored in config.
+ */
+is_builtin: boolean, 
+/**
+ * Provider this profile runs on. None = unbound (delegate will reject).
+ */
+provider_id: string | null, model: string, tools: Array<string>, context_budget_tokens: number, timeout_seconds: number, write_access: boolean, };
+
+export type ProfileCreateRequestDto = { id: string, model: string, provider_id: string | null, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
+
+export type ProfileUpdateRequestDto = { id: string, 
+/**
+ * Some("openai") = bind to openai; Some("") = unbind; None = unchanged.
+ */
+provider_id: string | null, model: string | null, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
+
+export type ProfileDeleteRequestDto = { id: string, };

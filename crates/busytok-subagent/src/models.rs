@@ -177,3 +177,91 @@ pub struct DelegateResult {
     pub summary: Option<String>,
     pub usage: TaskUsage,
 }
+
+/// Classification of task failures (Task 1 / Phase 3). Used by Task 3's
+/// error-handling layer to pick a recovery strategy:
+/// - `Auth`        → credential refresh / re-prompt (Phase 4 UI)
+/// - `RateLimit`   → exponential backoff with jitter
+/// - `Timeout`     → retry once with a longer budget
+/// - `Crash`       → sidecar restart (supervisor crash-reconciliation)
+/// - `Network`     → retry with circuit-breaker
+/// - `Unknown`     → propagate to caller, no auto-recovery
+///
+/// Serialized as `snake_case` for stable JSON contracts across the IPC
+/// boundary (Tauri command results, sidecar JSON-RPC error data).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskErrorKind {
+    Auth,
+    RateLimit,
+    Timeout,
+    Crash,
+    Network,
+    Unknown,
+}
+
+impl TaskErrorKind {
+    /// Stable snake_case string for DB persistence (Task 5). Matches the
+    /// `#[serde(rename_all = "snake_case")]` serialization so the value
+    /// stored in `subagent_tasks.error_kind` is the same string that
+    /// serde_json would emit.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskErrorKind::Auth => "auth",
+            TaskErrorKind::RateLimit => "rate_limit",
+            TaskErrorKind::Timeout => "timeout",
+            TaskErrorKind::Crash => "crash",
+            TaskErrorKind::Network => "network",
+            TaskErrorKind::Unknown => "unknown",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TaskErrorKind` serializes to `snake_case` so the JSON contract is
+    /// stable across IPC (Tauri commands, sidecar JSON-RPC error data).
+    #[test]
+    fn task_error_kind_serializes_snake_case() {
+        let cases = [
+            (TaskErrorKind::Auth, "\"auth\""),
+            (TaskErrorKind::RateLimit, "\"rate_limit\""),
+            (TaskErrorKind::Timeout, "\"timeout\""),
+            (TaskErrorKind::Crash, "\"crash\""),
+            (TaskErrorKind::Network, "\"network\""),
+            (TaskErrorKind::Unknown, "\"unknown\""),
+        ];
+        for (kind, expected) in cases {
+            let s = serde_json::to_string(&kind).unwrap();
+            assert_eq!(s, expected, "serialize mismatch for {kind:?}");
+            // Round-trip back to the same variant.
+            let back: TaskErrorKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, kind, "round-trip mismatch for {kind:?}");
+        }
+    }
+
+    /// All variants are constructible and comparable — Task 3's error
+    /// classifier will `match` on this enum, so variant equality matters.
+    #[test]
+    fn task_error_kind_variants_distinct() {
+        let all = [
+            TaskErrorKind::Auth,
+            TaskErrorKind::RateLimit,
+            TaskErrorKind::Timeout,
+            TaskErrorKind::Crash,
+            TaskErrorKind::Network,
+            TaskErrorKind::Unknown,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b, "variants {a:?} and {b:?} must be distinct");
+                }
+            }
+        }
+    }
+}

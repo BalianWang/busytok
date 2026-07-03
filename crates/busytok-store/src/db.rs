@@ -1945,6 +1945,19 @@ impl Database {
     ) -> Result<Vec<SubagentTaskRow>> {
         subagent_queries::list_tasks(self.conn(), subagent_id, limit)
     }
+    /// Recent tasks across all subagents (spec §4 Phase 2 `tasks_recent`).
+    pub fn subagent_list_recent_tasks_all(&self, limit: i64) -> Result<Vec<SubagentTaskRow>> {
+        subagent_queries::list_recent_tasks_all(self.conn(), limit)
+    }
+    /// Per-subagent task counts (spec §4 Phase 2 `subagents[].task_count`).
+    pub fn subagent_count_tasks_by_subagent(&self) -> Result<Vec<(String, u32)>> {
+        subagent_queries::count_tasks_by_subagent(self.conn())
+    }
+    /// Per-subagent last task: `(subagent_id, created_at_ms, status)`
+    /// (spec §4 Phase 2 `subagents[].last_task_{created_at,status}`).
+    pub fn subagent_last_task_by_subagent(&self) -> Result<Vec<(String, i64, String)>> {
+        subagent_queries::last_task_by_subagent(self.conn())
+    }
     /// Count tasks with `created_at_ms > since_ms` (compaction trigger (a)).
     pub fn subagent_count_tasks_since(&self, subagent_id: &str, since_ms: i64) -> Result<u32> {
         subagent_queries::count_tasks_since(self.conn(), subagent_id, since_ms)
@@ -1973,6 +1986,10 @@ impl Database {
         error: Option<String>,
     ) -> Result<()> {
         subagent_queries::set_task_status(self.conn(), id, status, result_summary, error)
+    }
+    /// Set the classified `error_kind` on a task row (Task 5).
+    pub fn subagent_set_task_error_kind(&self, id: &str, error_kind: Option<&str>) -> Result<()> {
+        subagent_queries::set_task_error_kind(self.conn(), id, error_kind)
     }
     pub fn subagent_upsert_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
         subagent_queries::upsert_binding(self.conn(), row)

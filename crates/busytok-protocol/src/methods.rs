@@ -47,6 +47,17 @@ pub fn method_manifest() -> Vec<String> {
         "subagent.tasks".to_string(),
         "subagent.hibernate".to_string(),
         "subagent.delete".to_string(),
+        "subagent.runtime_status".to_string(),
+        // Providers (credential foundation)
+        "provider.create".to_string(),
+        "provider.list".to_string(),
+        "provider.update".to_string(),
+        "provider.delete".to_string(),
+        "provider.test_connection".to_string(),
+        // Profiles (Phase 4: Profile/Model Configuration UI)
+        "profile.create".to_string(),
+        "profile.update".to_string(),
+        "profile.delete".to_string(),
     ]
 }
 
@@ -90,5 +101,22 @@ mod tests {
             methods.iter().any(|m| m == "live.window"),
             "live.window not found in method manifest"
         );
+    }
+
+    #[test]
+    fn method_manifest_contains_subagent_runtime_status() {
+        let methods = method_manifest();
+        assert!(
+            methods.iter().any(|m| m == "subagent.runtime_status"),
+            "subagent.runtime_status not found in method manifest"
+        );
+    }
+
+    #[test]
+    fn method_manifest_contains_profile_methods() {
+        let manifest = method_manifest();
+        assert!(manifest.contains(&"profile.create".to_string()));
+        assert!(manifest.contains(&"profile.update".to_string()));
+        assert!(manifest.contains(&"profile.delete".to_string()));
     }
 }

@@ -38,7 +38,11 @@ fn error_code_covers_all_variants() {
         "subagent.sidecar_spawn_failed"
     );
     assert_eq!(
-        SubagentError::SidecarRpc("x".into()).code(),
+        SubagentError::SidecarRpc {
+            message: "x".into(),
+            code: None
+        }
+        .code(),
         "subagent.sidecar_rpc_error"
     );
     assert_eq!(
@@ -113,6 +117,7 @@ async fn failing_executor_always_errors() {
             source: String::new(),
         },
         write_access: false,
+        provider_id: None,
     };
     let err = match exec.execute(&input).await {
         Ok(_) => panic!("FailingTaskExecutor must always fail"),

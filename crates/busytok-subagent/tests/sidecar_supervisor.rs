@@ -2,22 +2,122 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[path = "support/mod.rs"]
 mod support;
 
-use busytok_config::SubagentSettings;
+use busytok_config::{
+    ProviderConfig, ProviderKind, SubagentResourcePolicyConfig, SubagentSettings,
+};
 use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
 use busytok_store::Database;
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::DelegateRequest;
 use busytok_subagent::sidecar::{
-    PiSidecarSupervisor, SidecarConfig, SidecarError, SidecarTaskExecutor,
+    CredentialReader, PiSidecarSupervisor, PressureLevel, ProviderLookup, ResponderFactory,
+    SidecarConfig, SidecarError, SidecarTaskExecutor, WorkerPool, WorkerState,
 };
 use busytok_subagent::{PressureAction, PressureGate, PressureResponder};
+
+/// The test provider ID used by pool-based dummy executors.
+const TEST_PROVIDER_ID: &str = "test-prov";
+
+fn test_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: TEST_PROVIDER_ID.to_string(),
+        name: "Test".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://test.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    }
+}
+
+fn make_providers() -> ProviderLookup {
+    Arc::new(|pid: &str| -> Option<ProviderConfig> {
+        match pid {
+            TEST_PROVIDER_ID => Some(test_provider()),
+            _ => None,
+        }
+    })
+}
+
+fn canned_credential_reader() -> CredentialReader {
+    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+}
+
+/// Build a responder factory that keeps responders alive in a shared holder
+/// (mirrors production wiring in `construct_sidecar`).
+fn make_responder_factory(
+    gate: Arc<PressureGate>,
+    executor_weak: Weak<SidecarTaskExecutor>,
+) -> (ResponderFactory, Arc<Mutex<Vec<Arc<PressureResponder>>>>) {
+    let holder: Arc<Mutex<Vec<Arc<PressureResponder>>>> = Arc::new(Mutex::new(Vec::new()));
+    let holder_for_closure = Arc::clone(&holder);
+    let factory: ResponderFactory = Arc::new(
+        move |sup_weak: Weak<PiSidecarSupervisor>| -> Arc<PressureResponder> {
+            let responder = Arc::new(PressureResponder::new(
+                sup_weak,
+                executor_weak.clone(),
+                Arc::clone(&gate),
+            ));
+            holder_for_closure
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&responder));
+            responder
+        },
+    );
+    (factory, holder)
+}
+
+/// Build a dummy executor (pool with `/usr/bin/true` config) for tests that
+/// construct a supervisor directly with a custom policy. The executor just
+/// needs to exist so the `Weak<SidecarTaskExecutor>` in the responder stays
+/// upgradeable — `execute()` / `evict_lru()` are never called on it.
+fn make_dummy_executor(db: Arc<Mutex<Database>>) -> Arc<SidecarTaskExecutor> {
+    let config = SidecarConfig {
+        node_binary: PathBuf::from("/usr/bin/true"),
+        bundle_path: PathBuf::from("/dev/null"),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(300),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
+    };
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        config,
+        Some(Arc::clone(&db)),
+        make_providers(),
+        canned_credential_reader(),
+        Some(Arc::clone(&gate)),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = Arc::new(SidecarTaskExecutor::with_pool(
+        Arc::clone(&pool),
+        Some(Arc::clone(&db)),
+    ));
+    let (factory, _holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
+    pool.set_responder_factory(factory);
+    let _ = pool
+        .ensure_worker(TEST_PROVIDER_ID)
+        .expect("ensure_worker test-prov");
+    executor
+}
 
 fn mock_config() -> SidecarConfig {
     SidecarConfig {
@@ -33,6 +133,9 @@ fn mock_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     }
 }
 
@@ -702,6 +805,9 @@ fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -769,6 +875,9 @@ async fn spawn_rejects_after_3_crashes_within_5_min_window() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -815,6 +924,9 @@ async fn spawn_allows_restart_after_5_min_window_expires() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -911,7 +1023,7 @@ async fn pressure_responder_force_kill_kills_sidecar_and_writes_crash_event() {
     let _ = sup.ensure_started().await.unwrap();
     assert!(sup.try_is_running());
 
-    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let executor = make_dummy_executor(db.clone());
     let responder = Arc::new(PressureResponder::new(
         Arc::downgrade(&sup),
         Arc::downgrade(&executor),
@@ -955,7 +1067,7 @@ async fn reconcile_crash_error_path_when_db_write_fails() {
     let sup = PiSidecarSupervisor::new(cfg, Some(h.db.clone()));
     let _ = sup.ensure_started().await.unwrap();
 
-    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let executor = make_dummy_executor(h.db.clone());
     let responder = Arc::new(PressureResponder::new(
         Arc::downgrade(&sup),
         Arc::downgrade(&executor),
@@ -1261,7 +1373,7 @@ async fn resource_sampling_hard_limit_triggers_force_kill_via_responder() {
 
     // Wire a PressureResponder so invoke_pressure_responder spawns the
     // respond task (covers lines 848-850).
-    let executor = Arc::new(SidecarTaskExecutor::new(Arc::clone(&sup)));
+    let executor = make_dummy_executor(Arc::clone(&db));
     let responder = Arc::new(PressureResponder::new(
         Arc::downgrade(&sup),
         Arc::downgrade(&executor),
@@ -1381,5 +1493,161 @@ async fn sidecar_handle_debug_impl_produces_struct() {
         debug_str.contains(".."),
         "Debug output should use finish_non_exhaustive (..): {debug_str}"
     );
+    sup.shutdown().await.unwrap();
+}
+
+// --- Phase 2 worker_snapshot tests (Task 3) ---
+//
+// `worker_snapshot()` exposes the sidecar's current state for the
+// `runtime_status` handler (Task 6). Critical invariant: it ALWAYS returns
+// `Some` — even when the sidecar is stopped — so "configured-but-stopped"
+// sidecars stay observable. Only the handler returns `workers: []` when
+// `sidecar_supervisor` is `None`.
+
+/// Critical invariant: `worker_snapshot()` MUST always return `Some` — even
+/// when the sidecar is freshly constructed (never started). `state=Stopped`
+/// with `pid=None`/`uptime_seconds=None`/`sampled_at_ms=None` represents a
+/// configured-but-not-running sidecar.
+#[tokio::test]
+async fn worker_snapshot_always_returns_some_even_when_stopped() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let snap = sup.worker_snapshot().await;
+    assert!(snap.is_some(), "worker_snapshot must always return Some");
+    let snap = snap.unwrap();
+    assert_eq!(snap.state, WorkerState::Stopped);
+    assert!(snap.pid.is_none(), "pid must be None when stopped");
+    assert!(
+        snap.uptime_seconds.is_none(),
+        "uptime must be None when stopped"
+    );
+    assert_eq!(snap.hot_sessions, 0, "hot_sessions starts at 0");
+    assert!(
+        snap.sampled_at_ms.is_none(),
+        "sampled_at_ms is None before first sample"
+    );
+}
+
+/// Pressure level is `Normal` by default (no pressure transitions yet).
+#[tokio::test]
+async fn worker_snapshot_pressure_level_normal_by_default() {
+    let sup = PiSidecarSupervisor::new(mock_config(), None);
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(snap.pressure_level, PressureLevel::Normal);
+}
+
+/// After `ensure_started`, the snapshot reports `Running` with a pid and
+/// uptime. Verifies `spawned_at` is set in `spawn_internal`.
+#[tokio::test]
+async fn worker_snapshot_reports_running_after_ensure_started() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(
+        snap.state,
+        WorkerState::Running,
+        "sidecar should be running"
+    );
+    assert!(snap.pid.is_some(), "pid must be Some when running");
+    assert!(
+        snap.uptime_seconds.is_some(),
+        "uptime must be Some when running"
+    );
+    sup.shutdown().await.unwrap();
+}
+
+/// After `shutdown`, the snapshot reports `Stopped` with no pid/uptime.
+/// Verifies `spawned_at` is cleared in `shutdown_internal` AND that
+/// `worker_snapshot()` still returns `Some` (the critical invariant).
+#[tokio::test]
+async fn worker_snapshot_reports_stopped_after_shutdown() {
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_secs(3600);
+    cfg.idle_exit_seconds = 3600;
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let _ = sup.ensure_started().await.unwrap();
+    sup.shutdown().await.unwrap();
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(snap.state, WorkerState::Stopped);
+    assert!(snap.pid.is_none(), "pid must be cleared after shutdown");
+    assert!(
+        snap.uptime_seconds.is_none(),
+        "uptime must be cleared after shutdown"
+    );
+}
+
+/// After the supervision loop's health-pinger + resource-sampling tick fires,
+/// `sampled_at_ms` is set (absolute ms via `busytok_domain::now_ms()`). This
+/// enables the frontend freshness display (Task 6).
+#[tokio::test]
+async fn worker_snapshot_caches_sample_after_health_tick() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    let policy = SubagentResourcePolicyConfig {
+        memory_pressure_free_mb: 0,
+        monitor_interval_seconds: 5,
+    };
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, None, policy, None);
+    let _ = sup.ensure_started().await.unwrap();
+    // Wait for at least 2 health-pinger + resource-sampling cycles (200ms).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert!(
+        snap.sampled_at_ms.is_some(),
+        "sampled_at_ms must be set after sampling"
+    );
+    sup.shutdown().await.unwrap();
+}
+
+/// `memory_used_pct` is `None` before the first sample tick (bound to
+/// `sampled_at_ms` per the stamped-sample invariant, reviewer P1-1). After
+/// a health tick triggers `maybe_sample_resources`, both `sampled_at_ms`
+/// and `memory_used_pct` become `Some` — the freshness timestamp
+/// accurately reflects the memory value.
+#[tokio::test]
+async fn worker_snapshot_memory_used_pct_bound_to_sample_timestamp() {
+    use busytok_config::SubagentResourcePolicyConfig;
+
+    let mut cfg = mock_config();
+    cfg.health_interval = Duration::from_millis(200);
+    cfg.idle_exit_seconds = 3600;
+    let policy = SubagentResourcePolicyConfig {
+        memory_pressure_free_mb: 0,
+        monitor_interval_seconds: 5,
+    };
+    let sup = PiSidecarSupervisor::with_resource_policy(cfg, None, policy, None);
+
+    // Before any sample tick: both sampled_at_ms and memory_used_pct are None.
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert_eq!(
+        snap.sampled_at_ms, None,
+        "sampled_at_ms must be None before first tick"
+    );
+    assert_eq!(
+        snap.memory_used_pct, None,
+        "memory_used_pct must be None before first tick (stamped-sample invariant)"
+    );
+
+    // Start the sidecar so the supervision loop's health pinger fires.
+    let _ = sup.ensure_started().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let snap = sup.worker_snapshot().await.unwrap();
+    assert!(
+        snap.sampled_at_ms.is_some(),
+        "sampled_at_ms must be set after sampling"
+    );
+    assert!(
+        snap.memory_used_pct.is_some(),
+        "memory_used_pct must be Some after sampling (bound to sampled_at_ms)"
+    );
+    let pct = snap.memory_used_pct.unwrap();
+    assert!(pct <= 100, "memory_used_pct should be <= 100, got {pct}");
+
     sup.shutdown().await.unwrap();
 }

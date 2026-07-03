@@ -164,3 +164,123 @@ pub(crate) fn resolve_bundle_layout(
         exe.display()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── LifecycleStatus::as_str — stable identifiers ────────────────────
+
+    #[test]
+    fn lifecycle_status_as_str_returns_stable_identifiers() {
+        // These strings are part of the IPC/diagnostics contract — they
+        // must not change without coordination with the GUI/service.
+        assert_eq!(LifecycleStatus::NotRegistered.as_str(), "not_registered");
+        assert_eq!(
+            LifecycleStatus::RegisteredInactive.as_str(),
+            "registered_inactive"
+        );
+        assert_eq!(LifecycleStatus::Running.as_str(), "running");
+        assert_eq!(LifecycleStatus::Disabled.as_str(), "disabled");
+        assert_eq!(LifecycleStatus::NeedsAttention.as_str(), "needs_attention");
+    }
+
+    #[test]
+    fn lifecycle_status_as_str_covers_every_variant() {
+        // Sanity check that no variant was added without a corresponding
+        // `as_str` arm. Iterating isn't possible on a non-enum-iter derive,
+        // so we exhaustively list each variant.
+        let all = [
+            LifecycleStatus::NotRegistered,
+            LifecycleStatus::RegisteredInactive,
+            LifecycleStatus::Running,
+            LifecycleStatus::Disabled,
+            LifecycleStatus::NeedsAttention,
+        ];
+        let mut seen: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "disabled",
+                "needs_attention",
+                "not_registered",
+                "registered_inactive",
+                "running",
+            ]
+        );
+    }
+
+    // ── ServiceLifecycle::probe_service_identity — default impl ────────
+
+    /// Minimal ServiceLifecycle impl that uses the default
+    /// `probe_service_identity` impl — used to verify it returns Ok(None).
+    struct DefaultProbeLifecycle;
+    impl ServiceLifecycle for DefaultProbeLifecycle {
+        fn ensure_registered(&self) -> Result<InstallOutcome> {
+            Ok(InstallOutcome::NewlyInstalled)
+        }
+        fn ensure_running(&self) -> Result<EnsureRunningOutcome> {
+            Ok(EnsureRunningOutcome::AlreadyRunning)
+        }
+        fn status(&self) -> Result<LifecycleStatus> {
+            Ok(LifecycleStatus::Running)
+        }
+        fn stop_for_current_session(&self) -> Result<()> {
+            Ok(())
+        }
+        fn uninstall(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_probe_service_identity_returns_none() {
+        // The trait's default `probe_service_identity` impl is `Ok(None)`.
+        // Any implementor that doesn't override it must inherit that
+        // behaviour, so callers can rely on `?` not propagating an error.
+        let lc = DefaultProbeLifecycle;
+        let result = lc
+            .probe_service_identity()
+            .expect("default probe_service_identity must never return Err");
+        assert_eq!(result, None);
+    }
+
+    // ── resolve_bundle_layout — non-app-bundle path ────────────────────
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_bundle_layout_returns_err_when_no_app_bundle_encloses_exe() {
+        // The test binary lives under target/.../deps/<hash> — not inside
+        // a .app bundle — so resolve_bundle_layout must walk all the way
+        // up and bail. This exercises the "no .app ancestor" path.
+        let err = resolve_bundle_layout().unwrap_err().to_string();
+        assert!(
+            err.contains("could not locate enclosing .app bundle"),
+            "error must mention the missing .app bundle: {err}"
+        );
+        assert!(
+            err.contains("current executable"),
+            "error must include the executable path for diagnostics: {err}"
+        );
+    }
+
+    // ── macos_lifecycle_for_uninstall_self — error path ────────────────
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lifecycle_for_uninstall_self_returns_err_when_not_in_app_bundle() {
+        // Outside a real .app bundle (as is the case in unit tests),
+        // `resolve_bundle_layout()` fails and the lifecycle constructor
+        // must propagate the error rather than constructing a broken
+        // SmAppServiceLifecycle.
+        let err = macos_lifecycle_for_uninstall_self()
+            .err()
+            .expect("expected error when not running inside an .app bundle")
+            .to_string();
+        assert!(
+            err.contains("could not locate enclosing .app bundle"),
+            "macos_lifecycle_for_uninstall_self must propagate the bundle layout error: {err}"
+        );
+    }
+}

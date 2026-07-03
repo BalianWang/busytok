@@ -76,6 +76,7 @@ fn task_row(id: &str, summary: &str, created_at_ms: i64) -> SubagentTaskRow {
         completed_at_ms: Some(created_at_ms + 1000),
         timeout_seconds: None,
         model_override: None,
+        error_kind: None,
     }
 }
 

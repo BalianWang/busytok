@@ -36,6 +36,14 @@ import type {
   PromptUseResultDto,
   PromptSuggestTagsRequestDto,
   PromptSuggestTagsResponseDto,
+  ProviderCreateRequestDto,
+  ProviderDto,
+  ProviderListResponseDto,
+  ProviderTestConnectionResponseDto,
+  ProviderUpdateRequestDto,
+  ProfileCreateRequestDto,
+  ProfileDto,
+  ProfileUpdateRequestDto,
   ReceiptDailyDto,
   ReceiptDailyRequestDto,
   ReadEnvelopeDto,
@@ -45,6 +53,7 @@ import type {
   SettingsSnapshotDto,
   SettingsUpdateRequestDto,
   ShellStatusDto,
+  SubagentRuntimeStatusDto,
 } from "@busytok/protocol-types";
 
 /** Structured error from the control protocol, surviving the Tauri boundary. */
@@ -163,6 +172,32 @@ export function createBusytokClient(deps: { invoke: InvokeFn }) {
       call<PromptUseResultDto>("prompts.use", { ...request }),
     promptsSuggestTags: (request: PromptSuggestTagsRequestDto) =>
       call<PromptSuggestTagsResponseDto>("prompts.suggest_tags", { ...request }),
+
+    // Providers — bare DTOs (not wrapped in ReadEnvelopeDto)
+    providerList: () =>
+      call<ProviderListResponseDto>("provider.list"),
+    providerCreate: (request: ProviderCreateRequestDto) =>
+      call<ProviderDto>("provider.create", { ...request }),
+    providerUpdate: (request: ProviderUpdateRequestDto) =>
+      call<ProviderDto>("provider.update", { ...request }),
+    providerDelete: (id: string) =>
+      call<void>("provider.delete", { id }),
+    providerTestConnection: (id: string) =>
+      call<ProviderTestConnectionResponseDto>("provider.test_connection", { id }),
+
+    // Profiles (Phase 4) — bare DTOs (not envelope-wrapped), mirroring provider pattern.
+    // Read path: profiles come via settings.snapshot (subagent.profiles[]).
+    // Write path: dedicated profile.* RPCs.
+    profileCreate: (request: ProfileCreateRequestDto) =>
+      call<ProfileDto>("profile.create", { ...request }),
+    profileUpdate: (request: ProfileUpdateRequestDto) =>
+      call<ProfileDto>("profile.update", { ...request }),
+    profileDelete: (id: string) =>
+      call<void>("profile.delete", { id }),
+
+    // Subagent runtime status — envelope-wrapped (matches overview/settings pattern)
+    subagentRuntimeStatus: () =>
+      call<ReadEnvelopeDto<SubagentRuntimeStatusDto>>("subagent.runtime_status"),
 
     // Live
     liveWindow: (request: LiveWindowRequestDto) =>

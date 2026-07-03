@@ -33,6 +33,7 @@ impl TaskExecutor for RecordingExecutor {
             summary: "done".into(),
             usage: Default::default(),
             memory_update: Default::default(),
+            error_kind: None,
         })
     }
 }
@@ -256,6 +257,7 @@ fn pick_oldest_queued_task_skips_subagent_with_running_task() {
         completed_at_ms: None,
         timeout_seconds: None,
         model_override: None,
+        error_kind: None,
     })
     .unwrap();
     db.subagent_insert_task(&SubagentTaskRow {
@@ -278,6 +280,7 @@ fn pick_oldest_queued_task_skips_subagent_with_running_task() {
         completed_at_ms: None,
         timeout_seconds: None,
         model_override: None,
+        error_kind: None,
     })
     .unwrap();
     // Per-subagent FIFO guard: the queued task must NOT be picked because
@@ -344,6 +347,7 @@ impl TaskExecutor for DelayingExecutor {
             summary: "done".into(),
             usage: Default::default(),
             memory_update: Default::default(),
+            error_kind: None,
         })
     }
 }
@@ -477,6 +481,7 @@ async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
                 summary: "done".into(),
                 usage: Default::default(),
                 memory_update: Default::default(),
+                error_kind: None,
             })
         }
     }

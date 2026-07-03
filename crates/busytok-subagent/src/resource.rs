@@ -213,6 +213,24 @@ impl ResourceMonitor {
             .map(|rss| rss > self.hard_limit_mb as f64)
             .unwrap_or(false)
     }
+
+    /// System memory usage percentage (0–100) for `WorkerSnapshot`
+    /// (spec §4 Phase 2). Computed fresh on each call from the internal
+    /// `sysinfo::System` (refreshed at construction and on each `sample()`
+    /// tick): `used_pct = 100 - (available / total * 100)`. Returns `None`
+    /// only if `total_memory() == 0` (shouldn't happen on a real host).
+    /// Clamped to `[0, 100]` to guard against sysinfo reporting
+    /// `available > total` (swap pressure edge case).
+    pub fn memory_used_pct(&self) -> Option<u32> {
+        let total = bytes_to_mb(self.system.total_memory());
+        if total <= 0.0 {
+            return None;
+        }
+        let available_mb = bytes_to_mb(self.system.available_memory());
+        let pct = 100.0 - (available_mb / total * 100.0);
+        let pct = pct.clamp(0.0, 100.0);
+        Some(pct.round() as u32)
+    }
 }
 
 /// Convert bytes (sysinfo's `u64` memory) to megabytes as `f64`.

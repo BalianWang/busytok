@@ -176,4 +176,147 @@ mod tests {
             "recovery should call ensure_running at least once"
         );
     }
+
+    // ── Cover the Started outcome branch ──────────────────────────────
+
+    struct StartedFake;
+    impl ServiceLifecycle for StartedFake {
+        fn ensure_registered(&self) -> Result<InstallOutcome> {
+            Ok(InstallOutcome::AlreadyPresent)
+        }
+        fn ensure_running(&self) -> Result<EnsureRunningOutcome> {
+            Ok(EnsureRunningOutcome::Started {
+                install_outcome: InstallOutcome::AlreadyPresent,
+            })
+        }
+        fn status(&self) -> Result<LifecycleStatus> {
+            Ok(LifecycleStatus::Running)
+        }
+        fn stop_for_current_session(&self) -> Result<()> {
+            Ok(())
+        }
+        fn uninstall(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_with_started_outcome_returns_ok() {
+        let result = run_recovery_with(&StartedFake);
+        assert!(result.is_ok(), "Started outcome should be Ok");
+    }
+
+    // ── Cover the Err outcome branch ──────────────────────────────────
+
+    struct ErrorFake;
+    impl ServiceLifecycle for ErrorFake {
+        fn ensure_registered(&self) -> Result<InstallOutcome> {
+            Ok(InstallOutcome::AlreadyPresent)
+        }
+        fn ensure_running(&self) -> Result<EnsureRunningOutcome> {
+            Err(anyhow::anyhow!("service failed to start"))
+        }
+        fn status(&self) -> Result<LifecycleStatus> {
+            Ok(LifecycleStatus::RegisteredInactive)
+        }
+        fn stop_for_current_session(&self) -> Result<()> {
+            Ok(())
+        }
+        fn uninstall(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_with_error_outcome_propagates_error() {
+        let result = run_recovery_with(&ErrorFake);
+        assert!(result.is_err(), "error outcome should propagate");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("service failed to start"),
+            "error message should be preserved"
+        );
+    }
+
+    // ── Cover the status() Err branch ─────────────────────────────────
+
+    struct StatusErrorFake;
+    impl ServiceLifecycle for StatusErrorFake {
+        fn ensure_registered(&self) -> Result<InstallOutcome> {
+            Ok(InstallOutcome::AlreadyPresent)
+        }
+        fn ensure_running(&self) -> Result<EnsureRunningOutcome> {
+            Ok(EnsureRunningOutcome::AlreadyRunning)
+        }
+        fn status(&self) -> Result<LifecycleStatus> {
+            Err(anyhow::anyhow!("status probe failed"))
+        }
+        fn stop_for_current_session(&self) -> Result<()> {
+            Ok(())
+        }
+        fn uninstall(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_tolerates_status_check_failure() {
+        let result = run_recovery_with(&StatusErrorFake);
+        assert!(
+            result.is_ok(),
+            "status check failure should not block recovery"
+        );
+    }
+
+    // ── Cover connect_with_service_recovery ────────────────────────────
+
+    use busytok_control::transport::PlatformTransport;
+    use busytok_control::{server::ControlServer, TestRuntimeControl};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn connect_with_service_recovery_returns_client_when_server_is_running() {
+        let runtime = Arc::new(TestRuntimeControl::with_claude_fixture().await.unwrap());
+        let (server, socket_path) = ControlServer::<PlatformTransport>::spawn_for_test(runtime)
+            .await
+            .unwrap();
+        let server = Arc::new(server);
+        let server_task = tokio::spawn({
+            let s = Arc::clone(&server);
+            async move { s.run().await }
+        });
+
+        let client =
+            connect_with_service_recovery(&socket_path, || async { Ok::<_, String>(()) }).await;
+        server.shutdown();
+        let _ = server_task.await;
+        assert!(client.is_ok(), "should connect to a running server");
+    }
+
+    #[tokio::test]
+    async fn connect_with_service_recovery_calls_bootstrap_when_server_unavailable() {
+        let bootstrap_called = Arc::new(AtomicBool::new(false));
+        let bootstrap_called_clone = Arc::clone(&bootstrap_called);
+
+        let result = connect_with_service_recovery(
+            "/nonexistent/busytok-recovery-test.sock",
+            move || async move {
+                bootstrap_called_clone.store(true, Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "should fail when server stays unavailable after bootstrap"
+        );
+        assert!(
+            bootstrap_called.load(Ordering::SeqCst),
+            "bootstrap_service should be called when direct connect fails"
+        );
+    }
 }

@@ -10,7 +10,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import { useBusytokClient } from "./BusytokClientContext";
 import type { BusytokClient } from "./busytokClient";
-import { busytokClient } from "./busytokClient";
 import { queryKeys } from "./queryKeys";
 import type {
   ReadEnvelopeDto,
@@ -41,11 +40,16 @@ import type {
   PromptUseRequestDto,
   PromptUseResultDto,
   PromptSuggestTagsResponseDto,
+  ProviderCreateRequestDto,
+  ProviderUpdateRequestDto,
+  ProfileCreateRequestDto,
+  ProfileUpdateRequestDto,
   ReceiptDailyDto,
   SettingsSnapshotDto,
   SettingsDiagnosticsDto,
   SettingsRecoveryActionResponseDto,
   ShellStatusDto,
+  SubagentRuntimeStatusDto,
 } from "@busytok/protocol-types";
 
 const SHELL_STALE_MS = 5_000;
@@ -361,5 +365,88 @@ export function useSuggestTags(query: string | null) {
     queryFn: () => client.promptsSuggestTags({ query, limit: null }),
     staleTime: 5_000,
     enabled: query !== null,
+  });
+}
+
+// ── Providers ───────────────────────────────────────────────────────
+
+export function useProviders() {
+  const client = useBusytokClient();
+  return useQuery({
+    queryKey: queryKeys.providers(),
+    queryFn: () => client.providerList(),
+    staleTime: 30_000,
+  });
+}
+
+export function useProviderMutations() {
+  const client = useBusytokClient();
+  const queryClient = useQueryClient();
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.providers() });
+
+  const createProvider = useMutation({
+    mutationFn: (req: ProviderCreateRequestDto) => client.providerCreate(req),
+    onSuccess: invalidate,
+  });
+  const updateProvider = useMutation({
+    mutationFn: (req: ProviderUpdateRequestDto) => client.providerUpdate(req),
+    onSuccess: invalidate,
+  });
+  const deleteProvider = useMutation({
+    mutationFn: (id: string) => client.providerDelete(id),
+    onSuccess: invalidate,
+  });
+  const testConnection = useMutation({
+    mutationFn: (id: string) => client.providerTestConnection(id),
+  });
+
+  return { createProvider, updateProvider, deleteProvider, testConnection };
+}
+
+// ── Profiles (Phase 4) ───────────────────────────────────────────────
+
+/**
+ * Profile mutations. All three invalidate `settingsSnapshot` on success
+ * because profiles are READ via settings.snapshot (not a dedicated
+ * profile.list RPC). This keeps the read+write paths consistent.
+ */
+export function useProfileMutations() {
+  const client = useBusytokClient();
+  const queryClient = useQueryClient();
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: queryKeys.settingsSnapshot() });
+
+  const createProfile = useMutation({
+    mutationFn: (req: ProfileCreateRequestDto) => client.profileCreate(req),
+    onSuccess: invalidate,
+  });
+  const updateProfile = useMutation({
+    mutationFn: (req: ProfileUpdateRequestDto) => client.profileUpdate(req),
+    onSuccess: invalidate,
+  });
+  const deleteProfile = useMutation({
+    mutationFn: (id: string) => client.profileDelete(id),
+    onSuccess: invalidate,
+  });
+
+  return { createProfile, updateProfile, deleteProfile };
+}
+
+// ── Subagent runtime status ─────────────────────────────────────────
+
+// Poll cadence for the read-only Subagents monitoring page (spec §4 Phase 2:
+// 5s poll). `refetchIntervalInBackground: false` ties polling to a visible
+// window (matches `useShellStatus` pattern).
+const SUBAGENT_REFETCH_MS = 5_000;
+
+export function useSubagentRuntimeStatus() {
+  const client = useBusytokClient();
+  return useQuery<ReadEnvelopeDto<SubagentRuntimeStatusDto>>({
+    ...envelopeQueryOptions({
+      queryKey: queryKeys.subagentRuntimeStatus(),
+      queryFn: () => client.subagentRuntimeStatus(),
+    }),
+    refetchInterval: SUBAGENT_REFETCH_MS,
+    refetchIntervalInBackground: false,
   });
 }

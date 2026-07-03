@@ -1,6 +1,17 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { SessionPool } from '../src/session_pool.js';
 import { turnAutoHandlerWithPool } from '../src/handlers/turn_auto.js';
+
+// These tests exercise the MOCK turn_auto path (BUSYTOK_USE_MOCK_SIDECAR=1)
+// to verify memory_update behavior without hitting the real Pi SDK.
+const PREV_MOCK_SIDECAR = process.env.BUSYTOK_USE_MOCK_SIDECAR;
+beforeAll(() => {
+  process.env.BUSYTOK_USE_MOCK_SIDECAR = '1';
+});
+afterAll(() => {
+  if (PREV_MOCK_SIDECAR === undefined) delete process.env.BUSYTOK_USE_MOCK_SIDECAR;
+  else process.env.BUSYTOK_USE_MOCK_SIDECAR = PREV_MOCK_SIDECAR;
+});
 
 describe('turn_auto memory_update + structured params', () => {
   const origEnv = process.env.BUSYTOK_MOCK_MEMORY_UPDATE;

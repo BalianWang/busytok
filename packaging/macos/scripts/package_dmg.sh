@@ -72,6 +72,14 @@ if [ -d "$APP_PATH" ]; then
     bundle_helpers_into_app "$APP_PATH"
     bundle_service_plist_into_app "$APP_PATH"
 
+    # Phase 5: bundle pi-sidecar resources (JS bundle + manifest + dual-arch
+    # Node binaries) into Contents/Resources/pi-sidecar/ (spec §345-390).
+    source "$SCRIPT_DIR/_bundle_sidecar.sh"
+    bundle_sidecar_resources_into_app "$APP_PATH" || {
+        echo "  ERROR: sidecar bundling failed"
+        exit 1
+    }
+
     # Sign the helpers with service-specific entitlements before the
     # enclosing bundle is re-sealed.  The final bundle seal uses the app
     # entitlements so the app/helper split is explicit:
@@ -109,6 +117,10 @@ if [ -d "$APP_PATH" ]; then
             fi
             echo "  signed $helper"
         done
+
+        # Phase 5: sign the nested node binaries with allow-jit entitlements
+        # BEFORE the outer bundle re-seal (spec §375-381 signing order).
+        sign_sidecar_node_binaries "$APP_PATH" "$DEVELOPER_ID_APPLICATION" "$TIMESTAMP_FLAG"
 
         # Re-seal the app bundle so its _CodeSignature includes the
         # newly-added-and-signed helpers.  --deep is deliberately omitted:

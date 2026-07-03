@@ -1,9 +1,21 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { SessionPool } from '../src/session_pool.js';
 import { SidecarError } from '../src/errors.js';
 import { turnAutoHandlerWithPool } from '../src/handlers/turn_auto.js';
 
-describe('turn_auto with pool', () => {
+// These tests exercise the MOCK turn_auto path (BUSYTOK_USE_MOCK_SIDECAR=1),
+// which keeps the hardcoded mock usage so Rust-side e2e tests need no real
+// Pi credentials. The real SDK path is covered by real_sdk.test.ts.
+const PREV_MOCK = process.env.BUSYTOK_USE_MOCK_SIDECAR;
+beforeAll(() => {
+  process.env.BUSYTOK_USE_MOCK_SIDECAR = '1';
+});
+afterAll(() => {
+  if (PREV_MOCK === undefined) delete process.env.BUSYTOK_USE_MOCK_SIDECAR;
+  else process.env.BUSYTOK_USE_MOCK_SIDECAR = PREV_MOCK;
+});
+
+describe('turn_auto with pool (mock path)', () => {
   it('reuses session for same subagent', async () => {
     const pool = new SessionPool(3);
     const handler = turnAutoHandlerWithPool(pool);
@@ -14,11 +26,12 @@ describe('turn_auto with pool', () => {
       profile: 'pi/search-cheap',
       prompt: 'do 1',
     };
-    const result1 = await handler(params1);
+    const result1 = await handler(params1) as { session_reused: boolean; adapter_session_id: string };
     expect(result1.session_reused).toBe(false);
+    expect(result1.adapter_session_id).toMatch(/^pi_sess_mock_/);
 
     const params2 = { ...params1, prompt: 'do 2' };
-    const result2 = await handler(params2);
+    const result2 = await handler(params2) as { session_reused: boolean; adapter_session_id: string };
     expect(result2.session_reused).toBe(true);
     expect(result2.adapter_session_id).toBe(result1.adapter_session_id);
   });

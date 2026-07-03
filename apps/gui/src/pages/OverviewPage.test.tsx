@@ -6,9 +6,12 @@
 //! quieter. It also locks in the death of the legacy left-accent-bar
 //! treatment for summary metric cards.
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OverviewMetricDto } from "@busytok/protocol-types";
+import type {
+  ActivityListItemDto,
+  OverviewMetricDto,
+} from "@busytok/protocol-types";
 import { OverviewPage } from "./OverviewPage";
 
 // ── Mocks ───────────────────────────────────────────────────────────
@@ -132,6 +135,29 @@ function stubAllPanelsPopulated() {
     isLoading: false,
     isError: false,
   });
+}
+
+function activityItem(overrides: Partial<ActivityListItemDto> = {}): ActivityListItemDto {
+  return {
+    id: "evt-1",
+    happened_at_ms: Date.now(),
+    client_id: "claude-code",
+    client_label: "Claude Code",
+    source_id: "src-1",
+    source_label: "project-a",
+    source_root_path: "/tmp/project-a",
+    project_label: "Project A",
+    project_hash: "hash-1",
+    model_id: "model-1",
+    model_label: "GPT-4",
+    tokens: 1234,
+    cache_hit_rate: 0.5,
+    cost_usd: 0.42,
+    cost_status: "exact",
+    status: "ok",
+    detail_available: true,
+    ...overrides,
+  };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -289,7 +315,7 @@ describe("OverviewPage", () => {
 
     // Page-level degraded ribbon surfaces exactly once (no centered card).
     const degradedRibbons = document.querySelectorAll(
-      ".overview-console__degraded-ribbon",
+      ".degraded-ribbon",
     );
     expect(degradedRibbons.length).toBe(1);
     // The legacy centered PageState degraded card must not appear.
@@ -374,5 +400,106 @@ describe("OverviewPage", () => {
     });
     render(<OverviewPage />);
     expect(document.querySelectorAll("section.overview-console__recent").length).toBe(1);
+  });
+
+  // ── formatTime + toRecentRow coverage ───────────────────────────────
+  //
+  // The following tests render the page with actual recent_activity items so
+  // that toRecentRow() and formatTime() execute. formatTime has two
+  // branches (today vs non-today); toRecentRow exercises model_label null
+  // fallback, source-label joining, and token/cost formatting.
+
+  it("renders recent activity rows from populated data (today branch of formatTime)", () => {
+    stubAllPanelsPopulated();
+    const todayItem = activityItem({
+      id: "evt-today",
+      happened_at_ms: Date.now(),
+      client_label: "Claude Code",
+      source_label: "project-a",
+      model_label: "GPT-4",
+      tokens: 1234,
+    });
+    mockUseActivityRecent.mockReturnValue({
+      data: envelope({ recent_activity: [todayItem] }),
+      isLoading: false,
+      isError: false,
+    });
+
+    render(<OverviewPage />);
+
+    // toRecentRow joins client_label and source_label with " / ".
+    expect(screen.getByText("Claude Code / project-a")).toBeDefined();
+    // model_label renders directly.
+    expect(screen.getByText("GPT-4")).toBeDefined();
+    // tokens are formatted via toLocaleString.
+    expect(screen.getByText("1,234")).toBeDefined();
+  });
+
+  it("falls back to non-today date format for items from a prior day", () => {
+    stubAllPanelsPopulated();
+    // A timestamp from 10 days ago guarantees the non-today branch.
+    const tenDaysAgo = Date.now() - 10 * 24 * 60 * 60 * 1000;
+    const oldItem = activityItem({
+      id: "evt-old",
+      happened_at_ms: tenDaysAgo,
+    });
+    mockUseActivityRecent.mockReturnValue({
+      data: envelope({ recent_activity: [oldItem] }),
+      isLoading: false,
+      isError: false,
+    });
+
+    render(<OverviewPage />);
+
+    // The LedgerTable should still render the row (the source join is
+    // present). The non-today branch formats with month/day + time; we
+    // just verify the row was rendered without crashing.
+    expect(screen.getByText("Claude Code / project-a")).toBeDefined();
+  });
+
+  it("shows Unknown model when model_label is null and joins partial source labels", () => {
+    stubAllPanelsPopulated();
+    const item = activityItem({
+      id: "evt-null-model",
+      model_label: null,
+      client_label: "Codex",
+      source_label: null, // filter(Boolean) drops null
+    });
+    mockUseActivityRecent.mockReturnValue({
+      data: envelope({ recent_activity: [item] }),
+      isLoading: false,
+      isError: false,
+    });
+
+    render(<OverviewPage />);
+
+    // Null model_label falls back to "Unknown model".
+    expect(screen.getByText("Unknown model")).toBeDefined();
+    // With source_label null, only client_label remains (no " / " join).
+    expect(screen.getByText("Codex")).toBeDefined();
+  });
+
+  it("renders the summary error state with a Retry action when the summary hook errors", () => {
+    stubAllPanelsPopulated();
+    const refetch = vi.fn();
+    mockUseOverviewSummary.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      isFetching: false,
+      refetch,
+    });
+
+    render(<OverviewPage />);
+
+    // The catastrophic error PageState surfaces title + message + Retry.
+    expect(screen.getByText("Overview unavailable")).toBeDefined();
+    expect(screen.getByText("Could not load usage data.")).toBeDefined();
+    const retryBtn = screen.getByRole("button", { name: "Retry" });
+    expect(retryBtn).toBeDefined();
+
+    // Clicking Retry calls refetchSummary().
+    fireEvent.click(retryBtn);
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 });

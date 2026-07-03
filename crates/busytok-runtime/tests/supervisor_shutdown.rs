@@ -2,17 +2,25 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use busytok_config::SubagentSettings;
+use busytok_config::{
+    ProviderConfig, ProviderKind, SubagentResourcePolicyConfig, SubagentSettings,
+};
 use busytok_store::Database;
 use busytok_subagent::mock_executor::TaskExecutor;
 use busytok_subagent::models::DelegateRequest;
+use busytok_subagent::pressure::{PressureGate, PressureResponder};
 use busytok_subagent::sidecar::config::SidecarConfig;
 use busytok_subagent::sidecar::executor::SidecarTaskExecutor;
-use busytok_subagent::sidecar::PiSidecarSupervisor;
+use busytok_subagent::sidecar::{
+    CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, WorkerPool,
+};
 use busytok_subagent::SubagentManager;
+
+/// The test provider ID used by the pool-based test.
+const TEST_PROVIDER_ID: &str = "test-prov";
 
 fn mock_sidecar_script() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -74,7 +82,75 @@ fn mock_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
     }
+}
+
+fn test_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: TEST_PROVIDER_ID.to_string(),
+        name: "Test".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://test.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    }
+}
+
+fn make_providers() -> ProviderLookup {
+    Arc::new(|pid: &str| -> Option<ProviderConfig> {
+        match pid {
+            TEST_PROVIDER_ID => Some(test_provider()),
+            _ => None,
+        }
+    })
+}
+
+fn canned_credential_reader() -> CredentialReader {
+    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+}
+
+/// Build a responder factory that constructs a real `PressureResponder` and
+/// keeps a strong ref alive in a shared holder (mirrors production wiring
+/// where `BusytokSupervisor` holds the strong ref).
+fn make_responder_factory(
+    gate: Arc<PressureGate>,
+    executor_weak: Weak<SidecarTaskExecutor>,
+) -> (ResponderFactory, Arc<Mutex<Vec<Arc<PressureResponder>>>>) {
+    let holder: Arc<Mutex<Vec<Arc<PressureResponder>>>> = Arc::new(Mutex::new(Vec::new()));
+    let holder_for_closure = Arc::clone(&holder);
+    let factory: ResponderFactory = Arc::new(
+        move |sup_weak: Weak<PiSidecarSupervisor>| -> Arc<PressureResponder> {
+            let responder = Arc::new(PressureResponder::new(
+                sup_weak,
+                executor_weak.clone(),
+                Arc::clone(&gate),
+            ));
+            holder_for_closure
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&responder));
+            responder
+        },
+    );
+    (factory, holder)
+}
+
+/// Build `SubagentSettings` with the `pi/search-cheap` profile bound to
+/// `TEST_PROVIDER_ID` so `SubagentManager::delegate` threads a non-`None`
+/// `provider_id` into `ExecutorInput` (required by the pool-based executor).
+fn settings_with_test_provider() -> SubagentSettings {
+    let mut settings = SubagentSettings::default();
+    settings
+        .profiles
+        .get_mut("pi/search-cheap")
+        .expect("default profiles must include pi/search-cheap")
+        .provider_id = Some(TEST_PROVIDER_ID.to_string());
+    settings
 }
 
 fn req(name: &str, prompt: &str) -> DelegateRequest {
@@ -96,11 +172,35 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
 #[tokio::test]
 async fn sidecar_shutdown_kills_subprocess_then_restart_works() {
     let db = Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
-    let supervisor = PiSidecarSupervisor::new(mock_sidecar_config(), Some(Arc::clone(&db)));
-    let executor: Arc<dyn TaskExecutor> =
-        Arc::new(SidecarTaskExecutor::new(Arc::clone(&supervisor)));
-    let manager =
-        SubagentManager::new(Arc::clone(&db), SubagentSettings::default(), "pi", executor);
+
+    // Build a pool + executor + supervisor via the two-phase bootstrap
+    // (mirrors production wiring in `construct_sidecar`).
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        mock_sidecar_config(),
+        Some(Arc::clone(&db)),
+        make_providers(),
+        canned_credential_reader(),
+        Some(Arc::clone(&gate)),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = Arc::new(SidecarTaskExecutor::with_pool(
+        Arc::clone(&pool),
+        Some(Arc::clone(&db)),
+    ));
+    let (factory, _holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
+    pool.set_responder_factory(factory);
+    let supervisor = pool
+        .ensure_worker(TEST_PROVIDER_ID)
+        .expect("ensure_worker test-prov");
+
+    let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
+    let manager = SubagentManager::new(
+        Arc::clone(&db),
+        settings_with_test_provider(),
+        "pi",
+        exec_dyn,
+    );
 
     // First delegate spawns the sidecar.
     let r1 = manager.delegate(req("reviewer", "first")).await.unwrap();

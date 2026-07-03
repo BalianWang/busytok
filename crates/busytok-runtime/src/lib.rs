@@ -22,6 +22,8 @@ pub mod scan;
 pub mod service_app;
 pub(crate) mod source_registry;
 pub mod status;
+/// Phase 3 Task 5: usage normalization bridge for subagent tasks.
+pub mod subagent_usage;
 pub mod supervisor;
 pub mod tail;
 pub mod ui_models;

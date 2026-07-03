@@ -371,4 +371,164 @@ mod tests {
         assert!(!store.load().suppressed_for_session);
         assert!(store.load().suppressed_at_boot_secs.is_none());
     }
+
+    /// `Debug` impl must not panic and must redact the boot_secs_fn closure
+    /// (which is not Debug). Verifies the manual Debug impl at L117-122.
+    #[test]
+    fn debug_impl_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::new(DesktopLifecycleSettings::default(), paths);
+        let s = format!("{:?}", store);
+        assert!(s.contains("DesktopLifecycleSettingsStore"));
+        assert!(s.contains("settings"));
+        // The boot_secs_fn closure must NOT be in the debug output (it would
+        // not be Debug-derivable). finish_non_exhaustive hides it.
+        assert!(!s.contains("boot_secs_fn"));
+    }
+
+    /// `load` returns the in-memory default when the on-disk file is a
+    /// directory (read_to_string fails). Covers the read_failed branch.
+    #[test]
+    fn load_falls_back_when_file_is_a_directory() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let file_path = paths.config_dir().join(SETTINGS_FILE_NAME);
+        // Create a directory at the file path — read_to_string will fail.
+        std::fs::create_dir_all(&file_path).unwrap();
+
+        let store = DesktopLifecycleSettingsStore::new(DesktopLifecycleSettings::default(), paths);
+        // The in-memory default has launch_at_login=false; load() must return
+        // that default rather than panicking.
+        assert_eq!(
+            store.load().launch_busytok_desktop_at_login,
+            DesktopLifecycleSettings::default().launch_busytok_desktop_at_login,
+        );
+    }
+
+    /// `save` swallows atomic_write errors and logs them (does not panic).
+    /// Triggered by making config_dir read-only so the tmp file can't be written.
+    #[test]
+    fn save_swallows_atomic_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        // Create config_dir and a stale file first.
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let file_path = paths.config_dir().join(SETTINGS_FILE_NAME);
+        std::fs::write(&file_path, "old").unwrap();
+        // Make config_dir read-only so atomic_write's create_dir_all fails
+        // (actually create_dir_all succeeds for an existing dir, but the temp
+        // file write fails). On POSIX, write to a dir requires write+execute
+        // permission; mode 0o500 (r-x) denies writes.
+        std::fs::set_permissions(paths.config_dir(), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let store = DesktopLifecycleSettingsStore::new(DesktopLifecycleSettings::default(), paths);
+        // save() should not panic even though atomic_write fails.
+        store.save(DesktopLifecycleSettings {
+            launch_busytok_desktop_at_login: true,
+            suppressed_for_session: false,
+            suppressed_at_boot_secs: None,
+        });
+        // Restore permissions so TempDir cleanup works.
+        std::fs::set_permissions(
+            // Re-resolve config_dir because paths was moved into the store.
+            tmp.path().join("config").join("busytok"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .ok();
+    }
+
+    /// `suppression_active_for_current_session` returns `false` when
+    /// `boot_secs_fn` returns `None` (the `_ => false` branch).
+    #[test]
+    fn suppression_active_returns_false_when_boot_secs_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        // Inject a boot_secs_fn that always returns None (simulates a system
+        // where boot time cannot be read).
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            || None,
+        );
+        // Activate suppression in-memory only — the persisted value won't
+        // have a real boot_secs, but record_suppression calls save which
+        // uses our injected boot_secs_fn returning None.
+        store.record_suppression();
+        // Even with suppression flagged, the boot_secs_fn returning None
+        // means `suppression_active_for_current_session` returns false.
+        assert!(!store.suppression_active_for_current_session());
+        // But the persisted flag should still be true.
+        assert!(store.load().suppressed_for_session);
+    }
+
+    /// `suppression_active_for_current_session` returns `true` when both
+    /// stored and current boot_secs match.
+    #[test]
+    fn suppression_active_returns_true_when_boot_secs_match() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            || Some(12345),
+        );
+        store.record_suppression();
+        assert!(store.suppression_active_for_current_session());
+    }
+
+    /// `suppression_active_for_current_session` returns `false` when stored
+    /// and current boot_secs differ (different session).
+    #[test]
+    fn suppression_active_returns_false_when_boot_secs_differ() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            || Some(99999),
+        );
+        // Manually save with a stored value that differs from the boot_secs_fn.
+        store.save(DesktopLifecycleSettings {
+            launch_busytok_desktop_at_login: false,
+            suppressed_for_session: true,
+            suppressed_at_boot_secs: Some(1),
+        });
+        assert!(!store.suppression_active_for_current_session());
+    }
+
+    /// `suppression_active_for_current_session` returns `false` when
+    /// suppression was never activated.
+    #[test]
+    fn suppression_active_returns_false_when_never_suppressed() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            || Some(12345),
+        );
+        assert!(!store.suppression_active_for_current_session());
+    }
+
+    /// `clear_suppression` resets both the flag and the boot_secs stamp.
+    #[test]
+    fn clear_suppression_resets_boot_secs() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        let store = DesktopLifecycleSettingsStore::with_boot_secs_fn(
+            DesktopLifecycleSettings::default(),
+            paths,
+            || Some(12345),
+        );
+        store.record_suppression();
+        assert!(store.load().suppressed_at_boot_secs.is_some());
+
+        store.clear_suppression();
+        let s = store.load();
+        assert!(!s.suppressed_for_session);
+        assert!(s.suppressed_at_boot_secs.is_none());
+    }
 }

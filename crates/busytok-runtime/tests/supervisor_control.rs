@@ -22,13 +22,17 @@
 //! control method, asserting the shape and content of the returned DTOs.
 
 use futures::FutureExt;
+use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use busytok_adapters::AgentLogAdapter;
-use busytok_config::{BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig};
+use busytok_config::{
+    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig, ProviderConfig,
+    ProviderKind,
+};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_discovery::DiscoveredLogSource;
 use busytok_domain::{
@@ -37,9 +41,13 @@ use busytok_domain::{
 };
 use busytok_protocol::dto::*;
 use busytok_runtime::status::CachedClientRollup;
+use busytok_runtime::subagent_usage::normalize_task_usage;
 use busytok_runtime::BusytokSupervisor;
 use busytok_store::repository::LogSourceRow;
 use busytok_store::Database;
+use busytok_subagent::models::TaskUsage;
+use busytok_subagent::sidecar::SidecarConfig;
+use serial_test::serial;
 use time::{Duration as TimeDuration, Month, OffsetDateTime, Time, UtcOffset};
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -144,6 +152,118 @@ fn make_supervisor_with_settings(
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .ok();
     BusytokSupervisor::new(db, paths)
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar test helpers — used by the `workers: [one row]` stopped-sidecar
+// path (`subagent_runtime_status_workers_one_row_when_sidecar_stopped`).
+// Mirrors the helpers in `subagent_e2e_sidecar.rs`; duplicated because the
+// `busytok-subagent` test `support` module is test-private to that crate.
+// ---------------------------------------------------------------------------
+
+fn sidecar_shell_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            return PathBuf::from(program_files)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+        }
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/bin/bash")
+    }
+}
+
+fn mock_sidecar_path() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(format!(
+        "{manifest}/../busytok-subagent/tests/fixtures/mock-sidecar.sh"
+    ))
+}
+
+fn mock_sidecar_bundle_path() -> PathBuf {
+    let path = mock_sidecar_path();
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = raw.split_once(":/") {
+            let drive = drive.to_ascii_lowercase();
+            return PathBuf::from(format!("/{drive}/{rest}"));
+        }
+        PathBuf::from(raw)
+    }
+
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+/// `SidecarConfig` pointing at the mock-sidecar.sh fixture. Mirrors the fields
+/// `resolve_sidecar_config` would produce, with `bundle_path` set to the mock
+/// fixture (no env var needed).
+fn make_sidecar_config() -> SidecarConfig {
+    SidecarConfig {
+        node_binary: sidecar_shell_path(),
+        bundle_path: mock_sidecar_bundle_path(),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
+    }
+}
+
+/// Settings with `pi_sidecar.enabled = true` so `new_with_sidecar_config`
+/// takes the sidecar wiring path. The injected `SidecarConfig` means
+/// `resolve_sidecar_config` is skipped, so `node_runtime`/`system_node_path`
+/// are irrelevant here.
+fn make_sidecar_settings() -> BusytokSettings {
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+
+    // Add a test provider + bind profiles so the WorkerPool can route.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider".to_string(),
+        name: "Test Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    for profile in settings.subagent.profiles.values_mut() {
+        profile.provider_id = Some("test-provider".to_string());
+    }
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+
+    settings
+}
+
+/// Construct a supervisor with `pi_sidecar.enabled = true` and the mock sidecar
+/// bundle injected via `new_with_sidecar_config`. The sidecar child is NOT
+/// started (`ensure_started` is never called), so `worker_snapshot()` reports
+/// `Stopped` — the "configured-but-stopped" posture under test.
+fn make_sidecar_stopped_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
+    let paths = BusytokPaths::for_test(tmp.path());
+    make_sidecar_settings()
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
 }
 
 fn seed_event(
@@ -3414,4 +3534,3304 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
         .await
         .unwrap();
     assert!(after_list.subagents.iter().all(|s| s.id != sub_id));
+}
+
+// ---------------------------------------------------------------------------
+// providers.* (Phase 1: Credential Foundation)
+// ---------------------------------------------------------------------------
+//
+// The settings-CRUD code paths (create without api_key, list, update without
+// api_key, delete) never touch the OS keychain and are safe to run in CI on
+// every platform. `provider_to_dto` calls `ProviderCredentialStore::has_key`,
+// which is a read that returns `false` on `NoEntry` — also safe for CI.
+//
+// Tests that exercise the api_key flow (create/update with a non-empty key,
+// or delete of a provider that has a key) touch the real macOS Keychain and
+// are gated behind `#[cfg(target_os = "macos")] #[ignore]`.
+
+fn provider_create_request(id: &str, name: &str) -> ProviderCreateRequestDto {
+    ProviderCreateRequestDto {
+        id: id.to_string(),
+        name: name.to_string(),
+        base_url: "https://api.example.com/v1".to_string(),
+        api_key_env_name: "EXAMPLE_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["example-model".to_string()],
+        api_key: None,
+    }
+}
+
+#[tokio::test]
+async fn provider_crud_round_trips_without_api_key() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create → list shows it.
+    let created = sup
+        .provider_create(provider_create_request("acme-prod", "Acme"))
+        .await
+        .unwrap();
+    assert_eq!(created.id, "acme-prod");
+    assert_eq!(created.name, "Acme");
+    assert!(created.enabled);
+    assert!(!created.has_api_key, "no api_key was supplied");
+
+    let list = sup.provider_list().await.unwrap();
+    assert_eq!(list.providers.len(), 1);
+    assert_eq!(list.providers[0].id, "acme-prod");
+
+    // Update name + models + enabled, no api_key → keychain untouched.
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "acme-prod".to_string(),
+            name: Some("Acme Renamed".to_string()),
+            base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
+            models: Some(vec![
+                "example-model".to_string(),
+                "second-model".to_string(),
+            ]),
+            enabled: Some(false),
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "Acme Renamed");
+    assert_eq!(updated.models.len(), 2);
+    assert!(!updated.enabled);
+    assert!(!updated.has_api_key, "still no api_key after update");
+
+    // Delete → list empty.
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: "acme-prod".to_string(),
+    })
+    .await
+    .unwrap();
+    let list_after = sup.provider_list().await.unwrap();
+    assert!(
+        list_after.providers.is_empty(),
+        "provider list should be empty after delete"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_rejects_invalid_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Underscore and dot are not in the allowed alphabet [a-z0-9-].
+    let err = sup
+        .provider_create(provider_create_request("acme_prod", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider id must contain only"),
+        "expected id validation error, got: {err}"
+    );
+
+    let err = sup
+        .provider_create(provider_create_request("acme.prod", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider id must contain only"),
+        "expected id validation error for dotted id, got: {err}"
+    );
+
+    // Nothing should have been written.
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_rejects_uppercase_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Uppercase letters are not in the allowed alphabet [a-z0-9-].
+    let err = sup
+        .provider_create(provider_create_request("UPPER-CASE", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("[a-z0-9-]"),
+        "expected id validation error mentioning [a-z0-9-], got: {err}"
+    );
+
+    // Nothing should have been written.
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_rejects_empty_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Empty id must be rejected before the char-set check (which is vacuously
+    // true for an empty string).
+    let err = sup
+        .provider_create(provider_create_request("", "Acme"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("empty"),
+        "expected empty-id validation error, got: {err}"
+    );
+
+    // Nothing should have been written.
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_rejects_duplicate_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("dup", "First"))
+        .await
+        .unwrap();
+
+    let err = sup
+        .provider_create(provider_create_request("dup", "Second"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider already exists"),
+        "expected duplicate-id error, got: {err}"
+    );
+
+    let list = sup.provider_list().await.unwrap();
+    assert_eq!(
+        list.providers.len(),
+        1,
+        "duplicate create must not add a second row"
+    );
+    assert_eq!(list.providers[0].name, "First");
+}
+
+#[tokio::test]
+async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("noop-key", "Noop"))
+        .await
+        .unwrap();
+
+    // Update with api_key: None must succeed without touching the keychain.
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "noop-key".to_string(),
+            name: Some("Noop Renamed".to_string()),
+            base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.name, "Noop Renamed");
+    assert!(!updated.has_api_key, "no api_key was ever set");
+}
+
+#[tokio::test]
+async fn provider_update_applies_env_name_fields() {
+    // Spec §3.1 / Plan Task 6: api_key_env_name and base_url_env_name are
+    // editable provider fields surfaced through ProviderUpdateRequestDto.
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("env-edit", "Env Edit"))
+        .await
+        .unwrap();
+
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "env-edit".to_string(),
+            name: None,
+            base_url: None,
+            api_key_env_name: Some("EDITED_API_KEY".to_string()),
+            base_url_env_name: Some("EDITED_BASE_URL".to_string()),
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.api_key_env_name, "EDITED_API_KEY");
+    assert_eq!(
+        updated.base_url_env_name.as_deref(),
+        Some("EDITED_BASE_URL")
+    );
+
+    // A subsequent update that omits the env-name fields leaves them unchanged
+    // (patch semantics: absent == unchanged).
+    let after_omit = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "env-edit".to_string(),
+            name: Some("Env Edit Renamed".to_string()),
+            base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_omit.name, "Env Edit Renamed");
+    assert_eq!(after_omit.api_key_env_name, "EDITED_API_KEY");
+    assert_eq!(
+        after_omit.base_url_env_name.as_deref(),
+        Some("EDITED_BASE_URL")
+    );
+}
+
+#[tokio::test]
+async fn provider_update_returns_error_for_unknown_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: "ghost".to_string(),
+            name: Some("Ghost".to_string()),
+            base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "expected not-found error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_delete_returns_error_for_unknown_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .provider_delete(ProviderDeleteRequestDto {
+            id: "ghost".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "delete of unknown provider should error early; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_test_connection_errors_when_provider_missing() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .provider_test_connection(ProviderTestConnectionRequestDto {
+            id: "ghost".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "expected not-found error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_test_connection_errors_when_no_api_key() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(provider_create_request("no-key", "No Key"))
+        .await
+        .unwrap();
+
+    let err = sup
+        .provider_test_connection(ProviderTestConnectionRequestDto {
+            id: "no-key".to_string(),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no API key stored") || err.contains("failed to read keychain"),
+        "expected keychain-related error, got: {err}"
+    );
+
+    // Clean up so the keychain stays untouched (no key was set, so delete is a no-op).
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: "no-key".to_string(),
+    })
+    .await
+    .unwrap();
+}
+
+// --- Keychain-touching tests (manual only) -------------------------------
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "touches real macOS Keychain — run with --ignored"]
+async fn provider_crud_round_trips_with_api_key_macos() {
+    use busytok_config::ProviderCredentialStore;
+
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider_id = "task4-keychain-roundtrip";
+    // Defensive cleanup in case a prior run left a key behind.
+    let _ = ProviderCredentialStore::delete_key(provider_id);
+
+    // Create with api_key → has_api_key true.
+    let created = sup
+        .provider_create(ProviderCreateRequestDto {
+            id: provider_id.to_string(),
+            name: "Keychain Roundtrip".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key_env_name: "EXAMPLE_API_KEY".to_string(),
+            base_url_env_name: None,
+            models: vec!["example-model".to_string()],
+            api_key: Some("sk-test-123".to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        created.has_api_key,
+        "api_key was supplied, has_api_key should be true"
+    );
+
+    // Update with api_key: None → key unchanged.
+    let updated = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: provider_id.to_string(),
+            name: Some("Keychain Roundtrip Renamed".to_string()),
+            base_url: None,
+            api_key_env_name: None,
+            base_url_env_name: None,
+            models: None,
+            enabled: None,
+            api_key: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        updated.has_api_key,
+        "api_key must still be present after update with None"
+    );
+    assert_eq!(updated.name, "Keychain Roundtrip Renamed");
+
+    // Direct keychain read confirms the key value is intact.
+    let stored = ProviderCredentialStore::get_key(provider_id).unwrap();
+    assert_eq!(stored.as_deref(), Some("sk-test-123"));
+
+    // Delete cleans up both settings and keychain.
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: provider_id.to_string(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        !ProviderCredentialStore::has_key(provider_id),
+        "keychain entry must be removed after delete"
+    );
+    let list = sup.provider_list().await.unwrap();
+    assert!(list.providers.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// subagent.runtime_status (Phase 2: Subagent Monitoring Page)
+// ---------------------------------------------------------------------------
+//
+// Tests exercise the BusytokSupervisor handler end-to-end via the RuntimeControl
+// trait. Data is seeded directly via the shared DB handle (`sup.db_handle()`)
+// using `SubagentLogicalSubagentRow` / `SubagentTaskRow` so we can control
+// `created_at_ms` and `status` precisely — the mock executor path
+// (`subagent_delegate`) timestamps tasks at `now_ms()` and only produces
+// `completed` rows, which doesn't let us verify ordering or last_task_status.
+
+use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentTaskRow};
+
+/// Helper: insert a logical subagent row with the given name + status.
+/// Returns the row id (same as `name` for tests).
+fn seed_subagent_row(sup: &BusytokSupervisor, name: &str, status: &str) -> String {
+    let mut row = SubagentLogicalSubagentRow::for_test(name, name);
+    row.status = status.to_string();
+    let db = sup.db_handle().lock().unwrap();
+    db.subagent_upsert_logical(&row).expect("upsert logical");
+    row.id
+}
+
+/// Helper: insert a task row with the given id, subagent_id, status, and
+/// created_at_ms. `SubagentTaskRow::for_test` defaults to `status="queued"`;
+/// we override it (and the timestamp) after construction.
+fn seed_task_row(
+    sup: &BusytokSupervisor,
+    id: &str,
+    subagent_id: &str,
+    status: &str,
+    created_at_ms: i64,
+) {
+    let mut row = SubagentTaskRow::for_test(id, subagent_id, "pi/search-cheap", "do work");
+    row.status = status.to_string();
+    row.created_at_ms = created_at_ms;
+    if status == "completed" || status == "failed" || status == "cancelled" {
+        row.completed_at_ms = Some(created_at_ms + 1000);
+    }
+    if status == "failed" {
+        row.error = Some("boom".to_string());
+    }
+    let db = sup.db_handle().lock().unwrap();
+    db.subagent_insert_task(&row).expect("insert task");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_returns_empty_when_no_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .expect("runtime_status should succeed on empty DB");
+
+    // Envelope-level assertions — `build_read_envelope` populates these from
+    // `ServiceStatusSnapshot`. `generated_at_ms` is `now_ms()` so must be > 0.
+    assert!(
+        envelope.generated_at_ms > 0,
+        "generated_at_ms must be populated"
+    );
+
+    // Inner data — empty state.
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.memory_used_pct, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    // Default `max_hot_sessions` from `SubagentSettings::default()` is 3.
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3);
+    // No sidecar supervisor in `make_supervisor` → `worker_sampled_at_ms` is None.
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
+    assert!(envelope.data.subagents.is_empty());
+    assert!(envelope.data.tasks_recent.is_empty());
+    // `make_supervisor` doesn't configure a sidecar → `workers: []`.
+    assert!(envelope.data.workers.is_empty());
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_includes_subagents_with_task_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-a", "warm");
+    seed_subagent_row(&sup, "sub-b", "warm");
+    // sub-a: 2 tasks (one completed, one failed — failed is the latest by ts)
+    seed_task_row(&sup, "t1", "sub-a", "completed", 1_000);
+    seed_task_row(&sup, "t2", "sub-a", "failed", 2_000);
+    // sub-b: 1 task
+    seed_task_row(&sup, "t3", "sub-b", "completed", 3_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.subagents.len(), 2);
+    let sub_a = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "sub-a")
+        .expect("sub-a present");
+    assert_eq!(sub_a.task_count, 2);
+    assert_eq!(sub_a.last_task_at_ms, Some(2_000));
+    assert_eq!(sub_a.last_task_status.as_deref(), Some("failed"));
+
+    let sub_b = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "sub-b")
+        .expect("sub-b present");
+    assert_eq!(sub_b.task_count, 1);
+    assert_eq!(sub_b.last_task_at_ms, Some(3_000));
+    assert_eq!(sub_b.last_task_status.as_deref(), Some("completed"));
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_ordered_desc_by_created_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-a", "hot");
+    // Insert out of order — handler must return newest-first.
+    seed_task_row(&sup, "t1", "sub-a", "completed", 1_000);
+    seed_task_row(&sup, "t2", "sub-a", "completed", 3_000);
+    seed_task_row(&sup, "t3", "sub-a", "completed", 2_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.tasks_recent.len(), 3);
+    // Descending by created_at_ms.
+    assert_eq!(envelope.data.tasks_recent[0].task_id, "t2"); // 3000ms
+    assert_eq!(envelope.data.tasks_recent[1].task_id, "t3"); // 2000ms
+    assert_eq!(envelope.data.tasks_recent[2].task_id, "t1"); // 1000ms
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_excludes_deleted_subagents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-active", "warm");
+    seed_subagent_row(&sup, "sub-gone", "deleted");
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // `subagent_list_filtered(None, None, false)` excludes `deleted` rows.
+    assert_eq!(envelope.data.subagents.len(), 1);
+    assert_eq!(envelope.data.subagents[0].name, "sub-active");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_resolves_subagent_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "my-agent", "hot");
+    seed_task_row(&sup, "t1", "my-agent", "completed", 1_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.tasks_recent.len(), 1);
+    assert_eq!(envelope.data.tasks_recent[0].task_id, "t1");
+    assert_eq!(envelope.data.tasks_recent[0].subagent_name, "my-agent");
+    assert_eq!(envelope.data.tasks_recent[0].status, "completed");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_includes_error_for_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "sub-a", "warm");
+    seed_task_row(&sup, "t1", "sub-a", "failed", 1_000);
+    seed_task_row(&sup, "t2", "sub-a", "completed", 2_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    let failed = envelope
+        .data
+        .tasks_recent
+        .iter()
+        .find(|t| t.task_id == "t1")
+        .expect("failed task present");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error.as_deref(), Some("boom"));
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_envelope_populated_from_status_snapshot() {
+    // The handler must wrap the inner DTO via `build_read_envelope`, which
+    // populates `readiness` / `is_exact` / `is_stale` / `degraded_reason`
+    // from `ServiceStatusSnapshot`. On a fresh supervisor the snapshot is
+    // `Starting` (no scan has run), so `is_stale=true` and `is_exact=false`.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert!(envelope.generated_at_ms > 0);
+    // Fresh supervisor → readiness is `Starting`.
+    assert_eq!(envelope.readiness, ReadinessStateDto::Starting);
+    assert!(!envelope.is_exact);
+    assert!(envelope.is_stale);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_pressure_gate_no_sidecar_defaults() {
+    // When no sidecar supervisor is configured (`make_supervisor` path), the
+    // pressure gate must report `level=normal`, `memory_used_pct=0`,
+    // `hot_sessions_total=0`, `worker_sampled_at_ms=None`, and
+    // `hot_sessions_limit` from settings (default 3). `workers` must be `[]`.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.memory_used_pct, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3);
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
+    assert!(envelope.data.workers.is_empty(), "no sidecar → workers: []");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn subagent_runtime_status_subagent_status_string_mapped() {
+    // Verify `LogicalSubagent.status` (enum) → DTO `status` (String) mapping
+    // via `as_str()`. Seeds one subagent per non-deleted status variant.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    seed_subagent_row(&sup, "hot-sub", "hot");
+    seed_subagent_row(&sup, "warm-sub", "warm");
+    seed_subagent_row(&sup, "cold-sub", "cold");
+    // `deleted` excluded from the list — not asserted here (covered by
+    // `subagent_runtime_status_excludes_deleted_subagents`).
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // Ordering of subagents is by `last_active_at_ms DESC NULLS LAST`; all
+    // seeded rows have `last_active_at_ms = None`, so the order among them is
+    // unspecified. Assert presence + status mapping instead of order.
+    assert_eq!(envelope.data.subagents.len(), 3);
+    let hot = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "hot-sub")
+        .unwrap();
+    assert_eq!(hot.status, "hot");
+    let warm = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "warm-sub")
+        .unwrap();
+    assert_eq!(warm.status, "warm");
+    let cold = envelope
+        .data
+        .subagents
+        .iter()
+        .find(|s| s.name == "cold-sub")
+        .unwrap();
+    assert_eq!(cold.status, "cold");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+/// `workers: [one row]` path: when a sidecar supervisor is configured but the
+/// child has never been started, `subagent_runtime_status` must return exactly
+/// one worker row with `state="stopped"`, `pid=None`, `uptime_seconds=None`,
+/// and a `pressure_gate` reporting `level="normal"` with
+/// `worker_sampled_at_ms=None` (pre-first-sample). Covers the
+/// `if let Some(ref snap) = worker_opt` branches (PressureLevel/WorkerState
+/// string mapping; `worker_sampled_at_ms = Some(..)` is the NOT-taken branch
+/// here) that `..._pressure_gate_no_sidecar_defaults` does not exercise.
+#[tokio::test]
+async fn subagent_runtime_status_workers_one_row_when_sidecar_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_sidecar_stopped_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // Envelope is always populated.
+    assert!(
+        envelope.generated_at_ms > 0,
+        "generated_at_ms must be positive"
+    );
+
+    // workers: [one row] — the configured-but-stopped sidecar.
+    assert_eq!(envelope.data.workers.len(), 1, "stopped sidecar -> one row");
+    let worker = &envelope.data.workers[0];
+    assert_eq!(worker.state, "stopped");
+    assert_eq!(worker.pid, None, "pid must be None when stopped");
+    assert_eq!(
+        worker.uptime_seconds, None,
+        "uptime must be None when stopped"
+    );
+    assert_eq!(worker.hot_sessions, 0, "hot_sessions starts at 0");
+
+    // pressure_gate: normal, no sample yet, hot_sessions_total=0.
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_limit, 3);
+    assert_eq!(
+        envelope.data.pressure_gate.worker_sampled_at_ms, None,
+        "worker_sampled_at_ms is None before first sample"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `workers: [one row, state="running"]` path: when the sidecar supervisor is
+/// configured AND the child has been started via `ensure_started`,
+/// `subagent_runtime_status` must return exactly one worker row with
+/// `state="running"`, `pid=Some(..)`, `uptime_seconds=Some(..)`. Covers the
+/// `WorkerState::Running => "running"` branch (supervisor.rs) that the
+/// stopped-sidecar test does not exercise.
+#[tokio::test]
+async fn subagent_runtime_status_workers_running_when_sidecar_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_sidecar_stopped_supervisor(db, &tmp);
+
+    // Start the sidecar child so `worker_snapshot()` reports `Running`.
+    let sidecar = sup
+        .sidecar_supervisor()
+        .expect("sidecar supervisor must be configured");
+    let _handle = sidecar.ensure_started().await.expect("ensure_started");
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    assert_eq!(envelope.data.workers.len(), 1, "one worker row");
+    let worker = &envelope.data.workers[0];
+    assert_eq!(worker.state, "running");
+    assert!(worker.pid.is_some(), "pid must be Some when running");
+    assert!(
+        worker.uptime_seconds.is_some(),
+        "uptime must be Some when running"
+    );
+
+    // Clean up: stop the child, then shut down the writer thread.
+    sidecar.shutdown().await.expect("sidecar shutdown");
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `tasks_recent[].subagent_name` resolution for deleted subagents: when a
+/// task references a subagent that has been deleted (excluded from
+/// `subagents[]` by the non-deleted filter), the handler must STILL show the
+/// display name (not the raw `subagent_id`). The `name_lookup` in
+/// `runtime_status_snapshot` includes ALL subagents (including deleted),
+/// decoupling display name from delete filtering (reviewer P1-2).
+#[tokio::test]
+async fn subagent_runtime_status_tasks_recent_shows_display_name_for_deleted_subagent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Seed a subagent with id != name, then mark it deleted so it's excluded
+    // from the `subagents[]` list but its task still appears in `tasks_recent`.
+    let mut row = SubagentLogicalSubagentRow::for_test("ghost-id", "Ghost Agent");
+    row.status = "deleted".to_string();
+    {
+        let db = sup.db_handle().lock().unwrap();
+        db.subagent_upsert_logical(&row).expect("upsert logical");
+    }
+    seed_task_row(&sup, "t1", "ghost-id", "completed", 1_000);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .unwrap();
+
+    // The deleted subagent must NOT appear in `subagents[]`.
+    assert!(
+        envelope.data.subagents.is_empty(),
+        "deleted subagent must be excluded from subagents[]"
+    );
+
+    // The task must appear in `tasks_recent` with `subagent_name` showing
+    // the display name "Ghost Agent" (NOT the raw id "ghost-id").
+    assert_eq!(envelope.data.tasks_recent.len(), 1);
+    let task = &envelope.data.tasks_recent[0];
+    assert_eq!(task.task_id, "t1");
+    assert_eq!(
+        task.subagent_name, "Ghost Agent",
+        "subagent_name must show display name even for deleted subagent (reviewer P1-2)"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Task 4: BusytokSupervisor wiring — delegate validation,
+// runtime_status aggregation, provider_changed/deleted worker lifecycle.
+// ---------------------------------------------------------------------------
+//
+// These tests cover the Task 4 brief requirements:
+// - `subagent_delegate` validates profile.provider_id (unbound → error),
+//   provider existence (unknown → error), provider enabled state (disabled
+//   → error), and model whitelist (model not in provider.models → error).
+// - `subagent_runtime_status` aggregates `pool.worker_snapshots()` across
+//   all providers (not just the first).
+// - `provider_update` / `provider_delete` kill + remove the affected
+//   provider's worker so the next delegate re-spawns with fresh state.
+
+/// Build sidecar-enabled settings with a single test provider whose model
+/// whitelist is `["test-model"]`. Profiles are NOT bound by default (caller
+/// binds per-test). Used by the delegate validation tests.
+fn make_unbound_sidecar_settings() -> BusytokSettings {
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+    settings.providers.push(ProviderConfig {
+        id: "test-provider".to_string(),
+        name: "Test Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    settings
+}
+
+/// Build a sidecar-stopped supervisor from arbitrary settings. Mirrors
+/// `make_sidecar_stopped_supervisor` but accepts custom settings so the
+/// delegate validation tests can configure provider/profile bindings.
+fn make_sidecar_stopped_supervisor_with_settings(
+    db: Database,
+    tmp: &tempfile::TempDir,
+    settings: BusytokSettings,
+) -> BusytokSupervisor {
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
+}
+
+/// `delegate_fails_for_unbound_profile`: when the sidecar is enabled AND the
+/// profile has `provider_id: None`, the runtime handler must reject the
+/// delegate with "profile not bound to a provider" BEFORE the manager inserts
+/// a task row. Covers spec §3.4 + Phase 3 Task 4 Step 3.
+#[tokio::test]
+async fn delegate_fails_for_unbound_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // Built-in profiles ship unbound (`provider_id: None`).
+    let settings = make_unbound_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("unbound profile must fail validation");
+
+    assert!(
+        err.to_string().contains("profile not bound to a provider"),
+        "expected 'profile not bound to a provider' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `delegate_fails_for_unknown_provider`: profile bound to a provider_id that
+/// doesn't exist in `settings.providers` → "provider not found: ...".
+#[tokio::test]
+async fn delegate_fails_for_unknown_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Bind the profile to a provider that doesn't exist.
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .provider_id = Some("nonexistent".to_string());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("unknown provider must fail validation");
+
+    assert!(
+        err.to_string().contains("provider not found: nonexistent"),
+        "expected 'provider not found: nonexistent' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `delegate_fails_for_disabled_provider`: provider exists but `enabled:
+/// false` → "provider disabled: ...".
+#[tokio::test]
+async fn delegate_fails_for_disabled_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Add a disabled provider + bind the profile to it.
+    settings.providers.push(ProviderConfig {
+        id: "disabled-prov".to_string(),
+        name: "Disabled Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.disabled.example.com/v1".to_string(),
+        api_key_env_name: "DISABLED_API_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: false,
+    });
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .provider_id = Some("disabled-prov".to_string());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("disabled provider must fail validation");
+
+    assert!(
+        err.to_string().contains("provider disabled: disabled-prov"),
+        "expected 'provider disabled: disabled-prov' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `delegate_fails_for_model_not_in_whitelist` (M2 fix, spec §3.4): profile
+/// bound to an enabled provider, but `profile.model` is NOT in
+/// `provider.models` → "model '...' not in provider '...' whitelist". Also
+/// covers the empty-model edge case.
+#[tokio::test]
+async fn delegate_fails_for_model_not_in_whitelist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Bind the profile to the valid test-provider, but set its model to
+    // something NOT in the provider's `["test-model"]` whitelist.
+    {
+        let profile = settings
+            .subagent
+            .profiles
+            .get_mut("pi/search-cheap")
+            .unwrap();
+        profile.provider_id = Some("test-provider".to_string());
+        profile.model = "wrong-model".to_string();
+    }
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("model not in whitelist must fail validation");
+
+    assert!(
+        err.to_string()
+            .contains("model 'wrong-model' not in provider 'test-provider' whitelist"),
+        "expected whitelist violation error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `runtime_status_aggregates_multiple_workers`: when the pool has workers
+/// for MORE than one provider, `subagent_runtime_status` must return one
+/// worker row per provider (not just the first). Covers Phase 3 Task 4
+/// Step 4 multi-provider aggregation.
+#[tokio::test]
+async fn runtime_status_aggregates_multiple_workers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Add a second enabled provider so the pool can spawn two workers.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-2".to_string(),
+        name: "Test Provider 2".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY_2".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    // construct_sidecar auto-spawns the FIRST enabled provider's worker.
+    // Spawn the SECOND provider's worker via the pool to exercise the
+    // multi-provider aggregation path.
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+    pool.ensure_worker("test-provider-2")
+        .expect("ensure_worker for second provider must succeed");
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .expect("runtime_status must succeed");
+
+    // Two workers — one per provider. Both stopped (no ensure_started call).
+    assert_eq!(
+        envelope.data.workers.len(),
+        2,
+        "multi-provider pool must aggregate to two worker rows"
+    );
+
+    // Both provider_ids must be present (order is not guaranteed by HashMap).
+    let provider_ids: Vec<Option<String>> = envelope
+        .data
+        .workers
+        .iter()
+        .map(|w| w.provider_id.clone())
+        .collect();
+    assert!(
+        provider_ids.contains(&Some("test-provider".to_string())),
+        "workers must include test-provider, got: {provider_ids:?}"
+    );
+    assert!(
+        provider_ids.contains(&Some("test-provider-2".to_string())),
+        "workers must include test-provider-2, got: {provider_ids:?}"
+    );
+
+    // Both workers are stopped (child never started).
+    for worker in &envelope.data.workers {
+        assert_eq!(worker.state, "stopped");
+        assert_eq!(worker.pid, None);
+    }
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `runtime_status_workers_empty_when_pool_none`: when the sidecar is
+/// disabled (`worker_pool` is `None`), `subagent_runtime_status` must
+/// return `workers: []` and a default pressure_gate. Covers Phase 3 Task 4
+/// Step 4 "no pool" branch.
+#[tokio::test]
+async fn runtime_status_workers_empty_when_pool_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // `make_supervisor` uses default settings → sidecar disabled → pool None.
+    let sup = make_supervisor(db, &tmp);
+
+    let envelope = sup
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+        .await
+        .expect("runtime_status must succeed");
+
+    assert!(
+        envelope.data.workers.is_empty(),
+        "no pool → workers must be empty"
+    );
+    assert_eq!(envelope.data.pressure_gate.level, "normal");
+    assert_eq!(envelope.data.pressure_gate.hot_sessions_total, 0);
+    assert_eq!(envelope.data.pressure_gate.worker_sampled_at_ms, None);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_changed_removes_worker_then_respawns` (P1b fix): calling
+/// `provider_update` must kill + remove the affected provider's worker from
+/// the pool. The next `ensure_worker` call re-spawns a fresh worker (with
+/// updated credentials/config). Covers Phase 3 Task 4 Step 5.
+#[tokio::test]
+async fn provider_changed_removes_worker_then_respawns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Initially, construct_sidecar auto-spawned ONE worker for test-provider.
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 1, "initial state: one worker");
+    assert_eq!(snaps[0].0, "test-provider");
+
+    // Trigger provider_changed via provider_update (metadata-only change:
+    // update the display name). This must remove the worker.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: Some("Updated Name".to_string()),
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: None,
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .expect("provider_update must succeed");
+
+    // Worker must be gone from the pool.
+    let snaps_after = pool.worker_snapshots().await;
+    assert!(
+        snaps_after.is_empty(),
+        "provider_update must remove the worker from the pool, got: {snaps_after:?}"
+    );
+
+    // Re-spawn: ensure_worker creates a NEW worker with the updated config.
+    let re_spawned = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker must re-spawn the worker");
+    assert!(
+        re_spawned.worker_snapshot().await.is_some(),
+        "re-spawned worker must produce a snapshot"
+    );
+    let snaps_final = pool.worker_snapshots().await;
+    assert_eq!(
+        snaps_final.len(),
+        1,
+        "re-spawned worker must be in the pool"
+    );
+    assert_eq!(snaps_final[0].0, "test-provider");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_update_respawn_picks_up_live_config` (P1 fix): the
+/// `WorkerPool`'s provider-lookup closure must read LIVE settings (not a
+/// startup snapshot), so when `provider_update` changes `base_url` /
+/// `base_url_env_name`, the respawned supervisor's config reflects the new
+/// values. Without the live-settings fix, the closure would return the stale
+/// provider snapshot captured at `construct_sidecar` time, and `ensure_worker`
+/// would build the config with the OLD `base_url` / `base_url_env_name` —
+/// silently running the sidecar against the wrong endpoint.
+#[tokio::test]
+async fn provider_update_respawn_picks_up_live_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Initial worker: base_url_env_name defaults to OPENAI_BASE_URL (provider
+    // has base_url_env_name: None in make_sidecar_settings).
+    let initial = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker (initial)");
+    let initial_cfg = initial.config();
+    assert_eq!(initial_cfg.base_url_env_name, "OPENAI_BASE_URL");
+    assert_eq!(
+        initial_cfg.env.get("OPENAI_BASE_URL"),
+        Some(&"https://api.test-provider.example.com/v1".to_string()),
+        "initial worker env should have the original base_url"
+    );
+
+    // Update BOTH base_url and base_url_env_name via provider_update. This
+    // mutates `self.settings` (the shared `Arc<Mutex<BusytokSettings>>`) and
+    // calls `provider_changed` to kill + remove the worker.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: None,
+        base_url: Some("https://api.updated.example.com/v1".to_string()),
+        api_key_env_name: None,
+        base_url_env_name: Some("UPDATED_BASE_URL".to_string()),
+        models: None,
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .expect("provider_update must succeed");
+
+    // Worker must be gone (provider_changed killed + removed it).
+    assert!(
+        pool.worker_snapshots().await.is_empty(),
+        "provider_update must remove the worker from the pool"
+    );
+
+    // Re-spawn: ensure_worker builds a NEW supervisor. The pool's
+    // provider-lookup closure must read the LIVE (post-update) settings, so
+    // the new supervisor's config has the updated base_url / env name.
+    let respawned = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker must re-spawn the worker");
+    let respawned_cfg = respawned.config();
+
+    // The fix: base_url_env_name MUST be the updated value, not the original
+    // "OPENAI_BASE_URL" (which would indicate the closure read a stale snapshot).
+    assert_eq!(
+        respawned_cfg.base_url_env_name, "UPDATED_BASE_URL",
+        "respawned worker must use the updated base_url_env_name \
+         (live settings), not the startup snapshot"
+    );
+    // OPENAI_BASE_URL is always set (canonical name) and must reflect the new base_url.
+    assert_eq!(
+        respawned_cfg.env.get("OPENAI_BASE_URL"),
+        Some(&"https://api.updated.example.com/v1".to_string()),
+        "respawned worker env[OPENAI_BASE_URL] must be the updated base_url"
+    );
+    // The provider-specific alias (UPDATED_BASE_URL) must also be set to the new base_url.
+    assert_eq!(
+        respawned_cfg.env.get("UPDATED_BASE_URL"),
+        Some(&"https://api.updated.example.com/v1".to_string()),
+        "respawned worker env[UPDATED_BASE_URL] must be the updated base_url"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_deleted_removes_worker` (P1b fix): calling `provider_delete`
+/// must kill + remove the deleted provider's worker from the pool. Other
+/// providers' workers are unaffected. Covers Phase 3 Task 4 Step 5.
+#[tokio::test]
+async fn provider_deleted_removes_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_unbound_sidecar_settings();
+    // Add a second provider that NO profile references — `provider_delete`
+    // rejects if any profile still references the provider.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-2".to_string(),
+        name: "Test Provider 2".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY_2".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Spawn a worker for the second provider (no profile references it, so
+    // `provider_delete` won't reject on profile-reference check).
+    pool.ensure_worker("test-provider-2")
+        .expect("ensure_worker for second provider must succeed");
+    assert_eq!(
+        pool.worker_snapshots().await.len(),
+        2,
+        "two workers before delete"
+    );
+
+    // Delete the second provider — must remove ONLY its worker.
+    sup.provider_delete(ProviderDeleteRequestDto {
+        id: "test-provider-2".to_string(),
+    })
+    .await
+    .expect("provider_delete must succeed");
+
+    let snaps_after = pool.worker_snapshots().await;
+    assert_eq!(
+        snaps_after.len(),
+        1,
+        "only the deleted provider's worker must be removed, got: {snaps_after:?}"
+    );
+    assert_eq!(
+        snaps_after[0].0, "test-provider",
+        "the first provider's worker must still be alive"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_update_with_api_key_removes_worker_then_respawns` (Phase 3 Task 7):
+/// key rotation — when `provider_update` is called with
+/// `req.api_key = Some(...)`, the runtime must rotate the credential (writing
+/// the new key to the keychain) AND remove the worker so the next
+/// `ensure_worker` respawns with the rotated key. Complements the
+/// metadata-only `provider_changed_removes_worker_then_respawns` test by
+/// exercising the credential-bearing code path. Covers Phase 3 Task 7.
+#[tokio::test]
+async fn provider_update_with_api_key_removes_worker_then_respawns() {
+    // This test writes to the OS keychain (via provider_update → set_key).
+    // Skip on CI runners where no keyring daemon is available (e.g., Ubuntu
+    // without D-Bus secret service).
+    if busytok_config::ProviderCredentialStore::get_key("keyring-probe").is_err() {
+        eprintln!("skip: OS keyring unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // Initially, construct_sidecar auto-spawned ONE worker for test-provider.
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 1, "initial state: one worker");
+    assert_eq!(snaps[0].0, "test-provider");
+
+    // Key rotation: api_key = Some(...) instead of None. This writes the
+    // new key to the OS keychain (via ProviderCredentialStore::set_key) AND
+    // triggers provider_changed -> remove_worker_and_kill.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: None,
+        enabled: None,
+        api_key: Some("rotated-new-key".to_string()),
+    })
+    .await
+    .expect("provider_update with api_key rotation must succeed");
+
+    // Worker must be gone from the pool (remove_worker_and_kill ran).
+    let snaps_after = pool.worker_snapshots().await;
+    assert!(
+        snaps_after.is_empty(),
+        "provider_update with api_key rotation must remove the worker from the pool, got: {snaps_after:?}"
+    );
+
+    // Re-spawn: ensure_worker creates a NEW worker (with the rotated key
+    // injected into its env map).
+    let re_spawned = pool
+        .ensure_worker("test-provider")
+        .expect("ensure_worker must re-spawn the worker after key rotation");
+    assert!(
+        re_spawned.worker_snapshot().await.is_some(),
+        "re-spawned worker must produce a snapshot"
+    );
+    let snaps_final = pool.worker_snapshots().await;
+    assert_eq!(
+        snaps_final.len(),
+        1,
+        "re-spawned worker must be in the pool"
+    );
+    assert_eq!(snaps_final[0].0, "test-provider");
+
+    // Clean up the keychain entry written by provider_update so the test
+    // doesn't leave state behind.
+    let _ = busytok_config::ProviderCredentialStore::delete_key("test-provider");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// Check whether a process with the given PID is currently alive. Used by
+/// `provider_update_kills_old_process` (Phase 3 Task 7) to verify the P1b
+/// guarantee: `remove_worker_and_kill` actually kills the sidecar child,
+/// rather than just dropping the worker from the pool map (which would
+/// orphan the bash child). Uses sysinfo's targeted refresh to avoid a full
+/// process scan.
+fn is_process_alive(pid: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        false,
+        ProcessRefreshKind::everything(),
+    );
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+/// `provider_update_kills_old_process` (Phase 3 Task 7, P1b fix): the
+/// existing `provider_changed_removes_worker_then_respawns` test only checks
+/// that the worker is removed from the pool map — it does NOT verify the
+/// underlying sidecar child process is actually dead. This test captures the
+/// child PID (after `ensure_started` spawns it) and asserts it is NO LONGER
+/// alive after `provider_update`, proving `remove_worker_and_kill` actually
+/// killed the process (not just dropped the entry — a plain `remove_worker`
+/// without `force_kill` would orphan the bash child).
+#[tokio::test]
+async fn provider_update_kills_old_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let settings = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup
+        .worker_pool()
+        .expect("worker_pool must be Some when sidecar is enabled");
+
+    // The auto-spawned worker is Stopped (no child). Start the sidecar child
+    // so we have a real OS PID to verify kill.
+    let sidecar = sup
+        .sidecar_supervisor()
+        .expect("sidecar supervisor must be configured for the first enabled provider");
+    let _handle = sidecar
+        .ensure_started()
+        .await
+        .expect("ensure_started must spawn the child");
+
+    // Capture the initial sidecar child PID.
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 1, "one worker before provider_update");
+    let old_pid = snaps[0]
+        .1
+        .pid
+        .expect("worker must have a PID after ensure_started");
+    assert!(
+        is_process_alive(old_pid),
+        "old sidecar child (pid={old_pid}) must be alive before provider_update"
+    );
+
+    // Trigger provider_changed via provider_update (metadata-only change).
+    // This calls remove_worker_and_kill -> force_kill -> child.start_kill() +
+    // child.wait().await (SIGKILL on Unix).
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-provider".to_string(),
+        name: Some("Updated".to_string()),
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: None,
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .expect("provider_update must succeed");
+
+    // Give the kill (SIGKILL via child.start_kill()) time to take effect.
+    // `force_kill` already awaits `child.wait()` (reaps the process), but
+    // sysinfo's process table may lag by a tick. Poll up to 2s to avoid
+    // flakiness on slow CI runners.
+    let mut killed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !is_process_alive(old_pid) {
+            killed = true;
+            break;
+        }
+    }
+    assert!(
+        killed,
+        "old sidecar child (pid={old_pid}) must be DEAD after provider_update — \
+         remove_worker_and_kill must have force-killed it"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `provider_changed_no_op_when_pool_none` (Phase 3 Task 7): when the sidecar
+/// is disabled (`worker_pool == None`), `provider_changed` and
+/// `provider_deleted` must be safe no-ops — no panic, no error. The
+/// `if let Some(pool) = &self.worker_pool` guard in both methods routes to a
+/// `debug!` log + return on the None arm. Covers Phase 3 Task 7.
+#[tokio::test]
+async fn provider_changed_no_op_when_pool_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // make_supervisor uses BusytokSupervisor::new (sidecar disabled) —
+    // worker_pool is None.
+    let sup = make_supervisor(db, &tmp);
+    assert!(
+        sup.worker_pool().is_none(),
+        "worker_pool must be None when sidecar is disabled"
+    );
+
+    // Both must be safe no-ops regardless of whether the provider_id refers
+    // to a real provider (the None arm doesn't look it up).
+    sup.provider_changed("test-provider").await;
+    sup.provider_deleted("test-provider").await;
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Task 5: subagent usage bridge (usage_events + rollups)
+// ---------------------------------------------------------------------------
+
+/// Helper: count rows in `usage_events` matching the given predicate.
+fn count_usage_events(db: &Database, where_clause: &str) -> i64 {
+    let sql = format!("SELECT COUNT(*) FROM usage_events WHERE {where_clause}");
+    db.conn().query_row(&sql, [], |row| row.get(0)).unwrap_or(0)
+}
+
+/// Helper: count rows in a table matching the given predicate.
+fn count_rows(db: &Database, table: &str, where_clause: &str) -> i64 {
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {where_clause}");
+    db.conn().query_row(&sql, [], |row| row.get(0)).unwrap_or(0)
+}
+
+/// Helper: read the `generation_id` column of the first subagent usage event.
+fn subagent_event_generation_id(db: &Database) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT generation_id FROM usage_events WHERE client_kind = 'subagent' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// `normalize_usage_populates_required_fields` — the pure-function contract:
+/// `client_kind = "subagent"`, `model`, `input_tokens`, `output_tokens`,
+/// `total_tokens = input + output`. Also verifies `dedupe_key` is stable.
+#[test]
+fn normalize_usage_populates_required_fields() {
+    let usage = TaskUsage {
+        model: Some("gpt-5".to_string()),
+        provider: Some("test".to_string()),
+        input_tokens: Some(100),
+        output_tokens: Some(200),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cost_usd: None,
+    };
+    let event = normalize_task_usage("task-1", "sub-1", "/repo", &usage, None);
+    assert_eq!(event.client_kind.as_deref(), Some("subagent"));
+    assert_eq!(event.model.as_deref(), Some("gpt-5"));
+    assert_eq!(event.input_tokens, 100);
+    assert_eq!(event.output_tokens, 200);
+    assert_eq!(event.total_tokens, 300);
+    assert_eq!(event.cwd.as_deref(), Some("/repo"));
+    assert_eq!(event.session_id, "sub-1");
+    assert_eq!(event.agent, AgentKind::Codex);
+}
+
+/// `normalize_usage_handles_missing_tokens` — `input_tokens: None` → 0.
+#[test]
+fn normalize_usage_handles_missing_tokens() {
+    let usage = TaskUsage {
+        model: Some("gpt-5".to_string()),
+        provider: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cost_usd: None,
+    };
+    let event = normalize_task_usage("task-2", "sub-1", "/repo", &usage, None);
+    assert_eq!(event.input_tokens, 0);
+    assert_eq!(event.output_tokens, 0);
+    assert_eq!(event.total_tokens, 0);
+}
+
+/// `normalize_usage_cost_none_when_no_catalog` — `catalog: None` →
+/// `cost_usd: None`, `cost_source: None`.
+#[test]
+fn normalize_usage_cost_none_when_no_catalog() {
+    let usage = TaskUsage {
+        model: Some("gpt-5".to_string()),
+        provider: None,
+        input_tokens: Some(100),
+        output_tokens: Some(200),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cost_usd: None,
+    };
+    let event = normalize_task_usage("task-3", "sub-1", "/repo", &usage, None);
+    assert!(event.cost_usd.is_none());
+    assert!(event.cost_source.is_none());
+}
+
+/// `write_usage_event_inserts_into_usage_events` — after the runtime
+/// handler writes, `SELECT count(*) FROM usage_events WHERE
+/// client_kind='subagent'` = 1.
+#[tokio::test]
+async fn write_usage_event_inserts_into_usage_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-write-1", 1000);
+    let sup = make_supervisor(db, &tmp);
+    sup.hydrate_status_from_db().unwrap();
+
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "writer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do work".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "completed");
+
+    // The mock executor produces non-zero token usage.
+    let count = count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
+    assert_eq!(
+        count, 1,
+        "exactly one subagent usage event should be in usage_events"
+    );
+}
+
+/// `write_usage_event_idempotent_on_same_task_id` — write twice with the
+/// same `task_id` → only 1 row (the `dedupe_key` provides idempotency).
+#[tokio::test]
+async fn write_usage_event_idempotent_on_same_task_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-write-2", 1000);
+    let sup = make_supervisor(db, &tmp);
+    sup.hydrate_status_from_db().unwrap();
+
+    let cwd = tmp.path().join("repo").to_string_lossy().to_string();
+
+    // First delegate — writes one usage event via `write_subagent_usage_event`
+    // (called internally by `subagent_delegate`).
+    let resp1 = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "idem".to_string(),
+            subagent_id: None,
+            cwd: cwd.clone(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "first run".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp1.status, "completed");
+
+    let count = count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
+    assert_eq!(
+        count, 1,
+        "exactly one subagent usage event should be in usage_events after first delegate"
+    );
+
+    // Re-issue the SAME task_id via the internal API to verify dedupe.
+    // The `UsageWritePolicy::InsertOnce` dedupe_key (per-task_id) must
+    // suppress the second insert, so the row count stays at 1.
+    let result = busytok_subagent::models::DelegateResult {
+        task_id: resp1.task_id.clone(),
+        subagent_id: resp1.subagent_id.clone(),
+        subagent_name: "idem".to_string(),
+        adapter: "pi".to_string(),
+        adapter_session_id: None,
+        session_reused: false,
+        status: busytok_subagent::models::TaskStatus::Completed,
+        profile: "pi/search-cheap".to_string(),
+        model: None,
+        summary: Some("re-run".to_string()),
+        usage: TaskUsage {
+            model: Some("gpt-5".to_string()),
+            provider: Some("mock".to_string()),
+            input_tokens: Some(50),
+            output_tokens: Some(50),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+        },
+    };
+    sup.write_subagent_usage_event(&result, &cwd).unwrap();
+
+    let final_count =
+        count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
+    assert_eq!(
+        final_count, 1,
+        "duplicate write with same task_id should be deduped by InsertOnce"
+    );
+}
+
+/// `write_usage_event_uses_active_generation_id` (P0) — the event row's
+/// `generation_id` equals `generation_manager.active_generation_id()`,
+/// NOT a synthetic `subagent_{task_id}` string.
+#[tokio::test]
+async fn write_usage_event_uses_active_generation_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-active-for-subagent", 1000);
+    let sup = make_supervisor(db, &tmp);
+    sup.hydrate_status_from_db().unwrap();
+
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "gen-check".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "verify generation".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "completed");
+
+    let event_gen = subagent_event_generation_id(&sup.db_handle().lock().unwrap());
+    assert_eq!(
+        event_gen.as_deref(),
+        Some("gen-active-for-subagent"),
+        "subagent usage event must use the active generation_id, not a synthetic one"
+    );
+}
+
+/// `write_usage_event_produces_real_rollup_rows` (P1a) — after the handler
+/// writes, `SELECT count(*) FROM daily_usage WHERE agent='codex'` >= 1
+/// AND `SELECT count(*) FROM model_summary` >= 1. This proves
+/// `build_scan_mutations` ran (NOT `RollupRows::default()`).
+#[tokio::test]
+async fn write_usage_event_produces_real_rollup_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-rollup", 1000);
+    let sup = make_supervisor(db, &tmp);
+    sup.hydrate_status_from_db().unwrap();
+
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "rollup".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "produce rollups".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: Some("gpt-5".to_string()),
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "completed");
+
+    let db_ref = sup.db_handle().lock().unwrap();
+    let daily_count = count_rows(
+        &db_ref,
+        "daily_usage",
+        "agent = 'codex' AND generation_id = 'gen-rollup'",
+    );
+    assert!(
+        daily_count >= 1,
+        "daily_usage should have >=1 row for agent='codex', got {daily_count}"
+    );
+
+    let model_count = count_rows(&db_ref, "model_summary", "model = 'gpt-5'");
+    assert!(
+        model_count >= 1,
+        "model_summary should have >=1 row for model='gpt-5', got {model_count}"
+    );
+}
+
+/// `write_usage_event_visible_in_overview_read_path` (P1a end-to-end) —
+/// after the handler writes, `read_overview_summary_from_daily_usage(...)`
+/// returns totals that include the subagent tokens.
+#[tokio::test]
+async fn write_usage_event_visible_in_overview_read_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    // Use a fixed-offset timezone so the Overview read path uses
+    // `read_overview_summary_from_daily_usage` (the IANA path).
+    let settings = BusytokSettings {
+        timezone: "+00:00".to_string(),
+        ..BusytokSettings::default()
+    };
+    settings
+        .save_to_file(&tmp.path().join("config").join("settings.toml"))
+        .ok();
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .ok();
+    let db2 = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db2, "gen-overview", 1000);
+    let sup = make_supervisor_with_settings(db2, &tmp, settings);
+    sup.hydrate_status_from_db().unwrap();
+
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "overview".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "be visible in overview".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "completed");
+
+    // The mock executor produces input_tokens = prompt.len() and
+    // output_tokens = summary.len(), both non-zero. Read the overview
+    // summary from daily_usage and verify total_tokens > 0.
+    let db_ref = sup.db_handle().lock().unwrap();
+    let rtz = ReportingTimezone::parse("+00:00").unwrap();
+    let (year, month, day) = rtz.today_civil_ymd().unwrap_or((2026, 1, 1));
+    // Use a wide date range so today's event is always included.
+    let start_date = format!("{year:04}-01-01");
+    let end_date = format!("{year:04}-12-31");
+    let summary = busytok_store::read_queries::read_overview_summary_from_daily_usage(
+        db_ref.conn(),
+        rtz.canonical_name(),
+        &start_date,
+        &end_date,
+        "gen-overview",
+    )
+    .unwrap();
+    assert!(
+        summary.total_tokens > 0,
+        "overview summary should include subagent tokens, got {}",
+        summary.total_tokens
+    );
+    assert!(
+        summary.event_count >= 1,
+        "overview summary should count the subagent event, got {}",
+        summary.event_count
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 Task 8: end-to-end integration tests (acceptance criteria)
+// ---------------------------------------------------------------------------
+
+/// `e2e_multi_provider_creates_separate_workers` (Phase 3 Task 8): two
+/// configured providers → two delegates → two separate worker entries in the
+/// pool. Verifies the per-provider supervisor map routing (C7 fix).
+#[tokio::test]
+async fn e2e_multi_provider_creates_separate_workers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let mut settings = make_sidecar_settings();
+    // Add a second provider.
+    settings.providers.push(ProviderConfig {
+        id: "test-provider-2".to_string(),
+        name: "Test Provider 2".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
+        api_key_env_name: "TEST_API_KEY_2".to_string(),
+        base_url_env_name: None,
+        models: vec!["test-model".to_string()],
+        enabled: true,
+    });
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    let pool = sup.worker_pool().expect("worker_pool must be Some");
+
+    // Auto-spawn only created ONE worker (for the first enabled provider).
+    // Ensure the second provider's worker too.
+    pool.ensure_worker("test-provider-2")
+        .expect("ensure_worker for provider-2");
+    let snaps = pool.worker_snapshots().await;
+    assert_eq!(snaps.len(), 2, "two providers → two workers");
+    let ids: Vec<&str> = snaps.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains(&"test-provider"), "provider 1 worker present");
+    assert!(
+        ids.contains(&"test-provider-2"),
+        "provider 2 worker present"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `e2e_auth_failure_kills_worker` (Phase 3 Task 8): mock sidecar returns 401
+/// (AUTH_FAILURE -32010) → task fails with `error_kind: "auth"` → worker
+/// killed+removed from pool → next ensure_worker creates a new worker.
+/// Verifies the auth-fail kill path end-to-end through the delegate handler
+/// (not just the executor level — `sidecar_executor.rs` already covers that).
+///
+/// NOTE: This test spawns a real sidecar child (mock-sidecar.sh) so it is
+/// `#[serial]` to prevent parallel contamination.
+#[tokio::test]
+#[serial]
+async fn e2e_auth_failure_kills_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-auth-fail", 1000);
+    let mut settings = make_sidecar_settings();
+    // The default profile model ("deepseek-chat") is NOT in the test
+    // provider's whitelist (["test-model"]). Set it to "test-model" so the
+    // delegate passes whitelist validation and reaches the executor (where
+    // the auth-fail mock returns -32010).
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .model = "test-model".to_string();
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+    let mut sidecar_cfg = make_sidecar_config();
+    sidecar_cfg
+        .env
+        .insert("BUSYTOK_MOCK_AUTH_FAIL".into(), "1".into());
+    let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
+
+    let pool = sup.worker_pool().expect("worker_pool must be Some");
+    // Auto-spawn created one worker for test-provider (Stopped — no child).
+    assert_eq!(
+        pool.worker_snapshots().await.len(),
+        1,
+        "one worker before delegate"
+    );
+
+    // Start the sidecar child so we have a real OS PID to verify kill.
+    // The auto-spawned worker is Stopped; `ensure_started` spawns the bash
+    // child running mock-sidecar.sh.
+    let sidecar = sup
+        .sidecar_supervisor()
+        .expect("sidecar supervisor must be configured for the first enabled provider");
+    let _handle = sidecar
+        .ensure_started()
+        .await
+        .expect("ensure_started must spawn the child");
+
+    // Capture the sidecar child PID before the delegate triggers auth-fail kill.
+    let old_pid = {
+        let snaps = pool.worker_snapshots().await;
+        snaps[0]
+            .1
+            .pid
+            .expect("worker must have a PID after ensure_started")
+    };
+    assert!(
+        is_process_alive(old_pid),
+        "sidecar child (pid={old_pid}) must be alive before delegate"
+    );
+
+    // Delegate — will hit the auth-fail path. The executor's `execute()`
+    // returns Err (SidecarRpc -32010), which propagates through
+    // `execute_task` → `delegate` → `subagent_delegate`. The task row was
+    // already inserted (status="running") before execute() ran.
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do work".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await;
+
+    // The delegate returns Err because execute() returned Err (the `?` in
+    // `execute_task` propagates it before the success-path result
+    // persistence block runs).
+    assert!(
+        resp.is_err(),
+        "delegate must return Err on auth failure, got: {resp:?}"
+    );
+
+    // Verify the task row has error_kind = "auth". The task row was inserted
+    // (status="running") before execute() ran. The executor classifies the
+    // -32010 error as TaskErrorKind::Auth and calls remove_worker_and_kill,
+    // then returns Err. Spec §3.4 / Task 5 require the error_kind to be
+    // persisted on the task row.
+    let db_handle = sup.db_handle();
+    let error_kind: String = db_handle
+        .lock()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT error_kind FROM subagent_tasks ORDER BY created_at_ms DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    assert_eq!(
+        error_kind, "auth",
+        "task error_kind must be 'auth' after 401 (AUTH_FAILURE -32010)"
+    );
+
+    // Worker must be removed from the pool (auth-fail kill).
+    assert!(
+        pool.worker_snapshots().await.is_empty(),
+        "pool must be empty after auth-fail kill"
+    );
+
+    // The sidecar child PROCESS must actually be dead (P1b guarantee).
+    // `remove_worker_and_kill` calls `force_kill` which SIGKILLs the child;
+    // a mere `remove_worker` (without kill) would orphan the bash child.
+    // Poll up to 2s — sysinfo's process table may lag by a tick.
+    let mut killed = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !is_process_alive(old_pid) {
+            killed = true;
+            break;
+        }
+    }
+    assert!(
+        killed,
+        "sidecar child (pid={old_pid}) must be DEAD after auth-fail — \
+         remove_worker_and_kill must have force-killed it"
+    );
+
+    // Next ensure_worker creates a new worker (slot was freed).
+    pool.ensure_worker("test-provider")
+        .expect("ensure_worker re-spawns");
+    assert_eq!(pool.worker_snapshots().await.len(), 1);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `e2e_usage_events_agent_kind_is_codex` (Phase 3 Task 8, I3 fix): after
+/// delegate, the `agent` column in `usage_events` for the subagent row must
+/// be `'codex'` — verifying the `AgentKind::Codex` discriminator round-trips
+/// through the normalize → insert pipeline. (The pi-sidecar wraps a
+/// Codex-family SDK, so `AgentKind::Codex` is the correct agent kind for
+/// subagent events.)
+#[tokio::test]
+async fn e2e_usage_events_agent_kind_is_codex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-codex", 1000);
+    let sup = make_supervisor(db, &tmp);
+    sup.hydrate_status_from_db().unwrap();
+
+    sup.subagent_delegate(SubagentDelegateRequestDto {
+        subagent_name: "writer".to_string(),
+        subagent_id: None,
+        cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+        profile: "pi/search-cheap".to_string(),
+        intent: None,
+        prompt: "do work".to_string(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+    })
+    .await
+    .unwrap();
+
+    let agent: String = sup
+        .db_handle()
+        .lock()
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT agent FROM usage_events WHERE client_kind = 'subagent' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("must have a subagent usage event");
+    assert_eq!(
+        agent, "codex",
+        "subagent usage event agent must be 'codex' (AgentKind::Codex.as_str())"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// `queued_task_bridges_usage_events_through_dispatcher_hook` (P1 #2 fix):
+/// when a task is queued (because the pressure gate is paused) and later
+/// executed by the background `TaskDispatcher` after the gate clears, the
+/// post-task completion hook MUST bridge the queued task's usage into the
+/// unified `usage_events` + rollup tables — the SAME seam synchronous
+/// `delegate()` uses. Without the hook, queued tasks' usage is invisible in
+/// Overview / Activity / receipt reads.
+///
+/// Sequence:
+/// 1. Pause the gate → delegate returns `Queued`.
+/// 2. Assert NO usage_events / daily_usage / model_summary rows exist yet
+///    (proves the queued task hasn't been bridged — guards against tests
+///    that pass simply because the sync seam wrote events before queueing).
+/// 3. Resume the gate → dispatcher picks up + executes the queued task.
+/// 4. Assert usage_events has a row tagged with the active generation_id,
+///    and daily_usage / model_summary have rollup rows.
+///
+/// NOTE: spawns a real sidecar child (mock-sidecar.sh) — `#[serial]`.
+#[tokio::test]
+#[serial]
+async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    set_active_generation(&db, "gen-queued-bridge", 1000);
+    let mut settings = make_sidecar_settings();
+    // The default profile model ("deepseek-chat") is NOT in the test
+    // provider's whitelist (["test-model"]). Set it to "test-model" so the
+    // delegate passes whitelist validation and the dispatcher can execute it.
+    settings
+        .subagent
+        .profiles
+        .get_mut("pi/search-cheap")
+        .unwrap()
+        .model = "test-model".to_string();
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+    let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
+    sup.hydrate_status_from_db().unwrap();
+
+    let gate = sup
+        .pressure_gate()
+        .expect("pressure_gate must be Some when sidecar is enabled")
+        .clone();
+
+    // 1. Pause the gate → next delegate must queue.
+    gate.set_action(busytok_subagent::PressureAction::PauseNewTasks);
+    assert!(gate.is_paused(), "gate must be paused before delegate");
+
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "queued-bridge".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "queued bridge work".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status, "queued",
+        "delegate must return Queued when gate is paused, got: {:?}",
+        resp.status
+    );
+    let sub_id = resp.subagent_id.clone();
+    let task_id = resp.task_id.clone();
+
+    // 2. Pre-condition: NO usage_events / rollups for this task yet.
+    //    This proves the queued task hasn't been bridged (the sync seam
+    //    didn't fire — only the dispatcher hook can produce these rows).
+    {
+        let db_ref = sup.db_handle().lock().unwrap();
+        let event_count = count_rows(
+            &db_ref,
+            "usage_events",
+            &format!("client_kind = 'subagent' AND dedupe_key = '{task_id}'"),
+        );
+        assert_eq!(
+            event_count, 0,
+            "no usage_event row should exist for the queued task before dispatcher runs"
+        );
+        let daily_count = count_rows(
+            &db_ref,
+            "daily_usage",
+            "generation_id = 'gen-queued-bridge'",
+        );
+        assert_eq!(
+            daily_count, 0,
+            "no daily_usage rollup should exist before dispatcher runs"
+        );
+        let model_count = count_rows(&db_ref, "model_summary", "1=1");
+        assert_eq!(
+            model_count, 0,
+            "no model_summary rollup should exist before dispatcher runs"
+        );
+        // Sanity: the task row itself is queued.
+        let task_status: String = db_ref
+            .conn()
+            .query_row(
+                "SELECT status FROM subagent_tasks WHERE id = ?1",
+                rusqlite::params![&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_status, "queued", "task row must be in 'queued' status");
+    }
+
+    // 3. Resume the gate → dispatcher should pick up + execute the queued
+    //    task. Poll for up to 10s for the task to complete (the dispatcher
+    //    ticks at 200ms, and the mock sidecar needs to spawn a bash child).
+    gate.set_action(busytok_subagent::PressureAction::Resume);
+    assert!(!gate.is_paused(), "gate must be resumed before polling");
+
+    let mut completed = false;
+    for _ in 0..100 {
+        let status_now = {
+            let db_ref = sup.db_handle().lock().unwrap();
+            db_ref
+                .conn()
+                .query_row(
+                    "SELECT status FROM subagent_tasks WHERE id = ?1",
+                    rusqlite::params![&task_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_default()
+        };
+        if status_now == "completed" {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        completed,
+        "queued task must be executed by the dispatcher after gate clears"
+    );
+
+    // 4. Post-condition: usage_events + rollups are NOW present (the
+    //    dispatcher's post-task completion hook bridged them through the
+    //    same `bridge_subagent_usage` seam as synchronous `delegate()`).
+    let db_ref = sup.db_handle().lock().unwrap();
+
+    // Diagnostic: collect all subagent usage_events so an assertion failure
+    // message shows whether the hook wrote ANYTHING (and with what
+    // dedupe_key / generation_id), instead of just "left: None, right: Some".
+    let all_subagent_events: Vec<(String, String)> = db_ref
+        .conn()
+        .prepare(
+            "SELECT dedupe_key, generation_id FROM usage_events WHERE client_kind = 'subagent'",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let event_gen = db_ref
+        .conn()
+        .query_row(
+            "SELECT generation_id FROM usage_events WHERE client_kind = 'subagent' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    assert_eq!(
+        event_gen.as_deref(),
+        Some("gen-queued-bridge"),
+        "queued task's usage_event must use the active generation_id \
+         (proves the dispatcher hook sourced it from generation_manager, \
+         not a synthetic placeholder). All subagent events: {all_subagent_events:?}"
+    );
+
+    let daily_count = count_rows(
+        &db_ref,
+        "daily_usage",
+        "agent = 'codex' AND generation_id = 'gen-queued-bridge'",
+    );
+    assert!(
+        daily_count >= 1,
+        "daily_usage should have >=1 row for agent='codex' after dispatcher runs, got {daily_count}"
+    );
+
+    // The mock sidecar always returns model="deepseek-chat" in its canned
+    // response (regardless of the profile model the runtime requested).
+    // Assert against the sidecar's reported model, not the profile model.
+    let model_count = count_rows(&db_ref, "model_summary", "model = 'deepseek-chat'");
+    assert!(
+        model_count >= 1,
+        "model_summary should have >=1 row for model='deepseek-chat' after dispatcher runs, got {model_count}"
+    );
+
+    // Drop the db guard before awaiting shutdown (clippy::await_holding_lock).
+    drop(db_ref);
+
+    // Graceful shutdown: stop the sidecar child + drain the dispatcher +
+    // flush the writer. Order matters: shutdown_sidecar first so the child
+    // is dead, then shutdown_writer so the dispatcher is drained before the
+    // writer's final flush + WAL checkpoint.
+    sup.shutdown_sidecar().await;
+    sup.shutdown_writer().await.expect("writer shutdown");
+
+    // Suppress unused-variable warning for `sub_id` (kept for debuggability
+    // — readers can inspect the task row by subagent_id if the test fails).
+    let _ = sub_id;
+}
+
+// ---------------------------------------------------------------------------
+// Profile CRUD (Phase 4 Task 4: Profile/Model Configuration UI)
+// ---------------------------------------------------------------------------
+//
+// Tests exercise the BusytokSupervisor's profile_create / profile_update /
+// profile_delete handlers via the RuntimeControl trait. Built-in profiles
+// (pi/search-cheap, pi/review-cheap, pi/plan-cheap) ship with default
+// settings — these tests verify CRUD on user profiles + validation paths.
+
+#[tokio::test]
+async fn profile_crud_round_trips() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Built-in profiles exist from default_settings.
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert_eq!(snapshot.data.subagent.profiles.len(), 3);
+    assert!(snapshot
+        .data
+        .subagent
+        .profiles
+        .iter()
+        .any(|p| p.id == "pi/search-cheap"));
+    assert!(snapshot.data.subagent.profiles.iter().all(|p| p.is_builtin));
+
+    // Create a user profile.
+    let created = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-reviewer".to_string(),
+            model: "deepseek-chat".to_string(),
+            provider_id: None,
+            tools: Some(vec!["read".to_string(), "grep".to_string()]),
+            context_budget_tokens: Some(4000),
+            timeout_seconds: Some(150),
+            write_access: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.id, "my-reviewer");
+    assert!(!created.is_builtin);
+    assert_eq!(created.model, "deepseek-chat");
+    assert_eq!(created.context_budget_tokens, 4000);
+
+    // Settings snapshot now shows 4 profiles.
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert_eq!(snapshot.data.subagent.profiles.len(), 4);
+
+    // Update model + provider_id (patch semantics).
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-reviewer".to_string(),
+            provider_id: Some("".to_string()), // unbind (empty string = None)
+            model: Some("qwen-coder".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.model, "qwen-coder");
+    // provider_id was Some("") → unbound → None.
+    assert_eq!(updated.provider_id, None);
+    // tools/context_budget_tokens unchanged (patch semantics).
+    assert_eq!(updated.tools, vec!["read", "grep"]);
+    assert_eq!(updated.context_budget_tokens, 4000);
+
+    // Delete the user profile.
+    sup.profile_delete(ProfileDeleteRequestDto {
+        id: "my-reviewer".to_string(),
+    })
+    .await
+    .unwrap();
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert_eq!(snapshot.data.subagent.profiles.len(), 3);
+
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_builtin_name() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            model: "deepseek-chat".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("reserved for built-in"),
+        "expected reserved-name error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_delete_rejects_builtin() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_delete(ProfileDeleteRequestDto {
+            id: "pi/search-cheap".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot delete built-in"),
+        "expected built-in rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_disabled_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a disabled provider.
+    sup.provider_create(provider_create_request("disabled-p", "Disabled"))
+        .await
+        .unwrap();
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "disabled-p".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: Some(vec!["some-model".to_string()]),
+        enabled: Some(false),
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Try to bind a profile to the disabled provider → rejected.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: Some("disabled-p".to_string()),
+            model: Some("some-model".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("disabled provider"),
+        "expected disabled-provider rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_stale_model_on_rebind() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a provider with model "model-a".
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Bind profile to provider with model-a.
+    sup.profile_update(ProfileUpdateRequestDto {
+        id: "pi/search-cheap".to_string(),
+        provider_id: Some("test-p".to_string()),
+        model: Some("model-a".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Provider updates model list to ["model-b"] only — model-a is now stale.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-p".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: Some(vec!["model-b".to_string()]),
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Re-bind to the same provider (provider_id = Some("test-p")) without
+    // changing the model → the rebind path validates the effective model
+    // (model-a) against the new whitelist (["model-b"]) and rejects.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: Some("test-p".to_string()), // re-bind same provider
+            model: None,                             // not changing model
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
+        "expected stale-model rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_patches_tools_without_triggering_stale_check() {
+    // Patching only `tools` (neither provider_id nor model) must NOT run
+    // the whitelist validation — the service trusts the existing binding
+    // and only the UI surfaces stale-model warnings for already-bound profiles.
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_update(ProfileUpdateRequestDto {
+        id: "pi/search-cheap".to_string(),
+        provider_id: Some("test-p".to_string()),
+        model: Some("model-a".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Shrink the provider's whitelist so model-a is no longer in it.
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: "test-p".to_string(),
+        name: None,
+        base_url: None,
+        api_key_env_name: None,
+        base_url_env_name: None,
+        models: Some(vec!["model-b".to_string()]),
+        enabled: None,
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch ONLY tools — should succeed despite the stale model, because
+    // the service does not re-validate existing bindings on unrelated patches.
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: None, // unchanged
+            model: None,       // unchanged
+            tools: Some(vec!["new-tool".to_string()]),
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.tools, vec!["new-tool".to_string()]);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn settings_snapshot_includes_subagent_profiles() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let snapshot = sup.settings_snapshot().await.unwrap();
+    assert!(snapshot.data.subagent.enabled);
+    assert_eq!(snapshot.data.subagent.profiles.len(), 3);
+    let search = snapshot
+        .data
+        .subagent
+        .profiles
+        .iter()
+        .find(|p| p.id == "pi/search-cheap")
+        .unwrap();
+    assert!(search.is_builtin);
+    assert_eq!(search.model, "deepseek-chat");
+    assert_eq!(search.provider_id, None);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_nonexistent_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "some-model".to_string(),
+            provider_id: Some("nonexistent-provider".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("provider not found"),
+        "expected provider-not-found error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_model_not_in_whitelist() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a provider with only "model-a".
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Try to create a profile bound to that provider with a model NOT in its whitelist.
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "model-b".to_string(),
+            provider_id: Some("test-p".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
+        "expected whitelist rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_nonexistent_profile() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "nonexistent-profile".to_string(),
+            provider_id: None,
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("profile not found"),
+        "expected not-found error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_delete_rejects_nonexistent_profile() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_delete(ProfileDeleteRequestDto {
+            id: "nonexistent-profile".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("profile not found"),
+        "expected not-found error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_duplicate_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // First create succeeds.
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "some-model".to_string(),
+        provider_id: None,
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Second create with the same id fails.
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "other-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "expected already-exists error, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_unbinds_provider_with_empty_string() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a provider + bind a user profile to it.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Unbind via Some("").
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: Some("".to_string()),
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.provider_id, None);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_with_all_none_patch_is_noop() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Capture the built-in search profile's pre-state.
+    let before = sup
+        .settings_snapshot()
+        .await
+        .unwrap()
+        .data
+        .subagent
+        .profiles
+        .iter()
+        .find(|p| p.id == "pi/search-cheap")
+        .cloned()
+        .unwrap();
+
+    // Patch everything as None (no-op).
+    let after = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: None,
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+
+    // Profile is returned unchanged.
+    assert_eq!(after.model, before.model);
+    assert_eq!(after.provider_id, before.provider_id);
+    assert_eq!(after.tools, before.tools);
+    assert_eq!(after.context_budget_tokens, before.context_budget_tokens);
+    assert_eq!(after.timeout_seconds, before.timeout_seconds);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_changes_provider_and_model_together() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create two providers, each with a different model.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "prov-a".to_string(),
+        name: "Prov A".to_string(),
+        base_url: "https://a.test/v1".to_string(),
+        api_key_env_name: "A_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "prov-b".to_string(),
+        name: "Prov B".to_string(),
+        base_url: "https://b.test/v1".to_string(),
+        api_key_env_name: "B_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-b".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    // Create a profile bound to prov-a/model-a.
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("prov-a".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Atomically switch to prov-b/model-b.
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: Some("prov-b".to_string()),
+            model: Some("model-b".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.provider_id, Some("prov-b".to_string()));
+    assert_eq!(updated.model, "model-b");
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_invalid_id_format() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Uppercase and spaces are not allowed.
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "My Profile".to_string(),
+            model: "some-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("[a-z0-9/_-]+") || err.to_string().contains("id format"),
+        "expected id-format rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_patches_only_model_on_bound_profile() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create provider + profile bound to it.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string(), "model-b".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch only the model (provider_id stays None = unchanged).
+    let updated = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: None,
+            model: Some("model-b".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+    // Provider unchanged, model updated.
+    assert_eq!(updated.provider_id, Some("test-p".to_string()));
+    assert_eq!(updated.model, "model-b");
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_applies_defaults_for_omitted_fields() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create a profile with tools/budget/timeout all None.
+    let dto = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "some-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap();
+
+    // Defaults: write_access=false, tools=[], budget=3000, timeout=120.
+    assert!(!dto.write_access);
+    assert_eq!(dto.tools, Vec::<String>::new());
+    assert_eq!(dto.context_budget_tokens, 3000);
+    assert_eq!(dto.timeout_seconds, 120);
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_empty_id() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "".to_string(),
+            model: "some-model".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("profile id must not be empty"),
+        "expected empty-id rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_create_rejects_empty_model() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .profile_create(ProfileCreateRequestDto {
+            id: "my-profile".to_string(),
+            model: "".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("model must not be empty"),
+        "expected empty-model rejection, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_model_not_in_whitelist_on_model_only_patch() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create provider with model "model-a" only.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+
+    // Bind profile to provider with the whitelisted model.
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch only the model to a value NOT in the provider whitelist.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: None,
+            model: Some("model-b".to_string()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
+        "expected whitelist rejection on model-only patch, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_empty_model_unbound() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Built-in profile ships unbound; patch model to empty string.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "pi/search-cheap".to_string(),
+            provider_id: None,
+            model: Some(String::new()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("model must not be empty"),
+        "expected empty-model rejection on unbound profile, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_empty_model_bound() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Create provider + bind profile to it.
+    sup.provider_create(ProviderCreateRequestDto {
+        id: "test-p".to_string(),
+        name: "Test".to_string(),
+        base_url: "https://api.test.com/v1".to_string(),
+        api_key_env_name: "TEST_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["model-a".to_string()],
+        api_key: None,
+    })
+    .await
+    .unwrap();
+    sup.profile_create(ProfileCreateRequestDto {
+        id: "my-profile".to_string(),
+        model: "model-a".to_string(),
+        provider_id: Some("test-p".to_string()),
+        tools: None,
+        context_budget_tokens: None,
+        timeout_seconds: None,
+        write_access: None,
+    })
+    .await
+    .unwrap();
+
+    // Patch model to empty string while provider is bound.
+    let err = sup
+        .profile_update(ProfileUpdateRequestDto {
+            id: "my-profile".to_string(),
+            provider_id: None,
+            model: Some(String::new()),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("model must not be empty"),
+        "expected empty-model rejection on bound profile, got: {err}"
+    );
+    sup.shutdown_writer().await.unwrap();
 }

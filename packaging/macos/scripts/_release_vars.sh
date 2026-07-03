@@ -21,3 +21,8 @@ unsigned_dmg_path() {
     local version="$1"
     printf '%s/Busytok_%s_unsigned.dmg' "$BUNDLE_DMG_DIR" "$version"
 }
+
+# Phase 5: Node runtime version bundled into the .app for the pi-sidecar.
+# Pinned to a specific major.minor.patch from nodejs.org. Bump explicitly;
+# there is no auto-update (spec §419 deferred).
+SIDECAR_NODE_VERSION="22.6.0"
