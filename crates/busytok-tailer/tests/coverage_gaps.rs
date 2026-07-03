@@ -92,13 +92,17 @@ fn unwatch_path_removes_from_watched_paths() {
 }
 
 #[test]
+#[cfg(unix)]
 fn unwatch_unwatched_path_returns_error() {
     let mut service = FileWatchService::new().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let result = service.unwatch_path(temp.path());
+    // The notify crate's unwatch behavior is platform-dependent:
+    //   - Unix (inotify): returns Err for an unwatched path (no watch descriptor)
+    //   - Windows (ReadDirectoryChangesW): returns Ok as a no-op
     assert!(
         result.is_err(),
-        "unwatching a path that was never watched should error"
+        "unwatching a path that was never watched should error on Unix (inotify)"
     );
 }
 
