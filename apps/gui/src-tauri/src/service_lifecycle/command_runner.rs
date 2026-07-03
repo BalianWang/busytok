@@ -217,12 +217,18 @@ mod tests {
 
     #[test]
     fn launchctl_label_formats_target_spec_with_uid_and_label() {
-        assert_eq!(launchctl_label(501, "com.busytok.service"), "gui/501/com.busytok.service");
+        assert_eq!(
+            launchctl_label(501, "com.busytok.service"),
+            "gui/501/com.busytok.service"
+        );
     }
 
     #[test]
     fn launchctl_label_uses_zero_uid_for_root() {
-        assert_eq!(launchctl_label(0, "com.busytok.service"), "gui/0/com.busytok.service");
+        assert_eq!(
+            launchctl_label(0, "com.busytok.service"),
+            "gui/0/com.busytok.service"
+        );
     }
 
     #[test]
@@ -290,9 +296,15 @@ mod tests {
         );
         // Substring "bootout" is NOT in the enqueued rule, so this should panic.
         let result = catch_unwind(|| {
-            runner.run("launchctl", &["bootout".to_string(), "gui/501/x".to_string()])
+            runner.run(
+                "launchctl",
+                &["bootout".to_string(), "gui/501/x".to_string()],
+            )
         });
-        assert!(result.is_err(), "FakeCommandRunner must panic when args substring does not match");
+        assert!(
+            result.is_err(),
+            "FakeCommandRunner must panic when args substring does not match"
+        );
     }
 
     #[test]
@@ -393,7 +405,11 @@ mod tests {
     #[test]
     fn launchctl_bootout_strict_bails_when_runner_fails() {
         let runner = FakeCommandRunner::new();
-        runner.enqueue("launchctl", "bootout", fail_status(1, "Bootout failed: not loaded"));
+        runner.enqueue(
+            "launchctl",
+            "bootout",
+            fail_status(1, "Bootout failed: not loaded"),
+        );
         let err = launchctl_bootout_strict(&runner, "gui/501/com.busytok.service")
             .unwrap_err()
             .to_string();
@@ -452,8 +468,14 @@ mod tests {
         let err = launchctl_bootstrap_strict(&runner, "gui/501", plist)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("bootstrap"), "error must mention bootstrap: {err}");
-        assert!(err.contains("exit 2"), "error must include exit code: {err}");
+        assert!(
+            err.contains("bootstrap"),
+            "error must mention bootstrap: {err}"
+        );
+        assert!(
+            err.contains("exit 2"),
+            "error must include exit code: {err}"
+        );
         assert!(
             err.contains("already loaded"),
             "error must include trimmed stderr: {err}"
@@ -478,8 +500,14 @@ mod tests {
         let err = launchctl_kickstart_strict(&runner, "gui/501/com.busytok.service")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("kickstart"), "error must mention kickstart: {err}");
-        assert!(err.contains("exit 3"), "error must include exit code: {err}");
+        assert!(
+            err.contains("kickstart"),
+            "error must mention kickstart: {err}"
+        );
+        assert!(
+            err.contains("exit 3"),
+            "error must include exit code: {err}"
+        );
         assert!(
             err.contains("No such process"),
             "error must include trimmed stderr: {err}"

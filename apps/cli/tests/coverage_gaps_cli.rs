@@ -44,10 +44,7 @@ fn run_busytok(args: &[&str]) -> std::process::Output {
 
 /// Spawn `busytok` with args and a specific `BUSYTOK_SOCKET` from within an
 /// async test context.
-async fn run_busytok_with_socket_async(
-    socket: String,
-    args: Vec<String>,
-) -> std::process::Output {
+async fn run_busytok_with_socket_async(socket: String, args: Vec<String>) -> std::process::Output {
     let bin = bin();
     tokio::task::spawn_blocking(move || {
         Command::new(&bin)
@@ -334,7 +331,9 @@ impl RuntimeControl for ConfigurableRuntime {
         }
         self.inner.settings_snapshot().await
     }
-    async fn settings_diagnostics(&self) -> anyhow::Result<ReadEnvelopeDto<SettingsDiagnosticsDto>> {
+    async fn settings_diagnostics(
+        &self,
+    ) -> anyhow::Result<ReadEnvelopeDto<SettingsDiagnosticsDto>> {
         self.inner.settings_diagnostics().await
     }
     async fn settings_recovery_action(
@@ -463,9 +462,7 @@ impl RuntimeControl for ConfigurableRuntime {
 }
 
 /// Spawn a server backed by a `ConfigurableRuntime`.
-async fn spawn_configurable_server(
-    runtime: ConfigurableRuntime,
-) -> (ServerHarness, String) {
+async fn spawn_configurable_server(runtime: ConfigurableRuntime) -> (ServerHarness, String) {
     let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
     spawn_server(runtime).await
 }
@@ -483,7 +480,11 @@ async fn sources_rescan_with_source_id_calls_rpc() {
 
     let output = run_busytok_with_socket_async(
         socket,
-        vec!["sources".to_string(), "rescan".to_string(), "src-1".to_string()],
+        vec![
+            "sources".to_string(),
+            "rescan".to_string(),
+            "src-1".to_string(),
+        ],
     )
     .await;
     drop(harness);
@@ -517,7 +518,10 @@ fn usage_export_dry_run_normalizes_non_claude_code_agent() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("usage.export"), "should print method: {stdout}");
+    assert!(
+        stdout.contains("usage.export"),
+        "should print method: {stdout}"
+    );
     assert!(
         stdout.contains("codex"),
         "should include codex agent: {stdout}"
@@ -602,7 +606,10 @@ async fn settings_update_with_discovery_defaults_propagates_validation_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "should exit non-zero: {stderr}");
-    assert!(stderr.contains("RPC error"), "should surface RPC error: {stderr}");
+    assert!(
+        stderr.contains("RPC error"),
+        "should surface RPC error: {stderr}"
+    );
     assert!(
         stderr.contains("settings_validation_failed"),
         "should include error code: {stderr}"
@@ -632,7 +639,10 @@ async fn prompt_batch_skips_empty_lines() {
         "batch with empty + valid should succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("created"), "should have a created entry: {stdout}");
+    assert!(
+        stdout.contains("created"),
+        "should have a created entry: {stdout}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -643,11 +653,9 @@ async fn prompt_batch_emits_rpc_error_on_failing_create() {
         .with_prompts_create_error("create_failed: prompts.create is broken");
     let (harness, socket) = spawn_configurable_server(runtime).await;
 
-    let output = run_busytok_batch_with_socket_async(
-        socket,
-        vec![r#"{"content":"hello"}"#.to_string()],
-    )
-    .await;
+    let output =
+        run_busytok_batch_with_socket_async(socket, vec![r#"{"content":"hello"}"#.to_string()])
+            .await;
     drop(harness);
 
     assert!(
@@ -656,7 +664,10 @@ async fn prompt_batch_emits_rpc_error_on_failing_create() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("skipped"), "should emit skipped entry: {stdout}");
+    assert!(
+        stdout.contains("skipped"),
+        "should emit skipped entry: {stdout}"
+    );
     assert!(
         stdout.contains("rpc_error"),
         "should use rpc_error reason: {stdout}"
@@ -691,7 +702,10 @@ async fn prompt_batch_succeeds_with_all_valid() {
         created_count >= 2,
         "should have >=2 created entries, got {created_count}: {stdout}"
     );
-    assert!(!stdout.contains("skipped"), "should not have skipped: {stdout}");
+    assert!(
+        !stdout.contains("skipped"),
+        "should not have skipped: {stdout}"
+    );
 }
 
 // ===========================================================================
@@ -806,7 +820,9 @@ async fn prompt_batch_reconnects_when_rpc_error_mentions_transport_error() {
     // Both entries should be skipped (the runtime always errors), and the
     // reconnect retry at line 726 should fire between them.
     assert!(
-        lines.iter().all(|v| v.get("status").and_then(|s| s.as_str()) == Some("skipped")),
+        lines
+            .iter()
+            .all(|v| v.get("status").and_then(|s| s.as_str()) == Some("skipped")),
         "both entries should be skipped: {:?}",
         lines
     );
@@ -845,8 +861,7 @@ async fn settings_update_add_root_with_existing_manual_roots() {
         root_path: "/existing/path".to_string(),
         source_type: SourceTypeDto::ManualRoot,
     };
-    let runtime = ConfigurableRuntime::new(inner)
-        .with_snapshot_manual_roots(vec![existing_root]);
+    let runtime = ConfigurableRuntime::new(inner).with_snapshot_manual_roots(vec![existing_root]);
     let (harness, socket) = spawn_configurable_server(runtime).await;
 
     let output = run_busytok_with_socket_async(
@@ -952,7 +967,10 @@ fn cli_install_creates_shim_and_reports_valid_status() {
         "cli uninstall should succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!bin_dir.join("busytok").exists(), "shim removed after uninstall");
+    assert!(
+        !bin_dir.join("busytok").exists(),
+        "shim removed after uninstall"
+    );
 }
 
 #[test]
@@ -982,7 +1000,10 @@ fn cli_uninstall_reports_success() {
     );
     // The uninstall message is printed to stderr.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("uninstalled"), "should report uninstall: {stderr}");
+    assert!(
+        stderr.contains("uninstalled"),
+        "should report uninstall: {stderr}"
+    );
     assert!(!bin_dir.join("busytok").exists(), "shim removed");
 }
 

@@ -299,7 +299,9 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
 
     // Live
     let _ = runtime
-        .live_window(LiveWindowRequestDto { window_seconds: None })
+        .live_window(LiveWindowRequestDto {
+            window_seconds: None,
+        })
         .await
         .unwrap();
 
@@ -721,7 +723,10 @@ async fn dispatcher_routes_provider_create_returns_error() {
     let result = dispatcher
         .dispatch(ControlRequest::new("provider.create", params))
         .await;
-    assert!(result.is_err(), "provider.create should propagate the error");
+    assert!(
+        result.is_err(),
+        "provider.create should propagate the error"
+    );
     assert!(result
         .unwrap_err()
         .to_string()
@@ -1021,7 +1026,10 @@ impl RuntimeControl for SettingsValidationRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<PromptEntryDto>> {
         self.inner.prompts_update(req).await
     }
-    async fn prompts_delete(&self, req: PromptDeleteRequestDto) -> anyhow::Result<PromptDeleteResultDto> {
+    async fn prompts_delete(
+        &self,
+        req: PromptDeleteRequestDto,
+    ) -> anyhow::Result<PromptDeleteResultDto> {
         self.inner.prompts_delete(req).await
     }
     async fn prompts_use(&self, req: PromptUseRequestDto) -> anyhow::Result<PromptUseResultDto> {
@@ -1164,7 +1172,10 @@ async fn settings_update_validation_failed_with_invalid_json_payload_propagates_
             serde_json::json!({"timezone": "bad"}),
         ))
         .await;
-    assert!(result.is_err(), "invalid JSON payload should propagate as Err");
+    assert!(
+        result.is_err(),
+        "invalid JSON payload should propagate as Err"
+    );
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("SETTINGS_VALIDATION_FAILED"));
 }
@@ -1298,10 +1309,9 @@ async fn invalid_utf8_frame_body_returns_read_error() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let ((), result) = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { tokio::join!(client_fut, server.accept_one()) },
-    )
+    let ((), result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server.accept_one())
+    })
     .await
     .expect("test timed out");
 
@@ -1353,10 +1363,9 @@ async fn partial_body_read_is_treated_as_connection_closed() {
         drop(stream);
     };
 
-    let ((), result) = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { tokio::join!(client_fut, server.accept_one()) },
-    )
+    let ((), result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client_fut, server.accept_one())
+    })
     .await
     .expect("test timed out");
 
@@ -1527,7 +1536,10 @@ impl RuntimeControl for RuntimeWithLatestSeq {
     ) -> anyhow::Result<ReadEnvelopeDto<PromptEntryDto>> {
         self.inner.prompts_update(req).await
     }
-    async fn prompts_delete(&self, req: PromptDeleteRequestDto) -> anyhow::Result<PromptDeleteResultDto> {
+    async fn prompts_delete(
+        &self,
+        req: PromptDeleteRequestDto,
+    ) -> anyhow::Result<PromptDeleteResultDto> {
         self.inner.prompts_delete(req).await
     }
     async fn prompts_use(&self, req: PromptUseRequestDto) -> anyhow::Result<PromptUseResultDto> {
@@ -1640,11 +1652,7 @@ async fn subscription_gap_detection_emits_gap_event_batch() {
     // Subscribe with a stale last_event_seq (5 < 100). The server should
     // detect the gap and emit a gap_detected batch.
     let ack = client
-        .subscribe_with_meta_and_last_event_seq(
-            vec![],
-            RequestMeta::default(),
-            Some(5),
-        )
+        .subscribe_with_meta_and_last_event_seq(vec![], RequestMeta::default(), Some(5))
         .await
         .unwrap();
     assert!(matches!(ack, ControlResponse::Ok(_)));
@@ -2057,7 +2065,10 @@ async fn client_invalid_handshake_ack_returns_error() {
         // Send a wrong ack.
         let wrong_ack = b"busytok-not-ok";
         let ack_len = wrong_ack.len() as u32;
-        server_stream.write_all(&ack_len.to_be_bytes()).await.unwrap();
+        server_stream
+            .write_all(&ack_len.to_be_bytes())
+            .await
+            .unwrap();
         server_stream.write_all(wrong_ack).await.unwrap();
         server_stream.flush().await.unwrap();
         // Keep the stream alive briefly so the client reads the ack.
@@ -2112,7 +2123,10 @@ async fn client_call_with_malformed_response_returns_error() {
         // Send HELLO_ACK.
         let ack = b"busytok-ok";
         let ack_len = ack.len() as u32;
-        server_stream.write_all(&ack_len.to_be_bytes()).await.unwrap();
+        server_stream
+            .write_all(&ack_len.to_be_bytes())
+            .await
+            .unwrap();
         server_stream.write_all(ack).await.unwrap();
         server_stream.flush().await.unwrap();
         // Read the request frame.
@@ -2123,7 +2137,10 @@ async fn client_call_with_malformed_response_returns_error() {
         // Send a malformed (non-JSON) response.
         let bad = b"not json at all";
         let bad_len = bad.len() as u32;
-        server_stream.write_all(&bad_len.to_be_bytes()).await.unwrap();
+        server_stream
+            .write_all(&bad_len.to_be_bytes())
+            .await
+            .unwrap();
         server_stream.write_all(bad).await.unwrap();
         server_stream.flush().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;

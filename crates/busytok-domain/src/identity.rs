@@ -424,8 +424,14 @@ mod tests {
         // "~/foo" should be expanded using the home directory.
         let result = normalize_project_path("~/foo").unwrap();
         // The result must be absolute and end with foo.
-        assert!(result.starts_with('/'), "tilde expansion must produce absolute path");
-        assert!(result.ends_with("/foo"), "result should preserve trailing path: {result}");
+        assert!(
+            result.starts_with('/'),
+            "tilde expansion must produce absolute path"
+        );
+        assert!(
+            result.ends_with("/foo"),
+            "result should preserve trailing path: {result}"
+        );
         // Must not contain a literal `~`.
         assert!(!result.contains('~'), "tilde must be expanded: {result}");
     }
@@ -434,7 +440,10 @@ mod tests {
     fn normalize_project_path_expands_bare_tilde() {
         // "~" alone should be expanded to the home directory.
         let result = normalize_project_path("~").unwrap();
-        assert!(result.starts_with('/'), "home dir must be absolute: {result}");
+        assert!(
+            result.starts_with('/'),
+            "home dir must be absolute: {result}"
+        );
         assert!(!result.contains('~'), "tilde must be expanded: {result}");
     }
 

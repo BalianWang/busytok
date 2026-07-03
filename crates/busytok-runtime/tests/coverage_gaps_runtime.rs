@@ -37,6 +37,12 @@ use busytok_pricing::CostMode;
 use busytok_protocol::dto::{
     RangePresetDto, ReadinessStateDto, TrendBucketGranularityDto, WeekdayIndexDto,
 };
+use busytok_runtime::aggregates::{
+    apply_event_batch_aggregates, apply_replay_batch_aggregates, update_generation_summaries,
+};
+use busytok_runtime::range::{
+    heatmap_window_from_date, parse_date_to_ms, parse_date_to_ms_exclusive, resolve_range,
+};
 use busytok_runtime::rebuild::{
     create_generation, initiate_rebuild, record_new_file_observation, record_rebuild_diagnostic,
     RebuildFrontierSet,
@@ -45,12 +51,6 @@ use busytok_runtime::scan::{derive_file_id, enrich_cost};
 use busytok_runtime::ui_models::{
     breakdown_metrics, format_thousands, format_tokens, format_trend_label, trend_granularity,
     UsageTotals,
-};
-use busytok_runtime::range::{
-    heatmap_window_from_date, parse_date_to_ms, parse_date_to_ms_exclusive, resolve_range,
-};
-use busytok_runtime::aggregates::{
-    apply_event_batch_aggregates, apply_replay_batch_aggregates, update_generation_summaries,
 };
 use busytok_runtime::{BusytokSupervisor, ServiceApp};
 use busytok_store::Database;
@@ -65,7 +65,9 @@ fn make_supervisor() -> (BusytokSupervisor, tempfile::TempDir) {
     (BusytokSupervisor::new(db, paths), dir)
 }
 
-fn make_supervisor_with_settings(settings: BusytokSettings) -> (BusytokSupervisor, tempfile::TempDir) {
+fn make_supervisor_with_settings(
+    settings: BusytokSettings,
+) -> (BusytokSupervisor, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = BusytokPaths::for_test(dir.path());
     paths.ensure_dirs_exist().expect("ensure dirs");
@@ -150,7 +152,10 @@ fn apply_replay_batch_aggregates_returns_ok_on_empty_batch() {
     let conn = db.conn();
     let events: Vec<NormalizedUsageEvent> = vec![];
     let result = apply_replay_batch_aggregates(conn, &events, "gen-1");
-    assert!(result.is_ok(), "apply_replay_batch_aggregates should succeed");
+    assert!(
+        result.is_ok(),
+        "apply_replay_batch_aggregates should succeed"
+    );
 }
 
 #[test]
@@ -414,7 +419,11 @@ fn parse_date_to_ms_returns_midnight_utc() {
     // mis-compute) so the test stays correct regardless of the date chosen.
     let ms = parse_date_to_ms("2026-05-20").expect("parse");
     // Must be exactly midnight UTC: divisible by 86_400_000 ms (1 day).
-    assert_eq!(ms % 86_400_000, 0, "parse_date_to_ms should return midnight UTC");
+    assert_eq!(
+        ms % 86_400_000,
+        0,
+        "parse_date_to_ms should return midnight UTC"
+    );
     // Inclusive start must be strictly less than the exclusive end (next midnight).
     let exclusive = parse_date_to_ms_exclusive("2026-05-20").expect("parse exclusive");
     assert_eq!(
@@ -435,8 +444,16 @@ fn parse_date_to_ms_exclusive_returns_next_midnight_utc() {
     // Exclusive end: start of next day (midnight UTC of the following day).
     let inclusive = parse_date_to_ms("2026-05-20").expect("parse inclusive");
     let exclusive = parse_date_to_ms_exclusive("2026-05-20").expect("parse exclusive");
-    assert_eq!(exclusive % 86_400_000, 0, "exclusive should also land on midnight UTC");
-    assert_eq!(exclusive - inclusive, 86_400_000, "exclusive = inclusive + 1 day");
+    assert_eq!(
+        exclusive % 86_400_000,
+        0,
+        "exclusive should also land on midnight UTC"
+    );
+    assert_eq!(
+        exclusive - inclusive,
+        86_400_000,
+        "exclusive = inclusive + 1 day"
+    );
 }
 
 #[test]
@@ -650,7 +667,10 @@ fn derive_file_id_is_deterministic_and_prefixed() {
     let id2 = derive_file_id(std::path::Path::new("/tmp/claude/logs.jsonl"));
     assert_eq!(id1, id2, "same path must produce same id");
     assert!(id1.starts_with("file_"), "id must be prefixed with file_");
-    assert!(id1.len() > "file_".len() + 16, "id must contain a hash digest");
+    assert!(
+        id1.len() > "file_".len() + 16,
+        "id must contain a hash digest"
+    );
 }
 
 #[test]
@@ -675,8 +695,14 @@ fn enrich_cost_auto_mode_uses_source_cost_when_present() {
 
     // When source cost is present in Auto mode, estimate_cost_with_catalog
     // returns it as-is.
-    assert!(evt.estimated_cost_usd.is_some(), "estimated_cost_usd should be populated");
-    assert!(evt.price_catalog_version.is_some(), "catalog version should be stamped");
+    assert!(
+        evt.estimated_cost_usd.is_some(),
+        "estimated_cost_usd should be populated"
+    );
+    assert!(
+        evt.price_catalog_version.is_some(),
+        "catalog version should be stamped"
+    );
 }
 
 #[test]
@@ -755,7 +781,9 @@ fn enrich_cost_with_empty_model_does_not_panic() {
 #[test]
 fn legacy_audit_rebuild_recommended_returns_false_on_fresh_db() {
     let (supervisor, _dir) = make_supervisor();
-    let result = supervisor.legacy_audit_rebuild_recommended().expect("check");
+    let result = supervisor
+        .legacy_audit_rebuild_recommended()
+        .expect("check");
     assert!(!result, "fresh DB should not need legacy rebuild");
 }
 
@@ -768,8 +796,13 @@ fn legacy_audit_rebuild_recommended_returns_true_for_codex_null_model() {
     seed_legacy_codex_event(&db, "codex-legacy-1", "gen-1");
     drop(db);
 
-    let result = supervisor.legacy_audit_rebuild_recommended().expect("check");
-    assert!(result, "codex events with NULL model should trigger rebuild recommendation");
+    let result = supervisor
+        .legacy_audit_rebuild_recommended()
+        .expect("check");
+    assert!(
+        result,
+        "codex events with NULL model should trigger rebuild recommendation"
+    );
 }
 
 #[test]
@@ -781,8 +814,13 @@ fn legacy_audit_rebuild_recommended_returns_true_for_claude_token_mismatch() {
     seed_legacy_claude_event(&db, "claude-legacy-1", "gen-2");
     drop(db);
 
-    let result = supervisor.legacy_audit_rebuild_recommended().expect("check");
-    assert!(result, "claude events with mismatched token totals should trigger rebuild");
+    let result = supervisor
+        .legacy_audit_rebuild_recommended()
+        .expect("check");
+    assert!(
+        result,
+        "claude events with mismatched token totals should trigger rebuild"
+    );
 }
 
 #[test]

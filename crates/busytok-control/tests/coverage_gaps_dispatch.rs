@@ -234,7 +234,9 @@ impl RuntimeControl for SuccessRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<SettingsSnapshotDto>> {
         self.inner.settings_update(req).await
     }
-    async fn settings_diagnostics(&self) -> anyhow::Result<ReadEnvelopeDto<SettingsDiagnosticsDto>> {
+    async fn settings_diagnostics(
+        &self,
+    ) -> anyhow::Result<ReadEnvelopeDto<SettingsDiagnosticsDto>> {
         self.inner.settings_diagnostics().await
     }
     async fn settings_recovery_action(
@@ -716,7 +718,9 @@ impl RuntimeControl for AllErrorRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<SettingsSnapshotDto>> {
         Err(anyhow::anyhow!("runtime error"))
     }
-    async fn settings_diagnostics(&self) -> anyhow::Result<ReadEnvelopeDto<SettingsDiagnosticsDto>> {
+    async fn settings_diagnostics(
+        &self,
+    ) -> anyhow::Result<ReadEnvelopeDto<SettingsDiagnosticsDto>> {
         Err(anyhow::anyhow!("runtime error"))
     }
     async fn settings_recovery_action(
@@ -816,19 +820,13 @@ impl RuntimeControl for AllErrorRuntime {
         Err(anyhow::anyhow!("runtime error"))
     }
 
-    async fn provider_create(
-        &self,
-        _req: ProviderCreateRequestDto,
-    ) -> anyhow::Result<ProviderDto> {
+    async fn provider_create(&self, _req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         Err(anyhow::anyhow!("runtime error"))
     }
     async fn provider_list(&self) -> anyhow::Result<ProviderListResponseDto> {
         Err(anyhow::anyhow!("runtime error"))
     }
-    async fn provider_update(
-        &self,
-        _req: ProviderUpdateRequestDto,
-    ) -> anyhow::Result<ProviderDto> {
+    async fn provider_update(&self, _req: ProviderUpdateRequestDto) -> anyhow::Result<ProviderDto> {
         Err(anyhow::anyhow!("runtime error"))
     }
     async fn provider_delete(&self, _req: ProviderDeleteRequestDto) -> anyhow::Result<()> {
@@ -916,7 +914,10 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
         ),
         ("clients.snapshot", serde_json::json!({})),
         ("clients.detail", serde_json::json!({"source_id": "src-1"})),
-        ("settings.update", serde_json::json!({"timezone": "US/Pacific"})),
+        (
+            "settings.update",
+            serde_json::json!({"timezone": "US/Pacific"}),
+        ),
         (
             "settings.recovery_action",
             serde_json::json!({"id": "rescan_all"}),
@@ -970,7 +971,10 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
             "pi_sidecar_locator_update",
             serde_json::json!({"runtime_dir": "/tmp/pi", "enabled": true}),
         ),
-        ("profile.create", serde_json::json!({"id": "prof1", "model": "m"})),
+        (
+            "profile.create",
+            serde_json::json!({"id": "prof1", "model": "m"}),
+        ),
         ("profile.update", serde_json::json!({"id": "prof1"})),
         ("profile.delete", serde_json::json!({"id": "prof1"})),
     ];

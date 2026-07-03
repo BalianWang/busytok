@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use busytok_config::BusytokPaths;
 use busytok_domain::{
-    now_ms, AgentKind, NormalizedUsageEvent, OperationalDiagnosticEvent, ToolEvent, UsageWritePolicy,
+    now_ms, AgentKind, NormalizedUsageEvent, OperationalDiagnosticEvent, ToolEvent,
+    UsageWritePolicy,
 };
 use busytok_events::{AppEvent, AppEventBus};
 use busytok_runtime::read_service::{
@@ -1418,10 +1419,7 @@ async fn service_app_run_shutdown_via_sigint_covers_graceful_path() {
     });
 
     // Run the LocalSet until run() completes (triggered by SIGINT → ctrl_c).
-    let _ = tokio::time::timeout(
-        Duration::from_secs(15),
-        local.run_until(run_task),
-    ).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), local.run_until(run_task)).await;
 
     // After graceful shutdown, the marker should be removed.
     assert!(

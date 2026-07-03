@@ -119,9 +119,30 @@ fn rollup_options_for_timezone_accepts_iana() {
 #[test]
 fn rebuild_sessions_groups_by_session_and_tracks_timestamps() {
     let events = vec![
-        make_event("a", AgentKind::ClaudeCode, "sess-1", 100, "claude-sonnet-4", 1_000),
-        make_event("b", AgentKind::ClaudeCode, "sess-1", 200, "claude-haiku", 2_000),
-        make_event("c", AgentKind::ClaudeCode, "sess-1", 50, "claude-sonnet-4", 500),
+        make_event(
+            "a",
+            AgentKind::ClaudeCode,
+            "sess-1",
+            100,
+            "claude-sonnet-4",
+            1_000,
+        ),
+        make_event(
+            "b",
+            AgentKind::ClaudeCode,
+            "sess-1",
+            200,
+            "claude-haiku",
+            2_000,
+        ),
+        make_event(
+            "c",
+            AgentKind::ClaudeCode,
+            "sess-1",
+            50,
+            "claude-sonnet-4",
+            500,
+        ),
     ];
 
     let rows = rebuild_sessions(&events, "UTC");
@@ -164,8 +185,7 @@ fn rebuild_sessions_dedupes_models() {
         make_event("c", AgentKind::Codex, "s1", 10, "gpt-5", 3_000),
     ];
     let rows = rebuild_sessions(&events, "UTC");
-    let models: Vec<String> =
-        serde_json::from_str(&rows[0].model_list_json).expect("valid JSON");
+    let models: Vec<String> = serde_json::from_str(&rows[0].model_list_json).expect("valid JSON");
     assert_eq!(models, vec!["gpt-5".to_string()]);
 }
 
@@ -269,7 +289,14 @@ fn rebuild_projects_merges_costs_all_branches() {
 #[test]
 fn rebuild_model_summaries_groups_by_model() {
     let events = vec![
-        make_event("a", AgentKind::ClaudeCode, "s1", 100, "claude-sonnet", 1_000),
+        make_event(
+            "a",
+            AgentKind::ClaudeCode,
+            "s1",
+            100,
+            "claude-sonnet",
+            1_000,
+        ),
         make_event("b", AgentKind::ClaudeCode, "s1", 50, "claude-sonnet", 2_000),
         make_event("c", AgentKind::ClaudeCode, "s1", 30, "claude-haiku", 3_000),
     ];
@@ -658,14 +685,15 @@ fn identify_session_blocks_returns_empty_for_empty_input() {
 
 #[test]
 fn build_scan_mutations_empty_events_returns_empty_mutations() {
-    let mutations =
-        build_scan_mutations(&[], RollupOptions::utc(), "gen-empty").expect("ok");
+    let mutations = build_scan_mutations(&[], RollupOptions::utc(), "gen-empty").expect("ok");
     assert!(mutations.daily_usage.is_empty());
     assert!(mutations.session_rollups.is_empty());
     assert!(mutations.project_rollups.is_empty());
     assert!(mutations.model_rollups.is_empty());
     // Realtime summary always contains keys (today_total_tokens, etc.).
-    assert!(mutations.realtime_summary.contains_key("today_total_tokens"));
+    assert!(mutations
+        .realtime_summary
+        .contains_key("today_total_tokens"));
     assert!(mutations.realtime_summary.contains_key("top_projects"));
     assert!(mutations.realtime_summary.contains_key("top_models"));
 }

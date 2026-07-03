@@ -495,8 +495,7 @@ mod tests {
             CommandStatus {
                 success: true,
                 exit_code: None,
-                stdout: "\"TaskName\",\"Status\"\n\"\\\\Busytok\\\\Service\",\"Queued\""
-                    .into(),
+                stdout: "\"TaskName\",\"Status\"\n\"\\\\Busytok\\\\Service\",\"Queued\"".into(),
                 stderr: String::new(),
             },
         );
@@ -663,7 +662,8 @@ mod tests {
             },
         );
         let lc = TaskSchedulerLifecycle::with_runner(paths, Box::new(runner));
-        lc.uninstall().expect("uninstall must tolerate a failing schtasks /Delete");
+        lc.uninstall()
+            .expect("uninstall must tolerate a failing schtasks /Delete");
     }
 
     #[test]
@@ -680,7 +680,8 @@ mod tests {
         let paths = BusytokPaths::for_test(tmp.path());
         let runner = FailingRunner;
         let lc = TaskSchedulerLifecycle::with_runner(paths, Box::new(runner));
-        lc.uninstall().expect("uninstall must tolerate runner invocation failure");
+        lc.uninstall()
+            .expect("uninstall must tolerate runner invocation failure");
     }
 
     // ── ensure_registered() — SID resolution is unsupported on non-Windows ──

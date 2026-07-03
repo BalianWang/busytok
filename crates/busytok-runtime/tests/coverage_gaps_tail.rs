@@ -51,7 +51,12 @@ use busytok_store::Database;
 type BoxedAdapter = Box<dyn AgentLogAdapter + Send + Sync>;
 
 /// Build a minimal Claude Code JSONL line that yields a usage event.
-fn claude_jsonl_line(session_id: &str, model: &str, input_tokens: u64, output_tokens: u64) -> String {
+fn claude_jsonl_line(
+    session_id: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> String {
     serde_json::json!({
         "type": "assistant",
         "message": {
@@ -69,7 +74,12 @@ fn claude_jsonl_line(session_id: &str, model: &str, input_tokens: u64, output_to
 }
 
 /// Codex heartbeat line with token_count payload (no model in info).
-fn codex_heartbeat_line(total_input: u64, total_output: u64, last_input: u64, last_output: u64) -> String {
+fn codex_heartbeat_line(
+    total_input: u64,
+    total_output: u64,
+    last_input: u64,
+    last_output: u64,
+) -> String {
     serde_json::json!({
         "timestamp": "2026-05-20T07:16:22.000Z",
         "type": "event_msg",
@@ -107,7 +117,12 @@ fn codex_turn_context_line(model: &str) -> String {
 }
 
 /// Build a `DiscoveredLogSource` that points to a single file under `root`.
-fn source_for_file(root: &Path, file: &Path, agent: AgentKind, source_id: &str) -> busytok_discovery::DiscoveredLogSource {
+fn source_for_file(
+    root: &Path,
+    file: &Path,
+    agent: AgentKind,
+    source_id: &str,
+) -> busytok_discovery::DiscoveredLogSource {
     busytok_discovery::DiscoveredLogSource {
         agent,
         source_id: source_id.to_string(),
@@ -271,8 +286,12 @@ fn rescan_changed_files_no_adapter_returns_ok_without_ingesting() {
     let file_path = dir.path().join("no-adapter.jsonl");
     {
         let mut f = std::fs::File::create(&file_path).expect("create");
-        writeln!(f, "{}", claude_jsonl_line("s", "claude-sonnet-4-20250514", 100, 50))
-            .expect("write");
+        writeln!(
+            f,
+            "{}",
+            claude_jsonl_line("s", "claude-sonnet-4-20250514", 100, 50)
+        )
+        .expect("write");
     }
 
     let db = Database::open_in_memory().expect("db");
@@ -382,10 +401,18 @@ fn rescan_changed_files_processes_claude_code_file() {
     let file_path = dir.path().join("claude.jsonl");
     {
         let mut f = std::fs::File::create(&file_path).expect("create");
-        writeln!(f, "{}", claude_jsonl_line("sess-1", "claude-sonnet-4-20250514", 100, 50))
-            .expect("write 1");
-        writeln!(f, "{}", claude_jsonl_line("sess-2", "claude-sonnet-4-20250514", 200, 100))
-            .expect("write 2");
+        writeln!(
+            f,
+            "{}",
+            claude_jsonl_line("sess-1", "claude-sonnet-4-20250514", 100, 50)
+        )
+        .expect("write 1");
+        writeln!(
+            f,
+            "{}",
+            claude_jsonl_line("sess-2", "claude-sonnet-4-20250514", 200, 100)
+        )
+        .expect("write 2");
     }
 
     let db = Database::open_in_memory().expect("db");
@@ -465,8 +492,12 @@ fn prepare_tail_batch_command_claude_code_agent_uses_claude_adapter() {
     let file_path = dir.path().join("claude-prepare.jsonl");
     {
         let mut f = std::fs::File::create(&file_path).expect("create");
-        writeln!(f, "{}", claude_jsonl_line("sess-prep", "claude-sonnet-4-20250514", 100, 50))
-            .expect("write");
+        writeln!(
+            f,
+            "{}",
+            claude_jsonl_line("sess-prep", "claude-sonnet-4-20250514", 100, 50)
+        )
+        .expect("write");
     }
 
     let db = Database::open_in_memory().expect("db");
@@ -487,7 +518,10 @@ fn prepare_tail_batch_command_claude_code_agent_uses_claude_adapter() {
         assert_eq!(c.source_id, "src-claude-prep");
         assert_eq!(c.source_file_agent, "claude_code");
         assert_eq!(c.generation_id, "gen-claude-prep");
-        assert!(!c.events.is_empty(), "claude_code adapter should ingest events");
+        assert!(
+            !c.events.is_empty(),
+            "claude_code adapter should ingest events"
+        );
     } else {
         panic!("expected TailBatch, got {:?}", cmd);
     }
@@ -627,12 +661,7 @@ async fn start_tailing_startup_catchup_processes_existing_files() {
     seed_active_generation(&db.lock().unwrap(), "gen-catchup");
 
     let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter)];
-    let source = source_for_file(
-        dir.path(),
-        &file_path,
-        AgentKind::Codex,
-        "src-catchup",
-    );
+    let source = source_for_file(dir.path(), &file_path, AgentKind::Codex, "src-catchup");
 
     let handle = start_tailing(
         Arc::clone(&db),
@@ -783,8 +812,12 @@ async fn start_tailing_dynamically_discovers_new_jsonl_file_under_watched_root()
             .truncate(true)
             .open(&new_file)
             .expect("open for write");
-        writeln!(f, "{}", claude_jsonl_line("sess-disc", "claude-sonnet-4-20250514", 100, 50))
-            .expect("write");
+        writeln!(
+            f,
+            "{}",
+            claude_jsonl_line("sess-disc", "claude-sonnet-4-20250514", 100, 50)
+        )
+        .expect("write");
         f.sync_all().expect("sync write");
     }
 
@@ -1196,8 +1229,12 @@ async fn start_tailing_multiple_sources_share_one_worker() {
         writeln!(f, "{}", codex_heartbeat_line(100, 50, 0, 0)).expect("codex hb1");
         writeln!(f, "{}", codex_heartbeat_line(130, 70, 30, 20)).expect("codex hb2");
         let mut f = std::fs::File::create(&claude_file).expect("create claude");
-        writeln!(f, "{}", claude_jsonl_line("sess-multi", "claude-sonnet-4-20250514", 100, 50))
-            .expect("claude line");
+        writeln!(
+            f,
+            "{}",
+            claude_jsonl_line("sess-multi", "claude-sonnet-4-20250514", 100, 50)
+        )
+        .expect("claude line");
     }
 
     let (db, _status, _event_bus, _settings, writer_handle, writer_join) = tail_test_setup(64);
@@ -1206,7 +1243,12 @@ async fn start_tailing_multiple_sources_share_one_worker() {
     let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter), Box::new(ClaudeCodeAdapter)];
     let sources = vec![
         source_for_file(dir.path(), &codex_file, AgentKind::Codex, "src-multi-codex"),
-        source_for_file(dir.path(), &claude_file, AgentKind::ClaudeCode, "src-multi-claude"),
+        source_for_file(
+            dir.path(),
+            &claude_file,
+            AgentKind::ClaudeCode,
+            "src-multi-claude",
+        ),
     ];
 
     let handle = start_tailing(
@@ -1384,12 +1426,7 @@ async fn start_tailing_catchup_no_new_data_returns_ok_none() {
         .expect("seed log_files row");
 
     let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter)];
-    let source = source_for_file(
-        dir.path(),
-        &file_path,
-        AgentKind::Codex,
-        "src-caught-up",
-    );
+    let source = source_for_file(dir.path(), &file_path, AgentKind::Codex, "src-caught-up");
 
     let handle = start_tailing(
         Arc::clone(&db),
@@ -1792,12 +1829,7 @@ async fn start_tailing_writer_backpressure_applies_sleep() {
     seed_active_generation(&db.lock().unwrap(), "gen-backpressure");
 
     let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter)];
-    let source = source_for_file(
-        dir.path(),
-        &file_path,
-        AgentKind::Codex,
-        "src-backpressure",
-    );
+    let source = source_for_file(dir.path(), &file_path, AgentKind::Codex, "src-backpressure");
 
     let handle = start_tailing(
         Arc::clone(&db),
@@ -1832,12 +1864,7 @@ async fn start_tailing_writer_backpressure_applies_sleep() {
 
     // Give the worker time to process the events (with backpressure sleeps).
     let process_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    wait_for(
-        || usage_event_count(&db) >= 2,
-        process_deadline,
-        100,
-    )
-    .await;
+    wait_for(|| usage_event_count(&db) >= 2, process_deadline, 100).await;
 
     let _ = handle.shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle.join_handle).await;
@@ -1897,7 +1924,8 @@ async fn start_tailing_modified_event_canonical_paths_covers_worker_loop() {
                 }
             }
         }
-    }).to_string();
+    })
+    .to_string();
     let hb2 = serde_json::json!({
         "timestamp": "2026-05-20T08:00:02.000Z",
         "type": "event_msg",
@@ -1916,7 +1944,8 @@ async fn start_tailing_modified_event_canonical_paths_covers_worker_loop() {
                 }
             }
         }
-    }).to_string();
+    })
+    .to_string();
     {
         let mut f = std::fs::File::create(&file_path).expect("create");
         writeln!(f, "{hb1}").expect("hb1");
@@ -1929,7 +1958,12 @@ async fn start_tailing_modified_event_canonical_paths_covers_worker_loop() {
 
     let adapters: Vec<BoxedAdapter> = vec![Box::new(CodexAdapter)];
     // Use canonicalized paths for both root and file.
-    let source = source_for_file(&dir_path, &file_path, AgentKind::Codex, "src-canonical-modify");
+    let source = source_for_file(
+        &dir_path,
+        &file_path,
+        AgentKind::Codex,
+        "src-canonical-modify",
+    );
 
     let handle = start_tailing(
         Arc::clone(&db),
@@ -1971,7 +2005,8 @@ async fn start_tailing_modified_event_canonical_paths_covers_worker_loop() {
                 }
             }
         }
-    }).to_string();
+    })
+    .to_string();
     {
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -2295,8 +2330,7 @@ fn rescan_changed_files_codex_with_model_triggers_backfill() {
             .append(true)
             .open(&file_path)
             .expect("open append");
-        writeln!(f, "{}", codex_turn_context_line("gpt-5.3-codex-spark"))
-            .expect("tc");
+        writeln!(f, "{}", codex_turn_context_line("gpt-5.3-codex-spark")).expect("tc");
         writeln!(f, "{}", codex_heartbeat_line(190, 110, 60, 40)).expect("hb3");
         f.sync_all().expect("sync");
     }
@@ -2448,12 +2482,7 @@ async fn start_tailing_writer_shutdown_covers_send_error_and_rescan_error() {
 
     // Wait for catch-up to process both files.
     let catchup_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    wait_for(
-        || usage_event_count(&db) >= 2,
-        catchup_deadline,
-        50,
-    )
-    .await;
+    wait_for(|| usage_event_count(&db) >= 2, catchup_deadline, 50).await;
     let count_after_catchup = usage_event_count(&db);
     assert!(
         count_after_catchup >= 2,

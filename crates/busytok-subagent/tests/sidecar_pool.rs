@@ -485,15 +485,15 @@ fn set_responder_factory_called_twice_is_ignored() {
         SubagentResourcePolicyConfig::default(),
     ));
     let executor2 = Arc::new(SidecarTaskExecutor::with_pool(Arc::clone(&pool2), None));
-    let (factory1, _h1) =
-        make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor2));
-    let (factory2, _h2) =
-        make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor2));
+    let (factory1, _h1) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor2));
+    let (factory2, _h2) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor2));
     pool2.set_responder_factory(factory1);
     // Second call — OnceLock::set returns Err, warning is logged, call is ignored.
     pool2.set_responder_factory(factory2);
     // Verify the first factory is still active by ensuring ensure_worker works.
-    let sup = pool2.ensure_worker("deepseek").expect("ensure_worker after double set");
+    let sup = pool2
+        .ensure_worker("deepseek")
+        .expect("ensure_worker after double set");
     assert!(sup.config().provider_id == "deepseek");
 }
 
@@ -504,7 +504,10 @@ async fn remove_worker_and_kill_with_no_worker_is_noop() {
     let (pool, _gate, _exec) = make_test_pool();
     // Don't create any worker — remove should be a no-op.
     let result = pool.remove_worker_and_kill("nonexistent").await;
-    assert!(result.is_ok(), "remove_worker_and_kill on nonexistent must be Ok");
+    assert!(
+        result.is_ok(),
+        "remove_worker_and_kill on nonexistent must be Ok"
+    );
 }
 
 /// `supervisor_for_session` with no DB returns the first supervisor

@@ -71,9 +71,7 @@ fn claude_default_roots_picks_up_claude_config_dir_env() {
 
     // The CLAUDE_CONFIG_DIR root should produce at least one source with
     // the .jsonl file we created.
-    let found = sources
-        .iter()
-        .any(|s| s.files.iter().any(|f| f == &file));
+    let found = sources.iter().any(|s| s.files.iter().any(|f| f == &file));
     assert!(
         found,
         "CLAUDE_CONFIG_DIR root must discover the test .jsonl file"

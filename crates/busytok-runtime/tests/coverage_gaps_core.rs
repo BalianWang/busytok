@@ -46,9 +46,7 @@ use busytok_domain::{
 };
 use busytok_events::AppEvent;
 use busytok_events::AppEventBus;
-use busytok_protocol::dto::{
-    LiveSampleDto, ReadinessStateDto, ScanProgressDto,
-};
+use busytok_protocol::dto::{LiveSampleDto, ReadinessStateDto, ScanProgressDto};
 use busytok_runtime::read_service::{ReadError, ReadErrorKind, ReadQuery, ReadService};
 use busytok_runtime::rebuild::{
     self, create_generation, execute_promotion_barrier, initiate_rebuild,
@@ -63,11 +61,11 @@ use busytok_runtime::writer::{
     self, spawn_test_writer_with_capacity, spawn_writer, ApplyReplayCommand,
     DiagnosticWriteCommand, FlushCommand, GenerationCreateCommand, LogSourceUpsertCommand,
     ProgressCheckpointCommand, PromotionBarrierCommand, RealtimeSummaryReplaceCommand,
-    RecordTailReplayCommand, ResetFailedCheckpointsCommand, RebuildRollupsCommand,
-    ShutdownCommand, TailBatchCommand, TailReplayBatchCommand, WriteCommand, WriterHandle,
+    RebuildRollupsCommand, RecordTailReplayCommand, ResetFailedCheckpointsCommand, ShutdownCommand,
+    TailBatchCommand, TailReplayBatchCommand, WriteCommand, WriterHandle,
 };
-use busytok_runtime::ServiceApp;
 use busytok_runtime::BusytokSupervisor;
+use busytok_runtime::ServiceApp;
 use busytok_store::write_queries;
 use busytok_store::{Database, LogSourceRow};
 
@@ -164,7 +162,10 @@ fn status_snapshot_push_transient_sample_evicts_oldest_at_capacity() {
             events_per_sec: 1.0,
         });
     }
-    assert_eq!(snap.transient_ring_buffer.len(), TRANSIENT_RING_BUFFER_CAPACITY);
+    assert_eq!(
+        snap.transient_ring_buffer.len(),
+        TRANSIENT_RING_BUFFER_CAPACITY
+    );
 
     // Push one more — oldest should be evicted.
     snap.push_transient_sample(LiveSampleDto {
@@ -173,10 +174,16 @@ fn status_snapshot_push_transient_sample_evicts_oldest_at_capacity() {
         cost_per_sec: Some(0.99),
         events_per_sec: 9.0,
     });
-    assert_eq!(snap.transient_ring_buffer.len(), TRANSIENT_RING_BUFFER_CAPACITY);
+    assert_eq!(
+        snap.transient_ring_buffer.len(),
+        TRANSIENT_RING_BUFFER_CAPACITY
+    );
     // First entry should now be index=1 (was 0, evicted).
     assert_ne!(snap.transient_ring_buffer[0].bucket_start_ms, 0);
-    assert_eq!(snap.transient_ring_buffer.back().unwrap().bucket_start_ms, 9999);
+    assert_eq!(
+        snap.transient_ring_buffer.back().unwrap().bucket_start_ms,
+        9999
+    );
 }
 
 #[test]
@@ -216,7 +223,11 @@ fn status_snapshot_apply_runtime_health_update_keeps_existing_seq_when_none() {
     let mut snap = ServiceStatusSnapshot::new();
     snap.latest_event_seq = Some(7);
     snap.apply_runtime_health_update(10, 20, None);
-    assert_eq!(snap.latest_event_seq, Some(7), "existing seq must be preserved");
+    assert_eq!(
+        snap.latest_event_seq,
+        Some(7),
+        "existing seq must be preserved"
+    );
 }
 
 #[test]
@@ -256,10 +267,7 @@ fn status_snapshot_apply_durable_transition_sets_readiness_and_generation() {
     assert_eq!(snap.readiness, ReadinessStateDto::Starting);
     assert!(snap.active_generation_id.is_none());
 
-    snap.apply_durable_transition(
-        ReadinessStateDto::ReadyExact,
-        Some("gen-xyz".to_string()),
-    );
+    snap.apply_durable_transition(ReadinessStateDto::ReadyExact, Some("gen-xyz".to_string()));
     assert_eq!(snap.readiness, ReadinessStateDto::ReadyExact);
     assert_eq!(snap.active_generation_id.as_deref(), Some("gen-xyz"));
 
@@ -468,7 +476,8 @@ fn record_new_file_during_rebuild_delegates_to_observation() {
         last_mtime_ms: Some(5555),
     };
 
-    record_new_file_during_rebuild(&db, "gen-f", &frontier).expect("record_new_file_during_rebuild");
+    record_new_file_during_rebuild(&db, "gen-f", &frontier)
+        .expect("record_new_file_during_rebuild");
 
     let conn = db.conn();
     let count: i64 = conn
@@ -533,7 +542,10 @@ fn promotion_barrier_succeeds_when_no_observations_exist() {
     }
 
     let result = execute_promotion_barrier(&db, &status, "gen-empty").expect("barrier");
-    assert!(result.promoted, "promotion should succeed with no observations");
+    assert!(
+        result.promoted,
+        "promotion should succeed with no observations"
+    );
     assert_eq!(result.replay_rows_applied, 0);
 
     let snap = status.try_read().unwrap();
@@ -929,7 +941,10 @@ async fn settings_write_week_starts_on_rejects_non_numeric_value() {
     let result = respond_rx.await.expect("response");
     assert!(result.is_err(), "non-numeric value should error");
     let err = result.unwrap_err();
-    assert!(err.contains("invalid week_starts_on"), "unexpected err: {err}");
+    assert!(
+        err.contains("invalid week_starts_on"),
+        "unexpected err: {err}"
+    );
 
     drop(handle);
     let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
@@ -956,7 +971,10 @@ async fn settings_write_unknown_key_returns_error() {
     let result = respond_rx.await.expect("response");
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.contains("unsupported settings key"), "unexpected err: {err}");
+    assert!(
+        err.contains("unsupported settings key"),
+        "unexpected err: {err}"
+    );
 
     drop(handle);
     let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
@@ -1196,7 +1214,10 @@ async fn diagnostic_write_with_warning_severity_publishes_error_event() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    assert!(found_error, "warning severity should publish AppEvent::Error");
+    assert!(
+        found_error,
+        "warning severity should publish AppEvent::Error"
+    );
 
     drop(handle);
     let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
@@ -1307,7 +1328,9 @@ async fn tail_replay_batch_command_enqueues_rows() {
         },
     ];
     handle
-        .send(WriteCommand::TailReplayBatch(TailReplayBatchCommand { rows }))
+        .send(WriteCommand::TailReplayBatch(TailReplayBatchCommand {
+            rows,
+        }))
         .await
         .expect("send");
 
@@ -1404,7 +1427,10 @@ async fn apply_replay_to_target_command_applies_rows_to_generation() {
             |r| r.get(0),
         )
         .expect("query");
-    assert_eq!(count, 2, "two events should be applied to target generation");
+    assert_eq!(
+        count, 2,
+        "two events should be applied to target generation"
+    );
 
     drop(handle);
     let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
@@ -1496,7 +1522,10 @@ async fn flush_command_returns_pending_errors() {
 
     // Send a flush with no pending errors — should return Ok.
     let result = handle.flush().await;
-    assert!(result.is_ok(), "flush with no pending errors should succeed");
+    assert!(
+        result.is_ok(),
+        "flush with no pending errors should succeed"
+    );
 
     drop(handle);
     let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
@@ -1661,17 +1690,19 @@ async fn progress_checkpoint_command_with_active_generation_refreshes_summary() 
     let (handle, join) = spawn_writer(db.clone(), status, event_bus, settings, 16);
 
     handle
-        .send(WriteCommand::ProgressCheckpoint(ProgressCheckpointCommand {
-            file_id: "file-ckpt".to_string(),
-            source_id: "src-ckpt".to_string(),
-            agent: "claude_code".to_string(),
-            path: "/tmp/ckpt.jsonl".to_string(),
-            inode: Some("inode-1".to_string()),
-            offset_bytes: 4096,
-            size_bytes: 8192,
-            last_mtime_ms: Some(12345),
-            state: "active".to_string(),
-        }))
+        .send(WriteCommand::ProgressCheckpoint(
+            ProgressCheckpointCommand {
+                file_id: "file-ckpt".to_string(),
+                source_id: "src-ckpt".to_string(),
+                agent: "claude_code".to_string(),
+                path: "/tmp/ckpt.jsonl".to_string(),
+                inode: Some("inode-1".to_string()),
+                offset_bytes: 4096,
+                size_bytes: 8192,
+                last_mtime_ms: Some(12345),
+                state: "active".to_string(),
+            },
+        ))
         .await
         .expect("send");
 
@@ -1785,7 +1816,8 @@ async fn read_service_in_memory_backend_propagates_query_error() {
 
     let result = service
         .run(ReadQuery::new("test.query_err", "test"), |conn| {
-            conn.execute("SELECT FROM invalid_sql", []).map(|_| ())
+            conn.execute("SELECT FROM invalid_sql", [])
+                .map(|_| ())
                 .map_err(anyhow::Error::from)
         })
         .await;
@@ -1853,9 +1885,12 @@ async fn read_service_returns_internal_on_join_handle_panic() {
     let service = ReadService::new_in_memory(db, 1);
 
     let result: Result<(), ReadError> = service
-        .run(ReadQuery::new("test.panic", "test"), |_conn| -> Result<(), anyhow::Error> {
-            panic!("intentional panic in read closure");
-        })
+        .run(
+            ReadQuery::new("test.panic", "test"),
+            |_conn| -> Result<(), anyhow::Error> {
+                panic!("intentional panic in read closure");
+            },
+        )
         .await;
 
     let err = result.unwrap_err();
@@ -1936,7 +1971,9 @@ async fn read_service_row_count_outcome_carries_count() {
                 let rows: Vec<i64> = stmt
                     .query_map([], |r| r.get(0))?
                     .collect::<std::result::Result<_, _>>()?;
-                Ok(busytok_runtime::read_service::ReadOutcome::with_row_count(rows, 3))
+                Ok(busytok_runtime::read_service::ReadOutcome::with_row_count(
+                    rows, 3,
+                ))
             },
         )
         .await

@@ -850,15 +850,14 @@ provider_id = "openai"
         std::fs::create_dir_all(paths.config_dir()).unwrap();
         let file_path = paths.config_dir().join(SETTINGS_FILE_NAME);
         // "local" is parseable but its canonical form differs.
-        std::fs::write(
-            &file_path,
-            "timezone = \"local\"\nweek_starts_on = 1\n",
-        )
-        .unwrap();
+        std::fs::write(&file_path, "timezone = \"local\"\nweek_starts_on = 1\n").unwrap();
 
         let settings = BusytokSettings::load(&paths).unwrap();
         // The canonical form must differ from "local".
-        assert_ne!(settings.timezone, "local", "timezone should be canonicalized");
+        assert_ne!(
+            settings.timezone, "local",
+            "timezone should be canonicalized"
+        );
         let rtz = busytok_domain::ReportingTimezone::parse(&settings.timezone).unwrap();
         assert_eq!(rtz.canonical_name(), settings.timezone);
         // Persistence: the file should now contain the canonical form.
@@ -970,11 +969,7 @@ provider_id = "openai"
         settings.canonicalize_builtin_profiles();
 
         // The custom pi/search-cheap should be preserved.
-        let preserved = settings
-            .subagent
-            .profiles
-            .get("pi/search-cheap")
-            .unwrap();
+        let preserved = settings.subagent.profiles.get("pi/search-cheap").unwrap();
         assert_eq!(preserved.model, "custom-model");
         assert_eq!(preserved.provider_id, Some("custom".to_string()));
         // The other two should be filled with defaults.
@@ -1010,7 +1005,10 @@ provider_id = "openai"
         let target = blocker.join("settings.toml"); // parent is a file
 
         let result = atomic_write(&target, "contents");
-        assert!(result.is_err(), "atomic_write should fail when parent is a file");
+        assert!(
+            result.is_err(),
+            "atomic_write should fail when parent is a file"
+        );
     }
 
     /// `atomic_write` succeeds and atomically replaces existing content.

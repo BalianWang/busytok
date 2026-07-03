@@ -2161,7 +2161,10 @@ mod tests {
         let result = parse_catalog_json(json);
         match result {
             Err(ReloadResult::Invalid { reason }) => {
-                assert!(reason.contains("unsupported schema_version"), "got: {reason}");
+                assert!(
+                    reason.contains("unsupported schema_version"),
+                    "got: {reason}"
+                );
                 assert!(reason.contains("expected '3'"), "got: {reason}");
             }
             other => panic!("expected Invalid, got {:?}", other),
@@ -2281,7 +2284,10 @@ mod tests {
         let result = parse_catalog_json(json);
         match result {
             Err(ReloadResult::Invalid { reason }) => {
-                assert!(reason.contains("cache_storage_per_million_hour"), "got: {reason}");
+                assert!(
+                    reason.contains("cache_storage_per_million_hour"),
+                    "got: {reason}"
+                );
             }
             other => panic!("expected Invalid, got {:?}", other),
         }
@@ -2313,8 +2319,18 @@ mod tests {
             cache_creation_tokens: 0,
             reasoning_tokens: 0,
         };
-        let result = estimate_cost_usd("definitely-not-a-real-model-xyz", usage, None, None, CostMode::Calculate);
-        assert!(result.is_none(), "expected None for unknown model, got {:?}", result);
+        let result = estimate_cost_usd(
+            "definitely-not-a-real-model-xyz",
+            usage,
+            None,
+            None,
+            CostMode::Calculate,
+        );
+        assert!(
+            result.is_none(),
+            "expected None for unknown model, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -2335,13 +2351,7 @@ mod tests {
             cache_creation_tokens: 0,
             reasoning_tokens: 0,
         };
-        let result = estimate_cost_usd(
-            &model_name,
-            usage,
-            Some(0.42),
-            None,
-            CostMode::Auto,
-        );
+        let result = estimate_cost_usd(&model_name, usage, Some(0.42), None, CostMode::Auto);
         assert_eq!(result, Some(0.42));
     }
 
@@ -2392,12 +2402,16 @@ mod tests {
         // (empty prices) should fall back to the embedded catalog.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("invalid-catalog.json");
-        let invalid = r#"{"schema_version":"3","version":"v","updated":"v","aliases":{},"prices":[]}"#;
+        let invalid =
+            r#"{"schema_version":"3","version":"v","updated":"v","aliases":{},"prices":[]}"#;
         std::fs::write(&path, invalid).unwrap();
         reset_catalog();
         init_catalog(Some(&path));
         let catalog = load_catalog();
-        assert!(!catalog.prices.is_empty(), "embedded fallback should be loaded");
+        assert!(
+            !catalog.prices.is_empty(),
+            "embedded fallback should be loaded"
+        );
         reset_catalog();
         init_catalog(None::<&std::path::Path>);
     }
@@ -2413,7 +2427,10 @@ mod tests {
         reset_catalog();
         init_catalog(Some(&dir_path));
         let catalog = load_catalog();
-        assert!(!catalog.prices.is_empty(), "embedded fallback should be loaded on IO error");
+        assert!(
+            !catalog.prices.is_empty(),
+            "embedded fallback should be loaded on IO error"
+        );
         reset_catalog();
         init_catalog(None::<&std::path::Path>);
     }

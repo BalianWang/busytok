@@ -251,7 +251,10 @@ fn refresh_source_summaries_for_inserted_events_uses_fallback_when_no_source_fil
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(fallback_exists, 1, "fallback source should have a summary row");
+    assert_eq!(
+        fallback_exists, 1,
+        "fallback source should have a summary row"
+    );
 
     // src-real is NOT in the fallback list and the event has no source_file_id
     // pointing to it, so it must NOT get a summary row — proving only the
@@ -265,7 +268,10 @@ fn refresh_source_summaries_for_inserted_events_uses_fallback_when_no_source_fil
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(real_exists, 0, "non-fallback source should not have a summary row");
+    assert_eq!(
+        real_exists, 0,
+        "non-fallback source should not have a summary row"
+    );
 }
 
 // ── remove_other_dedupe_rows no-op when only the keep_id matches ──────────────
@@ -336,7 +342,9 @@ fn update_materialized_aggregates_from_events_empty_is_noop() {
 
     let count: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM usage_buckets_2s", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM usage_buckets_2s", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(count, 0);
 }
