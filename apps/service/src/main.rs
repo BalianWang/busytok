@@ -51,3 +51,53 @@ async fn run_main(paths: BusytokPaths) -> Result<()> {
     let app = ServiceApp::boot(paths, startup).await?;
     app.run().await
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// `run_main` boots the full service (stages 1–4) and enters the `run()`
+    /// select-loop. We verify it reaches the blocking point by checking that
+    /// the service.ready marker is written (indicating boot completed).
+    ///
+    /// `run_main` is `!Send` (ServiceApp::run uses tokio::signal::ctrl_c),
+    /// so we use `tokio::select!` to race it against a marker-poll loop
+    /// instead of `tokio::spawn`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_main_boots_service_and_enters_run_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = BusytokPaths::for_test(dir.path());
+        paths.ensure_dirs_exist().expect("ensure dirs");
+        let data_dir = paths.data_dir().to_path_buf();
+
+        // Race run_main against a marker-poll loop. When the marker
+        // appears, boot() completed and run() entered its blocking select!.
+        tokio::select! {
+            result = run_main(paths) => {
+                panic!(
+                    "run_main should block on select! loop, but completed with: {:?}",
+                    result
+                );
+            }
+            _ = async {
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                loop {
+                    if busytok_config::service_marker::exists(&data_dir) {
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => {}
+        }
+
+        assert!(
+            busytok_config::service_marker::exists(&data_dir),
+            "service.ready marker must appear after boot()"
+        );
+    }
+}

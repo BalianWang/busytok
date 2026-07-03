@@ -475,6 +475,203 @@ async fn locator_update_skips_validation_when_disabling() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
+/// P2: `validate_runtime_dir` must reject malformed `manifest.json` content.
+/// A directory with `manifest.json` containing `"{}"` (missing required
+/// SidecarManifest fields: version/protocol_version/bundle/node_runtime_version)
+/// must be rejected at the write path, not persisted as enabled. Without
+/// this, the GUI could accept a dir that only fails later during doctor's
+/// `bundle_manifest_readable` check.
+#[tokio::test]
+#[serial]
+async fn locator_update_rejects_malformed_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let settings = BusytokSettings::default();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // Stage bundle.js + manifest.json with INVALID content (not a valid
+    // SidecarManifest — missing all required fields).
+    let dir = tmp.path().join("bad-manifest-sidecar");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("pi-sidecar.bundle.js"), "// stub").unwrap();
+    fs::write(dir.join("manifest.json"), "{}").unwrap();
+    let err = supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("validation_error"),
+        "should be validation_error: {msg}"
+    );
+    assert!(
+        msg.contains("valid SidecarManifest"),
+        "should mention 'valid SidecarManifest': {msg}"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+/// P2: `validate_runtime_dir` must reject a manifest that references a
+/// bundle filename which doesn't exist in the directory. Catches
+/// manifest/bundle drift — manifest says "foo.bundle.js" but only
+/// "pi-sidecar.bundle.js" is on disk. Without this, the runtime would
+/// fail at spawn time with a confusing "bundle not found" error.
+#[tokio::test]
+#[serial]
+async fn locator_update_rejects_manifest_referencing_missing_bundle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let settings = BusytokSettings::default();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // Stage pi-sidecar.bundle.js + a manifest referencing a DIFFERENT
+    // bundle filename that doesn't exist ("different.bundle.js").
+    let dir = tmp.path().join("drift-manifest-sidecar");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("pi-sidecar.bundle.js"), "// stub").unwrap();
+    let drift_manifest = SidecarManifest {
+        version: "1".to_string(),
+        protocol_version: busytok_subagent::sidecar::protocol::PROTOCOL_VERSION,
+        bundle: "different.bundle.js".to_string(),
+        node_runtime_version: "22.6.0".to_string(),
+    };
+    fs::write(dir.join("manifest.json"), drift_manifest.to_json_string()).unwrap();
+    let err = supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("validation_error"),
+        "should be validation_error: {msg}"
+    );
+    assert!(
+        msg.contains("different.bundle.js"),
+        "should mention the missing manifest-referenced bundle: {msg}"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+/// P2: when `node_runtime = "bundled"` (the default), `validate_runtime_dir`
+/// must reject a directory missing `node/<current-arch>/node`. Without
+/// this, the GUI could persist a broken packaged runtime that would only
+/// fail later during rebuild (entering degraded `FailingTaskExecutor`
+/// mode) or doctor's `bundled_node_arch` check.
+#[tokio::test]
+#[serial]
+async fn locator_update_rejects_missing_node_binary_for_current_arch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    // Default settings → node_runtime = "bundled" → node binary required.
+    let settings = BusytokSettings::default();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // Stage bundle.js + valid manifest but NO node binary (omit the
+    // `node/<arch>/node` file entirely).
+    let dir = tmp.path().join("no-node-sidecar");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("pi-sidecar.bundle.js"), "// stub").unwrap();
+    let manifest = SidecarManifest {
+        version: "1".to_string(),
+        protocol_version: busytok_subagent::sidecar::protocol::PROTOCOL_VERSION,
+        bundle: "pi-sidecar.bundle.js".to_string(),
+        node_runtime_version: "22.6.0".to_string(),
+    };
+    fs::write(dir.join("manifest.json"), manifest.to_json_string()).unwrap();
+    let err = supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("validation_error"),
+        "should be validation_error: {msg}"
+    );
+    assert!(
+        msg.contains("node_runtime='bundled'"),
+        "should mention node_runtime='bundled': {msg}"
+    );
+    assert!(
+        msg.contains("not found"),
+        "should mention 'not found': {msg}"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
+/// P2 (Unix-only): when `node_runtime = "bundled"`, `validate_runtime_dir`
+/// must reject a node binary that EXISTS but is NOT executable. Without the
+/// execute-bit check, the GUI could persist a runtime that passes existence
+/// but fails at spawn with EACCES. The `stage_complete_sidecar_dir` fixture
+/// uses 0o755; here we explicitly chmod 0o644 to exercise the negative path.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn locator_update_rejects_non_executable_node_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let settings = BusytokSettings::default();
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .unwrap();
+
+    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
+
+    // Stage a complete sidecar dir, then strip the execute bits.
+    let dir = stage_complete_sidecar_dir(&tmp);
+    let node_path = dir.join("node").join(std::env::consts::ARCH).join("node");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&node_path).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&node_path, perms).unwrap();
+
+    let err = supervisor
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: dir.to_string_lossy().to_string(),
+            enabled: true,
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("validation_error"),
+        "should be validation_error: {msg}"
+    );
+    assert!(
+        msg.contains("not executable"),
+        "should mention 'not executable': {msg}"
+    );
+
+    supervisor.shutdown_writer().await.unwrap();
+}
+
 /// P0 edge: calling `pi_sidecar_locator_update` with the SAME runtime_dir
 /// and enabled=true (when already enabled) is a no-op — no rebuild, no
 /// dispatcher churn. Verifies the `changed=false` branch.
@@ -523,39 +720,45 @@ async fn locator_update_no_rebuild_when_unchanged() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
-/// P0 edge: when `construct_sidecar` fails during rebuild (e.g., missing
-/// node binary → `resolve_base_sidecar_config` error), the rebuild
+/// P0 edge: when `construct_sidecar` fails during rebuild, the rebuild
 /// "succeeds" but produces a degraded `FailingTaskExecutor` +
 /// `sidecar_init_error`. The RPC still returns Ok — the error is
 /// surfaced via `sidecar_init_error()` / doctor checks, not propagated.
+///
+/// After the P2 upgrade, `validate_runtime_dir` catches missing
+/// `node/<arch>/node` when `node_runtime = "bundled"` (the default) — so
+/// the "missing node binary" scenario is no longer reachable via the RPC.
+/// This test now exercises the degraded-mode rebuild path via a DIFFERENT
+/// trigger: `node_runtime = "unknown"`, which validation doesn't check
+/// (it only validates the directory shape, not the `node_runtime` value).
+/// `resolve_base_sidecar_config` then fails with "unknown node_runtime"
+/// inside `construct_sidecar` → degraded `FailingTaskExecutor` injected.
 #[tokio::test]
 #[serial]
-async fn rebuild_degraded_when_node_binary_missing() {
+async fn rebuild_degraded_when_node_runtime_invalid() {
     let tmp = tempfile::tempdir().unwrap();
-    // Stage bundle.js + manifest.json but NO node binary.
-    let runtime_dir = tmp.path().join("pi-sidecar");
-    fs::create_dir_all(&runtime_dir).unwrap();
-    fs::write(runtime_dir.join("pi-sidecar.bundle.js"), "// stub bundle").unwrap();
-    let manifest = SidecarManifest {
-        version: "1".to_string(),
-        protocol_version: busytok_subagent::sidecar::protocol::PROTOCOL_VERSION,
-        bundle: "pi-sidecar.bundle.js".to_string(),
-        node_runtime_version: "22.6.0".to_string(),
-    };
-    fs::write(runtime_dir.join("manifest.json"), manifest.to_json_string()).unwrap();
+    // Stage a COMPLETE sidecar dir (bundle + manifest + node) so P2
+    // validation passes — the degraded mode must come from the
+    // `node_runtime = "unknown"` setting, not from missing files.
+    let runtime_dir = stage_complete_sidecar_dir(&tmp);
     let runtime_dir_str = runtime_dir.to_string_lossy().to_string();
 
     let db = Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let settings = BusytokSettings::default();
+    let mut settings = BusytokSettings::default();
+    // node_runtime="unknown" → resolve_base_sidecar_config fails with
+    // "unknown node_runtime" (config.rs:100-104). Validation doesn't
+    // check the node_runtime value, only the directory shape — so the
+    // RPC succeeds, but the rebuild enters degraded mode.
+    settings.subagent.pi_sidecar.node_runtime = "unknown".to_string();
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
 
     let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
 
-    // Validation passes (bundle.js + manifest.json exist), but
-    // resolve_base_sidecar_config fails (no node binary) → degraded mode.
+    // Validation passes (complete dir), but resolve_base_sidecar_config
+    // fails (unknown node_runtime) → degraded mode.
     supervisor
         .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
             runtime_dir: runtime_dir_str,
@@ -567,7 +770,7 @@ async fn rebuild_degraded_when_node_binary_missing() {
     // The rebuild produced a FailingTaskExecutor + sidecar_init_error.
     assert!(
         supervisor.sidecar_init_error().is_some(),
-        "sidecar_init_error should be Some (node binary missing)"
+        "sidecar_init_error should be Some (unknown node_runtime)"
     );
     // worker_pool is None (construct_sidecar's Err branch).
     assert!(

@@ -779,4 +779,107 @@ mod tests {
         let snap = status.try_read().unwrap();
         assert!(matches!(snap.readiness, ReadinessStateDto::ReadyDegraded));
     }
+
+    /// `record_new_file_observation` writes the source_file_checkpoint,
+    /// log_file_checkpoint, and generation_file_observation rows for a newly
+    /// discovered file. Covers the new-file recording path.
+    #[test]
+    fn record_new_file_observation_writes_all_three_rows() {
+        let db = seeded_db();
+        create_generation(&db, "gen-newfile").unwrap();
+
+        record_new_file_observation(
+            &db,
+            "gen-newfile",
+            "file-new-1",
+            "src-1",
+            "claude_code",
+            "/tmp/new.jsonl",
+            0,
+            100,
+            None,
+        )
+        .unwrap();
+
+        // source_file_checkpoints row created.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM source_file_checkpoints WHERE id = 'file-new-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // log_files row created (upsert_log_file_checkpoint writes to log_files table).
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM log_files WHERE id = 'file-new-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // generation_file_observations row created with new_file scan_status.
+        let scan_status: String = db
+            .conn()
+            .query_row(
+                "SELECT scan_status FROM generation_file_observations \
+                 WHERE generation_id = 'gen-newfile' AND source_file_id = 'file-new-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scan_status, "new_file");
+    }
+
+    /// `record_new_file_observation` is idempotent for the checkpoint rows
+    /// (upsert) — calling twice with the same file_id doesn't fail.
+    #[test]
+    fn record_new_file_observation_is_idempotent_for_checkpoints() {
+        let db = seeded_db();
+        create_generation(&db, "gen-idem").unwrap();
+
+        // First call writes everything.
+        record_new_file_observation(
+            &db,
+            "gen-idem",
+            "file-x",
+            "src-1",
+            "claude_code",
+            "/tmp/x.jsonl",
+            0,
+            100,
+            None,
+        )
+        .unwrap();
+
+        // Second call upserts (no duplicate-key failure).
+        record_new_file_observation(
+            &db,
+            "gen-idem",
+            "file-x",
+            "src-1",
+            "claude_code",
+            "/tmp/x.jsonl",
+            200,
+            500,
+            None,
+        )
+        .unwrap();
+
+        // Checkpoint row count is still 1 (upsert, not insert).
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM source_file_checkpoints WHERE id = 'file-x'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

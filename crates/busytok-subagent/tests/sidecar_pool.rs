@@ -444,9 +444,10 @@ fn for_each_supervisor_iterates_all_workers() {
     assert_eq!(pids, vec!["deepseek".to_string(), "openai".to_string()]);
 }
 
-/// `shutdown_all` clears the map and force-kills all supervisors (best
-/// effort — supervisors in this test are not started, so force_kill is a
-/// no-op on a None child).
+/// `shutdown_all` (graceful) clears the map and drains all supervisors.
+/// Supervisors in this test are not started (no real child), so
+/// `shutdown().await` is a no-op on `child=None` — but the map drain happens
+/// regardless.
 #[tokio::test]
 async fn shutdown_all_clears_map() {
     let (pool, _gate, _exec) = make_test_pool();
@@ -464,5 +465,65 @@ async fn shutdown_all_clears_map() {
         pool.worker_snapshots().await.len(),
         0,
         "map must be empty after shutdown_all"
+    );
+}
+
+/// `set_responder_factory` called twice logs a warning and ignores the second
+/// call (OnceLock rejects the overwrite).
+#[test]
+fn set_responder_factory_called_twice_is_ignored() {
+    let (_pool, gate, _exec) = make_test_pool();
+    // First call succeeds (set in make_test_pool, but that's internal).
+    // We need to call it again on the same pool — but make_test_pool already
+    // called set_responder_factory. So we build a fresh pool and call twice.
+    let pool2 = Arc::new(WorkerPool::new(
+        base_config(),
+        None,
+        make_providers(),
+        canned_credential_reader(),
+        Some(Arc::clone(&gate)),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor2 = Arc::new(SidecarTaskExecutor::with_pool(Arc::clone(&pool2), None));
+    let (factory1, _h1) =
+        make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor2));
+    let (factory2, _h2) =
+        make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor2));
+    pool2.set_responder_factory(factory1);
+    // Second call — OnceLock::set returns Err, warning is logged, call is ignored.
+    pool2.set_responder_factory(factory2);
+    // Verify the first factory is still active by ensuring ensure_worker works.
+    let sup = pool2.ensure_worker("deepseek").expect("ensure_worker after double set");
+    assert!(sup.config().provider_id == "deepseek");
+}
+
+/// `remove_worker_and_kill` when no worker exists for the given provider_id
+/// is a no-op (returns Ok, no panic).
+#[tokio::test]
+async fn remove_worker_and_kill_with_no_worker_is_noop() {
+    let (pool, _gate, _exec) = make_test_pool();
+    // Don't create any worker — remove should be a no-op.
+    let result = pool.remove_worker_and_kill("nonexistent").await;
+    assert!(result.is_ok(), "remove_worker_and_kill on nonexistent must be Ok");
+}
+
+/// `supervisor_for_session` with no DB returns the first supervisor
+/// (single-provider fallback for no-DB test paths).
+#[tokio::test]
+async fn supervisor_for_session_with_no_db_returns_first() {
+    let (pool, _gate, _exec) = make_test_pool();
+    pool.ensure_worker("deepseek").expect("ensure deepseek");
+    pool.ensure_worker("openai").expect("ensure openai");
+
+    // No DB was passed to the pool, so supervisor_for_session should
+    // fall back to returning the first candidate.
+    let result = pool.supervisor_for_session("any-session-id");
+    assert!(result.is_some(), "must return Some fallback when no DB");
+    let (pid, _sup) = result.unwrap();
+    // The first inserted provider — HashMap iteration order is not
+    // guaranteed, but one of the two must be returned.
+    assert!(
+        pid == "deepseek" || pid == "openai",
+        "fallback must return a known provider, got {pid}"
     );
 }

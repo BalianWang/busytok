@@ -168,7 +168,7 @@ When upgrading from v0.0.8 (no Provider concept):
 - `keyring-rs` integration in `busytok-service` (sole credential owner)
 - Provider config in `settings.toml` (metadata) + Keychain (secrets)
 - New RPC methods: `provider.create / list / update / delete / test_connection`
-- New RPC: `provider.set_key / get_key_status` (key never returned in plaintext; only "set" / "not set" / "invalid" status)
+- Key management is merged into the CRUD surface (no separate `set_key` / `get_key_status` RPCs): `provider.create` / `provider.update` accept an optional `api_key` field (written to keyring, never persisted to `settings.toml`); `provider.list`'s `ProviderDto` exposes `has_api_key: bool` ("set" / "not set" — key never returned in plaintext); `provider.test_connection` surfaces "invalid" by probing the upstream API. Rationale: fewer RPCs with the same capability; key status is read-only metadata best served alongside the provider object; a separate `set_key` would add a round-trip for the common "create provider + set key" flow.
 - `test_connection`: lightweight Rust-side HTTPS probe (`GET /v1/models` or `POST /v1/chat/completions` with 1-token prompt). Key read from keyring in-memory, used for the probe, never persisted/logged. This is a service health probe, not user-traffic proxying — does not violate the "never proxies traffic" invariant (which is about relaying agent traffic).
 - GUI: new "Providers" sidebar page with CRUD + API key input + connection test
 - CONTRIBUTING.md invariant update

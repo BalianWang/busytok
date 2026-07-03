@@ -840,4 +840,187 @@ provider_id = "openai"
             .expect("profile");
         assert_eq!(p.provider_id.as_deref(), Some("openai"));
     }
+
+    /// `load` canonicalizes "local" timezone to the system IANA name and persists
+    /// the canonical form back to disk. Covers the timezone.canonicalized branch.
+    #[test]
+    fn load_canonicalizes_local_timezone_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let file_path = paths.config_dir().join(SETTINGS_FILE_NAME);
+        // "local" is parseable but its canonical form differs.
+        std::fs::write(
+            &file_path,
+            "timezone = \"local\"\nweek_starts_on = 1\n",
+        )
+        .unwrap();
+
+        let settings = BusytokSettings::load(&paths).unwrap();
+        // The canonical form must differ from "local".
+        assert_ne!(settings.timezone, "local", "timezone should be canonicalized");
+        let rtz = busytok_domain::ReportingTimezone::parse(&settings.timezone).unwrap();
+        assert_eq!(rtz.canonical_name(), settings.timezone);
+        // Persistence: the file should now contain the canonical form.
+        let persisted = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            persisted.contains(&settings.timezone),
+            "settings file should contain the canonicalized timezone"
+        );
+    }
+
+    /// `load` falls back to system timezone when the persisted value is unparseable.
+    /// Covers the timezone.parse_failed branch.
+    #[test]
+    fn load_falls_back_when_timezone_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let file_path = paths.config_dir().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &file_path,
+            "timezone = \"definitely-not-a-real-timezone\"\nweek_starts_on = 1\n",
+        )
+        .unwrap();
+
+        let settings = BusytokSettings::load(&paths).unwrap();
+        // Should resolve to a valid system timezone (parseable).
+        let rtz = busytok_domain::ReportingTimezone::parse(&settings.timezone);
+        assert!(rtz.is_ok(), "fallback timezone must be parseable");
+        // Persisted fallback.
+        let persisted = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            persisted.contains(&settings.timezone),
+            "settings file should contain the fallback timezone"
+        );
+    }
+
+    /// `load` falls back to defaults when the settings file is corrupt TOML.
+    /// Covers the warn-and-default branch in `load`.
+    #[test]
+    fn load_falls_back_to_defaults_on_corrupt_toml() {
+        let tmp = TempDir::new().unwrap();
+        let paths = BusytokPaths::for_test(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let file_path = paths.config_dir().join(SETTINGS_FILE_NAME);
+        // Not valid TOML: unbalanced bracket.
+        std::fs::write(&file_path, "timezone = \"UTC\"\n[broken\n").unwrap();
+
+        let settings = BusytokSettings::load(&paths).unwrap();
+        // Default timezone (system IANA) — proves the default fallback fired.
+        let default = BusytokSettings::default();
+        assert_eq!(settings.timezone, default.timezone);
+    }
+
+    /// `load_from_file` falls back to defaults on corrupt TOML.
+    /// Covers the warn-and-default branch in `load_from_file`.
+    #[test]
+    fn load_from_file_falls_back_to_defaults_on_corrupt_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        // Not valid TOML: unterminated string.
+        std::fs::write(&path, "timezone = \"UTC\n").unwrap();
+
+        let settings = BusytokSettings::load_from_file(&path).unwrap();
+        let default = BusytokSettings::default();
+        assert_eq!(settings.timezone, default.timezone);
+    }
+
+    /// `canonicalize_builtin_profiles` fills missing built-in profiles and
+    /// emits the canonicalization log line.
+    #[test]
+    fn canonicalize_builtin_profiles_fills_missing() {
+        let mut settings = BusytokSettings::default();
+        // Remove all built-in profiles to force the fill path.
+        settings.subagent.profiles.clear();
+        assert!(settings.subagent.profiles.is_empty());
+
+        settings.canonicalize_builtin_profiles();
+
+        // All three built-ins should be present.
+        for name in ["pi/search-cheap", "pi/review-cheap", "pi/plan-cheap"] {
+            assert!(
+                settings.subagent.profiles.contains_key(name),
+                "built-in profile {name} should be filled"
+            );
+        }
+    }
+
+    /// `canonicalize_builtin_profiles` does not overwrite existing profiles.
+    #[test]
+    fn canonicalize_builtin_profiles_preserves_existing() {
+        let mut settings = BusytokSettings::default();
+        // Pre-set a custom profile for pi/search-cheap.
+        let custom = SubagentProfileConfig {
+            write_access: true,
+            tools: vec!["read".to_string()],
+            model: "custom-model".to_string(),
+            context_budget_tokens: 9999,
+            timeout_seconds: 1,
+            provider_id: Some("custom".to_string()),
+        };
+        settings
+            .subagent
+            .profiles
+            .insert("pi/search-cheap".to_string(), custom.clone());
+        // Remove the others.
+        settings.subagent.profiles.remove("pi/review-cheap");
+        settings.subagent.profiles.remove("pi/plan-cheap");
+
+        settings.canonicalize_builtin_profiles();
+
+        // The custom pi/search-cheap should be preserved.
+        let preserved = settings
+            .subagent
+            .profiles
+            .get("pi/search-cheap")
+            .unwrap();
+        assert_eq!(preserved.model, "custom-model");
+        assert_eq!(preserved.provider_id, Some("custom".to_string()));
+        // The other two should be filled with defaults.
+        assert!(settings.subagent.profiles.contains_key("pi/review-cheap"));
+        assert!(settings.subagent.profiles.contains_key("pi/plan-cheap"));
+    }
+
+    /// `save_to_file` creates parent directories when they don't exist.
+    #[test]
+    fn save_to_file_creates_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        // Nested path where neither `sub` nor `sub2` exists yet.
+        let path = tmp.path().join("sub").join("sub2").join("settings.toml");
+        assert!(!path.parent().unwrap().exists());
+
+        let settings = BusytokSettings::default();
+        settings.save_to_file(&path).unwrap();
+
+        assert!(path.exists(), "file should be created with parent dirs");
+        // Round-trip to verify it's actually valid TOML.
+        let loaded = BusytokSettings::load_from_file(&path).unwrap();
+        assert_eq!(loaded.timezone, settings.timezone);
+    }
+
+    /// `atomic_write` fails cleanly when the destination parent is a file
+    /// (not a directory), surfacing the create_dir_all error.
+    #[test]
+    fn atomic_write_fails_when_parent_is_a_file() {
+        let tmp = TempDir::new().unwrap();
+        // Create a file at `blocker` — trying to use it as a directory fails.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "i am a file").unwrap();
+        let target = blocker.join("settings.toml"); // parent is a file
+
+        let result = atomic_write(&target, "contents");
+        assert!(result.is_err(), "atomic_write should fail when parent is a file");
+    }
+
+    /// `atomic_write` succeeds and atomically replaces existing content.
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "old content").unwrap();
+
+        atomic_write(&path, "new content").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+    }
 }

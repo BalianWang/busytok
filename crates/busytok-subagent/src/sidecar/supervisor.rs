@@ -1245,3 +1245,67 @@ impl SidecarHandle {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PressureLevel::severity()` defines the escalation ordering:
+    /// Normal < Throttled < Evicting < Restarting.
+    #[test]
+    fn pressure_level_severity_orders_correctly() {
+        assert_eq!(PressureLevel::Normal.severity(), 0);
+        assert_eq!(PressureLevel::Throttled.severity(), 1);
+        assert_eq!(PressureLevel::Evicting.severity(), 2);
+        assert_eq!(PressureLevel::Restarting.severity(), 3);
+    }
+
+    /// The severity ordering is strict — every level differs from the others.
+    #[test]
+    fn pressure_level_severity_is_strictly_ordered() {
+        let levels = [
+            PressureLevel::Normal,
+            PressureLevel::Throttled,
+            PressureLevel::Evicting,
+            PressureLevel::Restarting,
+        ];
+        for (i, &a) in levels.iter().enumerate() {
+            for (j, &b) in levels.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a.severity(),
+                        b.severity(),
+                        "levels {i} and {j} should have distinct severity"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The poll interval constant is what the supervision loop uses; pinning
+    /// it to 100ms keeps the test-spawn loop responsive without busy-spinning.
+    #[test]
+    fn poll_interval_constant_value() {
+        assert_eq!(POLL_INTERVAL, Duration::from_millis(100));
+    }
+
+    /// The shutdown grace window must be long enough for the sidecar to flush
+    /// in-flight tasks but short enough that a stuck sidecar doesn't block
+    /// service exit indefinitely.
+    #[test]
+    fn shutdown_grace_constant_value() {
+        assert_eq!(SHUTDOWN_GRACE, Duration::from_secs(10));
+    }
+
+    /// Spec §5.4: rolling 5-minute window for crash-restart attempts.
+    #[test]
+    fn restart_window_constant_value() {
+        assert_eq!(RESTART_WINDOW, Duration::from_secs(300));
+    }
+
+    /// Spec §5.4: max 3 crash-restarts per 5-minute rolling window.
+    #[test]
+    fn max_crashes_per_window_constant_value() {
+        assert_eq!(MAX_CRASHES_PER_WINDOW, 3);
+    }
+}

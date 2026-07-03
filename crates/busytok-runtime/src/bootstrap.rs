@@ -432,4 +432,82 @@ mod tests {
             }
         }
     }
+
+    /// When readiness is NOT Starting (e.g., ReadyExact from a previous run),
+    /// `run_initial_scan_or_register_sources` takes the `run_initial_scan`
+    /// path instead of `register_new_install_sources`. With an in-memory DB,
+    /// `run_initial_scan` fails (reopen returns None) → ReadyDegraded outcome.
+    #[tokio::test]
+    async fn non_fresh_install_with_in_memory_db_yields_degraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = BusytokPaths::for_test(dir.path());
+        paths.ensure_dirs_exist().expect("ensure dirs");
+
+        let db = Database::open_in_memory().expect("open in-memory");
+        let mut settings = busytok_config::BusytokSettings::default();
+        settings.discovery.claude_code_default_paths = false;
+        settings.discovery.codex_default_paths = false;
+        let supervisor = Arc::new(BusytokSupervisor::with_adapters_and_settings(
+            db,
+            paths,
+            vec![],
+            settings,
+        ));
+
+        // Set readiness to ReadyExact so is_fresh_install is false.
+        supervisor.apply_service_status_snapshot(|snap| {
+            snap.readiness = ReadinessStateDto::ReadyExact;
+        });
+
+        let outcome = run_initial_scan_or_register_sources(supervisor).await;
+        match outcome {
+            InitialScanOutcome::ReadyDegraded(report) => {
+                assert!(
+                    report.error.contains("detached database")
+                        || report.error.contains("reopen"),
+                    "expected DB reopen error, got: {}",
+                    report.error
+                );
+            }
+            InitialScanOutcome::ReadyExact(_) => {
+                panic!("in-memory DB should fail run_initial_scan");
+            }
+        }
+    }
+
+    /// When readiness is NOT Starting and a file-backed DB is used,
+    /// `run_initial_scan` is called and should succeed (Ok path).
+    #[tokio::test]
+    async fn non_fresh_install_with_file_db_takes_scan_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = BusytokPaths::for_test(dir.path());
+        paths.ensure_dirs_exist().expect("ensure dirs");
+
+        let db = Database::open(&paths.db_path()).expect("open file-backed db");
+        let mut settings = busytok_config::BusytokSettings::default();
+        settings.discovery.claude_code_default_paths = false;
+        settings.discovery.codex_default_paths = false;
+        let supervisor = Arc::new(BusytokSupervisor::with_adapters_and_settings(
+            db,
+            paths,
+            vec![],
+            settings,
+        ));
+
+        // Set readiness to ReadyExact so is_fresh_install is false.
+        supervisor.apply_service_status_snapshot(|snap| {
+            snap.readiness = ReadinessStateDto::ReadyExact;
+        });
+
+        let outcome = run_initial_scan_or_register_sources(supervisor).await;
+        match outcome {
+            InitialScanOutcome::ReadyExact(report) => {
+                assert_eq!(report.sources, 0);
+                assert_eq!(report.files_scanned, 0);
+            }
+            InitialScanOutcome::ReadyDegraded(report) => {
+                panic!("file-backed DB scan should succeed, got error: {}", report.error);
+            }
+        }
+    }
 }

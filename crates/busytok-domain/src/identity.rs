@@ -357,4 +357,137 @@ mod tests {
             "hash must differ when tokens are included and token values differ"
         );
     }
+
+    // -- normalize_project_path tests --
+
+    #[test]
+    fn normalize_project_path_rejects_empty() {
+        let err = normalize_project_path("").unwrap_err();
+        assert!(matches!(err, IdentityError::EmptyPath));
+    }
+
+    #[test]
+    fn normalize_project_path_rejects_relative() {
+        let err = normalize_project_path("relative/path").unwrap_err();
+        assert!(matches!(err, IdentityError::NotAbsolute(_)));
+    }
+
+    #[test]
+    fn normalize_project_path_rejects_dot_relative() {
+        // "./foo" starts with a CurDir component — normalize_path_components
+        // strips it but the result remains relative.
+        let err = normalize_project_path("./foo").unwrap_err();
+        assert!(matches!(err, IdentityError::NotAbsolute(_)));
+    }
+
+    #[test]
+    fn normalize_project_path_rejects_parent_relative() {
+        // "../foo" starts with a ParentDir component — pop on an empty result
+        // is a no-op, leaving the path relative.
+        let err = normalize_project_path("../foo").unwrap_err();
+        assert!(matches!(err, IdentityError::NotAbsolute(_)));
+    }
+
+    #[test]
+    fn normalize_project_path_accepts_absolute() {
+        let result = normalize_project_path("/var/log/foo").unwrap();
+        assert_eq!(result, "/var/log/foo");
+    }
+
+    #[test]
+    fn normalize_project_path_strips_curdir_segments() {
+        let result = normalize_project_path("/var/./log/foo").unwrap();
+        assert_eq!(result, "/var/log/foo");
+    }
+
+    #[test]
+    fn normalize_project_path_resolves_parent_segments() {
+        let result = normalize_project_path("/var/log/../foo").unwrap();
+        assert_eq!(result, "/var/foo");
+    }
+
+    #[test]
+    fn normalize_project_path_handles_root_only() {
+        let result = normalize_project_path("/").unwrap();
+        assert_eq!(result, "/");
+    }
+
+    #[test]
+    fn normalize_project_path_handles_root_with_parent_segments() {
+        // "/.." should resolve to "/" (cannot go above root).
+        let result = normalize_project_path("/..").unwrap();
+        assert_eq!(result, "/");
+    }
+
+    #[test]
+    fn normalize_project_path_expands_tilde() {
+        // "~/foo" should be expanded using the home directory.
+        let result = normalize_project_path("~/foo").unwrap();
+        // The result must be absolute and end with foo.
+        assert!(result.starts_with('/'), "tilde expansion must produce absolute path");
+        assert!(result.ends_with("/foo"), "result should preserve trailing path: {result}");
+        // Must not contain a literal `~`.
+        assert!(!result.contains('~'), "tilde must be expanded: {result}");
+    }
+
+    #[test]
+    fn normalize_project_path_expands_bare_tilde() {
+        // "~" alone should be expanded to the home directory.
+        let result = normalize_project_path("~").unwrap();
+        assert!(result.starts_with('/'), "home dir must be absolute: {result}");
+        assert!(!result.contains('~'), "tilde must be expanded: {result}");
+    }
+
+    #[test]
+    fn normalize_project_path_handles_complex_segments() {
+        let result = normalize_project_path("/a/b/../c/./d/e/../f").unwrap();
+        assert_eq!(result, "/a/c/d/f");
+    }
+
+    #[test]
+    fn derive_project_hash_is_deterministic() {
+        let h1 = derive_project_hash("/var/log/foo");
+        let h2 = derive_project_hash("/var/log/foo");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64, "SHA-256 hex digest length");
+    }
+
+    #[test]
+    fn derive_project_hash_differs_for_different_inputs() {
+        let h1 = derive_project_hash("/var/log/foo");
+        let h2 = derive_project_hash("/var/log/bar");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn derive_session_id_prefers_source_session_id() {
+        let result = derive_session_id(Some("session-123"), "file-456");
+        assert_eq!(result, "session-123");
+    }
+
+    #[test]
+    fn derive_session_id_falls_back_to_source_file_id_when_none() {
+        let result = derive_session_id(None, "file-456");
+        assert_eq!(result, "file-456");
+    }
+
+    #[test]
+    fn derive_session_id_falls_back_to_source_file_id_when_empty() {
+        let result = derive_session_id(Some(""), "file-456");
+        assert_eq!(result, "file-456");
+    }
+
+    #[test]
+    fn hash_short_returns_12_chars() {
+        let h = hash_short("some-input");
+        assert_eq!(h.len(), 12);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn hash_short_differs_for_different_inputs() {
+        let h1 = hash_short("input-a");
+        let h2 = hash_short("input-b");
+        assert_ne!(h1, h2);
+    }
 }

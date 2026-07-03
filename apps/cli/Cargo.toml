@@ -28,4 +28,5 @@ assert_cmd = "2"
 async-trait.workspace = true
 busytok-events = { path = "../../crates/busytok-events" }
 predicates = "3"
+serial_test.workspace = true
 tempfile.workspace = true

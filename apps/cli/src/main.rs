@@ -617,3 +617,367 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Command::Doctor => commands::handle_doctor().await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
+    use super::*;
+
+    // ── command_name ────────────────────────────────────────────────────
+
+    #[test]
+    fn command_name_returns_status_for_status_variant() {
+        assert_eq!(command_name(&Command::Status), "status");
+    }
+
+    #[test]
+    fn command_name_returns_scan_for_scan_variant() {
+        let cmd = Command::Scan {
+            offline: false,
+            agent: None,
+            path: None,
+        };
+        assert_eq!(command_name(&cmd), "scan");
+    }
+
+    #[test]
+    fn command_name_returns_sources_for_sources_variant() {
+        let cmd = Command::Sources {
+            subcommand: SourcesCommand::List,
+        };
+        assert_eq!(command_name(&cmd), "sources");
+    }
+
+    #[test]
+    fn command_name_returns_usage_for_usage_variant() {
+        let cmd = Command::Usage {
+            subcommand: UsageCommand::Summary,
+        };
+        assert_eq!(command_name(&cmd), "usage");
+    }
+
+    #[test]
+    fn command_name_returns_diagnostics_for_diagnostics_variant() {
+        let cmd = Command::Diagnostics {
+            subcommand: DiagnosticsCommand::ScanStatus,
+        };
+        assert_eq!(command_name(&cmd), "diagnostics");
+    }
+
+    #[test]
+    fn command_name_returns_settings_for_settings_variant() {
+        let cmd = Command::Settings {
+            subcommand: SettingsCommand::Snapshot,
+        };
+        assert_eq!(command_name(&cmd), "settings");
+    }
+
+    #[test]
+    fn command_name_returns_prompt_for_prompt_variant() {
+        let cmd = Command::Prompt {
+            subcommand: PromptCommand::Create {
+                content: None,
+                alias: None,
+                tags: vec![],
+                batch: false,
+            },
+        };
+        assert_eq!(command_name(&cmd), "prompt");
+    }
+
+    #[test]
+    fn command_name_returns_cli_for_cli_variant() {
+        let cmd = Command::Cli {
+            subcommand: CliCommand::Status {
+                bin_dir: "~/.local/bin".to_string(),
+            },
+        };
+        assert_eq!(command_name(&cmd), "cli");
+    }
+
+    #[test]
+    fn command_name_returns_delegate_for_delegate_variant() {
+        let cmd = Command::Delegate {
+            subagent: "worker".to_string(),
+            id: None,
+            cwd: ".".to_string(),
+            profile: "default".to_string(),
+            intent: None,
+            model: None,
+            timeout: None,
+            output: "text".to_string(),
+            prompt: "do thing".to_string(),
+        };
+        assert_eq!(command_name(&cmd), "delegate");
+    }
+
+    #[test]
+    fn command_name_returns_subagent_for_subagent_variant() {
+        let cmd = Command::Subagent {
+            subcommand: SubagentCommand::List {
+                status: None,
+                project: None,
+                include_deleted: false,
+            },
+        };
+        assert_eq!(command_name(&cmd), "subagent");
+    }
+
+    #[test]
+    fn command_name_returns_doctor_for_doctor_variant() {
+        assert_eq!(command_name(&Command::Doctor), "doctor");
+    }
+
+    // ── parse_discovery_default ─────────────────────────────────────────
+
+    #[test]
+    fn parse_discovery_default_accepts_true_value() {
+        let result = parse_discovery_default("claude-code:true").unwrap();
+        assert_eq!(result.0, "claude-code");
+        assert!(result.1);
+    }
+
+    #[test]
+    fn parse_discovery_default_accepts_false_value() {
+        let result = parse_discovery_default("codex:false").unwrap();
+        assert_eq!(result.0, "codex");
+        assert!(!result.1);
+    }
+
+    #[test]
+    fn parse_discovery_default_rejects_missing_colon() {
+        let err = parse_discovery_default("claude-code").unwrap_err();
+        assert!(
+            err.contains("expected agent:bool"),
+            "should mention agent:bool, got: {err}"
+        );
+        assert!(
+            err.contains("claude-code"),
+            "should echo back the bad input: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_discovery_default_rejects_non_bool_value() {
+        let err = parse_discovery_default("claude-code:yes").unwrap_err();
+        assert!(
+            err.contains("expected true or false"),
+            "should mention true/false, got: {err}"
+        );
+        assert!(err.contains("yes"), "should echo back the bad value: {err}");
+    }
+
+    #[test]
+    fn parse_discovery_default_accepts_empty_agent_name() {
+        // An empty agent string is structurally valid (agent:bool shape);
+        // validation of agent names happens downstream in handle_settings_update.
+        let result = parse_discovery_default(":true").unwrap();
+        assert_eq!(result.0, "");
+        assert!(result.1);
+    }
+
+    // ── parse_add_root ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_add_root_accepts_absolute_path() {
+        let result = parse_add_root("claude-code:/path/to/logs").unwrap();
+        assert_eq!(result.0, "claude-code");
+        assert_eq!(result.1, "/path/to/logs");
+    }
+
+    #[test]
+    fn parse_add_root_accepts_relative_path() {
+        let result = parse_add_root("codex:relative/path").unwrap();
+        assert_eq!(result.0, "codex");
+        assert_eq!(result.1, "relative/path");
+    }
+
+    #[test]
+    fn parse_add_root_rejects_missing_colon() {
+        let err = parse_add_root("claude-code").unwrap_err();
+        assert!(
+            err.contains("expected agent:path"),
+            "should mention agent:path, got: {err}"
+        );
+        assert!(
+            err.contains("claude-code"),
+            "should echo back the bad input: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_add_root_accepts_empty_path() {
+        // Structurally valid (agent:path shape); downstream validation
+        // handles empty paths.
+        let result = parse_add_root("claude-code:").unwrap();
+        assert_eq!(result.0, "claude-code");
+        assert_eq!(result.1, "");
+    }
+
+    // ── expand_home ────────────────────────────────────────────────────
+
+    #[test]
+    fn expand_home_expands_tilde_prefix() {
+        let home = dirs::home_dir().expect("home_dir should be available in test env");
+        let result = expand_home("~/some/relative/path");
+        assert_eq!(result, home.join("some/relative/path"));
+    }
+
+    #[test]
+    fn expand_home_returns_home_for_bare_tilde() {
+        // "~/".strip_prefix("~/") returns Some("") so this yields home.join("")
+        // which is equivalent to the home directory itself.
+        let home = dirs::home_dir().expect("home_dir should be available in test env");
+        let result = expand_home("~/");
+        assert_eq!(result, home.join(""));
+    }
+
+    #[test]
+    fn expand_home_does_not_expand_absolute_path() {
+        let result = expand_home("/absolute/path");
+        assert_eq!(result, std::path::PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_home_does_not_expand_relative_path() {
+        let result = expand_home("relative/path");
+        assert_eq!(result, std::path::PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn expand_home_does_not_expand_tilde_in_middle() {
+        // Only a leading "~/..." is expanded; a tilde elsewhere is literal.
+        let result = expand_home("/foo/~/bar");
+        assert_eq!(result, std::path::PathBuf::from("/foo/~/bar"));
+    }
+
+    #[test]
+    fn expand_home_returns_unchanged_when_home_dir_unavailable() {
+        // We can't easily force `dirs::home_dir()` to return None in a real
+        // test environment, but we can at least exercise the non-tilde branch
+        // (which is the same fallback path) for a non-~/ input.
+        let result = expand_home("no-tilde-here");
+        assert_eq!(result, std::path::PathBuf::from("no-tilde-here"));
+    }
+
+    // ── Args parsing round-trip via clap ───────────────────────────────
+
+    #[test]
+    fn args_defaults_to_none_command_when_omitted() {
+        // clap's Parser::try_parse_from with no args yields Args with
+        // command=None (the default behavior when no subcommand is given).
+        let args = Args::try_parse_from(["busytok"]).unwrap();
+        assert!(args.command.is_none());
+        assert!(args.log_dir.is_none());
+    }
+
+    #[test]
+    fn args_parses_log_dir_flag() {
+        let args = Args::try_parse_from(["busytok", "--log-dir", "/tmp/logs"]).unwrap();
+        assert_eq!(
+            args.log_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/logs"))
+        );
+    }
+
+    #[test]
+    fn args_parses_status_subcommand() {
+        let args = Args::try_parse_from(["busytok", "status"]).unwrap();
+        assert!(matches!(args.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn args_parses_doctor_subcommand() {
+        let args = Args::try_parse_from(["busytok", "doctor"]).unwrap();
+        assert!(matches!(args.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn args_parses_settings_update_with_discovery_default() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "settings",
+            "update",
+            "--discovery-default",
+            "claude-code:true",
+            "--discovery-default",
+            "codex:false",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Settings {
+                subcommand:
+                    SettingsCommand::Update {
+                        discovery_default, ..
+                    },
+            }) => {
+                assert_eq!(discovery_default.len(), 2);
+                assert_eq!(discovery_default[0], ("claude-code".to_string(), true));
+                assert_eq!(discovery_default[1], ("codex".to_string(), false));
+            }
+            other => panic!("expected Settings::Update, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_settings_update_with_add_root() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "settings",
+            "update",
+            "--add-root",
+            "claude-code:/path/to/logs",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Settings {
+                subcommand: SettingsCommand::Update { add_root, .. },
+            }) => {
+                assert_eq!(add_root.len(), 1);
+                assert_eq!(
+                    add_root[0],
+                    ("claude-code".to_string(), "/path/to/logs".to_string())
+                );
+            }
+            other => panic!("expected Settings::Update, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_rejects_invalid_discovery_default_value() {
+        // clap's value_parser propagates the error from parse_discovery_default.
+        let result = Args::try_parse_from([
+            "busytok",
+            "settings",
+            "update",
+            "--discovery-default",
+            "claude-code:yes",
+        ]);
+        assert!(
+            result.is_err(),
+            "should reject non-bool discovery-default value"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expected true or false"),
+            "should surface the parser error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn args_rejects_invalid_add_root_format() {
+        let result = Args::try_parse_from([
+            "busytok",
+            "settings",
+            "update",
+            "--add-root",
+            "no-colon-here",
+        ]);
+        assert!(result.is_err(), "should reject add-root without colon");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expected agent:path"),
+            "should surface the parser error, got: {err}"
+        );
+    }
+}

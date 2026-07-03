@@ -727,4 +727,26 @@ describe("ProvidersPage", () => {
       expect(screen.getByText(/✗|failed/i)).toBeTruthy();
     });
   });
+
+  it("shows error when inline edit submit fails (handleEditSubmit onError)", () => {
+    const updateMutate = vi.fn(
+      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+        opts?.onError?.(new Error("edit submit failed"));
+      },
+    );
+    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
+    mockUseProviders.mockReturnValue(
+      mockProvidersQuery(
+        makeListResponse([
+          makeProvider({ id: "deepseek-prod", name: "DeepSeek", enabled: true }),
+        ]),
+      ),
+    );
+    renderPage();
+    // Enter edit mode for this provider row.
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+    // The edit form reuses the Save button.
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(screen.getByText("edit submit failed")).toBeTruthy();
+  });
 });

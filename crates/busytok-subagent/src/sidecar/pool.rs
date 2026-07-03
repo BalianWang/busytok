@@ -391,9 +391,15 @@ impl WorkerPool {
         out
     }
 
-    /// Graceful shutdown all workers. Same lock-ordering as
+    /// Gracefully shut down all workers. Same lock-ordering as
     /// `remove_worker_and_kill`: collect all entries under lock, drop
-    /// lock, then `force_kill().await` each outside lock.
+    /// lock, then call `shutdown().await` on each supervisor outside the
+    /// lock. Used by `BusytokSupervisor::shutdown_sidecar` (service exit)
+    /// and `rebuild_sidecar_runtime` (mid-flight config change) — both
+    /// need the FULL pool drained, not just the single "first enabled
+    /// provider" supervisor, so no orphaned Node subprocesses survive
+    /// config flips or service exit. Best-effort: per-worker failures
+    /// are logged but don't abort the loop.
     pub async fn shutdown_all(&self) {
         let supervisors: Vec<Arc<PiSidecarSupervisor>> = {
             let mut workers = self.workers.lock().expect("workers map lock poisoned");
@@ -403,16 +409,22 @@ impl WorkerPool {
         debug!(
             event_code = "subagent.worker_pool.shutdown_all_start",
             worker_count = count,
-            "shutdown_all: force-killing {} supervisor(s)",
+            "shutdown_all: gracefully shutting down {} supervisor(s)",
             count
         );
         for sup in supervisors {
-            sup.force_kill().await;
+            if let Err(e) = sup.shutdown().await {
+                warn!(
+                    event_code = "subagent.worker_pool.shutdown_one_failed",
+                    error = %e,
+                    "shutdown_all: one supervisor graceful-shutdown failed (continuing)"
+                );
+            }
         }
         debug!(
             event_code = "subagent.worker_pool.shutdown_all_done",
             worker_count = count,
-            "shutdown_all: all supervisors killed"
+            "shutdown_all: all supervisors gracefully shut down"
         );
     }
 

@@ -2152,4 +2152,284 @@ mod tests {
         let expected_above = 200_000.0 * 2.0 / 1_000_000.0;
         assert!((cost_above - expected_above).abs() < 0.0001);
     }
+
+    // -- additional validation coverage tests --
+
+    #[test]
+    fn validate_rejects_unsupported_schema_version() {
+        let json = r#"{"schema_version":"2","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("unsupported schema_version"), "got: {reason}");
+                assert!(reason.contains("expected '3'"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_version() {
+        let json = r#"{"schema_version":"3","version":"   ","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("catalog version is empty"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_provider() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"   ","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("empty provider"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_uppercase_provider() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"Anthropic","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("must be lowercase"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_usd_currency() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"EUR","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("currency must be 'USD'"), "got: {reason}");
+                assert!(reason.contains("EUR"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_required_tier_field() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":-1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("input_per_million"), "got: {reason}");
+                assert!(reason.contains("must be >= 0"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_nan_required_tier_field() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":NaN,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result: Result<PriceCatalog, _> = serde_json::from_str(json);
+        // serde_json rejects NaN by default — confirms the type guard holds.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_rejects_negative_output_per_million() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":-0.5,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("output_per_million"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_optional_cached_input() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":-0.1,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("cached_input_per_million"), "got: {reason}");
+                assert!(reason.contains("if set"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_optional_cache_write() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":-3.0,"cache_storage_per_million_hour":null,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("cache_write_per_million"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_optional_cache_storage() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":-0.5,"reasoning_per_million":null}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("cache_storage_per_million_hour"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_optional_reasoning() {
+        let json = r#"{"schema_version":"3","version":"v1","updated":"v1","aliases":{},"prices":[{"provider":"test","model":"m","currency":"USD","effective_date":"2099-01-01","fast_multiplier":null,"tiers":[{"from_tokens":0,"input_per_million":1.0,"output_per_million":2.0,"cached_input_per_million":null,"cache_write_per_million":null,"cache_storage_per_million_hour":null,"reasoning_per_million":-2.0}]}]}"#;
+        let result = parse_catalog_json(json);
+        match result {
+            Err(ReloadResult::Invalid { reason }) => {
+                assert!(reason.contains("reasoning_per_million"), "got: {reason}");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn estimate_cost_usd_uses_global_catalog_for_unknown_model() {
+        // Reset to embedded catalog and confirm estimate_cost_usd resolves None
+        // for an unknown model (does not block ingestion).
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let result = estimate_cost_usd("definitely-not-a-real-model-xyz", usage, None, None, CostMode::Calculate);
+        assert!(result.is_none(), "expected None for unknown model, got {:?}", result);
+    }
+
+    #[test]
+    #[serial]
+    fn estimate_cost_usd_uses_source_cost_in_auto_mode() {
+        // In Auto mode, when source_cost is present it is preferred.
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+        let catalog = load_catalog();
+        // Find a real model from the embedded catalog so resolve_model succeeds
+        // through the global path.
+        let model_name = catalog.prices[0].model.clone();
+        drop(catalog);
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let result = estimate_cost_usd(
+            &model_name,
+            usage,
+            Some(0.42),
+            None,
+            CostMode::Auto,
+        );
+        assert_eq!(result, Some(0.42));
+    }
+
+    #[test]
+    #[serial]
+    fn estimate_cost_usd_display_mode_returns_zero_when_no_source_cost() {
+        // In Display mode with no source_cost, returns Some(0.0) regardless of usage.
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+        let catalog = load_catalog();
+        let model_name = catalog.prices[0].model.clone();
+        drop(catalog);
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let result = estimate_cost_usd(&model_name, usage, None, None, CostMode::Display);
+        assert_eq!(result, Some(0.0));
+    }
+
+    #[test]
+    #[serial]
+    fn init_catalog_falls_back_when_file_invalid_json() {
+        // init_catalog with an unparseable file should fall back to the embedded
+        // catalog rather than panicking. Covers the warning-emitting branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad-catalog.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+        reset_catalog();
+        init_catalog(Some(&path));
+        // Embedded catalog must be loaded.
+        let catalog = load_catalog();
+        assert!(!catalog.prices.is_empty());
+        assert_eq!(catalog.schema_version, "3");
+        // File state should remain unset (embedded fallback path).
+        assert_eq!(LAST_FILE_LEN.load(Ordering::SeqCst), 0);
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+    }
+
+    #[test]
+    #[serial]
+    fn init_catalog_falls_back_when_validation_fails() {
+        // init_catalog with a structurally-valid but semantically invalid catalog
+        // (empty prices) should fall back to the embedded catalog.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("invalid-catalog.json");
+        let invalid = r#"{"schema_version":"3","version":"v","updated":"v","aliases":{},"prices":[]}"#;
+        std::fs::write(&path, invalid).unwrap();
+        reset_catalog();
+        init_catalog(Some(&path));
+        let catalog = load_catalog();
+        assert!(!catalog.prices.is_empty(), "embedded fallback should be loaded");
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+    }
+
+    #[test]
+    #[serial]
+    fn init_catalog_falls_back_on_io_error_for_directory_path() {
+        // init_catalog with a directory (not a file) should treat it as an I/O error
+        // and fall back to the embedded catalog.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_path = tmp.path().join("a-directory");
+        std::fs::create_dir_all(&dir_path).unwrap();
+        reset_catalog();
+        init_catalog(Some(&dir_path));
+        let catalog = load_catalog();
+        assert!(!catalog.prices.is_empty(), "embedded fallback should be loaded on IO error");
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+    }
+
+    #[test]
+    #[serial]
+    fn init_catalog_handles_missing_file_gracefully() {
+        // init_catalog with a nonexistent file path is not an error — embedded
+        // catalog is used.
+        let missing = std::path::Path::new("/tmp/busytok-test-missing-catalog-xyz.json");
+        let _ = std::fs::remove_file(missing);
+        reset_catalog();
+        init_catalog(Some(missing));
+        let catalog = load_catalog();
+        assert!(!catalog.prices.is_empty());
+        reset_catalog();
+        init_catalog(None::<&std::path::Path>);
+    }
 }

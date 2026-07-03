@@ -767,10 +767,21 @@ impl BusytokSupervisor {
         *self.task_dispatcher.lock().unwrap() = new_handle;
         *self.dispatcher_shutdown.lock().unwrap() = new_shutdown;
 
-        // 7. Shut down the old sidecar supervisor (async, after lock
-        //    release). Best-effort: failures are logged but don't
-        //    propagate — the new runtime is already live.
-        if let Some(old_sup) = old_runtime.sidecar_supervisor {
+        // 7. Shut down the OLD sidecar supervisor(s) (async, after lock
+        //    release). Best-effort: failures are logged but don't propagate —
+        //    the new runtime is already live.
+        //
+        //    Multi-provider fix: prefer `pool.shutdown_all()` to drain ALL
+        //    workers (including lazily-spawned ones from delegate calls),
+        //    not just the single "first enabled provider" supervisor.
+        //    Without this, flipping `enabled` (or disabling the sidecar)
+        //    would orphan Node subprocesses for the other providers,
+        //    leaking stale-credential children. Falls back to single-
+        //    supervisor shutdown only when no pool exists (degraded mode
+        //    where construct_sidecar failed before pool creation).
+        if let Some(old_pool) = old_runtime.worker_pool.as_ref() {
+            old_pool.shutdown_all().await;
+        } else if let Some(old_sup) = old_runtime.sidecar_supervisor {
             if let Err(e) = old_sup.shutdown().await {
                 warn!(
                     event_code = "subagent.sidecar.rebuild_old_shutdown_failed",
@@ -1871,15 +1882,25 @@ impl BusytokSupervisor {
         Ok(())
     }
 
-    /// Gracefully shut down the Pi sidecar subprocess (hibernate sessions,
-    /// kill child). Called from `ServiceApp::run()` after the control server
-    /// has stopped accepting new delegate requests and before the
-    /// tailer/sampler drain. No-op when `pi_sidecar.enabled = false` (the
-    /// default) — `sidecar_supervisor` is `None` in that case. Failures are
+    /// Gracefully shut down the Pi sidecar subprocess(es) — hibernate
+    /// sessions, kill children, reconcile DB state. Called from
+    /// `ServiceApp::run()` after the control server has stopped accepting
+    /// new delegate requests and before the tailer/sampler drain.
+    ///
+    /// Multi-provider fix: prefer `pool.shutdown_all()` to drain ALL
+    /// workers (including lazily-spawned ones from delegate calls), not
+    /// just the single "first enabled provider" supervisor. Without this,
+    /// service exit would orphan Node subprocesses for any provider that
+    /// was delegated to but wasn't the "first enabled" one. Falls back to
+    /// single-supervisor shutdown only when no pool exists (degraded mode
+    /// where construct_sidecar failed before pool creation). No-op when
+    /// `pi_sidecar.enabled = false` (no pool, no supervisor). Failures are
     /// logged but do not propagate; service shutdown must continue so the
     /// writer actor flush and WAL checkpoint still run.
     pub async fn shutdown_sidecar(&self) {
-        if let Some(sup) = self.sidecar_supervisor() {
+        if let Some(pool) = self.worker_pool() {
+            pool.shutdown_all().await;
+        } else if let Some(sup) = self.sidecar_supervisor() {
             if let Err(e) = sup.shutdown().await {
                 warn!(event_code = "subagent.sidecar.shutdown_failed", error = %e);
             }
@@ -2617,13 +2638,30 @@ fn map_subagent_error(e: busytok_subagent::SubagentError) -> anyhow::Error {
 /// a `MethodDispatchError` (code=`validation_error`) when not. Called BEFORE
 /// the settings are persisted so a bad path never reaches `settings.toml`.
 ///
-/// Checks:
+/// Reuses the same infrastructure as the doctor checks:
+/// - `SidecarManifest` typed parse (manifest.rs) — catches malformed content,
+///   not just absence (doctor check #5 `bundle_manifest_readable`).
+/// - `node/<ARCH>/node` arch-aware path — mirrors doctor check #4
+///   `bundled_node_arch` (supervisor.rs `bundled_node_arch` probe).
+///
+/// Checks (in order):
 /// 1. Path is absolute (relative paths break the service-owned settings
 ///    contract — the GUI always sends absolute app-bundle paths).
 /// 2. Directory exists (catches stale paths from uninstalled bundles).
-/// 3. Contains `pi-sidecar.bundle.js` (minimum viable bundle).
-/// 4. Contains `manifest.json` (protocol version + bundle metadata).
-fn validate_runtime_dir(runtime_dir: &str) -> Result<()> {
+/// 3. Contains `pi-sidecar.bundle.js` (minimum viable bundle — conventional
+///    name; the manifest-referenced bundle is checked separately at step 6).
+/// 4. Contains `manifest.json` (existence — content parsed at step 5).
+/// 5. `manifest.json` parses as a valid `SidecarManifest` (catches malformed
+///    content that would only fail later during doctor/delegate).
+/// 6. The bundle filename declared in the manifest exists in the directory
+///    (catches manifest/bundle drift — manifest says "foo.bundle.js" but only
+///    "pi-sidecar.bundle.js" is on disk).
+/// 7. When `node_runtime == "bundled"`: `node/<current-arch>/node` exists
+///    (the runtime needs a real Node binary to spawn — without it,
+///    `resolve_base_sidecar_config` would fail at rebuild time, entering
+///    degraded `FailingTaskExecutor` mode. Catching this at validation
+///    surfaces the error to the GUI immediately, before the rebuild).
+fn validate_runtime_dir(runtime_dir: &str, node_runtime: &str) -> Result<()> {
     let path = Path::new(runtime_dir);
     if !path.is_absolute() {
         return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
@@ -2651,8 +2689,8 @@ fn validate_runtime_dir(runtime_dir: &str) -> Result<()> {
             }),
         )));
     }
-    let manifest = path.join("manifest.json");
-    if !manifest.exists() {
+    let manifest_path = path.join("manifest.json");
+    if !manifest_path.exists() {
         return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
             "validation_error",
             "runtime_dir missing required file: manifest.json".to_string(),
@@ -2662,6 +2700,106 @@ fn validate_runtime_dir(runtime_dir: &str) -> Result<()> {
                 "path": runtime_dir,
             }),
         )));
+    }
+    // Parse manifest.json content as a typed SidecarManifest. Catches
+    // malformed JSON / missing required fields that the doctor's
+    // `bundle_manifest_readable` check would flag — but BEFORE persisting.
+    let manifest_contents = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        anyhow::Error::new(MethodDispatchError::from_read_error(
+            "validation_error",
+            format!("manifest.json not readable at {runtime_dir}: {e}"),
+            serde_json::json!({
+                "field": "runtime_dir",
+                "missing": "manifest.json (readable)",
+                "path": runtime_dir,
+            }),
+        ))
+    })?;
+    let manifest: busytok_config::SidecarManifest = serde_json::from_str(&manifest_contents)
+        .map_err(|e| {
+            anyhow::Error::new(MethodDispatchError::from_read_error(
+                "validation_error",
+                format!("manifest.json is not a valid SidecarManifest: {e}"),
+                serde_json::json!({
+                    "field": "manifest.json",
+                    "error": e.to_string(),
+                    "path": runtime_dir,
+                }),
+            ))
+        })?;
+    // Verify the bundle filename declared in the manifest actually exists.
+    // Catches manifest/bundle drift (manifest says "foo.bundle.js" but the
+    // actual file is named differently).
+    let manifest_bundle = path.join(&manifest.bundle);
+    if !manifest_bundle.exists() {
+        return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+            "validation_error",
+            format!(
+                "manifest references bundle '{}' but file not found at {}",
+                manifest.bundle, runtime_dir
+            ),
+            serde_json::json!({
+                "field": "manifest.bundle",
+                "expected": manifest.bundle,
+                "path": runtime_dir,
+            }),
+        )));
+    }
+    // When using bundled Node, verify the current-arch binary exists AND is
+    // executable. The doctor's `bundled_node_arch` check also does the
+    // existence half, but catching it at validation surfaces the error to the
+    // GUI before the rebuild enters degraded mode. System mode doesn't need
+    // the bundled binary. On Unix we additionally require any execute bit
+    // (0o111) — a non-executable file would pass existence but fail at spawn.
+    if node_runtime == "bundled" {
+        let node_path = path.join("node").join(std::env::consts::ARCH).join("node");
+        if !node_path.exists() {
+            return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+                "validation_error",
+                format!(
+                    "node_runtime='bundled' but node/{arch}/node not found at {runtime_dir}",
+                    arch = std::env::consts::ARCH
+                ),
+                serde_json::json!({
+                    "field": "node",
+                    "arch": std::env::consts::ARCH,
+                    "path": runtime_dir,
+                }),
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&node_path)
+                .map_err(|e| {
+                    anyhow::Error::new(MethodDispatchError::from_read_error(
+                        "validation_error",
+                        format!(
+                            "node_runtime='bundled' but cannot read node/{arch}/node permissions at {runtime_dir}: {e}",
+                            arch = std::env::consts::ARCH
+                        ),
+                        serde_json::json!({
+                            "field": "node",
+                            "arch": std::env::consts::ARCH,
+                            "path": runtime_dir,
+                        }),
+                    ))
+                })?;
+            if perms.permissions().mode() & 0o111 == 0 {
+                return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+                    "validation_error",
+                    format!(
+                        "node_runtime='bundled' but node/{arch}/node is not executable at {runtime_dir}",
+                        arch = std::env::consts::ARCH
+                    ),
+                    serde_json::json!({
+                        "field": "node",
+                        "arch": std::env::consts::ARCH,
+                        "path": runtime_dir,
+                    }),
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -5895,8 +6033,19 @@ impl RuntimeControl for BusytokSupervisor {
         // to settings — that would leave the service in a broken state that
         // survives restart. Only validate when enabling (when disabling, the
         // path may be stale and we don't care about its contents).
+        //
+        // P2: validation now parses manifest.json as SidecarManifest +
+        // verifies the manifest-referenced bundle + (when node_runtime=
+        // "bundled") requires node/<current-arch>/node. This catches
+        // malformed/broken packaged runtimes at the write path, before they
+        // can be persisted and marked enabled — without this, the GUI could
+        // accept a dir that only fails later during doctor/delegate.
         if req.enabled {
-            validate_runtime_dir(&req.runtime_dir)?;
+            let node_runtime = {
+                let settings = self.settings.lock().unwrap();
+                settings.subagent.pi_sidecar.node_runtime.clone()
+            };
+            validate_runtime_dir(&req.runtime_dir, &node_runtime)?;
         }
 
         let mut pending_settings = {

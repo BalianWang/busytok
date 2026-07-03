@@ -238,7 +238,6 @@ mod tests {
     /// Tests `shutdown_control_server` directly since making `start_tailing`
     /// fail in a unit test is impractical.
     #[tokio::test]
-    #[ignore = "Unix-domain-socket; macOS-only service infrastructure"]
     async fn shutdown_control_server_awaits_task() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
@@ -271,7 +270,6 @@ mod tests {
     /// silently swallowed). This models the tailer-failure path where the
     /// result_already_read flag is false.
     #[tokio::test]
-    #[ignore = "Unix-domain-socket; macOS-only service infrastructure"]
     async fn shutdown_propagates_already_errored_task() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
@@ -303,6 +301,94 @@ mod tests {
         assert!(
             result.is_err(),
             "shutdown should propagate the already-stored task error"
+        );
+    }
+
+    /// `shutdown_control_server` with `result_already_read=true` skips the
+    /// server_task await (the caller already consumed the JoinHandle result
+    /// via `result??` in the `tokio::select!` block of `run()`). This test
+    /// verifies the skip path does not hang or panic.
+    #[tokio::test]
+    async fn shutdown_control_server_skips_task_when_already_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = BusytokPaths::for_test(dir.path());
+        paths.ensure_dirs_exist().expect("ensure dirs");
+        let socket = tempfile::tempdir()
+            .expect("tempdir")
+            .into_path()
+            .join("test.sock");
+
+        let db = busytok_store::Database::open_in_memory().expect("db");
+        let supervisor = Arc::new(BusytokSupervisor::new(db, paths));
+
+        let server = ControlServer::bind(socket.display().to_string(), supervisor)
+            .await
+            .expect("bind");
+        let server = Arc::new(server);
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { server.run().await }
+        });
+
+        // With result_already_read=true, the function must NOT await the
+        // server_task — it just shuts down the server and drains.
+        let result = shutdown_control_server(Arc::clone(&server), server_task, true).await;
+        assert!(result.is_ok(), "shutdown with already_read=true must succeed");
+    }
+
+    /// Full `run()` lifecycle: boot, reach the `select!` block, then trigger
+    /// shutdown by calling `server.shutdown()` from a separate task. This
+    /// exercises the `server_task` completion branch of the `select!` and
+    /// the entire graceful-shutdown cleanup sequence (sampler, tailer,
+    /// writer, sidecar, marker removal).
+    ///
+    /// The `server` field is private, but this test is in a child module of
+    /// `service_app`, so it can access private fields.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completes_gracefully_on_server_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = BusytokPaths::for_test(dir.path());
+        paths.ensure_dirs_exist().expect("ensure dirs");
+        let data_dir = paths.data_dir().to_path_buf();
+
+        let app = ServiceApp::boot(paths, Instant::now())
+            .await
+            .expect("boot");
+
+        // Clone the server Arc BEFORE run() takes ownership of app.
+        // Child modules can access private parent fields.
+        let server = Arc::clone(&app.server);
+
+        // Spawn a task that waits for run() to reach the select! block,
+        // then shuts down the server to trigger the server_task completion
+        // path (the first branch of the tokio::select!).
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            server.shutdown();
+        });
+
+        // run() should complete when server_task completes.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.run(),
+        )
+        .await;
+
+        // The timeout should NOT fire — run() should complete.
+        assert!(
+            result.is_ok(),
+            "run() should complete within 10s after server shutdown"
+        );
+        let run_result = result.unwrap();
+        assert!(
+            run_result.is_ok(),
+            "run() should return Ok(()) after graceful shutdown"
+        );
+
+        // The marker must be removed by run()'s cleanup path.
+        assert!(
+            !busytok_config::service_marker::exists(&data_dir),
+            "service.ready marker must be removed after run() completes"
         );
     }
 }

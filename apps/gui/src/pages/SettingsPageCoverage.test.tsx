@@ -38,6 +38,18 @@ vi.mock("../lib/backgroundServiceCommands", () => ({
     bgServiceMocks.repairBackgroundService(...args),
 }));
 
+const desktopHostMocks = vi.hoisted(() => ({
+  desktopHostShortcutDiagnostics: vi.fn(),
+  desktopHostRetryShortcutRegistration: vi.fn(),
+}));
+
+vi.mock("../lib/desktopHostCommands", () => ({
+  desktopHostShortcutDiagnostics: (...args: unknown[]) =>
+    desktopHostMocks.desktopHostShortcutDiagnostics(...args),
+  desktopHostRetryShortcutRegistration: (...args: unknown[]) =>
+    desktopHostMocks.desktopHostRetryShortcutRegistration(...args),
+}));
+
 // Mock the reporter so frontend log emission from the page (theme changes,
 // shortcut diagnostics) does not trip jsdom localStorage.removeItem assertions
 // in the shared reporter module.
@@ -182,6 +194,15 @@ beforeEach(() => {
     service_build_identity: "0.1.0",
     version_skew: false,
   });
+  desktopHostMocks.desktopHostShortcutDiagnostics.mockReset();
+  desktopHostMocks.desktopHostRetryShortcutRegistration.mockReset();
+  desktopHostMocks.desktopHostShortcutDiagnostics.mockResolvedValue({
+    state: "registered",
+    shortcut: "Cmd+Shift+P",
+    failure_reason: null,
+    retry_count: 0,
+  });
+  desktopHostMocks.desktopHostRetryShortcutRegistration.mockResolvedValue(undefined);
   for (const key of Object.keys(memoryStore)) delete memoryStore[key];
 });
 
@@ -431,5 +452,214 @@ describe("SettingsPage additional coverage", () => {
     render(<SettingsPage />);
     const groups = document.querySelectorAll(".segmented-control");
     expect(groups.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // ── Background Service: diagnostics toggle + repair action ──────────
+
+  it("reveals detailed diagnostics when Show Diagnostics is toggled on", async () => {
+    bgServiceMocks.getBackgroundServiceDiagnostics.mockResolvedValue({
+      state: "running",
+      actionable: false,
+      gui_build_identity: "gui-0.1.0",
+      service_build_identity: "svc-0.1.0",
+      version_skew: false,
+    });
+    mockPage();
+
+    render(<SettingsPage />);
+
+    // Wait for the background service section to load.
+    await screen.findByRole("heading", { name: /background service/i, level: 2 });
+
+    // Toggle "Show Diagnostics" on.
+    const toggle = screen.getByLabelText("Show Diagnostics");
+    fireEvent.click(toggle);
+
+    // The detailed rows (GUI build, Service build) now render with their
+    // unique build identity strings.
+    expect(screen.getByText("gui-0.1.0")).toBeDefined();
+    expect(screen.getByText("svc-0.1.0")).toBeDefined();
+  });
+
+  it("calls repairBackgroundService and refetches diagnostics when Repair is clicked", async () => {
+    bgServiceMocks.getBackgroundServiceDiagnostics
+      .mockResolvedValueOnce({
+        state: "needs_attention",
+        actionable: true,
+        gui_build_identity: "0.1.0",
+        service_build_identity: null,
+        version_skew: false,
+      })
+      .mockResolvedValueOnce({
+        state: "running",
+        actionable: false,
+        gui_build_identity: "0.1.0",
+        service_build_identity: "0.1.0",
+        version_skew: false,
+      });
+    bgServiceMocks.repairBackgroundService.mockResolvedValue(undefined);
+    mockPage();
+
+    render(<SettingsPage />);
+
+    const repairBtn = await screen.findByRole("button", {
+      name: /repair background service/i,
+    });
+    fireEvent.click(repairBtn);
+
+    // Wait for the repair promise + diagnostics refetch to settle.
+    await waitFor(() => {
+      expect(bgServiceMocks.repairBackgroundService).toHaveBeenCalledTimes(1);
+    });
+    // After repair, diagnostics are refetched (second call returns "running").
+    await waitFor(() => {
+      expect(bgServiceMocks.getBackgroundServiceDiagnostics).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ── Desktop lifecycle toggle ────────────────────────────────────────
+
+  it("persists the launch-at-login toggle and reverts on failure", async () => {
+    bgServiceMocks.getDesktopLifecycleSettings.mockResolvedValue({
+      launch_busytok_desktop_at_login: false,
+    });
+    bgServiceMocks.updateDesktopLifecycleSettings.mockResolvedValue(undefined);
+    mockPage();
+
+    render(<SettingsPage />);
+
+    const toggle = await screen.findByLabelText("Launch Busytok Desktop at login");
+    // Toggle ON.
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(bgServiceMocks.updateDesktopLifecycleSettings).toHaveBeenCalledWith({
+        launch_busytok_desktop_at_login: true,
+      });
+    });
+  });
+
+  it("reverts the launch-at-login toggle when the update fails", async () => {
+    bgServiceMocks.getDesktopLifecycleSettings.mockResolvedValue({
+      launch_busytok_desktop_at_login: true,
+    });
+    bgServiceMocks.updateDesktopLifecycleSettings.mockRejectedValue(
+      new Error("permission denied"),
+    );
+    mockPage();
+
+    render(<SettingsPage />);
+
+    const toggle = await screen.findByLabelText("Launch Busytok Desktop at login");
+    // Toggle OFF.
+    fireEvent.click(toggle);
+
+    // The update fails; the toggle should revert to ON.
+    await waitFor(() => {
+      expect(bgServiceMocks.updateDesktopLifecycleSettings).toHaveBeenCalledWith({
+        launch_busytok_desktop_at_login: false,
+      });
+    });
+  });
+
+  // ── Shortcut retry button ───────────────────────────────────────────
+
+  it("shows the Retry button and refetches diagnostics when host shortcut is failed", async () => {
+    desktopHostMocks.desktopHostShortcutDiagnostics.mockResolvedValue({
+      state: "failed",
+      shortcut: "Cmd+Shift+P",
+      failure_reason: "platform_restriction",
+      retry_count: 0,
+    });
+    setPromptPaletteShortcutStatus({ state: "failed" });
+    mockPage();
+
+    render(<SettingsPage />);
+
+    const retryBtn = await screen.findByRole("button", { name: /^retry$/i });
+    fireEvent.click(retryBtn);
+
+    // Retry triggers desktopHostRetryShortcutRegistration then re-fetches diagnostics.
+    await waitFor(() => {
+      expect(desktopHostMocks.desktopHostRetryShortcutRegistration).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── Add/remove manual roots ─────────────────────────────────────────
+
+  it("adds a new manual root row via Add root button", async () => {
+    const user = userEvent.setup();
+    mockPage(snapshot({ discovery: { claude_code_default_paths: true, codex_default_paths: false, manual_roots: [] } }));
+
+    render(<SettingsPage />);
+
+    await user.click(screen.getByRole("button", { name: /add root/i }));
+
+    // A new root row with empty Client ID / Root path inputs appears.
+    expect(screen.getByPlaceholderText("Client ID")).toBeDefined();
+    expect(screen.getByPlaceholderText("Root path")).toBeDefined();
+
+    // Typing into the new root fields triggers syncManualRoots → mutate.
+    await user.type(screen.getByPlaceholderText("Client ID"), "codex");
+    await user.type(screen.getByPlaceholderText("Root path"), "/tmp/codex");
+
+    await waitFor(() => {
+      expect(apiMocks.mutate).toHaveBeenCalled();
+    });
+  });
+
+  it("edits an existing manual root path field", async () => {
+    const user = userEvent.setup();
+    mockPage();
+
+    render(<SettingsPage />);
+
+    // The snapshot has one root: { client_id: "codex", root_path: "/tmp/codex" }
+    const pathInput = screen.getByDisplayValue("/tmp/codex");
+    await user.clear(pathInput);
+    await user.type(pathInput, "/new/path");
+
+    await waitFor(() => {
+      expect(apiMocks.mutate).toHaveBeenCalled();
+    });
+  });
+
+  // ── Prompt palette default action change ───────────────────────────
+
+  it("changes the prompt palette default action via the select", async () => {
+    const user = userEvent.setup();
+    mockPage(snapshot({ prompt_palette_default_action: "CopyAndPaste" }));
+
+    render(<SettingsPage />);
+
+    // Open the select and choose "Only paste".
+    await user.click(screen.getByLabelText("Prompt palette default action"));
+    await user.click(screen.getByRole("option", { name: /only paste/i }));
+
+    await waitFor(() => {
+      expect(apiMocks.mutate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          prompt_palette_default_action: "OnlyPaste",
+        }),
+        expect.anything(),
+      );
+    });
+  });
+
+  // ── Paste status: permission missing on macOS ───────────────────────
+
+  it("shows the Open System Settings button when paste permission is missing on macOS", async () => {
+    promptActionMocks.getPromptPaletteAccessibilityStatus.mockResolvedValue({
+      ok: false,
+      failure_reason: "permission_missing",
+    });
+    const platformGetter = vi.spyOn(navigator, "platform", "get");
+    platformGetter.mockReturnValue("MacIntel");
+    mockPage();
+
+    render(<SettingsPage />);
+
+    expect(await screen.findByRole("button", { name: /open system settings/i })).toBeDefined();
+    platformGetter.mockRestore();
   });
 });
