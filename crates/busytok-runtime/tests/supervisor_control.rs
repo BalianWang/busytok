@@ -4941,6 +4941,13 @@ async fn provider_deleted_removes_worker() {
 /// exercising the credential-bearing code path. Covers Phase 3 Task 7.
 #[tokio::test]
 async fn provider_update_with_api_key_removes_worker_then_respawns() {
+    // This test writes to the OS keychain (via provider_update → set_key).
+    // Skip on CI runners where no keyring daemon is available (e.g., Ubuntu
+    // without D-Bus secret service).
+    if busytok_config::ProviderCredentialStore::get_key("keyring-probe").is_err() {
+        eprintln!("skip: OS keyring unavailable");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let settings = make_sidecar_settings();
