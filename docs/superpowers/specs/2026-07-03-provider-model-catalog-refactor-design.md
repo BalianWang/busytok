@@ -41,7 +41,7 @@
 
 ## 4. Domain Model
 
-放在 `crates/busytok-domain/src/provider_catalog.rs`。`ProviderKind` 从 `busytok-config` 迁移到 `busytok-domain`。
+放在 `crates/busytok-domain/src/provider_catalog.rs`。`ProviderKind` 从 `busytok-config` 迁移到 `busytok-domain`（新 `Provider` 引用它）。`busytok-protocol` 新增对 `busytok-domain` 的依赖（DTO 引用 `ProviderKind` 枚举，wire 层类型统一，不混用 `String`）。
 
 ```rust
 /// Provider = 连接能力。不含模型列表，不含 env name。
@@ -178,7 +178,9 @@ pub fn list_models_by_provider(conn: &Connection, provider_id: &str) -> Result<V
 
 ### `list_models_filtered` SQL 策略
 
-单条 SQL 用 `LEFT JOIN` + `GROUP_CONCAT` 聚合 tags，避免 N+1：
+单条 SQL 用 `LEFT JOIN` + `GROUP_CONCAT` 聚合 tags，避免 N+1。注意：`rusqlite` 不能把 `Vec<String>` 直接绑定到 `IN (:tags)` 占位符，必须在 Rust 层动态展开 placeholder（如 `IN (?, ?, ?)`）或用临时表。
+
+**`include_disabled` 语义**：`include_disabled=false` 时同时过滤 `provider_enabled=false` 和 `model_enabled=false`（禁用 provider 下的模型不应出现在"可路由目录"中）。`include_disabled=true` 时返回全部。
 
 ```sql
 SELECT
@@ -189,19 +191,21 @@ SELECT
 FROM models m
 JOIN providers p ON p.id = m.provider_id
 LEFT JOIN model_tags mt ON mt.model_id = m.id
-WHERE (:include_disabled OR m.enabled = 1)
+WHERE (:include_disabled = 1 OR (p.enabled = 1 AND m.enabled = 1))
   AND (:provider_id IS NULL OR m.provider_id = :provider_id)
-  AND (:tag_count = 0 OR m.id IN (
-      SELECT model_id FROM model_tags
-      WHERE tag IN (:tags)
-      GROUP BY model_id
-      HAVING COUNT(DISTINCT tag) = :tag_count
-  ))
 GROUP BY m.id
+HAVING :tag_count = 0 OR (
+    SELECT COUNT(DISTINCT tag) FROM model_tags
+    WHERE model_id = m.id AND tag IN ({dynamic_tag_placeholders})
+) = :tag_count
 ORDER BY p.name, m.model_id;
 ```
 
-多 tag AND 语义：子查询 `HAVING COUNT(DISTINCT tag) = :tag_count`。tags_csv 在 Rust 层 split 成 `Vec<String>`。
+实现要点：
+- `{dynamic_tag_placeholders}` 在 Rust 层根据 `tags.len()` 动态生成 `?, ?, ?`，用 `rusqlite::params_from_iter` 绑定
+- 多 tag AND 语义：`HAVING` 子查询 `COUNT(DISTINCT tag) = :tag_count` 确保模型同时拥有所有指定 tag
+- `include_disabled` 绑定为 INTEGER（0/1）
+- tags_csv 在 Rust 层 split 成 `Vec<String>`（空字符串 → 空 Vec）
 
 ### api_key 隔离
 
@@ -248,7 +252,7 @@ pub struct ProviderUpdateRequestDto {
 pub struct ModelCatalogEntryDto {
     pub provider_id: String,
     pub provider_name: String,
-    pub provider_kind: String,
+    pub provider_kind: ProviderKind,  // 统一用枚举，与 ProviderDto 一致
     pub provider_enabled: bool,
     pub model_db_id: String,
     pub model_id: String,
@@ -281,15 +285,35 @@ pub struct ModelTagUpdateDto {
 - `provider.list` → 返回 `Vec<ProviderDto>`（无 models 字段）
 - `provider.create` → 接收 `ProviderCreateRequestDto`，生成 UUID，写 SQL
 - `provider.update` → 接收 `ProviderUpdateRequestDto`，patch SQL
-- `provider.delete` → 删 SQL provider（CASCADE 删 model + tag）
-- `provider.test_connection` → 用 SQL 中的 api_key + base_url 测试
+- `provider.delete` → **阻断删除**：先检查 `settings.subagent.profiles` 中是否有 profile 引用该 `provider_id`，有则拒绝（`bail!("cannot delete provider: N profiles still reference it")`）。无引用时删 SQL provider（CASCADE 删 model + tag）
+- `provider.test_connection` → 见下方"测试探针"小节
 
 **新增**：
 - `model.list` → 参数 `{provider_id?, tags?, include_disabled?}`，返回 `Vec<ModelCatalogEntryDto>`
 - `model.create` → 接收 `ModelCreateRequestDto`，生成 UUID，写 SQL，可选批量 insert tags
 - `model.update` → 接收 `ModelUpdateRequestDto`，patch SQL
-- `model.delete` → 删 SQL model（CASCADE 删 tag）
+- `model.delete` → **阻断删除**：先检查 `settings.subagent.profiles` 中是否有 profile 引用 `(provider_id, model_id)`，有则拒绝（`bail!("cannot delete model: N profiles still reference it")`）。无引用时删 SQL model（CASCADE 删 tag）
 - `model.tags.update` → 接收 `ModelTagUpdateDto`，全量覆盖 tags（差集 add/remove）
+
+### Profile 引用完整性（跨存储约束）
+
+`profiles` 仍留在 `settings.toml`（本次不迁入 SQL），但 profile 的 `provider_id` + `model` 字段引用 SQL 中的 provider/model 记录。删除 provider/model 时必须阻断：
+
+- `provider_delete`：遍历 `settings.subagent.profiles`，任何 profile 的 `provider_id == req.id` → 拒绝删除
+- `model_delete`：遍历 `settings.subagent.profiles`，任何 profile 的 `provider_id == model.provider_id && model == model.model_id` → 拒绝删除
+- `profile_create` / `profile_update`：校验 `provider_id` 存在且 `enabled`，校验 `model` 在该 provider 下存在且 `enabled`（从 `models` 表查，不再从 `provider.models` 字段查）
+
+阻断删除而非自动解绑，是因为 profile 是用户显式创建的路由配置，静默解绑会导致 profile 变成无模型可用的僵尸配置。
+
+### Provider 测试探针（`provider.test_connection`）
+
+当前实现先打 `GET /models`，失败时 fallback 到 `POST /chat/completions`，fallback 需要一个 model id 作为 probe body。删除 `provider.models` 字段后，probe model 来源：
+
+1. 从 `models` 表查该 provider 下第一个 `enabled=true` 的 model，用其 `model_id` 作为 probe
+2. 若该 provider 下没有任何 enabled model，跳过 `/chat/completions` fallback，`/models` 成功即视为连接通过；`/models` 失败则返回错误 `"provider has no models configured, cannot probe /chat/completions"`
+3. 不盲探（不硬编码 `gpt-3.5-turbo` 之类的默认模型）
+
+API key + base_url 仍从 SQL provider 记录读取。
 
 ### Sidecar env 注入（`crates/busytok-subagent/src/sidecar/pool.rs`）
 
@@ -452,9 +476,14 @@ error!(event_code = "model.sql_read_failed", error = %e, "SQL read failed");
 
 ### Runtime 层（`crates/busytok-runtime/tests/supervisor_control.rs`）
 - provider.create/update/delete RPC
+- provider.delete 被引用时**阻断删除**（profile 引用 → 拒绝）
+- provider.test_connection 无 enabled model 时跳过 fallback，返回明确错误
+- provider.test_connection 有 enabled model 时用其 model_id 探针
 - model.create/update/delete RPC
+- model.delete 被引用时**阻断删除**（profile 引用 → 拒绝）
 - model.tags.update RPC（全量覆盖）
-- model.list RPC with filter
+- model.list RPC with filter（provider_id / tags AND / include_disabled 同时过滤 provider 和 model）
+- profile.create/update 校验 model 存在于 `models` 表（不再校验 `provider.models` 字段）
 - sidecar spawn 注入 `OPENAI_API_KEY` + `OPENAI_BASE_URL`
 - 断言不依赖 `api_key_env_name` / keychain
 
