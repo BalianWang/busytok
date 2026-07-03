@@ -274,12 +274,21 @@ fn prune_removes_old_file_with_valid_date_suffix() {
     // Create a file with a valid date suffix and set its mtime to the past.
     let old = log_dir.join("service.2020-01-01");
     std::fs::write(&old, "old data").unwrap();
-    let f = std::fs::File::open(&old).unwrap();
     let thirty_days_ago = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(30 * 86400))
         .unwrap();
-    f.set_modified(thirty_days_ago).ok();
-    drop(f);
+    // On Windows, File::open (read-only) cannot set file times —
+    // SetFileTime requires write access. Open with write(true) and skip
+    // the test if set_modified fails.
+    let mtime_ok = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&old)
+        .and_then(|f| f.set_modified(thirty_days_ago))
+        .is_ok();
+    if !mtime_ok {
+        eprintln!("skip: cannot set file mtime on this platform");
+        return;
+    }
 
     prune_old_logs(&log_dir, 7);
 
