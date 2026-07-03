@@ -2001,6 +2001,7 @@ async fn read_service_row_count_outcome_carries_count() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn service_app_boot_writes_marker_and_can_be_shutdown() {
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = BusytokPaths::for_test(dir.path());
