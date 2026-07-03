@@ -1463,14 +1463,20 @@ async fn start_tailing_catchup_error_logs_warning_without_failing() {
     // `Err(e) => { warn!(...); }` branch in the catch-up match.
     let (db, _status, _event_bus, _settings, writer_handle, writer_join) = tail_test_setup(16);
 
+    // Use a private temp directory as the watch root. Using `/tmp` directly
+    // fails on Ubuntu CI where `/tmp` contains systemd-private directories that
+    // the watcher cannot access (Permission denied).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
     // Source points to a file path that does not exist on disk. The catch-up
     // phase will try to read it, read_file_once will fail, and the error
     // will be logged as a warning.
-    let missing_file = PathBuf::from("/tmp/busytok-nonexistent-catchup-12345678.jsonl");
+    let missing_file = root.join("busytok-nonexistent-catchup-12345678.jsonl");
     let source = busytok_discovery::DiscoveredLogSource {
         agent: AgentKind::Codex,
         source_id: "src-missing-catchup".to_string(),
-        root_path: PathBuf::from("/tmp"),
+        root_path: root,
         files: vec![missing_file.clone()],
         source_type: LogSourceType::Jsonl,
         configured_by_user: false,
