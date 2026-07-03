@@ -196,6 +196,7 @@ mod tests {
     use super::*;
     use busytok_config::BusytokPaths;
     use busytok_control::server::ControlServer;
+    use serial_test::serial;
     use std::time::Instant;
 
     /// boot() should complete stages 1-4 and return a ServiceApp with a
@@ -208,6 +209,7 @@ mod tests {
     /// `service_marker::write` manually — if boot() regresses and stops
     /// writing the marker, this assertion fails.
     #[tokio::test]
+    #[serial]
     async fn boot_creates_operational_service() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
@@ -336,6 +338,7 @@ mod tests {
     /// The `server` field is private, but this test is in a child module of
     /// `service_app`, so it can access private fields.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn run_completes_gracefully_on_server_shutdown() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
