@@ -395,10 +395,10 @@ config.env.insert("OPENAI_BASE_URL".to_string(), provider.base_url);
 
 ## 8. CLI 命令
 
-在 `apps/cli/src/main.rs` 的 `Command` enum 新增 `Catalog`：
+在 `apps/cli/src/main.rs` 的 `Command` enum 新增 `Models`（命令名 `busytok models`）：
 
 ```rust
-Catalog {
+Models {
     /// 按 provider ID 过滤
     #[arg(long)]
     provider: Option<String>,
