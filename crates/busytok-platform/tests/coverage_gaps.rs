@@ -54,9 +54,16 @@ fn with_home_dir_uses_custom_home_for_service_paths() {
     // custom home directory.
     if cfg!(target_os = "macos") {
         let install_root = p.service_install_root();
-        assert!(install_root.starts_with(&custom), "install root should be under custom home: {} vs {}", install_root.display(), custom.display());
         assert!(
-            install_root.to_string_lossy().contains("Library/LaunchAgents"),
+            install_root.starts_with(&custom),
+            "install root should be under custom home: {} vs {}",
+            install_root.display(),
+            custom.display()
+        );
+        assert!(
+            install_root
+                .to_string_lossy()
+                .contains("Library/LaunchAgents"),
             "install root should point at LaunchAgents"
         );
 
@@ -81,8 +88,14 @@ fn resolve_home_dir_prefers_custom_over_system() {
     // home directory — distinct from the custom override.
     let default = PlatformPaths::new();
     let resolved = default.resolve_home_dir();
-    assert!(!resolved.as_os_str().is_empty(), "system home must not be empty");
-    assert_ne!(resolved, custom, "default should not resolve to custom override");
+    assert!(
+        !resolved.as_os_str().is_empty(),
+        "system home must not be empty"
+    );
+    assert_ne!(
+        resolved, custom,
+        "default should not resolve to custom override"
+    );
 }
 
 /// `PlatformPaths::default()` is equivalent to `PlatformPaths::new()`:
@@ -108,12 +121,6 @@ fn default_impl_matches_new() {
         from_new.service_definition_path(),
         from_default.service_definition_path()
     );
-    assert_eq!(
-        from_new.busytok_data_dir(),
-        from_default.busytok_data_dir()
-    );
-    assert_eq!(
-        from_new.busytok_db_path(),
-        from_default.busytok_db_path()
-    );
+    assert_eq!(from_new.busytok_data_dir(), from_default.busytok_data_dir());
+    assert_eq!(from_new.busytok_db_path(), from_default.busytok_db_path());
 }

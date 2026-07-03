@@ -463,8 +463,7 @@ mod tests {
         match outcome {
             InitialScanOutcome::ReadyDegraded(report) => {
                 assert!(
-                    report.error.contains("detached database")
-                        || report.error.contains("reopen"),
+                    report.error.contains("detached database") || report.error.contains("reopen"),
                     "expected DB reopen error, got: {}",
                     report.error
                 );
@@ -506,7 +505,10 @@ mod tests {
                 assert_eq!(report.files_scanned, 0);
             }
             InitialScanOutcome::ReadyDegraded(report) => {
-                panic!("file-backed DB scan should succeed, got error: {}", report.error);
+                panic!(
+                    "file-backed DB scan should succeed, got error: {}",
+                    report.error
+                );
             }
         }
     }

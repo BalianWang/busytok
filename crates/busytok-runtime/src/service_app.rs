@@ -333,7 +333,10 @@ mod tests {
         // With result_already_read=true, the function must NOT await the
         // server_task — it just shuts down the server and drains.
         let result = shutdown_control_server(Arc::clone(&server), server_task, true).await;
-        assert!(result.is_ok(), "shutdown with already_read=true must succeed");
+        assert!(
+            result.is_ok(),
+            "shutdown with already_read=true must succeed"
+        );
     }
 
     /// Full `run()` lifecycle: boot, reach the `select!` block, then trigger
@@ -351,9 +354,7 @@ mod tests {
         paths.ensure_dirs_exist().expect("ensure dirs");
         let data_dir = paths.data_dir().to_path_buf();
 
-        let app = ServiceApp::boot(paths, Instant::now())
-            .await
-            .expect("boot");
+        let app = ServiceApp::boot(paths, Instant::now()).await.expect("boot");
 
         // Clone the server Arc BEFORE run() takes ownership of app.
         // Child modules can access private parent fields.
@@ -368,11 +369,7 @@ mod tests {
         });
 
         // run() should complete when server_task completes.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            app.run(),
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), app.run()).await;
 
         // The timeout should NOT fire — run() should complete.
         assert!(

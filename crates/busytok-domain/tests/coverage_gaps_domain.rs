@@ -18,8 +18,8 @@
 )]
 
 use busytok_domain::{
-    derive_project_hash, derive_session_id, hash_short, metadata_event_hash, normalize_project_path,
-    IdentityError, MetadataFingerprint, ReportingTimezone,
+    derive_project_hash, derive_session_id, hash_short, metadata_event_hash,
+    normalize_project_path, IdentityError, MetadataFingerprint, ReportingTimezone,
 };
 
 // ── hash_short (FNDA:0) ─────────────────────────────────────────────────
@@ -129,10 +129,7 @@ fn normalize_empty_path_returns_empty_path_error() {
 #[test]
 fn normalize_relative_path_returns_not_absolute_error() {
     let err = normalize_project_path("relative/path").unwrap_err();
-    assert!(
-        matches!(err, IdentityError::NotAbsolute(_)),
-        "got {err:?}"
-    );
+    assert!(matches!(err, IdentityError::NotAbsolute(_)), "got {err:?}");
 }
 
 #[test]
@@ -176,7 +173,10 @@ fn normalize_tilde_slash_path_expands() {
         // normalize_path_components on "~/foo" keeps "~" as a Normal
         // component, so result is "~/foo" which is NOT absolute.
         // This would be a NotAbsolute error.
-        assert!(result.contains("foo"), "result must contain 'foo': {result}");
+        assert!(
+            result.contains("foo"),
+            "result must contain 'foo': {result}"
+        );
     }
 }
 

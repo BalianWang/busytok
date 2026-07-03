@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use busytok_tailer::{
-    read_file_once, FileChangeKind, FileChangeEvent, FileWatchService, JsonlLineBuffer,
+    read_file_once, FileChangeEvent, FileChangeKind, FileWatchService, JsonlLineBuffer,
     ScanFileRequest,
 };
 
@@ -75,10 +75,7 @@ fn watch_path_fails_for_nonexistent_path() {
     let mut service = FileWatchService::new().unwrap();
     let bogus = PathBuf::from("/this/path/does/not/exist/anywhere");
     let result = service.watch_path(&bogus);
-    assert!(
-        result.is_err(),
-        "watching a nonexistent path should error"
-    );
+    assert!(result.is_err(), "watching a nonexistent path should error");
 }
 
 #[test]
@@ -242,11 +239,21 @@ fn poll_for_events(service: &FileWatchService, timeout: Duration) -> Vec<FileCha
     let deadline = Instant::now() + timeout;
     let mut all = Vec::new();
     while Instant::now() < deadline {
-        all.extend(service.poll_events(Duration::from_millis(200)).into_iter().flatten());
+        all.extend(
+            service
+                .poll_events(Duration::from_millis(200))
+                .into_iter()
+                .flatten(),
+        );
         if !all.is_empty() {
             // Once we have events, do one more short poll to catch any
             // coalesced events that arrive slightly later.
-            all.extend(service.poll_events(Duration::from_millis(100)).into_iter().flatten());
+            all.extend(
+                service
+                    .poll_events(Duration::from_millis(100))
+                    .into_iter()
+                    .flatten(),
+            );
             return all;
         }
     }
@@ -305,7 +312,11 @@ fn read_file_once_handles_invalid_utf8_bytes() {
 
     // Both lines should be present (lossy-converted). The invalid UTF-8
     // check in `read_file_once` triggers the `tracing::warn!` branch.
-    assert_eq!(batch.lines.len(), 2, "both completed lines should be present");
+    assert_eq!(
+        batch.lines.len(),
+        2,
+        "both completed lines should be present"
+    );
     assert_eq!(batch.lines[0].text, "valid");
     // Invalid bytes are replaced with U+FFFD by from_utf8_lossy.
     assert!(

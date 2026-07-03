@@ -182,10 +182,7 @@ mod tests {
         );
         assert_eq!(LifecycleStatus::Running.as_str(), "running");
         assert_eq!(LifecycleStatus::Disabled.as_str(), "disabled");
-        assert_eq!(
-            LifecycleStatus::NeedsAttention.as_str(),
-            "needs_attention"
-        );
+        assert_eq!(LifecycleStatus::NeedsAttention.as_str(), "needs_attention");
     }
 
     #[test]
@@ -243,9 +240,9 @@ mod tests {
         // Any implementor that doesn't override it must inherit that
         // behaviour, so callers can rely on `?` not propagating an error.
         let lc = DefaultProbeLifecycle;
-        let result = lc.probe_service_identity().expect(
-            "default probe_service_identity must never return Err",
-        );
+        let result = lc
+            .probe_service_identity()
+            .expect("default probe_service_identity must never return Err");
         assert_eq!(result, None);
     }
 

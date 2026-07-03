@@ -232,7 +232,10 @@ mod tests {
         let result = run_recovery_with(&ErrorFake);
         assert!(result.is_err(), "error outcome should propagate");
         assert!(
-            result.unwrap_err().to_string().contains("service failed to start"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("service failed to start"),
             "error message should be preserved"
         );
     }
@@ -261,7 +264,10 @@ mod tests {
     #[test]
     fn recovery_tolerates_status_check_failure() {
         let result = run_recovery_with(&StatusErrorFake);
-        assert!(result.is_ok(), "status check failure should not block recovery");
+        assert!(
+            result.is_ok(),
+            "status check failure should not block recovery"
+        );
     }
 
     // ── Cover connect_with_service_recovery ────────────────────────────
@@ -274,8 +280,9 @@ mod tests {
     #[tokio::test]
     async fn connect_with_service_recovery_returns_client_when_server_is_running() {
         let runtime = Arc::new(TestRuntimeControl::with_claude_fixture().await.unwrap());
-        let (server, socket_path) =
-            ControlServer::<PlatformTransport>::spawn_for_test(runtime).await.unwrap();
+        let (server, socket_path) = ControlServer::<PlatformTransport>::spawn_for_test(runtime)
+            .await
+            .unwrap();
         let server = Arc::new(server);
         let server_task = tokio::spawn({
             let s = Arc::clone(&server);

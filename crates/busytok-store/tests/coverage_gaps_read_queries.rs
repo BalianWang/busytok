@@ -47,9 +47,12 @@ fn read_overview_summary_reports_zero_cost_when_priced_row_has_zero_cost() {
         )
         .unwrap();
 
-    let summary =
-        read_queries::read_overview_summary(db.conn(), "gen-zero-cost", &RangeWindow::new(0, 3_600_000))
-            .unwrap();
+    let summary = read_queries::read_overview_summary(
+        db.conn(),
+        "gen-zero-cost",
+        &RangeWindow::new(0, 3_600_000),
+    )
+    .unwrap();
     assert_eq!(summary.total_tokens, 100);
     assert!(summary.has_cost);
     assert!(!summary.has_no_cost);
@@ -61,7 +64,8 @@ fn read_overview_summary_reports_zero_cost_when_priced_row_has_zero_cost() {
 #[test]
 fn read_overview_window_aggregates_exact_empty_windows_returns_empty_vec() {
     let db = Database::open_in_memory().unwrap();
-    let rows = read_queries::read_overview_window_aggregates_exact(db.conn(), "gen-empty", &[]).unwrap();
+    let rows =
+        read_queries::read_overview_window_aggregates_exact(db.conn(), "gen-empty", &[]).unwrap();
     assert!(rows.is_empty());
 }
 
@@ -81,7 +85,8 @@ fn read_breakdown_window_aggregates_exact_filters_by_project_hash() {
     priced.cost_usd = Some(0.4);
     priced.project_hash = Some("proj-A".to_string());
     priced.project_path = Some("/repo/A".to_string());
-    db.write_usage_event(&priced, UsageWritePolicy::InsertOnce).unwrap();
+    db.write_usage_event(&priced, UsageWritePolicy::InsertOnce)
+        .unwrap();
     db.conn()
         .execute(
             "UPDATE usage_events SET generation_id = 'gen-bd', dedupe_key = 'evt-bd-window-1' \
@@ -209,7 +214,10 @@ fn read_breakdown_list_groups_by_model_and_populates_extra_values() {
     assert!(!rows.items[0].has_no_cost);
     // extra_values[0] = agent label, extra_values[1] = top project label
     assert_eq!(rows.items[0].extra_values.len(), 2);
-    assert_eq!(rows.items[0].extra_values[0], Some("claude_code".to_string()));
+    assert_eq!(
+        rows.items[0].extra_values[0],
+        Some("claude_code".to_string())
+    );
     assert_eq!(rows.items[0].extra_values[1], Some("/repo/1".to_string()));
 
     assert_eq!(rows.items[1].group_key, "haiku");
@@ -354,7 +362,8 @@ fn read_session_source_context_returns_distinct_sources_for_session() {
         )
         .unwrap();
 
-    let rows = read_queries::read_session_source_context(db.conn(), "gen-sc", "sess-A", 20).unwrap();
+    let rows =
+        read_queries::read_session_source_context(db.conn(), "gen-sc", "sess-A", 20).unwrap();
     assert_eq!(rows.len(), 2);
     let source_ids: Vec<&str> = rows.iter().map(|r| r.source_id.as_str()).collect();
     assert!(source_ids.contains(&"src-1"));
@@ -489,18 +498,14 @@ fn read_source_health_summaries_cursor_pagination_returns_second_page() {
 
     // Page 1: limit=1, should return one row (src-3, the highest scan) and a
     // next_cursor that encodes (scan=3000, source_id="src-3").
-    let page1 = read_queries::read_source_health_summaries(
-        db.conn(),
-        "gen-sh",
-        1,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let page1 =
+        read_queries::read_source_health_summaries(db.conn(), "gen-sh", 1, None, None, None)
+            .unwrap();
     assert_eq!(page1.items.len(), 1);
     assert_eq!(page1.items[0].source_id, "src-3");
-    let cursor = page1.next_cursor.expect("first page should produce a cursor");
+    let cursor = page1
+        .next_cursor
+        .expect("first page should produce a cursor");
 
     // Page 2: cursor set, exercises the `idx, idx2, idx3` parameter binding.
     let page2 = read_queries::read_source_health_summaries(
@@ -541,23 +546,35 @@ fn read_source_health_summary_totals_filters_by_client_and_status() {
         .unwrap();
 
     // status_filter = "scanning_or_active" → matches src-1 and src-2 (active_source_count = 1).
-    let totals_scanning_or_active =
-        read_queries::read_source_health_summary_totals(db.conn(), "gen-totals", None, Some("scanning_or_active"))
-            .unwrap();
+    let totals_scanning_or_active = read_queries::read_source_health_summary_totals(
+        db.conn(),
+        "gen-totals",
+        None,
+        Some("scanning_or_active"),
+    )
+    .unwrap();
     assert_eq!(totals_scanning_or_active.source_count, 2);
     assert_eq!(totals_scanning_or_active.active_source_count, 1);
 
     // status_filter = "idle" → src-4 only (idle status, NOT in the excluded list).
-    let totals_idle =
-        read_queries::read_source_health_summary_totals(db.conn(), "gen-totals", None, Some("idle"))
-            .unwrap();
+    let totals_idle = read_queries::read_source_health_summary_totals(
+        db.conn(),
+        "gen-totals",
+        None,
+        Some("idle"),
+    )
+    .unwrap();
     assert_eq!(totals_idle.source_count, 1);
     assert_eq!(totals_idle.active_source_count, 0);
 
     // status_filter = "error" (other arm) → only src-3.
-    let totals_error =
-        read_queries::read_source_health_summary_totals(db.conn(), "gen-totals", None, Some("error"))
-            .unwrap();
+    let totals_error = read_queries::read_source_health_summary_totals(
+        db.conn(),
+        "gen-totals",
+        None,
+        Some("error"),
+    )
+    .unwrap();
     assert_eq!(totals_error.source_count, 1);
     assert_eq!(totals_error.active_source_count, 0);
 
@@ -612,7 +629,11 @@ fn read_source_health_summaries_filters_by_client_and_status() {
         Some("scanning_or_active"),
     )
     .unwrap();
-    let ids: Vec<&str> = scanning_or_active.items.iter().map(|r| r.source_id.as_str()).collect();
+    let ids: Vec<&str> = scanning_or_active
+        .items
+        .iter()
+        .map(|r| r.source_id.as_str())
+        .collect();
     assert_eq!(ids, vec!["src-2", "src-1"]); // ordered by last_scan DESC, source_id DESC
 
     let idle = read_queries::read_source_health_summaries(
@@ -695,9 +716,14 @@ fn read_client_source_detail_returns_row_for_active_source() {
 #[test]
 fn read_model_token_breakdown_returns_zeros_when_model_not_found() {
     let db = Database::open_in_memory().unwrap();
-    let row =
-        read_queries::read_model_token_breakdown(db.conn(), "gen-empty", "no-such-model", 0, 10_000)
-            .unwrap();
+    let row = read_queries::read_model_token_breakdown(
+        db.conn(),
+        "gen-empty",
+        "no-such-model",
+        0,
+        10_000,
+    )
+    .unwrap();
     assert_eq!(row.prompt_input_total_tokens, 0);
     assert_eq!(row.cache_read_tokens, 0);
     assert_eq!(row.input_tokens, 0);

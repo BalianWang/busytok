@@ -153,14 +153,20 @@ week_starts_on = 1
 
     // Verify the file was NOT rewritten (canonical == original).
     let after = fs::read_to_string(paths.config_dir().join("settings.toml")).unwrap();
-    assert_eq!(after, original, "file should not be rewritten if canonical matches");
+    assert_eq!(
+        after, original,
+        "file should not be rewritten if canonical matches"
+    );
 
     // mtime should be unchanged (no save happened).
     let mtime_after = fs::metadata(paths.config_dir().join("settings.toml"))
         .and_then(|m| m.modified())
         .ok();
     if let (Some(before), Some(after)) = (mtime_before, mtime_after) {
-        assert_eq!(before, after, "mtime must be unchanged when no save happens");
+        assert_eq!(
+            before, after,
+            "mtime must be unchanged when no save happens"
+        );
     }
 }
 

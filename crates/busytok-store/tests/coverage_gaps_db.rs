@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 
 use busytok_domain::{
-    AgentKind, NormalizedUsageEvent, OperationalDiagnosticEvent, ReportingTimezone, UsageWritePolicy,
+    AgentKind, NormalizedUsageEvent, OperationalDiagnosticEvent, ReportingTimezone,
+    UsageWritePolicy,
 };
 use busytok_store::{
     CodexTokenSnapshotRow, DailyUsageRow, Database, LogSourceRow, ModelSummaryRow, ModelUsageRow,
@@ -206,7 +207,9 @@ fn old_event_tokens_compute_delta_both_some_subtracts() {
     // 1.5 - 0.5 is not exactly 1.0 in f64 — use approximate comparison.
     let cost = delta.cost_usd.expect("cost_usd should be Some");
     assert!((cost - 1.0).abs() < 1e-9, "cost_usd delta: {cost}");
-    let est = delta.estimated_cost_usd.expect("estimated_cost_usd should be Some");
+    let est = delta
+        .estimated_cost_usd
+        .expect("estimated_cost_usd should be Some");
     assert!((est - 0.5).abs() < 1e-9, "estimated_cost_usd delta: {est}");
 }
 
@@ -241,15 +244,15 @@ fn in_memory_reopen_and_reopen_readonly_return_none() {
     // In-memory databases have no file path, so reopen() and
     // reopen_readonly() must return Ok(None) (lines 254, 268).
     let db = Database::open_in_memory().unwrap();
-    assert!(db.reopen().unwrap().is_none(), "in-memory reopen returns None");
+    assert!(
+        db.reopen().unwrap().is_none(),
+        "in-memory reopen returns None"
+    );
     assert!(
         db.reopen_readonly().unwrap().is_none(),
         "in-memory reopen_readonly returns None"
     );
-    assert!(
-        db.path_buf().is_none(),
-        "in-memory path_buf returns None"
-    );
+    assert!(db.path_buf().is_none(), "in-memory path_buf returns None");
 }
 
 #[test]
@@ -266,15 +269,19 @@ fn file_backed_open_round_trip_and_path_buf_returns_path() {
         // macOS symlinks /var -> /private/var, so compare canonical paths.
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         assert_eq!(
-            db.path_buf().map(|p| {
-                std::fs::canonicalize(&p).unwrap_or(p)
-            }),
+            db.path_buf()
+                .map(|p| { std::fs::canonicalize(&p).unwrap_or(p) }),
             Some(canonical.clone())
         );
         // reopen should succeed and return a fresh Database to the same path.
-        let reopened = db.reopen().unwrap().expect("file-backed reopen returns Some");
+        let reopened = db
+            .reopen()
+            .unwrap()
+            .expect("file-backed reopen returns Some");
         assert_eq!(
-            reopened.path_buf().map(|p| std::fs::canonicalize(&p).unwrap_or(p)),
+            reopened
+                .path_buf()
+                .map(|p| std::fs::canonicalize(&p).unwrap_or(p)),
             Some(canonical.clone())
         );
         // reopen_readonly should succeed for a file-backed DB.
@@ -489,7 +496,9 @@ fn get_latest_codex_snapshot_returns_none_when_empty_empty_turn() {
     // Cover the empty-turn_id branch of get_latest_codex_snapshot
     // (lines 752-762, 768).
     let db = Database::open_in_memory().unwrap();
-    let got = db.get_latest_codex_snapshot("file-1", "sess-1", "").unwrap();
+    let got = db
+        .get_latest_codex_snapshot("file-1", "sess-1", "")
+        .unwrap();
     assert!(got.is_none());
 }
 
@@ -520,24 +529,8 @@ fn get_latest_codex_snapshot_returns_highest_ordinal_empty_turn() {
 #[test]
 fn get_latest_codex_snapshot_returns_highest_ordinal_nonempty_turn() {
     let db = Database::open_in_memory().unwrap();
-    let snap_a = make_codex_snapshot(
-        "snap-a",
-        "file-1",
-        "sess-1",
-        Some("turn-1"),
-        1,
-        None,
-        100,
-    );
-    let snap_b = make_codex_snapshot(
-        "snap-b",
-        "file-1",
-        "sess-1",
-        Some("turn-1"),
-        3,
-        None,
-        300,
-    );
+    let snap_a = make_codex_snapshot("snap-a", "file-1", "sess-1", Some("turn-1"), 1, None, 100);
+    let snap_b = make_codex_snapshot("snap-b", "file-1", "sess-1", Some("turn-1"), 3, None, 300);
     db.upsert_codex_snapshot(&snap_a).unwrap();
     db.upsert_codex_snapshot(&snap_b).unwrap();
     let latest = db
@@ -560,15 +553,7 @@ fn latest_codex_snapshot_model_for_source_file_returns_none_when_empty() {
 #[test]
 fn latest_codex_snapshot_model_for_source_file_returns_latest_non_empty() {
     let db = Database::open_in_memory().unwrap();
-    let snap = make_codex_snapshot(
-        "snap-1",
-        "file-1",
-        "sess-1",
-        None,
-        1,
-        Some("codex-1"),
-        100,
-    );
+    let snap = make_codex_snapshot("snap-1", "file-1", "sess-1", None, 1, Some("codex-1"), 100);
     db.upsert_codex_snapshot(&snap).unwrap();
     let got = db
         .latest_codex_snapshot_model_for_source_file("file-1")
@@ -745,7 +730,9 @@ fn replace_daily_usage_rebuilds_atomically() {
     db.replace_daily_usage(&[event], &rtz, "gen-A").unwrap();
     let rows = db.daily_usage_rows().unwrap();
     assert!(!rows.is_empty());
-    let total: i64 = db.daily_usage_total_tokens(rows[0].date.as_str(), "gen-A").unwrap();
+    let total: i64 = db
+        .daily_usage_total_tokens(rows[0].date.as_str(), "gen-A")
+        .unwrap();
     assert_eq!(total, 100);
 }
 
@@ -758,9 +745,19 @@ fn checkpoint_log_file_round_trips_via_get_log_file() {
     // get_log_file on unknown id returns None (line 979, 983-985, 994).
     assert!(db.get_log_file("unknown").unwrap().is_none());
 
-    db.checkpoint_log_file("file-1", 1024, "claude_code", "src-1", "/tmp/x.jsonl", Some("inode-1"))
-        .unwrap();
-    let got = db.get_log_file("file-1").unwrap().expect("log file should exist");
+    db.checkpoint_log_file(
+        "file-1",
+        1024,
+        "claude_code",
+        "src-1",
+        "/tmp/x.jsonl",
+        Some("inode-1"),
+    )
+    .unwrap();
+    let got = db
+        .get_log_file("file-1")
+        .unwrap()
+        .expect("log file should exist");
     assert_eq!(got.source_id, "src-1");
     assert_eq!(got.agent, "claude_code");
     assert_eq!(got.path, "/tmp/x.jsonl");
@@ -812,7 +809,8 @@ fn read_chip_hydration_counts_returns_zero_on_fresh_db() {
 fn read_chip_hydration_counts_returns_counts_after_data() {
     let db = Database::open_in_memory().unwrap();
     // Seed two log sources — one 'active', one 'removed'.
-    db.upsert_log_source(&make_log_source("src-active")).unwrap();
+    db.upsert_log_source(&make_log_source("src-active"))
+        .unwrap();
     let mut removed = make_log_source("src-removed");
     removed.status = "removed".to_string();
     db.upsert_log_source(&removed).unwrap();
@@ -825,7 +823,10 @@ fn read_chip_hydration_counts_returns_counts_after_data() {
 
     let (total, sources) = db.read_chip_hydration_counts().unwrap();
     assert_eq!(total, 1, "one usage event");
-    assert_eq!(sources, 1, "only the active source counts (status != 'removed')");
+    assert_eq!(
+        sources, 1,
+        "only the active source counts (status != 'removed')"
+    );
 }
 
 // ── list_log_sources / list_all_diagnostic_events etc ───────────────────────
@@ -1029,7 +1030,8 @@ fn update_log_source_status_changes_status() {
 fn update_log_source_status_no_op_for_unknown_id() {
     // The UPDATE statement matches 0 rows but should not error.
     let db = Database::open_in_memory().unwrap();
-    db.update_log_source_status("does-not-exist", "paused").unwrap();
+    db.update_log_source_status("does-not-exist", "paused")
+        .unwrap();
 }
 
 // ── query_usage_events_paginated (lines 1503-1540) ──────────────────────────
@@ -1051,7 +1053,8 @@ fn query_usage_events_paginated_no_cursor_returns_most_recent_first() {
     let mut e3 = make_test_event("evt-3", AgentKind::ClaudeCode, 300);
     e3.timestamp_ms = 3_000;
     for e in [&e1, &e2, &e3] {
-        db.write_usage_event(e, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(e, UsageWritePolicy::InsertOnce)
+            .unwrap();
     }
 
     // No cursor: return most recent first.
@@ -1072,7 +1075,8 @@ fn query_usage_events_paginated_with_cursor_returns_older_events() {
     let mut e3 = make_test_event("evt-3", AgentKind::ClaudeCode, 300);
     e3.timestamp_ms = 3_000;
     for e in [&e1, &e2, &e3] {
-        db.write_usage_event(e, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(e, UsageWritePolicy::InsertOnce)
+            .unwrap();
     }
 
     // Cursor at (evt-3, ts=3_000): should return evt-2 and evt-1.
@@ -1090,7 +1094,8 @@ fn query_usage_events_paginated_respects_limit() {
     for i in 0..5 {
         let mut e = make_test_event(&format!("evt-{i}"), AgentKind::ClaudeCode, 100);
         e.timestamp_ms = 1_000 + i as i64;
-        db.write_usage_event(&e, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&e, UsageWritePolicy::InsertOnce)
+            .unwrap();
     }
     let rows = db.query_usage_events_paginated(None, 2).unwrap();
     assert_eq!(rows.len(), 2, "limit must be respected");
@@ -1122,15 +1127,8 @@ fn health_check_reports_counts_after_data() {
         UsageWritePolicy::InsertOnce,
     )
     .unwrap();
-    db.checkpoint_log_file(
-        "file-1",
-        1000,
-        "claude_code",
-        "src-1",
-        "/tmp/x.jsonl",
-        None,
-    )
-    .unwrap();
+    db.checkpoint_log_file("file-1", 1000, "claude_code", "src-1", "/tmp/x.jsonl", None)
+        .unwrap();
     let info = db.health_check().unwrap();
     assert!(info.healthy);
     assert_eq!(info.usage_event_count, 1);
@@ -1161,7 +1159,10 @@ fn row_to_usage_event_unknown_agent_falls_back_to_claude_code() {
             [],
         )
         .unwrap();
-    let got = db.get_usage_event("weird-id").unwrap().expect("row should exist");
+    let got = db
+        .get_usage_event("weird-id")
+        .unwrap()
+        .expect("row should exist");
     assert_eq!(
         got.agent,
         AgentKind::ClaudeCode,
@@ -1236,7 +1237,10 @@ fn validate_date_format_rejects_non_numeric_month() {
     let db = Database::open_in_memory().unwrap();
     let err = ingest_with_bad_date_returns_err(&db, "2026-xx-02");
     let msg = format!("{err:#}").to_lowercase();
-    assert!(msg.contains("month"), "expected 'month' in error, got: {msg}");
+    assert!(
+        msg.contains("month"),
+        "expected 'month' in error, got: {msg}"
+    );
 }
 
 #[test]
@@ -1263,7 +1267,10 @@ fn validate_date_format_rejects_month_out_of_range() {
     let db = Database::open_in_memory().unwrap();
     let err = ingest_with_bad_date_returns_err(&db, "2026-13-02");
     let msg = format!("{err:#}").to_lowercase();
-    assert!(msg.contains("month"), "expected 'month' in error, got: {msg}");
+    assert!(
+        msg.contains("month"),
+        "expected 'month' in error, got: {msg}"
+    );
 }
 
 #[test]

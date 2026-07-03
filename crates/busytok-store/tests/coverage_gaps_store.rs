@@ -29,15 +29,17 @@
     dead_code
 )]
 
-use busytok_domain::{AgentKind, CodexTokenSnapshot, NormalizedUsageEvent, OperationalDiagnosticEvent};
+use busytok_domain::{
+    AgentKind, CodexTokenSnapshot, NormalizedUsageEvent, OperationalDiagnosticEvent,
+};
 use busytok_store::read_models::BreakdownFilterField;
 use busytok_store::repository::{
     CodexTokenSnapshotRow, DailyUsageRow, LogSourceRow, ModelSummaryRow, ModelUsageRow, ProjectRow,
     RealtimeSummaryRow, SessionRow, StoreWriteBatch, SubagentHarnessBindingRow,
     SubagentLogicalSubagentRow, SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow,
 };
-use busytok_store::{live_queries, read_queries, write_queries, Database};
 use busytok_store::subagent_queries;
+use busytok_store::{live_queries, read_queries, write_queries, Database};
 use rusqlite::params;
 
 // =============================================================================
@@ -108,8 +110,7 @@ fn query_backfill_buckets_range_returns_bucketed_samples() {
     seed_usage_event(&db, "evt-c", 4_000, 200, Some(0.05));
     seed_usage_event(&db, "evt-d", 6_000, 75, Some(0.007));
 
-    let samples =
-        live_queries::query_backfill_buckets_range(db.conn(), 0, 10_000).unwrap();
+    let samples = live_queries::query_backfill_buckets_range(db.conn(), 0, 10_000).unwrap();
     // Buckets: [2000-4000) -> 150 tokens, 1 cost. [4000-6000) -> 200, 0.05. [6000-8000) -> 75, 0.007.
     assert_eq!(samples.len(), 3);
     assert_eq!(samples[0].bucket_start_ms, 2_000);
@@ -130,19 +131,37 @@ fn query_backfill_buckets_range_returns_empty_for_no_events_in_range() {
     let db = Database::open_in_memory().unwrap();
     seed_usage_event(&db, "evt-out", 100_000, 10, None);
 
-    let samples =
-        live_queries::query_backfill_buckets_range(db.conn(), 0, 10_000).unwrap();
+    let samples = live_queries::query_backfill_buckets_range(db.conn(), 0, 10_000).unwrap();
     assert!(samples.is_empty());
 }
 
 #[test]
 fn query_exact_buckets_range_returns_some_samples_when_buckets_have_cost() {
     let db = Database::open_in_memory().unwrap();
-    seed_usage_bucket_2s(&db, 2_000, "gen-1", "claude_code", "sonnet", 100, Some(0.02), "exact", 1);
-    seed_usage_bucket_2s(&db, 4_000, "gen-1", "claude_code", "sonnet", 200, Some(0.04), "exact", 1);
+    seed_usage_bucket_2s(
+        &db,
+        2_000,
+        "gen-1",
+        "claude_code",
+        "sonnet",
+        100,
+        Some(0.02),
+        "exact",
+        1,
+    );
+    seed_usage_bucket_2s(
+        &db,
+        4_000,
+        "gen-1",
+        "claude_code",
+        "sonnet",
+        200,
+        Some(0.04),
+        "exact",
+        1,
+    );
 
-    let samples =
-        live_queries::query_exact_buckets_range(db.conn(), "gen-1", 0, 10_000).unwrap();
+    let samples = live_queries::query_exact_buckets_range(db.conn(), "gen-1", 0, 10_000).unwrap();
     assert_eq!(samples.len(), 2);
     assert_eq!(samples[0].bucket_start_ms, 2_000);
     assert_eq!(samples[0].tokens_per_sec, 50.0); // 100 / 2
@@ -155,12 +174,24 @@ fn query_exact_buckets_range_returns_some_samples_when_buckets_have_cost() {
 fn query_exact_buckets_range_filters_out_zero_cost_to_none() {
     let db = Database::open_in_memory().unwrap();
     // Seed a bucket with NULL cost_usd (so SUM(COALESCE(cost_usd, 0)) = 0).
-    seed_usage_bucket_2s(&db, 2_000, "gen-1", "claude_code", "sonnet", 100, None, "unavailable", 1);
+    seed_usage_bucket_2s(
+        &db,
+        2_000,
+        "gen-1",
+        "claude_code",
+        "sonnet",
+        100,
+        None,
+        "unavailable",
+        1,
+    );
 
-    let samples =
-        live_queries::query_exact_buckets_range(db.conn(), "gen-1", 0, 10_000).unwrap();
+    let samples = live_queries::query_exact_buckets_range(db.conn(), "gen-1", 0, 10_000).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].cost_per_sec, None, "NULL cost should map to None");
+    assert_eq!(
+        samples[0].cost_per_sec, None,
+        "NULL cost should map to None"
+    );
     assert_eq!(samples[0].tokens_per_sec, 50.0);
 }
 
@@ -183,8 +214,7 @@ fn query_exact_sample_window_returns_some_for_current_bucket_with_tokens() {
         2,
     );
 
-    let sample =
-        live_queries::query_exact_sample_window(db.conn(), "gen-current").unwrap();
+    let sample = live_queries::query_exact_sample_window(db.conn(), "gen-current").unwrap();
     let sample = sample.expect("expected Some sample for current bucket");
     assert_eq!(sample.bucket_start_ms, bucket_start_ms);
     assert_eq!(sample.tokens_per_sec, 200.0); // 400 / 2
@@ -196,10 +226,19 @@ fn query_exact_sample_window_returns_some_for_current_bucket_with_tokens() {
 fn query_exact_sample_window_returns_none_for_current_bucket_with_no_activity() {
     let db = Database::open_in_memory().unwrap();
     // Seed a bucket far in the past — does not intersect the current 2s window.
-    seed_usage_bucket_2s(&db, 0, "gen-old", "claude_code", "sonnet", 999, None, "exact", 1);
+    seed_usage_bucket_2s(
+        &db,
+        0,
+        "gen-old",
+        "claude_code",
+        "sonnet",
+        999,
+        None,
+        "exact",
+        1,
+    );
 
-    let sample =
-        live_queries::query_exact_sample_window(db.conn(), "gen-old").unwrap();
+    let sample = live_queries::query_exact_sample_window(db.conn(), "gen-old").unwrap();
     assert!(
         sample.is_none(),
         "no rows in current bucket -> None (Ok(_) branch)"
@@ -224,8 +263,7 @@ fn query_exact_sample_window_returns_none_when_table_has_rows_but_generation_mis
         1,
     );
 
-    let sample =
-        live_queries::query_exact_sample_window(db.conn(), "gen-missing").unwrap();
+    let sample = live_queries::query_exact_sample_window(db.conn(), "gen-missing").unwrap();
     assert!(sample.is_none(), "missing generation -> None");
 }
 
@@ -247,8 +285,7 @@ fn query_exact_sample_window_returns_some_with_only_events_no_cost() {
         3,
     );
 
-    let sample =
-        live_queries::query_exact_sample_window(db.conn(), "gen-events-only").unwrap();
+    let sample = live_queries::query_exact_sample_window(db.conn(), "gen-events-only").unwrap();
     let sample = sample.expect("events > 0 should produce Some");
     assert_eq!(sample.tokens_per_sec, 0.0);
     assert_eq!(sample.cost_per_sec, None);
@@ -266,8 +303,7 @@ fn query_exact_buckets_range_returns_empty_when_table_has_no_rows() {
 #[test]
 fn query_exact_sample_window_returns_none_when_table_has_no_rows() {
     let db = Database::open_in_memory().unwrap();
-    let sample =
-        live_queries::query_exact_sample_window(db.conn(), "gen-empty").unwrap();
+    let sample = live_queries::query_exact_sample_window(db.conn(), "gen-empty").unwrap();
     assert!(sample.is_none());
 }
 
@@ -416,7 +452,13 @@ fn seed_subagent(db: &Database, id: &str, status: &str) {
     db.subagent_upsert_logical(&row).unwrap();
 }
 
-fn seed_subagent_with_project(db: &Database, id: &str, status: &str, project_id: &str, repo_hash: &str) {
+fn seed_subagent_with_project(
+    db: &Database,
+    id: &str,
+    status: &str,
+    project_id: &str,
+    repo_hash: &str,
+) {
     let mut row = SubagentLogicalSubagentRow::for_test(id, id);
     row.status = status.to_string();
     row.project_id = project_id.to_string();
@@ -424,7 +466,13 @@ fn seed_subagent_with_project(db: &Database, id: &str, status: &str, project_id:
     db.subagent_upsert_logical(&row).unwrap();
 }
 
-fn seed_task_for_subagent(db: &Database, id: &str, subagent_id: &str, status: &str, created_at_ms: i64) {
+fn seed_task_for_subagent(
+    db: &Database,
+    id: &str,
+    subagent_id: &str,
+    status: &str,
+    created_at_ms: i64,
+) {
     let mut task = SubagentTaskRow::for_test(id, subagent_id, "pi/review-cheap", "do something");
     task.status = status.to_string();
     task.created_at_ms = created_at_ms;
@@ -437,7 +485,13 @@ fn seed_memory(db: &Database, subagent_id: &str, hot_summary: Option<&str>) {
     db.subagent_upsert_memory(&mem).unwrap();
 }
 
-fn seed_hot_binding(db: &Database, id: &str, subagent_id: &str, harness: &str, last_used_at_ms: Option<i64>) {
+fn seed_hot_binding(
+    db: &Database,
+    id: &str,
+    subagent_id: &str,
+    harness: &str,
+    last_used_at_ms: Option<i64>,
+) {
     let now = busytok_domain::now_ms();
     db.subagent_upsert_binding(&SubagentHarnessBindingRow {
         id: id.to_string(),
@@ -572,9 +626,7 @@ fn list_filtered_with_status_filter_returns_only_matching_status() {
     seed_subagent_with_project(&db, "sa-deleted", "deleted", "proj-1", "hash-1");
 
     // Filter by status="hot" — only the hot one should be returned.
-    let rows = db
-        .subagent_list_filtered(Some("hot"), None, false)
-        .unwrap();
+    let rows = db.subagent_list_filtered(Some("hot"), None, false).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "sa-hot");
 }
@@ -613,16 +665,12 @@ fn list_filtered_with_include_deleted_returns_tombstones() {
     seed_subagent_with_project(&db, "sa-dead", "deleted", "proj-1", "hash-1");
 
     // Default (exclude deleted) — only warm/cold/hot
-    let excluded = db
-        .subagent_list_filtered(None, None, false)
-        .unwrap();
+    let excluded = db.subagent_list_filtered(None, None, false).unwrap();
     assert_eq!(excluded.len(), 1);
     assert_eq!(excluded[0].id, "sa-live");
 
     // include_deleted=true — both
-    let included = db
-        .subagent_list_filtered(None, None, true)
-        .unwrap();
+    let included = db.subagent_list_filtered(None, None, true).unwrap();
     assert_eq!(included.len(), 2);
 }
 
@@ -655,7 +703,8 @@ fn write_hot_summary_inserts_new_memory_row_when_none_exists() {
     seed_subagent(&db, "sa-1", "warm");
 
     // No memory row yet — calling write_hot_summary should INSERT a new one.
-    db.subagent_write_hot_summary("sa-1", "first hot summary").unwrap();
+    db.subagent_write_hot_summary("sa-1", "first hot summary")
+        .unwrap();
 
     let mem = db.subagent_get_memory("sa-1").unwrap().unwrap();
     assert_eq!(mem.hot_summary.as_deref(), Some("first hot summary"));
@@ -713,9 +762,7 @@ fn commit_eviction_without_hot_summary_returns_cold_when_no_memory() {
     binding.closed_at_ms = Some(now);
 
     // Pass None — hot_summary write skipped; no memory -> status='cold'.
-    let new_status = db
-        .subagent_commit_eviction(&binding, "sa-1", None)
-        .unwrap();
+    let new_status = db.subagent_commit_eviction(&binding, "sa-1", None).unwrap();
     assert_eq!(new_status, "cold");
 }
 
@@ -781,7 +828,9 @@ fn list_resource_events_returns_empty_when_no_events_match_target() {
     })
     .unwrap();
 
-    let filtered = db.subagent_list_resource_events(Some("nonexistent"), 10).unwrap();
+    let filtered = db
+        .subagent_list_resource_events(Some("nonexistent"), 10)
+        .unwrap();
     assert!(filtered.is_empty());
 }
 
@@ -855,7 +904,13 @@ fn find_hot_binding_by_session_returns_none_for_unknown_session() {
 // write_queries.rs coverage
 // =============================================================================
 
-fn enqueue_replay_row(db: &Database, source_file_id: &str, event_seq: i64, event_id: &str, ts: i64) {
+fn enqueue_replay_row(
+    db: &Database,
+    source_file_id: &str,
+    event_seq: i64,
+    event_id: &str,
+    ts: i64,
+) {
     let event_json = serde_json::json!({
         "id": event_id,
         "agent": "claude_code",
@@ -968,13 +1023,9 @@ fn apply_replay_rows_with_source_file_filter_applies_only_matching_rows() {
 #[test]
 fn apply_replay_rows_with_no_rows_returns_zero() {
     let db = Database::open_in_memory().unwrap();
-    let applied = write_queries::apply_replay_rows_to_target_generation(
-        db.conn(),
-        "gen-target",
-        None,
-        10,
-    )
-    .unwrap();
+    let applied =
+        write_queries::apply_replay_rows_to_target_generation(db.conn(), "gen-target", None, 10)
+            .unwrap();
     assert_eq!(applied, 0);
 }
 
@@ -1074,7 +1125,14 @@ fn seed_source_health_summary(
               event_count, last_error, latest_activity_at_ms, created_at_ms, updated_at_ms) \
              VALUES (?1, ?2, ?3, '/root', 'jsonl', ?4, \
                      1, ?5, 0, 0, ?6, NULL, NULL, 1, 1)",
-            params![generation_id, source_id, agent, status, last_scan_at_ms, event_count],
+            params![
+                generation_id,
+                source_id,
+                agent,
+                status,
+                last_scan_at_ms,
+                event_count
+            ],
         )
         .unwrap();
 }
@@ -1082,8 +1140,24 @@ fn seed_source_health_summary(
 #[test]
 fn read_source_health_summaries_filters_by_scanning_or_active_status() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "scanning", Some(1_000), 5);
-    seed_source_health_summary(&db, "gen-1", "src-2", "claude_code", "active", Some(2_000), 10);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "scanning",
+        Some(1_000),
+        5,
+    );
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-2",
+        "claude_code",
+        "active",
+        Some(2_000),
+        10,
+    );
     seed_source_health_summary(&db, "gen-1", "src-3", "claude_code", "idle", Some(3_000), 2);
 
     let page = read_queries::read_source_health_summaries(
@@ -1095,7 +1169,11 @@ fn read_source_health_summaries_filters_by_scanning_or_active_status() {
         Some("scanning_or_active"),
     )
     .unwrap();
-    assert_eq!(page.items.len(), 2, "should return scanning + active sources");
+    assert_eq!(
+        page.items.len(),
+        2,
+        "should return scanning + active sources"
+    );
     let ids: Vec<String> = page.items.iter().map(|r| r.source_id.clone()).collect();
     assert!(ids.contains(&"src-1".to_string()));
     assert!(ids.contains(&"src-2".to_string()));
@@ -1104,10 +1182,34 @@ fn read_source_health_summaries_filters_by_scanning_or_active_status() {
 #[test]
 fn read_source_health_summaries_filters_by_idle_status() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "scanning", Some(1_000), 5);
-    seed_source_health_summary(&db, "gen-1", "src-2", "claude_code", "active", Some(2_000), 10);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "scanning",
+        Some(1_000),
+        5,
+    );
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-2",
+        "claude_code",
+        "active",
+        Some(2_000),
+        10,
+    );
     seed_source_health_summary(&db, "gen-1", "src-3", "claude_code", "idle", Some(3_000), 2);
-    seed_source_health_summary(&db, "gen-1", "src-4", "claude_code", "error", Some(4_000), 1);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-4",
+        "claude_code",
+        "error",
+        Some(4_000),
+        1,
+    );
 
     let page = read_queries::read_source_health_summaries(
         db.conn(),
@@ -1126,8 +1228,24 @@ fn read_source_health_summaries_filters_by_idle_status() {
 #[test]
 fn read_source_health_summaries_filters_by_other_status_string() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "warning", Some(1_000), 5);
-    seed_source_health_summary(&db, "gen-1", "src-2", "claude_code", "error", Some(2_000), 10);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "warning",
+        Some(1_000),
+        5,
+    );
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-2",
+        "claude_code",
+        "error",
+        Some(2_000),
+        10,
+    );
 
     let page = read_queries::read_source_health_summaries(
         db.conn(),
@@ -1146,26 +1264,44 @@ fn read_source_health_summaries_filters_by_other_status_string() {
 #[test]
 fn read_source_health_summaries_with_empty_status_filter_treats_as_none() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "scanning", Some(1_000), 5);
-    seed_source_health_summary(&db, "gen-1", "src-2", "claude_code", "active", Some(2_000), 10);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "scanning",
+        Some(1_000),
+        5,
+    );
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-2",
+        "claude_code",
+        "active",
+        Some(2_000),
+        10,
+    );
 
     // Empty string filter is treated as None (no filter applied).
-    let page = read_queries::read_source_health_summaries(
-        db.conn(),
-        "gen-1",
-        10,
-        None,
-        None,
-        Some(""),
-    )
-    .unwrap();
+    let page =
+        read_queries::read_source_health_summaries(db.conn(), "gen-1", 10, None, None, Some(""))
+            .unwrap();
     assert_eq!(page.items.len(), 2);
 }
 
 #[test]
 fn read_source_health_summaries_filters_by_client_id_and_status() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "active", Some(1_000), 5);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "active",
+        Some(1_000),
+        5,
+    );
     seed_source_health_summary(&db, "gen-1", "src-2", "codex", "active", Some(2_000), 10);
 
     let page = read_queries::read_source_health_summaries(
@@ -1185,15 +1321,9 @@ fn read_source_health_summaries_filters_by_client_id_and_status() {
 #[test]
 fn read_source_health_summaries_returns_empty_when_generation_has_no_sources() {
     let db = Database::open_in_memory().unwrap();
-    let page = read_queries::read_source_health_summaries(
-        db.conn(),
-        "gen-empty",
-        10,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let page =
+        read_queries::read_source_health_summaries(db.conn(), "gen-empty", 10, None, None, None)
+            .unwrap();
     assert!(page.items.is_empty());
     assert!(page.next_cursor.is_none());
 }
@@ -1201,27 +1331,35 @@ fn read_source_health_summaries_returns_empty_when_generation_has_no_sources() {
 #[test]
 fn read_source_health_summary_totals_with_status_filter() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "active", Some(1_000), 5);
-    seed_source_health_summary(&db, "gen-1", "src-2", "claude_code", "active", Some(2_000), 10);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "active",
+        Some(1_000),
+        5,
+    );
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-2",
+        "claude_code",
+        "active",
+        Some(2_000),
+        10,
+    );
     seed_source_health_summary(&db, "gen-1", "src-3", "claude_code", "idle", Some(3_000), 2);
 
-    let totals = read_queries::read_source_health_summary_totals(
-        db.conn(),
-        "gen-1",
-        None,
-        Some("active"),
-    )
-    .unwrap();
+    let totals =
+        read_queries::read_source_health_summary_totals(db.conn(), "gen-1", None, Some("active"))
+            .unwrap();
     assert_eq!(totals.source_count, 2);
     assert_eq!(totals.active_source_count, 2);
 
-    let totals_idle = read_queries::read_source_health_summary_totals(
-        db.conn(),
-        "gen-1",
-        None,
-        Some("idle"),
-    )
-    .unwrap();
+    let totals_idle =
+        read_queries::read_source_health_summary_totals(db.conn(), "gen-1", None, Some("idle"))
+            .unwrap();
     assert_eq!(totals_idle.source_count, 1);
     assert_eq!(totals_idle.active_source_count, 0);
 }
@@ -1473,7 +1611,11 @@ fn upsert_log_source_inserts_and_updates() {
     write_queries::upsert_log_source(db.conn(), &source).unwrap();
     let agent: String = db
         .conn()
-        .query_row("SELECT agent FROM log_sources WHERE id = 'src-1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT agent FROM log_sources WHERE id = 'src-1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(agent, "claude_code");
 
@@ -1483,7 +1625,11 @@ fn upsert_log_source_inserts_and_updates() {
     write_queries::upsert_log_source(db.conn(), &updated).unwrap();
     let status: String = db
         .conn()
-        .query_row("SELECT status FROM log_sources WHERE id = 'src-1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT status FROM log_sources WHERE id = 'src-1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(status, "scanning");
 }
@@ -1524,7 +1670,11 @@ fn record_diagnostic_event_inserts_row() {
     write_queries::record_diagnostic_event(db.conn(), &event2).unwrap();
     let msg2: String = db
         .conn()
-        .query_row("SELECT message FROM diagnostic_events WHERE id = 'diag-1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT message FROM diagnostic_events WHERE id = 'diag-1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(msg2, "updated message");
 }
@@ -1540,14 +1690,17 @@ fn find_by_name_in_repo_returns_matching_subagents() {
     seed_subagent_with_project(&db, "sa-2", "warm", "proj-1", "hash-abc");
     seed_subagent_with_project(&db, "sa-3", "warm", "proj-2", "hash-xyz");
 
-    let rows = subagent_queries::find_by_name_in_repo(db.conn(), "proj-1", "hash-abc", "sa-1").unwrap();
+    let rows =
+        subagent_queries::find_by_name_in_repo(db.conn(), "proj-1", "hash-abc", "sa-1").unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "sa-1");
     assert_eq!(rows[0].project_id, "proj-1");
     assert_eq!(rows[0].repo_hash, "hash-abc");
 
     // No match.
-    let empty = subagent_queries::find_by_name_in_repo(db.conn(), "proj-1", "hash-abc", "nonexistent").unwrap();
+    let empty =
+        subagent_queries::find_by_name_in_repo(db.conn(), "proj-1", "hash-abc", "nonexistent")
+            .unwrap();
     assert!(empty.is_empty());
 }
 
@@ -1606,7 +1759,9 @@ fn set_task_status_updates_status_and_completed_at() {
     )
     .unwrap();
 
-    let task = subagent_queries::get_task(db.conn(), "task-1").unwrap().unwrap();
+    let task = subagent_queries::get_task(db.conn(), "task-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(task.status, "completed");
     assert_eq!(task.result_summary.as_deref(), Some("done"));
     assert!(task.completed_at_ms.is_some());
@@ -1619,12 +1774,16 @@ fn set_task_error_kind_updates_error_kind() {
     seed_task_for_subagent(&db, "task-1", "sa-1", "failed", 100);
 
     subagent_queries::set_task_error_kind(db.conn(), "task-1", Some("timeout")).unwrap();
-    let task = subagent_queries::get_task(db.conn(), "task-1").unwrap().unwrap();
+    let task = subagent_queries::get_task(db.conn(), "task-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(task.error_kind.as_deref(), Some("timeout"));
 
     // Clear error_kind.
     subagent_queries::set_task_error_kind(db.conn(), "task-1", None).unwrap();
-    let task = subagent_queries::get_task(db.conn(), "task-1").unwrap().unwrap();
+    let task = subagent_queries::get_task(db.conn(), "task-1")
+        .unwrap()
+        .unwrap();
     assert!(task.error_kind.is_none());
 }
 
@@ -1679,7 +1838,9 @@ fn pick_oldest_queued_task_picks_and_flips_to_running() {
     seed_task_for_subagent(&db, "task-2", "sa-1", "queued", 200);
 
     // First pick: gets task-1 (oldest), flips to running.
-    let picked = subagent_queries::pick_oldest_queued_task(db.conn()).unwrap().unwrap();
+    let picked = subagent_queries::pick_oldest_queued_task(db.conn())
+        .unwrap()
+        .unwrap();
     assert_eq!(picked.id, "task-1");
     assert_eq!(picked.status, "running");
     assert!(picked.started_at_ms.is_some());
@@ -1690,7 +1851,9 @@ fn pick_oldest_queued_task_picks_and_flips_to_running() {
 
     // Mark task-1 as completed, then task-2 should be picked.
     subagent_queries::set_task_status(db.conn(), "task-1", "completed", None, None).unwrap();
-    let picked2 = subagent_queries::pick_oldest_queued_task(db.conn()).unwrap().unwrap();
+    let picked2 = subagent_queries::pick_oldest_queued_task(db.conn())
+        .unwrap()
+        .unwrap();
     assert_eq!(picked2.id, "task-2");
     assert_eq!(picked2.status, "running");
 }
@@ -1710,7 +1873,10 @@ fn get_memory_returns_memory_for_subagent() {
 
     let mem = subagent_queries::get_memory(db.conn(), "sa-1").unwrap();
     assert!(mem.is_some());
-    assert_eq!(mem.unwrap().hot_summary.as_deref(), Some("hot summary text"));
+    assert_eq!(
+        mem.unwrap().hot_summary.as_deref(),
+        Some("hot summary text")
+    );
 
     let none = subagent_queries::get_memory(db.conn(), "nonexistent").unwrap();
     assert!(none.is_none());
@@ -1735,7 +1901,9 @@ fn reconcile_sidecar_crash_reconciles_state() {
     assert_eq!(counts.status_rolled_back, 2);
 
     // Tasks should be failed.
-    let task1 = subagent_queries::get_task(db.conn(), "task-1").unwrap().unwrap();
+    let task1 = subagent_queries::get_task(db.conn(), "task-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(task1.status, "failed");
     assert_eq!(task1.error.as_deref(), Some("SIDECAR_CRASHED"));
 
@@ -1751,7 +1919,9 @@ fn reconcile_sidecar_crash_reconciles_state() {
     assert_eq!(binding_count, 0);
 
     // Subagents should roll back to warm (memory exists with hot_summary).
-    let sa1 = subagent_queries::get_logical_subagent(db.conn(), "sa-1").unwrap().unwrap();
+    let sa1 = subagent_queries::get_logical_subagent(db.conn(), "sa-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(sa1.status, "warm");
 }
 
@@ -1774,7 +1944,9 @@ fn reconcile_sidecar_crash_rolls_back_to_cold_when_no_memory() {
     let counts = subagent_queries::reconcile_sidecar_crash(db.conn(), "pi").unwrap();
     assert_eq!(counts.status_rolled_back, 1);
 
-    let sa = subagent_queries::get_logical_subagent(db.conn(), "sa-1").unwrap().unwrap();
+    let sa = subagent_queries::get_logical_subagent(db.conn(), "sa-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(sa.status, "cold");
 }
 
@@ -1872,14 +2044,33 @@ fn read_breakdown_activity_list_returns_empty_when_no_match() {
 #[test]
 fn read_client_rollups_returns_grouped_clients() {
     let db = Database::open_in_memory().unwrap();
-    seed_source_health_summary(&db, "gen-1", "src-1", "claude_code", "active", Some(1_000), 5);
-    seed_source_health_summary(&db, "gen-1", "src-2", "claude_code", "idle", Some(2_000), 10);
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-1",
+        "claude_code",
+        "active",
+        Some(1_000),
+        5,
+    );
+    seed_source_health_summary(
+        &db,
+        "gen-1",
+        "src-2",
+        "claude_code",
+        "idle",
+        Some(2_000),
+        10,
+    );
     seed_source_health_summary(&db, "gen-1", "src-3", "codex", "active", Some(3_000), 15);
 
     let rollups = read_queries::read_client_rollups(db.conn(), "gen-1").unwrap();
     assert_eq!(rollups.len(), 2); // claude_code and codex
-    // claude_code has 1 active source, 15 events total.
-    let cc = rollups.iter().find(|r| r.client_kind == "claude_code").unwrap();
+                                  // claude_code has 1 active source, 15 events total.
+    let cc = rollups
+        .iter()
+        .find(|r| r.client_kind == "claude_code")
+        .unwrap();
     assert_eq!(cc.active_source_count, 1);
     assert_eq!(cc.event_count, 15);
 
@@ -2031,7 +2222,10 @@ fn read_overview_summary_exact_returns_totals() {
         .unwrap();
 
     use busytok_store::read_models::RangeWindow;
-    let range = RangeWindow { start_ms: 0, end_ms: 3000 };
+    let range = RangeWindow {
+        start_ms: 0,
+        end_ms: 3000,
+    };
     let summary = read_queries::read_overview_summary_exact(db.conn(), "gen-1", &range).unwrap();
     assert_eq!(summary.total_tokens, 300);
     assert!((summary.total_cost_usd.unwrap() - 2.0).abs() < 0.01);

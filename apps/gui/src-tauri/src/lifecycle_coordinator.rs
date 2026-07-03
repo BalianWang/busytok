@@ -1602,10 +1602,7 @@ mod tests {
     fn cause_as_str_covers_all_variants() {
         // Cover the previously-uncovered arms (LoginItemLaunch,
         // AppMoveDetected, VersionSkewDetected, SettingsToggle, Repair).
-        assert_eq!(
-            LifecycleCause::SettingsToggle.as_str(),
-            "settings_toggle"
-        );
+        assert_eq!(LifecycleCause::SettingsToggle.as_str(), "settings_toggle");
         assert_eq!(LifecycleCause::Repair.as_str(), "repair");
         assert_eq!(
             LifecycleCause::LoginItemLaunch.as_str(),
@@ -1712,7 +1709,11 @@ mod tests {
         );
 
         let stop_logs = logs_matching(&recorder, "lifecycle.stop_for_session");
-        assert_eq!(stop_logs.len(), 1, "exactly one stop_for_session log expected");
+        assert_eq!(
+            stop_logs.len(),
+            1,
+            "exactly one stop_for_session log expected"
+        );
         let log = &stop_logs[0];
         assert_eq!(log.cause.as_deref(), Some("settings_toggle"));
         assert_eq!(log.result, "retryable_failure");
@@ -1776,10 +1777,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let paths = BusytokPaths::for_test(tmp.path());
-        let store = DesktopLifecycleSettingsStore::new(
-            DesktopLifecycleSettings::default(),
-            paths,
-        );
+        let store = DesktopLifecycleSettingsStore::new(DesktopLifecycleSettings::default(), paths);
 
         assert!(!coordinator.is_suppressed().await);
         coordinator
@@ -1903,8 +1901,7 @@ mod tests {
         lifecycle.set_status_response(Err(anyhow::anyhow!("launchctl print timeout")));
         let lifecycle_for_assert = Arc::clone(&lifecycle);
         let login_start = Arc::new(RecordingLoginStart::new());
-        let (coordinator, _recorder) =
-            LifecycleCoordinator::for_test(lifecycle, login_start);
+        let (coordinator, _recorder) = LifecycleCoordinator::for_test(lifecycle, login_start);
 
         coordinator
             .repair(LifecycleCause::Repair)
@@ -1939,18 +1936,12 @@ mod tests {
 
     #[test]
     fn extract_launchctl_exit_parses_exit_equals_prefix() {
-        assert_eq!(
-            extract_launchctl_exit("bootstrap failed exit=7"),
-            Some(7)
-        );
+        assert_eq!(extract_launchctl_exit("bootstrap failed exit=7"), Some(7));
     }
 
     #[test]
     fn extract_launchctl_exit_parses_status_prefix() {
-        assert_eq!(
-            extract_launchctl_exit("error: status: 19"),
-            Some(19)
-        );
+        assert_eq!(extract_launchctl_exit("error: status: 19"), Some(19));
     }
 
     #[test]
@@ -2001,8 +1992,12 @@ mod tests {
         assert!(result.is_ok());
 
         // Both stops attempted (both succeed).
-        assert!(lifecycle.recorded_actions().contains(&"stop_for_current_session".to_string()));
-        assert!(login_start.recorded_actions().contains(&"stop_for_current_session".to_string()));
+        assert!(lifecycle
+            .recorded_actions()
+            .contains(&"stop_for_current_session".to_string()));
+        assert!(login_start
+            .recorded_actions()
+            .contains(&"stop_for_current_session".to_string()));
 
         // exit_app called exactly once with code 0.
         assert_eq!(exit_calls.load(Ordering::SeqCst), 1);
@@ -2286,10 +2281,8 @@ mod tests {
     async fn coordinator_lifecycle_and_login_start_accessors_return_arcs() {
         let lifecycle: Arc<dyn ServiceLifecycle> = Arc::new(CountingLifecycle::new());
         let login_start: Arc<dyn DesktopLoginStart> = Arc::new(RecordingLoginStart::new());
-        let coordinator = LifecycleCoordinator::new(
-            Arc::clone(&lifecycle),
-            Arc::clone(&login_start),
-        );
+        let coordinator =
+            LifecycleCoordinator::new(Arc::clone(&lifecycle), Arc::clone(&login_start));
 
         // The accessor returns &Arc<dyn ...> referencing the same Arc.
         assert!(

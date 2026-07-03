@@ -554,8 +554,16 @@ fn palette_close_invokes_registered_close_handler() {
     let callback = bridge.create_message_callback(services);
     callback(r#"{"id":"close-1","type":"invoke","method":"palette:close"}"#);
 
-    assert_eq!(close_called.load(Ordering::SeqCst), 1, "close handler should be called");
-    assert_eq!(eval_count.load(Ordering::SeqCst), 1, "should send ok response");
+    assert_eq!(
+        close_called.load(Ordering::SeqCst),
+        1,
+        "close handler should be called"
+    );
+    assert_eq!(
+        eval_count.load(Ordering::SeqCst),
+        1,
+        "should send ok response"
+    );
 }
 
 #[test]
@@ -575,7 +583,11 @@ fn palette_close_without_handler_warns_but_responds_ok() {
     let callback = bridge.create_message_callback(services);
     callback(r#"{"id":"close-2","type":"invoke","method":"palette:close"}"#);
 
-    assert_eq!(eval_count.load(Ordering::SeqCst), 1, "should still respond ok");
+    assert_eq!(
+        eval_count.load(Ordering::SeqCst),
+        1,
+        "should still respond ok"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +609,11 @@ fn subscribe_type_responds_ok() {
     let callback = bridge.create_message_callback(services);
     callback(r#"{"id":"sub-1","type":"subscribe"}"#);
 
-    assert_eq!(eval_count.load(Ordering::SeqCst), 1, "subscribe should get ok response");
+    assert_eq!(
+        eval_count.load(Ordering::SeqCst),
+        1,
+        "subscribe should get ok response"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -692,11 +708,13 @@ fn log_frontend_event_with_missing_payload_responds_error() {
     let services = crate::host_application_services::HostServices::new("/tmp/test.sock".into());
     let callback = bridge.create_message_callback(services);
     // log_frontend_event with no payload field → "missing frontend log payload"
-    callback(
-        r#"{"id":"log-err","type":"invoke","method":"log_frontend_event"}"#,
-    );
+    callback(r#"{"id":"log-err","type":"invoke","method":"log_frontend_event"}"#);
 
-    assert_eq!(eval_count.load(Ordering::SeqCst), 1, "should send error response");
+    assert_eq!(
+        eval_count.load(Ordering::SeqCst),
+        1,
+        "should send error response"
+    );
 }
 
 #[test]
@@ -713,11 +731,13 @@ fn flush_frontend_logs_with_missing_entries_responds_error() {
     let services = crate::host_application_services::HostServices::new("/tmp/test.sock".into());
     let callback = bridge.create_message_callback(services);
     // flush_frontend_logs with payload but no "entries" field
-    callback(
-        r#"{"id":"flush-err","type":"invoke","method":"flush_frontend_logs","payload":{}}"#,
-    );
+    callback(r#"{"id":"flush-err","type":"invoke","method":"flush_frontend_logs","payload":{}}"#);
 
-    assert_eq!(eval_count.load(Ordering::SeqCst), 1, "should send error response");
+    assert_eq!(
+        eval_count.load(Ordering::SeqCst),
+        1,
+        "should send error response"
+    );
 }
 
 // ---------------------------------------------------------------------------

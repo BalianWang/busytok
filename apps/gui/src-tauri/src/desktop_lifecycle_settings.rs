@@ -422,7 +422,8 @@ mod tests {
         // (actually create_dir_all succeeds for an existing dir, but the temp
         // file write fails). On POSIX, write to a dir requires write+execute
         // permission; mode 0o500 (r-x) denies writes.
-        std::fs::set_permissions(paths.config_dir(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(paths.config_dir(), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
         let store = DesktopLifecycleSettingsStore::new(DesktopLifecycleSettings::default(), paths);
         // save() should not panic even though atomic_write fails.
         store.save(DesktopLifecycleSettings {
