@@ -242,17 +242,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
         paths.ensure_dirs_exist().expect("ensure dirs");
-        let socket = tempfile::tempdir()
-            .expect("tempdir")
-            .into_path()
-            .join("test.sock");
 
         let db = busytok_store::Database::open_in_memory().expect("db");
         let supervisor = Arc::new(BusytokSupervisor::new(db, paths));
 
-        let server = ControlServer::bind(socket.display().to_string(), supervisor)
+        let (server, _endpoint) = ControlServer::spawn_for_test(supervisor)
             .await
-            .expect("bind");
+            .expect("spawn_for_test");
         let server = Arc::new(server);
         let server_task = tokio::spawn({
             let server = Arc::clone(&server);
@@ -274,17 +270,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
         paths.ensure_dirs_exist().expect("ensure dirs");
-        let socket = tempfile::tempdir()
-            .expect("tempdir")
-            .into_path()
-            .join("test.sock");
 
         let db = busytok_store::Database::open_in_memory().expect("db");
         let supervisor = Arc::new(BusytokSupervisor::new(db, paths));
 
-        let server = ControlServer::bind(socket.display().to_string(), supervisor)
+        let (server, _endpoint) = ControlServer::spawn_for_test(supervisor)
             .await
-            .expect("bind");
+            .expect("spawn_for_test");
         let server = Arc::new(server);
 
         // Spawn a task that immediately errors (simulating server crash).
@@ -313,17 +305,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = BusytokPaths::for_test(dir.path());
         paths.ensure_dirs_exist().expect("ensure dirs");
-        let socket = tempfile::tempdir()
-            .expect("tempdir")
-            .into_path()
-            .join("test.sock");
 
         let db = busytok_store::Database::open_in_memory().expect("db");
         let supervisor = Arc::new(BusytokSupervisor::new(db, paths));
 
-        let server = ControlServer::bind(socket.display().to_string(), supervisor)
+        let (server, _endpoint) = ControlServer::spawn_for_test(supervisor)
             .await
-            .expect("bind");
+            .expect("spawn_for_test");
         let server = Arc::new(server);
         let server_task = tokio::spawn({
             let server = Arc::clone(&server);
