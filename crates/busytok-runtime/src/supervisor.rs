@@ -20,7 +20,7 @@ use rusqlite::Connection;
 use tracing::{debug, error, info, warn};
 
 use busytok_config::{
-    BusytokPaths, BusytokSettings, ProviderConfig, ProviderCredentialStore, ProviderKind,
+    BusytokPaths, BusytokSettings, ProviderCredentialStore, ProviderKind,
 };
 use busytok_control::dispatch::{MethodDispatchError, RuntimeControl};
 use busytok_domain::{now_ms, ReportingTimezone};
@@ -1795,6 +1795,39 @@ impl BusytokSupervisor {
     /// Access the database handle (for testing and diagnostics).
     pub fn db_handle(&self) -> &Arc<std::sync::Mutex<Database>> {
         &self.db
+    }
+
+    /// Access the settings handle (for testing — e.g. injecting profile
+    /// references to exercise `provider_delete`'s blocking check). Production
+    /// code mutates settings via the RPC handlers (`provider_update`,
+    /// `pi_sidecar_locator_update`, `profile_*`).
+    pub fn settings_for_test(&self) -> Arc<Mutex<BusytokSettings>> {
+        Arc::clone(&self.settings)
+    }
+
+    /// Collect (provider_id, model_id) references from `settings.subagent.profiles`.
+    /// Used by `provider_delete` / `model_delete` for blocking-delete checks.
+    /// Profiles still live in TOML (they're user-facing config, not catalog
+    /// data), so the store layer can't collect them itself — this helper
+    /// bridges the config layer to the store's reference-check functions.
+    /// Skips profiles with no `provider_id` or an empty `model`.
+    fn collect_profile_refs(&self) -> Vec<busytok_domain::ProfileModelRef> {
+        let settings = self.settings.lock().unwrap();
+        settings
+            .subagent
+            .profiles
+            .values()
+            .filter_map(|p| {
+                let pid = p.provider_id.as_ref()?;
+                if p.model.is_empty() {
+                    return None;
+                }
+                Some(busytok_domain::ProfileModelRef {
+                    provider_id: pid.clone(),
+                    model_id: p.model.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Access the resolved filesystem paths.
@@ -5344,25 +5377,27 @@ impl RuntimeControl for BusytokSupervisor {
                 }
             };
             if let Some(provider_id) = profile_provider.as_deref() {
-                let provider_cfg = {
-                    let settings = self.settings.lock().unwrap();
-                    settings
-                        .providers
-                        .iter()
-                        .find(|p| p.id == provider_id)
-                        .cloned()
+                // SQL-backed provider + model whitelist validation.
+                let (provider_enabled, model_ok) = {
+                    let db = self.db.lock().unwrap();
+                    let provider = db.get_provider_with_secret(provider_id)?
+                        .ok_or_else(|| anyhow::anyhow!("provider not found: {}", provider_id))?;
+                    let model_ok = if profile_model.is_empty() {
+                        false
+                    } else {
+                        db.get_model_by_provider_and_model_id(provider_id, &profile_model)?
+                            .map(|m| m.enabled)
+                            .unwrap_or(false)
+                    };
+                    (provider.enabled, model_ok)
                 };
-                let provider_cfg = provider_cfg
-                    .ok_or_else(|| anyhow::anyhow!("provider not found: {}", provider_id))?;
-                if !provider_cfg.enabled {
+                if !provider_enabled {
                     anyhow::bail!("provider disabled: {}", provider_id);
                 }
                 // Model whitelist (spec §3.4). Empty `profile.model` is
                 // treated as a whitelist violation — the sidecar would have
                 // no model to send.
-                if profile_model.is_empty()
-                    || !provider_cfg.models.iter().any(|m| m == &profile_model)
-                {
+                if !model_ok {
                     anyhow::bail!(
                         "model '{}' not in provider '{}' whitelist",
                         profile_model,
@@ -5698,177 +5733,80 @@ impl RuntimeControl for BusytokSupervisor {
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
-        // Validate id format (used as keychain account name)
-        if req.id.is_empty() {
-            anyhow::bail!("provider id must not be empty");
-        }
-        if !req
-            .id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            anyhow::bail!("provider id must contain only [a-z0-9-]+");
-        }
-        let mut pending_settings = {
-            let settings = self.settings.lock().unwrap();
-            settings.clone()
+        // id 由 store 层生成（UUID v4），不再校验用户输入。api_key 直接
+        // 存入 SQL providers 表（不再走 OS keychain）。
+        let provider = {
+            let db = self.db.lock().unwrap();
+            db.create_provider(busytok_store::CreateProviderReq {
+                name: req.name,
+                provider_kind: req.provider_kind,
+                base_url: req.base_url,
+                enabled: true,
+                api_key: req.api_key,
+            })?
         };
-        if pending_settings.providers.iter().any(|p| p.id == req.id) {
-            anyhow::bail!("provider already exists: {}", req.id);
-        }
-        let provider = ProviderConfig {
-            id: req.id.clone(),
-            name: req.name,
-            provider_kind: ProviderKind::OpenAiCompatible,
-            base_url: req.base_url,
-            api_key_env_name: req.api_key_env_name,
-            base_url_env_name: req.base_url_env_name,
-            models: req.models,
-            enabled: true,
-        };
-        // Write settings first — if keychain fails, the provider exists
-        // but has no key (user can retry set_key later). If keychain
-        // succeeded but settings.save() fails, the key becomes orphaned.
-        pending_settings.providers.push(provider.clone());
-        pending_settings.save(&self.paths)?;
-        {
-            let mut settings = self.settings.lock().unwrap();
-            *settings = pending_settings;
-        }
-        if let Some(key) = &req.api_key {
-            ProviderCredentialStore::set_key(&provider.id, key).context(
-                "failed to store API key in keychain; provider config was written — retry if needed",
-            )?;
-        }
         tracing::info!(event_code = "provider.created", provider_id = %provider.id, "provider created");
-        // Phase 3 Task 4 (I3 fix): defensively kill any pre-existing worker
-        // for this provider id. Typically a no-op (brand-new provider has no
-        // worker yet), but covers the edge case where a provider was deleted
-        // without the worker being cleaned up, then re-created with the same
-        // id — the stale worker would hold the OLD credentials.
+        // Defensive: kill any pre-existing worker for this provider id.
+        // Typically a no-op (brand-new provider has no worker yet), but
+        // covers the edge case where a provider was deleted without the
+        // worker being cleaned up, then re-created — the stale worker would
+        // hold the OLD credentials.
         self.provider_changed(&provider.id).await;
         Ok(provider_to_dto(&provider))
     }
 
     async fn provider_list(&self) -> Result<ProviderListResponseDto> {
-        // Clone the provider vec under the lock, then drop the guard before
-        // mapping to DTOs — `provider_to_dto` calls `ProviderCredentialStore::has_key`
-        // (sync keychain I/O) for each provider, and holding the settings lock
-        // during that window blocks other settings operations.
-        let providers: Vec<ProviderConfig> = {
-            let settings = self.settings.lock().unwrap();
-            settings.providers.clone()
+        // SQL-backed: list_providers returns ProviderSummary (no api_key).
+        // The settings lock is NOT taken — provider CRUD no longer touches
+        // settings.toml.
+        let summaries = {
+            let db = self.db.lock().unwrap();
+            db.list_providers()?
         };
-        let dtos: Vec<ProviderDto> = providers.iter().map(provider_to_dto).collect();
-        tracing::debug!(count = dtos.len(), "listed providers");
-        Ok(ProviderListResponseDto { providers: dtos })
+        let providers: Vec<ProviderDto> = summaries.iter().map(provider_summary_to_dto).collect();
+        tracing::debug!(count = providers.len(), "listed providers");
+        Ok(ProviderListResponseDto { providers })
     }
 
     async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
-        let mut pending_settings = {
-            let settings = self.settings.lock().unwrap();
-            settings.clone()
+        // SQL-backed: api_key is three-state Option<Option<String>>.
+        //   None              → no change
+        //   Some(None)        → clear
+        //   Some(Some(k))     → update
+        // The store layer handles all three branches atomically under a
+        // transaction. No keychain access.
+        let provider = {
+            let db = self.db.lock().unwrap();
+            db.update_provider(&req.id, busytok_store::UpdateProviderPatch {
+                name: req.name,
+                base_url: req.base_url,
+                enabled: req.enabled,
+                api_key: req.api_key,
+            })?
         };
-        let provider = pending_settings
-            .providers
-            .iter_mut()
-            .find(|p| p.id == req.id)
-            .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
-        if let Some(name) = req.name {
-            provider.name = name;
-        }
-        if let Some(base_url) = req.base_url {
-            provider.base_url = base_url;
-        }
-        // Spec §3.1: api_key_env_name and base_url_env_name are editable provider
-        // fields. They reach the handler via ProviderUpdateRequestDto (patch
-        // semantics: None == leave unchanged).
-        if let Some(api_key_env_name) = req.api_key_env_name {
-            provider.api_key_env_name = api_key_env_name;
-        }
-        if let Some(base_url_env_name) = req.base_url_env_name {
-            provider.base_url_env_name = Some(base_url_env_name);
-        }
-        if let Some(models) = req.models {
-            provider.models = models;
-        }
-        if let Some(enabled) = req.enabled {
-            provider.enabled = enabled;
-        }
-        // Snapshot the provider before `pending_settings` is moved into the
-        // in-memory cache — the reference can't outlive that move.
-        let provider_snapshot = provider.clone();
-        pending_settings.save(&self.paths)?;
-        {
-            let mut settings = self.settings.lock().unwrap();
-            *settings = pending_settings;
-        }
-        // api_key: None = no change; Some("") is ignored (MVP: empty string = no-op).
-        // Future: add clear_api_key: bool if clearing is needed.
-        // Write keychain AFTER settings are persisted — mirrors provider_create's
-        // order so a keychain failure cannot leave the keychain and settings.toml
-        // out of sync (settings is the source of truth; orphaned key is harmless).
-        if let Some(key) = &req.api_key {
-            if !key.is_empty() {
-                ProviderCredentialStore::set_key(&req.id, key)
-                    .context("failed to update API key")?;
-            }
-        }
-        // Compute DTO AFTER the keychain write so has_api_key reflects the
-        // post-update keychain state (mirrors provider_create).
-        let dto = provider_to_dto(&provider_snapshot);
-        tracing::info!(event_code = "provider.updated", provider_id = %req.id, "provider updated");
-        // Phase 3 Task 4 (I3 fix): kill the worker so the next delegate
-        // re-spawns it with the updated config (metadata changes like
-        // base_url / api_key_env_name / models AND key rotations). Covers
-        // both `req.api_key.is_some()` (key rotation) and metadata-only
-        // changes. Safe no-op when no worker exists for this provider.
-        self.provider_changed(&req.id).await;
-        Ok(dto)
+        tracing::info!(event_code = "provider.updated", provider_id = %provider.id, "provider updated");
+        // Kill the worker so the next delegate re-spawns it with the updated
+        // config (metadata changes like base_url AND key rotations). Safe
+        // no-op when no worker exists for this provider.
+        self.provider_changed(&provider.id).await;
+        Ok(provider_to_dto(&provider))
     }
 
     async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()> {
-        let mut pending_settings = {
-            let settings = self.settings.lock().unwrap();
-            settings.clone()
-        };
-        if !pending_settings.providers.iter().any(|p| p.id == req.id) {
-            anyhow::bail!("provider not found: {}", req.id);
-        }
-        // Check if any profile references this provider (Phase 4 adds provider_id to profiles).
-        // NOTE: BusytokSettings.subagent is SubagentSettings (NOT Option), per lib.rs:106.
-        for (_, profile) in &pending_settings.subagent.profiles {
-            if profile_provider_id(profile).as_deref() == Some(req.id.as_str()) {
-                anyhow::bail!(
-                    "cannot delete provider '{}': profiles still reference it",
-                    req.id
-                );
-            }
-        }
-        pending_settings.providers.retain(|p| p.id != req.id);
-        pending_settings.save(&self.paths)?;
+        // SQL-backed delete with blocking profile-reference check.
+        // collect_profile_refs walks settings.subagent.profiles and collects
+        // (provider_id, model_id) pairs — the store layer rejects the delete
+        // if any profile references this provider. No auto-unbind: the caller
+        // must unbind profiles before deleting.
+        let profile_refs = self.collect_profile_refs();
         {
-            let mut settings = self.settings.lock().unwrap();
-            *settings = pending_settings;
-        }
-        // Delete key from keychain AFTER settings are persisted.
-        // If keychain delete fails, the orphaned key is harmless (no provider references it);
-        // downgrading to a warning keeps `provider_delete` resilient on platforms where the
-        // OS keychain/secret-service is unavailable (e.g. Ubuntu CI runners without D-Bus).
-        if let Err(e) = ProviderCredentialStore::delete_key(&req.id) {
-            tracing::warn!(
-                event_code = "provider.keychain_delete_failed",
-                provider_id = %req.id,
-                error = %e,
-                "failed to delete API key from keychain (orphaned key is harmless)"
-            );
+            let db = self.db.lock().unwrap();
+            db.delete_provider(&req.id, &profile_refs)?;
         }
         tracing::info!(event_code = "provider.deleted", provider_id = %req.id, "provider deleted");
-        // Phase 3 Task 4 (I3 fix): kill + remove the worker for the deleted
-        // provider so its sidecar process doesn't keep running with stale
-        // credentials. Distinct log event code (`subagent.provider_deleted`
-        // vs `subagent.provider_changed`) for audit trail clarity. Safe
-        // no-op when no worker exists for this provider.
+        // Kill + remove the worker for the deleted provider so its sidecar
+        // process doesn't keep running with stale credentials. Safe no-op
+        // when no worker exists for this provider.
         self.provider_deleted(&req.id).await;
         Ok(())
     }
@@ -5877,33 +5815,24 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto> {
-        // Snapshot the provider fields under the lock, then drop the guard
-        // before awaiting — holding a `MutexGuard` across `.await` makes the
-        // future `!Send` and breaks the `RuntimeControl` trait bound.
-        let (provider_id, base_url, models) = {
-            let settings = self.settings.lock().unwrap();
-            let provider = settings
-                .providers
-                .iter()
-                .find(|p| p.id == req.id)
-                .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
-            // Clone `models` too — the /chat/completions fallback needs a model
-            // id for the probe body.
-            (
-                provider.id.clone(),
-                provider.base_url.clone(),
-                provider.models.clone(),
-            )
+        // SQL-backed: load provider (with secret) from the store. Drop the db
+        // guard before awaiting — holding a `MutexGuard` across `.await` makes
+        // the future `!Send` and breaks the `RuntimeControl` trait bound.
+        let provider = {
+            let db = self.db.lock().unwrap();
+            db.get_provider_with_secret(&req.id)?
+                .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?
         };
+        let provider_id = provider.id.clone();
+        let base_url = provider.base_url.clone();
         // Defense-in-depth: the frontend doesn't enforce HTTPS, so the backend
         // must reject cleartext URLs before reading the key or sending the key
         // in an Authorization header.
         if !base_url.starts_with("https://") {
             anyhow::bail!("provider base_url must use HTTPS (got: {})", base_url);
         }
-        let key = ProviderCredentialStore::get_key(&provider_id)
-            .context("failed to read keychain")?
-            .ok_or_else(|| anyhow::anyhow!("no API key stored for provider '{}'", provider_id))?;
+        let api_key = provider.api_key.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider has no api key"))?;
         let url = format!("{}/models", base_url.trim_end_matches('/'));
         tracing::info!(
             event_code = "provider.test_connection",
@@ -5920,7 +5849,7 @@ impl RuntimeControl for BusytokSupervisor {
             .build()?;
         let resp = client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .send()
             .await;
         match resp {
@@ -5943,15 +5872,28 @@ impl RuntimeControl for BusytokSupervisor {
                         models_status = %status,
                         "falling back to /chat/completions"
                     );
+                    // Probe model comes from the SQL models table (enabled only).
+                    let probe_model = {
+                        let db = self.db.lock().unwrap();
+                        db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                            provider_id: Some(provider_id.clone()),
+                            tags: vec![],
+                            include_disabled: false,
+                        })?
+                    };
+                    let probe_model = probe_model.into_iter().next()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "provider has no enabled models configured, cannot probe /chat/completions"
+                        ))?;
                     let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
                     let body = serde_json::json!({
-                        "model": chat_probe_model(&models),
+                        "model": probe_model.model_id,
                         "max_tokens": 1,
                         "messages": [{"role": "user", "content": "ping"}],
                     });
                     let chat_resp = client
                         .post(&chat_url)
-                        .header("Authorization", format!("Bearer {}", key))
+                        .header("Authorization", format!("Bearer {}", api_key))
                         .json(&body)
                         .send()
                         .await;
@@ -5988,7 +5930,7 @@ impl RuntimeControl for BusytokSupervisor {
                             );
                             Ok(ProviderTestConnectionResponseDto {
                                 ok: false,
-                                error: Some(e.to_string()),
+                                error: Some(format!("request failed: {}", e)),
                                 models_detected: None,
                             })
                         }
@@ -6005,11 +5947,34 @@ impl RuntimeControl for BusytokSupervisor {
                 tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "connection test error");
                 Ok(ProviderTestConnectionResponseDto {
                     ok: false,
-                    error: Some(e.to_string()),
+                    error: Some(format!("request failed: {}", e)),
                     models_detected: None,
                 })
             }
         }
+    }
+
+    // ── Models (Phase: Provider/Model Catalog Refactor) ─────────────
+    //
+    // Stubs — Task 6 implements these fully against the SQL store. The
+    // `RuntimeControl` trait requires all 5 methods; returning `not yet
+    // implemented` lets the dispatcher compile + route `model.*` RPCs to a
+    // clean error rather than a method-not-found response.
+
+    async fn model_create(&self, _req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_list(&self, _req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_update(&self, _req: ModelUpdateRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_delete(&self, _req: ModelDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
     }
 
     // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update) ──
@@ -6142,25 +6107,34 @@ impl RuntimeControl for BusytokSupervisor {
             anyhow::bail!("profile already exists: {}", req.id);
         }
 
-        // If provider_id is specified, validate the provider exists and is enabled.
+        // If provider_id is specified, validate the provider exists and is
+        // enabled in the SQL catalog, and the model is in the provider's
+        // model whitelist (SQL `models` table).
         if let Some(ref pid) = req.provider_id {
-            let provider = pending.providers.iter().find(|p| &p.id == pid.as_str())
-                .ok_or_else(|| {
-                    tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
-                    anyhow::anyhow!("provider not found: {}", pid)
-                })?;
-            if !provider.enabled {
+            let (provider_enabled, model_ok) = {
+                let db = self.db.lock().unwrap();
+                let provider = db.get_provider_with_secret(pid)
+                    .map_err(|e| {
+                        tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, error = %e, "provider lookup failed");
+                        e
+                    })?
+                    .ok_or_else(|| {
+                        tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
+                        anyhow::anyhow!("provider not found: {}", pid)
+                    })?;
+                let model = db.get_model_by_provider_and_model_id(pid, &req.model)?;
+                (provider.enabled, model.map(|m| m.enabled).unwrap_or(false))
+            };
+            if !provider_enabled {
                 tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
                 anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
             }
-            // Validate model is in provider's whitelist.
-            if !provider.models.contains(&req.model) {
+            if !model_ok {
                 tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, model = %req.model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                 anyhow::bail!(
-                    "model '{}' is not in provider '{}'s model whitelist: {:?}",
+                    "model '{}' is not in provider '{}'s model whitelist",
                     req.model,
-                    pid,
-                    provider.models
+                    pid
                 );
             }
         }
@@ -6205,60 +6179,73 @@ impl RuntimeControl for BusytokSupervisor {
             let new_provider_id = if pid.is_empty() {
                 None
             } else {
-                // Validate the new provider exists and is enabled.
-                let provider = pending.providers.iter().find(|p| &p.id == pid.as_str())
-                    .ok_or_else(|| {
-                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
-                        anyhow::anyhow!("provider not found: {}", pid)
-                    })?;
-                if !provider.enabled {
+                // Validate the new provider exists and is enabled (SQL catalog).
+                let provider_enabled = {
+                    let db = self.db.lock().unwrap();
+                    let provider = db.get_provider_with_secret(pid)
+                        .map_err(|e| {
+                            tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, error = %e, "provider lookup failed");
+                            e
+                        })?
+                        .ok_or_else(|| {
+                            tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
+                            anyhow::anyhow!("provider not found: {}", pid)
+                        })?;
+                    provider.enabled
+                };
+                if !provider_enabled {
                     tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
                     anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
                 }
                 Some(pid.clone())
             };
             // If binding to a provider (new or same), validate the effective
-            // model against that provider's whitelist (unless model is also
-            // being updated this call — the model block below will validate).
+            // model against that provider's whitelist (SQL models table).
+            // Skipped when model is also being updated this call — the model
+            // block below will validate.
             if let Some(ref new_pid) = new_provider_id {
-                let provider = pending
-                    .providers
-                    .iter()
-                    .find(|p| &p.id == new_pid.as_str())
-                    .unwrap();
-                let effective_model = req.model.as_ref().unwrap_or(&profile.model);
-                if !provider.models.contains(effective_model) {
-                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                    anyhow::bail!(
-                        "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                        effective_model,
-                        new_pid,
-                        provider.models
-                    );
+                if req.model.is_none() {
+                    let effective_model = profile.model.clone();
+                    let model_ok = {
+                        let db = self.db.lock().unwrap();
+                        db.get_model_by_provider_and_model_id(new_pid, &effective_model)?
+                            .map(|m| m.enabled)
+                            .unwrap_or(false)
+                    };
+                    if !model_ok {
+                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
+                        anyhow::bail!(
+                            "model '{}' is not in provider '{}'s model whitelist",
+                            effective_model,
+                            new_pid
+                        );
+                    }
                 }
             }
             profile.provider_id = new_provider_id;
         }
 
         // Handle model patch: validate non-empty first (mirrors profile_create),
-        // then whitelist-check against the bound provider if any.
+        // then whitelist-check against the bound provider if any (SQL models table).
         if let Some(ref model) = req.model {
             if model.is_empty() {
                 tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
                 anyhow::bail!("model must not be empty");
             }
             if let Some(ref pid) = profile.provider_id {
-                let provider = pending.providers.iter().find(|p| &p.id == pid.as_str());
-                if let Some(provider) = provider {
-                    if !provider.models.contains(model) {
-                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                        anyhow::bail!(
-                            "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                            model,
-                            pid,
-                            provider.models
-                        );
-                    }
+                let model_ok = {
+                    let db = self.db.lock().unwrap();
+                    db.get_model_by_provider_and_model_id(pid, model)?
+                        .map(|m| m.enabled)
+                        .unwrap_or(false)
+                };
+                if !model_ok {
+                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
+                    anyhow::bail!(
+                        "model '{}' is not in provider '{}'s model whitelist",
+                        model,
+                        pid
+                    );
                 }
             }
             profile.model = model.clone();
@@ -6383,21 +6370,33 @@ fn interpret_chat_probe(status: reqwest::StatusCode) -> (bool, Option<String>) {
     }
 }
 
-/// Maps a `ProviderConfig` (settings-layer type) to a `ProviderDto` (wire type).
-///
-/// Free function rather than a method on `BusytokSupervisor` because it only
-/// needs `ProviderCredentialStore::has_key` (a static method) — taking `&self`
-/// would trip `clippy::unused_self`.
-fn provider_to_dto(provider: &ProviderConfig) -> ProviderDto {
+/// Maps a `busytok_domain::Provider` (SQL domain type, with secret) to a
+/// `ProviderDto` (wire type). Never exposes `api_key` — only `has_api_key`.
+fn provider_to_dto(p: &busytok_domain::Provider) -> ProviderDto {
     ProviderDto {
-        id: provider.id.clone(),
-        name: provider.name.clone(),
-        base_url: provider.base_url.clone(),
-        api_key_env_name: provider.api_key_env_name.clone(),
-        base_url_env_name: provider.base_url_env_name.clone(),
-        models: provider.models.clone(),
-        enabled: provider.enabled,
-        has_api_key: ProviderCredentialStore::has_key(&provider.id),
+        id: p.id.clone(),
+        name: p.name.clone(),
+        provider_kind: p.provider_kind.clone(),
+        base_url: p.base_url.clone(),
+        enabled: p.enabled,
+        has_api_key: p.api_key.is_some(),
+        created_at_ms: p.created_at_ms,
+        updated_at_ms: p.updated_at_ms,
+    }
+}
+
+/// Maps a `busytok_domain::ProviderSummary` (SQL domain type, no secret) to a
+/// `ProviderDto` (wire type). Used by `provider_list` which reads summaries.
+fn provider_summary_to_dto(s: &busytok_domain::ProviderSummary) -> ProviderDto {
+    ProviderDto {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        provider_kind: s.provider_kind.clone(),
+        base_url: s.base_url.clone(),
+        enabled: s.enabled,
+        has_api_key: s.has_api_key,
+        created_at_ms: s.created_at_ms,
+        updated_at_ms: s.updated_at_ms,
     }
 }
 
@@ -6406,8 +6405,7 @@ fn provider_to_dto(provider: &ProviderConfig) -> ProviderDto {
 /// Single source of truth for "which provider does this profile run on?".
 /// Used by:
 /// - `subagent_delegate` (validation before delegating + whitelist check);
-/// - `provider_delete` (reject deletion when a profile still references
-///   the provider).
+/// - `collect_profile_refs` (builds the reference list for blocking deletes).
 ///
 /// Returns `None` for unbound profiles (built-in defaults ship unbound;
 /// Phase 4 adds the UI that lets users set it). Caller decides whether

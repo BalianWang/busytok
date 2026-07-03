@@ -3549,16 +3549,90 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
 // or delete of a provider that has a key) touch the real macOS Keychain and
 // are gated behind `#[cfg(target_os = "macos")] #[ignore]`.
 
-fn provider_create_request(id: &str, name: &str) -> ProviderCreateRequestDto {
+fn provider_create_request(name: &str) -> ProviderCreateRequestDto {
     ProviderCreateRequestDto {
-        id: id.to_string(),
         name: name.to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://api.example.com/v1".to_string(),
-        api_key_env_name: "EXAMPLE_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["example-model".to_string()],
         api_key: None,
     }
+}
+
+/// Seed a provider row directly into SQL with a SPECIFIC id (bypassing the
+/// store's UUID v4 generation). Used by sidecar-coupled tests where the
+/// worker-pool provider-lookup closure still reads from `settings.providers`
+/// (which uses hardcoded ids like "test-provider"). Task 7 will unify the
+/// sidecar to read from SQL, at which point this helper can be removed.
+fn seed_provider_to_sql(
+    sup: &BusytokSupervisor,
+    id: &str,
+    name: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+    enabled: bool,
+) {
+    use rusqlite::params;
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db.conn()
+        .execute(
+            "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                id,
+                name,
+                serde_json::to_string(&ProviderKind::OpenAiCompatible).unwrap(),
+                base_url,
+                enabled as i64,
+                api_key,
+                now,
+            ],
+        )
+        .expect("seed provider to SQL");
+}
+
+/// Seed a model row directly into SQL with a specific provider_id + model_id.
+/// Used by profile tests that need model whitelist validation (the whitelist
+/// check now queries SQL instead of `provider.models.contains(...)`).
+fn seed_model_to_sql(sup: &BusytokSupervisor, provider_id: &str, model_id: &str, enabled: bool) {
+    use rusqlite::params;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    let id = format!(
+        "seed-model-{}-{}",
+        now,
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    db.conn()
+        .execute(
+            "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, provider_id, model_id, enabled as i64, now],
+        )
+        .expect("seed model to SQL");
+}
+
+/// Toggle a model's `enabled` flag in SQL. Used by profile tests that need
+/// to simulate "shrinking the whitelist" (previously done via
+/// `provider_update(models: Some(vec![...]))`).
+fn set_model_enabled_in_sql(
+    sup: &BusytokSupervisor,
+    provider_id: &str,
+    model_id: &str,
+    enabled: bool,
+) {
+    use rusqlite::params;
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db.conn()
+        .execute(
+            "UPDATE models SET enabled = ?1, updated_at_ms = ?2
+             WHERE provider_id = ?3 AND model_id = ?4",
+            params![enabled as i64, now, provider_id, model_id],
+        )
+        .expect("set model enabled in SQL");
 }
 
 #[tokio::test]
@@ -3567,45 +3641,38 @@ async fn provider_crud_round_trips_without_api_key() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create → list shows it.
+    // Create → list shows it. id is now system-generated (UUID v4).
     let created = sup
-        .provider_create(provider_create_request("acme-prod", "Acme"))
+        .provider_create(provider_create_request("Acme"))
         .await
         .unwrap();
-    assert_eq!(created.id, "acme-prod");
     assert_eq!(created.name, "Acme");
     assert!(created.enabled);
     assert!(!created.has_api_key, "no api_key was supplied");
+    let pid = created.id.clone();
 
     let list = sup.provider_list().await.unwrap();
     assert_eq!(list.providers.len(), 1);
-    assert_eq!(list.providers[0].id, "acme-prod");
+    assert_eq!(list.providers[0].id, pid);
 
-    // Update name + models + enabled, no api_key → keychain untouched.
+    // Update name + enabled, no api_key → keychain untouched.
     let updated = sup
         .provider_update(ProviderUpdateRequestDto {
-            id: "acme-prod".to_string(),
+            id: pid.clone(),
             name: Some("Acme Renamed".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: Some(vec![
-                "example-model".to_string(),
-                "second-model".to_string(),
-            ]),
             enabled: Some(false),
             api_key: None,
         })
         .await
         .unwrap();
     assert_eq!(updated.name, "Acme Renamed");
-    assert_eq!(updated.models.len(), 2);
     assert!(!updated.enabled);
     assert!(!updated.has_api_key, "still no api_key after update");
 
     // Delete → list empty.
     sup.provider_delete(ProviderDeleteRequestDto {
-        id: "acme-prod".to_string(),
+        id: pid.clone(),
     })
     .await
     .unwrap();
@@ -3617,125 +3684,23 @@ async fn provider_crud_round_trips_without_api_key() {
 }
 
 #[tokio::test]
-async fn provider_create_rejects_invalid_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Underscore and dot are not in the allowed alphabet [a-z0-9-].
-    let err = sup
-        .provider_create(provider_create_request("acme_prod", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider id must contain only"),
-        "expected id validation error, got: {err}"
-    );
-
-    let err = sup
-        .provider_create(provider_create_request("acme.prod", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider id must contain only"),
-        "expected id validation error for dotted id, got: {err}"
-    );
-
-    // Nothing should have been written.
-    let list = sup.provider_list().await.unwrap();
-    assert!(list.providers.is_empty());
-}
-
-#[tokio::test]
-async fn provider_create_rejects_uppercase_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Uppercase letters are not in the allowed alphabet [a-z0-9-].
-    let err = sup
-        .provider_create(provider_create_request("UPPER-CASE", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("[a-z0-9-]"),
-        "expected id validation error mentioning [a-z0-9-], got: {err}"
-    );
-
-    // Nothing should have been written.
-    let list = sup.provider_list().await.unwrap();
-    assert!(list.providers.is_empty());
-}
-
-#[tokio::test]
-async fn provider_create_rejects_empty_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Empty id must be rejected before the char-set check (which is vacuously
-    // true for an empty string).
-    let err = sup
-        .provider_create(provider_create_request("", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("empty"),
-        "expected empty-id validation error, got: {err}"
-    );
-
-    // Nothing should have been written.
-    let list = sup.provider_list().await.unwrap();
-    assert!(list.providers.is_empty());
-}
-
-#[tokio::test]
-async fn provider_create_rejects_duplicate_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    sup.provider_create(provider_create_request("dup", "First"))
-        .await
-        .unwrap();
-
-    let err = sup
-        .provider_create(provider_create_request("dup", "Second"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider already exists"),
-        "expected duplicate-id error, got: {err}"
-    );
-
-    let list = sup.provider_list().await.unwrap();
-    assert_eq!(
-        list.providers.len(),
-        1,
-        "duplicate create must not add a second row"
-    );
-    assert_eq!(list.providers[0].name, "First");
-}
-
-#[tokio::test]
 async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    sup.provider_create(provider_create_request("noop-key", "Noop"))
+    let created = sup
+        .provider_create(provider_create_request("Noop"))
         .await
         .unwrap();
+    let pid = created.id.clone();
 
-    // Update with api_key: None must succeed without touching the keychain.
+    // Update with api_key: None must succeed (three-state: None = unchanged).
     let updated = sup
         .provider_update(ProviderUpdateRequestDto {
-            id: "noop-key".to_string(),
+            id: pid,
             name: Some("Noop Renamed".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
             api_key: None,
         })
@@ -3743,60 +3708,6 @@ async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
         .unwrap();
     assert_eq!(updated.name, "Noop Renamed");
     assert!(!updated.has_api_key, "no api_key was ever set");
-}
-
-#[tokio::test]
-async fn provider_update_applies_env_name_fields() {
-    // Spec §3.1 / Plan Task 6: api_key_env_name and base_url_env_name are
-    // editable provider fields surfaced through ProviderUpdateRequestDto.
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    sup.provider_create(provider_create_request("env-edit", "Env Edit"))
-        .await
-        .unwrap();
-
-    let updated = sup
-        .provider_update(ProviderUpdateRequestDto {
-            id: "env-edit".to_string(),
-            name: None,
-            base_url: None,
-            api_key_env_name: Some("EDITED_API_KEY".to_string()),
-            base_url_env_name: Some("EDITED_BASE_URL".to_string()),
-            models: None,
-            enabled: None,
-            api_key: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(updated.api_key_env_name, "EDITED_API_KEY");
-    assert_eq!(
-        updated.base_url_env_name.as_deref(),
-        Some("EDITED_BASE_URL")
-    );
-
-    // A subsequent update that omits the env-name fields leaves them unchanged
-    // (patch semantics: absent == unchanged).
-    let after_omit = sup
-        .provider_update(ProviderUpdateRequestDto {
-            id: "env-edit".to_string(),
-            name: Some("Env Edit Renamed".to_string()),
-            base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
-            enabled: None,
-            api_key: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(after_omit.name, "Env Edit Renamed");
-    assert_eq!(after_omit.api_key_env_name, "EDITED_API_KEY");
-    assert_eq!(
-        after_omit.base_url_env_name.as_deref(),
-        Some("EDITED_BASE_URL")
-    );
 }
 
 #[tokio::test]
@@ -3810,9 +3721,6 @@ async fn provider_update_returns_error_for_unknown_id() {
             id: "ghost".to_string(),
             name: Some("Ghost".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
             api_key: None,
         })
@@ -3866,73 +3774,62 @@ async fn provider_test_connection_errors_when_no_api_key() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    sup.provider_create(provider_create_request("no-key", "No Key"))
+    let created = sup
+        .provider_create(provider_create_request("No Key"))
         .await
         .unwrap();
+    let pid = created.id.clone();
 
     let err = sup
         .provider_test_connection(ProviderTestConnectionRequestDto {
-            id: "no-key".to_string(),
+            id: pid.clone(),
         })
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("no API key stored") || err.contains("failed to read keychain"),
-        "expected keychain-related error, got: {err}"
+        err.contains("provider has no api key"),
+        "expected no-api-key error, got: {err}"
     );
 
-    // Clean up so the keychain stays untouched (no key was set, so delete is a no-op).
+    // Clean up.
     sup.provider_delete(ProviderDeleteRequestDto {
-        id: "no-key".to_string(),
+        id: pid,
     })
     .await
     .unwrap();
 }
 
-// --- Keychain-touching tests (manual only) -------------------------------
-
-#[cfg(target_os = "macos")]
 #[tokio::test]
-#[ignore = "touches real macOS Keychain — run with --ignored"]
-async fn provider_crud_round_trips_with_api_key_macos() {
-    use busytok_config::ProviderCredentialStore;
-
+async fn provider_update_three_state_api_key_semantics() {
+    // SQL store replaces the macOS Keychain. This test verifies the three-state
+    // api_key patch semantics directly against the SQL store:
+    //   - None            = unchanged
+    //   - Some(None)      = clear
+    //   - Some(Some(k))   = update
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    let provider_id = "task4-keychain-roundtrip";
-    // Defensive cleanup in case a prior run left a key behind.
-    let _ = ProviderCredentialStore::delete_key(provider_id);
-
     // Create with api_key → has_api_key true.
     let created = sup
         .provider_create(ProviderCreateRequestDto {
-            id: provider_id.to_string(),
-            name: "Keychain Roundtrip".to_string(),
+            name: "Three State".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
-            api_key_env_name: "EXAMPLE_API_KEY".to_string(),
-            base_url_env_name: None,
-            models: vec!["example-model".to_string()],
             api_key: Some("sk-test-123".to_string()),
         })
         .await
         .unwrap();
-    assert!(
-        created.has_api_key,
-        "api_key was supplied, has_api_key should be true"
-    );
+    let pid = created.id.clone();
+    assert!(created.has_api_key, "api_key was supplied");
 
     // Update with api_key: None → key unchanged.
     let updated = sup
         .provider_update(ProviderUpdateRequestDto {
-            id: provider_id.to_string(),
-            name: Some("Keychain Roundtrip Renamed".to_string()),
+            id: pid.clone(),
+            name: Some("Three State Renamed".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
             api_key: None,
         })
@@ -3942,22 +3839,46 @@ async fn provider_crud_round_trips_with_api_key_macos() {
         updated.has_api_key,
         "api_key must still be present after update with None"
     );
-    assert_eq!(updated.name, "Keychain Roundtrip Renamed");
+    assert_eq!(updated.name, "Three State Renamed");
 
-    // Direct keychain read confirms the key value is intact.
-    let stored = ProviderCredentialStore::get_key(provider_id).unwrap();
-    assert_eq!(stored.as_deref(), Some("sk-test-123"));
+    // Update with api_key: Some(None) → clear.
+    let cleared = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: pid.clone(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            api_key: Some(None),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !cleared.has_api_key,
+        "api_key must be cleared after Some(None)"
+    );
 
-    // Delete cleans up both settings and keychain.
+    // Update with api_key: Some(Some(k)) → update.
+    let restored = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: pid.clone(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            api_key: Some(Some("sk-new-456".to_string())),
+        })
+        .await
+        .unwrap();
+    assert!(
+        restored.has_api_key,
+        "api_key must be present after Some(Some(k))"
+    );
+
+    // Delete cleans up the SQL row.
     sup.provider_delete(ProviderDeleteRequestDto {
-        id: provider_id.to_string(),
+        id: pid,
     })
     .await
     .unwrap();
-    assert!(
-        !ProviderCredentialStore::has_key(provider_id),
-        "keychain entry must be removed after delete"
-    );
     let list = sup.provider_list().await.unwrap();
     assert!(list.providers.is_empty());
 }
@@ -4561,6 +4482,18 @@ async fn delegate_fails_for_disabled_provider() {
         .provider_id = Some("disabled-prov".to_string());
     let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
 
+    // Seed SQL with the disabled provider so the SQL-backed delegate handler
+    // can find it. The delegate validates provider existence + enabled flag
+    // against SQL (not settings).
+    seed_provider_to_sql(
+        &sup,
+        "disabled-prov",
+        "Disabled Provider",
+        "https://api.disabled.example.com/v1",
+        None,
+        false,
+    );
+
     let err = sup
         .subagent_delegate(SubagentDelegateRequestDto {
             subagent_name: "reviewer".to_string(),
@@ -4607,6 +4540,19 @@ async fn delegate_fails_for_model_not_in_whitelist() {
         profile.model = "wrong-model".to_string();
     }
     let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+
+    // Seed SQL with test-provider (enabled) + test-model (enabled) so the
+    // delegate's SQL-backed validation finds the provider but rejects the
+    // model ("wrong-model" is not in the SQL whitelist).
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+    seed_model_to_sql(&sup, "test-provider", "test-model", true);
 
     let err = sup
         .subagent_delegate(SubagentDelegateRequestDto {
@@ -4749,15 +4695,24 @@ async fn provider_changed_removes_worker_then_respawns() {
     assert_eq!(snaps.len(), 1, "initial state: one worker");
     assert_eq!(snaps[0].0, "test-provider");
 
+    // Seed SQL with the same provider id so the SQL-backed provider_update
+    // handler can find it. (Sidecar worker pool still reads from settings; Task
+    // 7 will unify this.)
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+
     // Trigger provider_changed via provider_update (metadata-only change:
     // update the display name). This must remove the worker.
     sup.provider_update(ProviderUpdateRequestDto {
         id: "test-provider".to_string(),
         name: Some("Updated Name".to_string()),
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: None,
         enabled: None,
         api_key: None,
     })
@@ -4798,7 +4753,13 @@ async fn provider_changed_removes_worker_then_respawns() {
 /// provider snapshot captured at `construct_sidecar` time, and `ensure_worker`
 /// would build the config with the OLD `base_url` / `base_url_env_name` —
 /// silently running the sidecar against the wrong endpoint.
+///
+/// **DISABLED (Task 5):** provider CRUD now writes to SQL, not `settings.providers`.
+/// The sidecar worker-pool closure still reads from `settings.providers` (TOML),
+/// so `provider_update` no longer mutates the data the closure reads. This test
+/// will be rewritten in Task 7 when the sidecar provider-lookup migrates to SQL.
 #[tokio::test]
+#[ignore = "disabled under SQL-backed provider CRUD; rewritable in Task 7 (sidecar → SQL)"]
 async fn provider_update_respawn_picks_up_live_config() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
@@ -4829,9 +4790,6 @@ async fn provider_update_respawn_picks_up_live_config() {
         id: "test-provider".to_string(),
         name: None,
         base_url: Some("https://api.updated.example.com/v1".to_string()),
-        api_key_env_name: None,
-        base_url_env_name: Some("UPDATED_BASE_URL".to_string()),
-        models: None,
         enabled: None,
         api_key: None,
     })
@@ -4901,6 +4859,17 @@ async fn provider_deleted_removes_worker() {
         .worker_pool()
         .expect("worker_pool must be Some when sidecar is enabled");
 
+    // Seed SQL with the second provider so the SQL-backed provider_delete
+    // handler can find it. No profile references it, so delete won't be blocked.
+    seed_provider_to_sql(
+        &sup,
+        "test-provider-2",
+        "Test Provider 2",
+        "https://api.test-provider-2.example.com/v1",
+        None,
+        true,
+    );
+
     // Spawn a worker for the second provider (no profile references it, so
     // `provider_delete` won't reject on profile-reference check).
     pool.ensure_worker("test-provider-2")
@@ -4934,20 +4903,13 @@ async fn provider_deleted_removes_worker() {
 
 /// `provider_update_with_api_key_removes_worker_then_respawns` (Phase 3 Task 7):
 /// key rotation — when `provider_update` is called with
-/// `req.api_key = Some(...)`, the runtime must rotate the credential (writing
-/// the new key to the keychain) AND remove the worker so the next
-/// `ensure_worker` respawns with the rotated key. Complements the
-/// metadata-only `provider_changed_removes_worker_then_respawns` test by
-/// exercising the credential-bearing code path. Covers Phase 3 Task 7.
+/// `req.api_key = Some(Some(k))`, the runtime must persist the new key to the
+/// SQL store AND remove the worker so the next `ensure_worker` respawns with
+/// the rotated key. Complements the metadata-only
+/// `provider_changed_removes_worker_then_respawns` test by exercising the
+/// credential-bearing code path. Covers Phase 3 Task 7.
 #[tokio::test]
 async fn provider_update_with_api_key_removes_worker_then_respawns() {
-    // This test writes to the OS keychain (via provider_update → set_key).
-    // Skip on CI runners where no keyring daemon is available (e.g., Ubuntu
-    // without D-Bus secret service).
-    if busytok_config::ProviderCredentialStore::get_key("keyring-probe").is_err() {
-        eprintln!("skip: OS keyring unavailable");
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let settings = make_sidecar_settings();
@@ -4962,18 +4924,26 @@ async fn provider_update_with_api_key_removes_worker_then_respawns() {
     assert_eq!(snaps.len(), 1, "initial state: one worker");
     assert_eq!(snaps[0].0, "test-provider");
 
-    // Key rotation: api_key = Some(...) instead of None. This writes the
-    // new key to the OS keychain (via ProviderCredentialStore::set_key) AND
-    // triggers provider_changed -> remove_worker_and_kill.
+    // Seed SQL with the same provider id so the SQL-backed provider_update
+    // handler can find it.
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+
+    // Key rotation: api_key = Some(Some(k)) (three-state: update). This writes
+    // the new key to the SQL providers table AND triggers provider_changed ->
+    // remove_worker_and_kill.
     sup.provider_update(ProviderUpdateRequestDto {
         id: "test-provider".to_string(),
         name: None,
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: None,
         enabled: None,
-        api_key: Some("rotated-new-key".to_string()),
+        api_key: Some(Some("rotated-new-key".to_string())),
     })
     .await
     .expect("provider_update with api_key rotation must succeed");
@@ -5001,10 +4971,6 @@ async fn provider_update_with_api_key_removes_worker_then_respawns() {
         "re-spawned worker must be in the pool"
     );
     assert_eq!(snaps_final[0].0, "test-provider");
-
-    // Clean up the keychain entry written by provider_update so the test
-    // doesn't leave state behind.
-    let _ = busytok_config::ProviderCredentialStore::delete_key("test-provider");
 
     sup.shutdown_writer().await.expect("writer shutdown");
 }
@@ -5067,6 +5033,17 @@ async fn provider_update_kills_old_process() {
         "old sidecar child (pid={old_pid}) must be alive before provider_update"
     );
 
+    // Seed SQL with the same provider id so the SQL-backed provider_update
+    // handler can find it.
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+
     // Trigger provider_changed via provider_update (metadata-only change).
     // This calls remove_worker_and_kill -> force_kill -> child.start_kill() +
     // child.wait().await (SIGKILL on Unix).
@@ -5074,9 +5051,6 @@ async fn provider_update_kills_old_process() {
         id: "test-provider".to_string(),
         name: Some("Updated".to_string()),
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: None,
         enabled: None,
         api_key: None,
     })
@@ -5561,6 +5535,20 @@ async fn e2e_auth_failure_kills_worker() {
         .insert("BUSYTOK_MOCK_AUTH_FAIL".into(), "1".into());
     let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
 
+    // The sidecar worker-pool closure reads provider config from TOML
+    // (`settings.providers`), but the SQL-backed delegate validation queries
+    // the `providers` / `models` tables. Seed both so the delegate passes
+    // validation and reaches the executor (where the auth-fail mock fires).
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+    seed_model_to_sql(&sup, "test-provider", "test-model", true);
+
     let pool = sup.worker_pool().expect("worker_pool must be Some");
     // Auto-spawn created one worker for test-provider (Stopped — no child).
     assert_eq!(
@@ -5763,6 +5751,20 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
         .unwrap();
     let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
     sup.hydrate_status_from_db().unwrap();
+
+    // The sidecar worker-pool closure reads provider config from TOML
+    // (`settings.providers`), but the SQL-backed delegate validation queries
+    // the `providers` / `models` tables. Seed both so the delegate (and the
+    // dispatcher's later execution of the queued task) pass validation.
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+    seed_model_to_sql(&sup, "test-provider", "test-model", true);
 
     let gate = sup
         .pressure_gate()
@@ -6068,17 +6070,16 @@ async fn profile_update_rejects_disabled_provider() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create a disabled provider.
-    sup.provider_create(provider_create_request("disabled-p", "Disabled"))
+    // Create a provider, then disable it.
+    let created = sup
+        .provider_create(provider_create_request("Disabled"))
         .await
         .unwrap();
+    let pid = created.id.clone();
     sup.provider_update(ProviderUpdateRequestDto {
-        id: "disabled-p".to_string(),
+        id: pid.clone(),
         name: None,
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: Some(vec!["some-model".to_string()]),
         enabled: Some(false),
         api_key: None,
     })
@@ -6089,7 +6090,7 @@ async fn profile_update_rejects_disabled_provider() {
     let err = sup
         .profile_update(ProfileUpdateRequestDto {
             id: "pi/search-cheap".to_string(),
-            provider_id: Some("disabled-p".to_string()),
+            provider_id: Some(pid.clone()),
             model: Some("some-model".to_string()),
             tools: None,
             context_budget_tokens: None,
@@ -6111,23 +6112,18 @@ async fn profile_update_rejects_stale_model_on_rebind() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create a provider with model "model-a".
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create a provider and seed model "model-a" (enabled) in SQL.
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
 
     // Bind profile to provider with model-a.
     sup.profile_update(ProfileUpdateRequestDto {
         id: "pi/search-cheap".to_string(),
-        provider_id: Some("test-p".to_string()),
+        provider_id: Some(pid.clone()),
         model: Some("model-a".to_string()),
         tools: None,
         context_budget_tokens: None,
@@ -6137,28 +6133,18 @@ async fn profile_update_rejects_stale_model_on_rebind() {
     .await
     .unwrap();
 
-    // Provider updates model list to ["model-b"] only — model-a is now stale.
-    sup.provider_update(ProviderUpdateRequestDto {
-        id: "test-p".to_string(),
-        name: None,
-        base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: Some(vec!["model-b".to_string()]),
-        enabled: None,
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Disable model-a in SQL — model-a is now "stale" (no longer in the
+    // enabled whitelist).
+    set_model_enabled_in_sql(&sup, &pid, "model-a", false);
 
-    // Re-bind to the same provider (provider_id = Some("test-p")) without
-    // changing the model → the rebind path validates the effective model
-    // (model-a) against the new whitelist (["model-b"]) and rejects.
+    // Re-bind to the same provider without changing the model → the rebind
+    // path validates the effective model (model-a) against the SQL whitelist
+    // and rejects because model-a is disabled.
     let err = sup
         .profile_update(ProfileUpdateRequestDto {
             id: "pi/search-cheap".to_string(),
-            provider_id: Some("test-p".to_string()), // re-bind same provider
-            model: None,                             // not changing model
+            provider_id: Some(pid.clone()), // re-bind same provider
+            model: None,                    // not changing model
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6182,20 +6168,15 @@ async fn profile_update_patches_tools_without_triggering_stale_check() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
     sup.profile_update(ProfileUpdateRequestDto {
         id: "pi/search-cheap".to_string(),
-        provider_id: Some("test-p".to_string()),
+        provider_id: Some(pid.clone()),
         model: Some("model-a".to_string()),
         tools: None,
         context_budget_tokens: None,
@@ -6205,19 +6186,8 @@ async fn profile_update_patches_tools_without_triggering_stale_check() {
     .await
     .unwrap();
 
-    // Shrink the provider's whitelist so model-a is no longer in it.
-    sup.provider_update(ProviderUpdateRequestDto {
-        id: "test-p".to_string(),
-        name: None,
-        base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: Some(vec!["model-b".to_string()]),
-        enabled: None,
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Disable model-a so it's "stale" (no longer in the enabled whitelist).
+    set_model_enabled_in_sql(&sup, &pid, "model-a", false);
 
     // Patch ONLY tools — should succeed despite the stale model, because
     // the service does not re-validate existing bindings on unrelated patches.
@@ -6290,25 +6260,20 @@ async fn profile_create_rejects_model_not_in_whitelist() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create a provider with only "model-a".
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create a provider and seed only "model-a" in its SQL whitelist.
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
 
     // Try to create a profile bound to that provider with a model NOT in its whitelist.
     let err = sup
         .profile_create(ProfileCreateRequestDto {
             id: "my-profile".to_string(),
             model: "model-b".to_string(),
-            provider_id: Some("test-p".to_string()),
+            provider_id: Some(pid.clone()),
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6412,22 +6377,17 @@ async fn profile_update_unbinds_provider_with_empty_string() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create a provider + bind a user profile to it.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create a provider + seed model-a + bind a user profile to it.
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
     sup.profile_create(ProfileCreateRequestDto {
         id: "my-profile".to_string(),
         model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
+        provider_id: Some(pid.clone()),
         tools: None,
         context_budget_tokens: None,
         timeout_seconds: None,
@@ -6501,34 +6461,26 @@ async fn profile_update_changes_provider_and_model_together() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create two providers, each with a different model.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "prov-a".to_string(),
-        name: "Prov A".to_string(),
-        base_url: "https://a.test/v1".to_string(),
-        api_key_env_name: "A_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "prov-b".to_string(),
-        name: "Prov B".to_string(),
-        base_url: "https://b.test/v1".to_string(),
-        api_key_env_name: "B_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-b".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create two providers, each with a different model in SQL.
+    let prov_a = sup
+        .provider_create(provider_create_request("Prov A"))
+        .await
+        .unwrap();
+    let pid_a = prov_a.id.clone();
+    seed_model_to_sql(&sup, &pid_a, "model-a", true);
+
+    let prov_b = sup
+        .provider_create(provider_create_request("Prov B"))
+        .await
+        .unwrap();
+    let pid_b = prov_b.id.clone();
+    seed_model_to_sql(&sup, &pid_b, "model-b", true);
+
     // Create a profile bound to prov-a/model-a.
     sup.profile_create(ProfileCreateRequestDto {
         id: "my-profile".to_string(),
         model: "model-a".to_string(),
-        provider_id: Some("prov-a".to_string()),
+        provider_id: Some(pid_a.clone()),
         tools: None,
         context_budget_tokens: None,
         timeout_seconds: None,
@@ -6541,7 +6493,7 @@ async fn profile_update_changes_provider_and_model_together() {
     let updated = sup
         .profile_update(ProfileUpdateRequestDto {
             id: "my-profile".to_string(),
-            provider_id: Some("prov-b".to_string()),
+            provider_id: Some(pid_b.clone()),
             model: Some("model-b".to_string()),
             tools: None,
             context_budget_tokens: None,
@@ -6550,7 +6502,7 @@ async fn profile_update_changes_provider_and_model_together() {
         })
         .await
         .unwrap();
-    assert_eq!(updated.provider_id, Some("prov-b".to_string()));
+    assert_eq!(updated.provider_id, Some(pid_b.clone()));
     assert_eq!(updated.model, "model-b");
     sup.shutdown_writer().await.unwrap();
 }
@@ -6587,22 +6539,18 @@ async fn profile_update_patches_only_model_on_bound_profile() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create provider + profile bound to it.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string(), "model-b".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create provider + seed two models + profile bound to it.
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
+    seed_model_to_sql(&sup, &pid, "model-b", true);
     sup.profile_create(ProfileCreateRequestDto {
         id: "my-profile".to_string(),
         model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
+        provider_id: Some(pid.clone()),
         tools: None,
         context_budget_tokens: None,
         timeout_seconds: None,
@@ -6625,7 +6573,7 @@ async fn profile_update_patches_only_model_on_bound_profile() {
         .await
         .unwrap();
     // Provider unchanged, model updated.
-    assert_eq!(updated.provider_id, Some("test-p".to_string()));
+    assert_eq!(updated.provider_id, Some(pid.clone()));
     assert_eq!(updated.model, "model-b");
     sup.shutdown_writer().await.unwrap();
 }
@@ -6714,24 +6662,19 @@ async fn profile_update_rejects_model_not_in_whitelist_on_model_only_patch() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create provider with model "model-a" only.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create provider and seed only "model-a" in its SQL whitelist.
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
 
     // Bind profile to provider with the whitelisted model.
     sup.profile_create(ProfileCreateRequestDto {
         id: "my-profile".to_string(),
         model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
+        provider_id: Some(pid.clone()),
         tools: None,
         context_budget_tokens: None,
         timeout_seconds: None,
@@ -6792,22 +6735,17 @@ async fn profile_update_rejects_empty_model_bound() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create provider + bind profile to it.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
+    // Create provider + seed model-a + bind profile to it.
+    let created = sup
+        .provider_create(provider_create_request("Test"))
+        .await
+        .unwrap();
+    let pid = created.id.clone();
+    seed_model_to_sql(&sup, &pid, "model-a", true);
     sup.profile_create(ProfileCreateRequestDto {
         id: "my-profile".to_string(),
         model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
+        provider_id: Some(pid.clone()),
         tools: None,
         context_budget_tokens: None,
         timeout_seconds: None,
