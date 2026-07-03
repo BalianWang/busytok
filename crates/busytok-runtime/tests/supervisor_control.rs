@@ -221,9 +221,6 @@ fn make_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     }
 }
 
@@ -250,6 +247,10 @@ fn make_sidecar_settings() -> BusytokSettings {
         profile.provider_id = Some("test-provider".to_string());
     }
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    // Pre-set the second-provider env var so tests that push a
+    // `test-provider-2` (with `api_key_env_name: "TEST_API_KEY_2"`) don't
+    // need to remember to set it. Harmless if no second provider is added.
+    std::env::set_var("BUSYTOK_TEST_API_KEY_2", "test-key-2");
 
     settings
 }
@@ -257,10 +258,15 @@ fn make_sidecar_settings() -> BusytokSettings {
 /// Construct a supervisor with `pi_sidecar.enabled = true` and the mock sidecar
 /// bundle injected via `new_with_sidecar_config`. The sidecar child is NOT
 /// started (`ensure_started` is never called), so `worker_snapshot()` reports
-/// `Stopped` — the "configured-but-stopped" posture under test.
+/// `Stopped` — the "configured-but-stopped" posture under test. Providers from
+/// `make_sidecar_settings()` are seeded into SQL before construction so
+/// `construct_sidecar` (Task 7: reads from SQL, not TOML) can build the
+/// `WorkerPool`'s provider map.
 fn make_sidecar_stopped_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
+    let settings = make_sidecar_settings();
+    seed_providers_from_settings(&db, &settings);
     let paths = BusytokPaths::for_test(tmp.path());
-    make_sidecar_settings()
+    settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
     BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
@@ -3576,7 +3582,7 @@ fn seed_provider_to_sql(
     let now = busytok_domain::now_ms();
     db.conn()
         .execute(
-            "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+            "INSERT OR REPLACE INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
             params![
                 id,
@@ -3595,10 +3601,17 @@ fn seed_provider_to_sql(
 /// Used by profile tests that need model whitelist validation (the whitelist
 /// check now queries SQL instead of `provider.models.contains(...)`).
 fn seed_model_to_sql(sup: &BusytokSupervisor, provider_id: &str, model_id: &str, enabled: bool) {
+    let db = sup.db_handle().lock().unwrap();
+    seed_model_to_db(&db, provider_id, model_id, enabled);
+}
+
+/// Same as `seed_model_to_sql` but takes `&Database` directly — used by tests
+/// that need to seed the model BEFORE constructing the supervisor (so
+/// `construct_sidecar` sees the row).
+fn seed_model_to_db(db: &Database, provider_id: &str, model_id: &str, enabled: bool) {
     use rusqlite::params;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let db = sup.db_handle().lock().unwrap();
     let now = busytok_domain::now_ms();
     let id = format!(
         "seed-model-{}-{}",
@@ -4360,17 +4373,56 @@ fn make_unbound_sidecar_settings() -> BusytokSettings {
         enabled: true,
     });
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    // Pre-set the second-provider env var (see make_sidecar_settings).
+    std::env::set_var("BUSYTOK_TEST_API_KEY_2", "test-key-2");
     settings
+}
+
+/// Seed all providers from `settings.providers` into the SQL store so
+/// `construct_sidecar` (which reads from SQL, not TOML — Task 7) finds them
+/// when building the `WorkerPool`'s provider map. Resolves `api_key` from
+/// the `BUSYTOK_{api_key_env_name}` env var (the convention used by
+/// `make_sidecar_settings` / `make_unbound_sidecar_settings`). Uses
+/// `INSERT OR REPLACE` so tests that re-seed a provider with updated values
+/// (e.g. via `seed_provider_to_sql`) overwrite the initial row.
+fn seed_providers_from_settings(db: &Database, settings: &BusytokSettings) {
+    use rusqlite::params;
+    let now = busytok_domain::now_ms();
+    for p in &settings.providers {
+        let api_key = std::env::var(format!("BUSYTOK_{}", p.api_key_env_name))
+            .or_else(|_| std::env::var(&p.api_key_env_name))
+            .ok();
+        db.conn()
+            .execute(
+                "INSERT OR REPLACE INTO providers \
+                 (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    p.id,
+                    p.name,
+                    serde_json::to_string(&p.provider_kind).unwrap(),
+                    p.base_url,
+                    p.enabled as i64,
+                    api_key,
+                    now,
+                ],
+            )
+            .expect("seed provider to SQL");
+    }
 }
 
 /// Build a sidecar-stopped supervisor from arbitrary settings. Mirrors
 /// `make_sidecar_stopped_supervisor` but accepts custom settings so the
 /// delegate validation tests can configure provider/profile bindings.
+/// Providers from `settings.providers` are seeded into SQL before
+/// construction so `construct_sidecar` can build the `WorkerPool`'s provider
+/// map (Task 7: pool reads from SQL, not TOML).
 fn make_sidecar_stopped_supervisor_with_settings(
     db: Database,
     tmp: &tempfile::TempDir,
     settings: BusytokSettings,
 ) -> BusytokSupervisor {
+    seed_providers_from_settings(&db, &settings);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -4695,17 +4747,10 @@ async fn provider_changed_removes_worker_then_respawns() {
     assert_eq!(snaps.len(), 1, "initial state: one worker");
     assert_eq!(snaps[0].0, "test-provider");
 
-    // Seed SQL with the same provider id so the SQL-backed provider_update
-    // handler can find it. (Sidecar worker pool still reads from settings; Task
-    // 7 will unify this.)
-    seed_provider_to_sql(
-        &sup,
-        "test-provider",
-        "Test Provider",
-        "https://api.test-provider.example.com/v1",
-        None,
-        true,
-    );
+    // The provider is already seeded into SQL by
+    // `make_sidecar_stopped_supervisor_with_settings` (Task 7: pool reads
+    // from SQL, not TOML). No additional seed needed — `provider_update`
+    // will find the row and `provider_changed` will re-read it.
 
     // Trigger provider_changed via provider_update (metadata-only change:
     // update the display name). This must remove the worker.
@@ -4745,49 +4790,68 @@ async fn provider_changed_removes_worker_then_respawns() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
-/// `provider_update_respawn_picks_up_live_config` (P1 fix): the
-/// `WorkerPool`'s provider-lookup closure must read LIVE settings (not a
-/// startup snapshot), so when `provider_update` changes `base_url` /
-/// `base_url_env_name`, the respawned supervisor's config reflects the new
-/// values. Without the live-settings fix, the closure would return the stale
-/// provider snapshot captured at `construct_sidecar` time, and `ensure_worker`
-/// would build the config with the OLD `base_url` / `base_url_env_name` —
-/// silently running the sidecar against the wrong endpoint.
-///
-/// **DISABLED (Task 5):** provider CRUD now writes to SQL, not `settings.providers`.
-/// The sidecar worker-pool closure still reads from `settings.providers` (TOML),
-/// so `provider_update` no longer mutates the data the closure reads. This test
-/// will be rewritten in Task 7 when the sidecar provider-lookup migrates to SQL.
+/// `provider_update_respawn_picks_up_live_config` (Task 7 rewrite): the
+/// `WorkerPool` holds a `ProviderRuntimeEntry` per provider (populated from
+/// SQL at construction, updated via `update_provider_and_kill_old` on
+/// `provider_changed`). When `provider_update` changes `base_url`,
+/// `provider_changed` re-reads the provider from SQL, updates the entry, and
+/// force-kills the old worker — so the next `ensure_worker` re-spawns with
+/// the new `OPENAI_BASE_URL`. Sidecar only recognizes the FIXED env names
+/// `OPENAI_API_KEY` / `OPENAI_BASE_URL` (no provider-specific aliases).
 #[tokio::test]
-#[ignore = "disabled under SQL-backed provider CRUD; rewritable in Task 7 (sidecar → SQL)"]
 async fn provider_update_respawn_picks_up_live_config() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
+    // Use a minimal sidecar-enabled settings with NO providers so
+    // `construct_sidecar` starts with an empty pool. The test exercises the
+    // SQL-backed `provider_create` → `provider_update` → respawn flow, so
+    // the provider must NOT exist in SQL before `provider_create`.
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
     let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
 
     let pool = sup
         .worker_pool()
         .expect("worker_pool must be Some when sidecar is enabled");
 
-    // Initial worker: base_url_env_name defaults to OPENAI_BASE_URL (provider
-    // has base_url_env_name: None in make_sidecar_settings).
+    // Create the provider in SQL via the handler. This writes the row to SQL
+    // AND calls `provider_changed` → `update_provider_and_kill_old`, which
+    // inserts the `ProviderRuntimeEntry` into the pool's map (no old worker
+    // to kill yet). construct_sidecar ran with empty SQL, so the pool's map
+    // was empty until this call.
+    let created = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test Provider".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test-provider.example.com/v1".into(),
+            api_key: Some("test-key".into()),
+        })
+        .await
+        .expect("provider_create must succeed");
+    let pid = created.id.clone();
+
+    // Initial worker: ensure_worker reads the entry from the pool's map and
+    // injects OPENAI_API_KEY + OPENAI_BASE_URL (fixed names).
     let initial = pool
-        .ensure_worker("test-provider")
+        .ensure_worker(&pid)
         .expect("ensure_worker (initial)");
     let initial_cfg = initial.config();
-    assert_eq!(initial_cfg.base_url_env_name, "OPENAI_BASE_URL");
     assert_eq!(
         initial_cfg.env.get("OPENAI_BASE_URL"),
         Some(&"https://api.test-provider.example.com/v1".to_string()),
-        "initial worker env should have the original base_url"
+        "initial worker env[OPENAI_BASE_URL] should have the original base_url"
+    );
+    assert_eq!(
+        initial_cfg.env.get("OPENAI_API_KEY"),
+        Some(&"test-key".to_string()),
+        "initial worker env[OPENAI_API_KEY] should have the api_key"
     );
 
-    // Update BOTH base_url and base_url_env_name via provider_update. This
-    // mutates `self.settings` (the shared `Arc<Mutex<BusytokSettings>>`) and
-    // calls `provider_changed` to kill + remove the worker.
+    // Update base_url via provider_update. This mutates the SQL row AND calls
+    // `provider_changed` → `update_provider_and_kill_old` (entry updated +
+    // old worker force-killed).
     sup.provider_update(ProviderUpdateRequestDto {
-        id: "test-provider".to_string(),
+        id: pid.clone(),
         name: None,
         base_url: Some("https://api.updated.example.com/v1".to_string()),
         enabled: None,
@@ -4802,32 +4866,28 @@ async fn provider_update_respawn_picks_up_live_config() {
         "provider_update must remove the worker from the pool"
     );
 
-    // Re-spawn: ensure_worker builds a NEW supervisor. The pool's
-    // provider-lookup closure must read the LIVE (post-update) settings, so
-    // the new supervisor's config has the updated base_url / env name.
+    // Re-spawn: ensure_worker reads the UPDATED entry from the pool's map
+    // (update_provider_and_kill_old inserted it). The new config must reflect
+    // the updated base_url under the FIXED env name OPENAI_BASE_URL.
     let respawned = pool
-        .ensure_worker("test-provider")
+        .ensure_worker(&pid)
         .expect("ensure_worker must re-spawn the worker");
     let respawned_cfg = respawned.config();
-
-    // The fix: base_url_env_name MUST be the updated value, not the original
-    // "OPENAI_BASE_URL" (which would indicate the closure read a stale snapshot).
-    assert_eq!(
-        respawned_cfg.base_url_env_name, "UPDATED_BASE_URL",
-        "respawned worker must use the updated base_url_env_name \
-         (live settings), not the startup snapshot"
-    );
-    // OPENAI_BASE_URL is always set (canonical name) and must reflect the new base_url.
     assert_eq!(
         respawned_cfg.env.get("OPENAI_BASE_URL"),
         Some(&"https://api.updated.example.com/v1".to_string()),
         "respawned worker env[OPENAI_BASE_URL] must be the updated base_url"
     );
-    // The provider-specific alias (UPDATED_BASE_URL) must also be set to the new base_url.
+    // OPENAI_API_KEY unchanged (provider_update didn't rotate it).
     assert_eq!(
-        respawned_cfg.env.get("UPDATED_BASE_URL"),
-        Some(&"https://api.updated.example.com/v1".to_string()),
-        "respawned worker env[UPDATED_BASE_URL] must be the updated base_url"
+        respawned_cfg.env.get("OPENAI_API_KEY"),
+        Some(&"test-key".to_string()),
+        "respawned worker env[OPENAI_API_KEY] must still be the original key"
+    );
+    // Only fixed env names — no provider-specific aliases (Task 7 contract).
+    assert!(
+        !respawned_cfg.env.contains_key("UPDATED_BASE_URL"),
+        "respawned worker must NOT have provider-specific env aliases (fixed names only)"
     );
 
     sup.shutdown_writer().await.expect("writer shutdown");
@@ -4859,16 +4919,10 @@ async fn provider_deleted_removes_worker() {
         .worker_pool()
         .expect("worker_pool must be Some when sidecar is enabled");
 
-    // Seed SQL with the second provider so the SQL-backed provider_delete
-    // handler can find it. No profile references it, so delete won't be blocked.
-    seed_provider_to_sql(
-        &sup,
-        "test-provider-2",
-        "Test Provider 2",
-        "https://api.test-provider-2.example.com/v1",
-        None,
-        true,
-    );
+    // The second provider is already seeded into SQL by
+    // `make_sidecar_stopped_supervisor_with_settings` (Task 7: pool reads
+    // from SQL, not TOML). No profile references it, so delete won't be
+    // blocked.
 
     // Spawn a worker for the second provider (no profile references it, so
     // `provider_delete` won't reject on profile-reference check).
@@ -5525,6 +5579,12 @@ async fn e2e_auth_failure_kills_worker() {
         .get_mut("pi/search-cheap")
         .unwrap()
         .model = "test-model".to_string();
+    // Seed provider + model into SQL BEFORE construction so `construct_sidecar`
+    // (Task 7: reads from SQL) finds the provider, adds it to the pool's map,
+    // and auto-spawns a worker. The api_key must be non-None so the pool
+    // includes the provider.
+    seed_providers_from_settings(&db, &settings);
+    seed_model_to_db(&db, "test-provider", "test-model", true);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -5534,20 +5594,6 @@ async fn e2e_auth_failure_kills_worker() {
         .env
         .insert("BUSYTOK_MOCK_AUTH_FAIL".into(), "1".into());
     let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
-
-    // The sidecar worker-pool closure reads provider config from TOML
-    // (`settings.providers`), but the SQL-backed delegate validation queries
-    // the `providers` / `models` tables. Seed both so the delegate passes
-    // validation and reaches the executor (where the auth-fail mock fires).
-    seed_provider_to_sql(
-        &sup,
-        "test-provider",
-        "Test Provider",
-        "https://api.test-provider.example.com/v1",
-        None,
-        true,
-    );
-    seed_model_to_sql(&sup, "test-provider", "test-model", true);
 
     let pool = sup.worker_pool().expect("worker_pool must be Some");
     // Auto-spawn created one worker for test-provider (Stopped — no child).
@@ -5654,7 +5700,14 @@ async fn e2e_auth_failure_kills_worker() {
          remove_worker_and_kill must have force-killed it"
     );
 
-    // Next ensure_worker creates a new worker (slot was freed).
+    // Next ensure_worker creates a new worker (slot was freed). The auth-fail
+    // kill path calls `remove_worker_and_kill` which removes BOTH the worker
+    // AND the provider entry from the pool's map (Task 7: pool uses a
+    // HashMap, not a closure). To re-spawn, `provider_changed` must re-add
+    // the entry first — simulating the production recovery path (the provider
+    // is still configured in SQL, so `provider_changed` re-reads it and calls
+    // `update_provider_and_kill_old` to insert a fresh entry).
+    sup.provider_changed("test-provider").await;
     pool.ensure_worker("test-provider")
         .expect("ensure_worker re-spawns");
     assert_eq!(pool.worker_snapshots().await.len(), 1);
@@ -5745,26 +5798,18 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
         .get_mut("pi/search-cheap")
         .unwrap()
         .model = "test-model".to_string();
+    // Seed provider + model into SQL BEFORE construction so `construct_sidecar`
+    // (Task 7: reads from SQL) finds the provider, adds it to the pool's map,
+    // and auto-spawns a worker. The api_key must be non-None so the pool
+    // includes the provider.
+    seed_providers_from_settings(&db, &settings);
+    seed_model_to_db(&db, "test-provider", "test-model", true);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
     let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
     sup.hydrate_status_from_db().unwrap();
-
-    // The sidecar worker-pool closure reads provider config from TOML
-    // (`settings.providers`), but the SQL-backed delegate validation queries
-    // the `providers` / `models` tables. Seed both so the delegate (and the
-    // dispatcher's later execution of the queued task) pass validation.
-    seed_provider_to_sql(
-        &sup,
-        "test-provider",
-        "Test Provider",
-        "https://api.test-provider.example.com/v1",
-        None,
-        true,
-    );
-    seed_model_to_sql(&sup, "test-provider", "test-model", true);
 
     let gate = sup
         .pressure_gate()

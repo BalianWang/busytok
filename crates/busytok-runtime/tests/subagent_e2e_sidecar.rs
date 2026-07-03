@@ -129,9 +129,53 @@ fn make_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
+    }
+}
+
+/// Seed all providers AND their models from `settings.providers` into the SQL
+/// store so `construct_sidecar` (which reads from SQL, not TOML — Task 7)
+/// finds them when building the `WorkerPool`'s provider map, and the
+/// delegate's model-whitelist validation passes. Resolves `api_key` from the
+/// `BUSYTOK_{api_key_env_name}` env var (the convention used by
+/// `make_sidecar_settings`). Uses `INSERT OR REPLACE` for providers so tests
+/// that re-seed overwrite the initial row. Models use `INSERT OR REPLACE` on
+/// the `(provider_id, model_id)` unique constraint.
+fn seed_providers_from_settings(db: &busytok_store::Database, settings: &BusytokSettings) {
+    use rusqlite::params;
+    let now = busytok_domain::now_ms();
+    for p in &settings.providers {
+        let api_key = std::env::var(format!("BUSYTOK_{}", p.api_key_env_name))
+            .or_else(|_| std::env::var(&p.api_key_env_name))
+            .ok();
+        db.conn()
+            .execute(
+                "INSERT OR REPLACE INTO providers \
+                 (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    p.id,
+                    p.name,
+                    serde_json::to_string(&p.provider_kind).unwrap(),
+                    p.base_url,
+                    p.enabled as i64,
+                    api_key,
+                    now,
+                ],
+            )
+            .expect("seed provider to SQL");
+        // Seed each model in the provider's whitelist. The delegate validation
+        // (Task 7) queries the `models` table, not `settings.providers[].models`.
+        for model_id in &p.models {
+            let model_pk = format!("seed-{}-{}", p.id, model_id);
+            db.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO models \
+                     (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![model_pk, p.id, model_id, 1_i64, now],
+                )
+                .expect("seed model to SQL");
+        }
     }
 }
 
@@ -139,11 +183,15 @@ fn make_sidecar_config() -> SidecarConfig {
 /// config file in `tmp` and injects the mock sidecar bundle via
 /// `new_with_sidecar_config`. The settings file must still have
 /// `pi_sidecar.enabled = true` so the sidecar wiring path is taken.
+/// Providers from `settings.providers` are seeded into SQL before
+/// construction so `construct_sidecar` can build the `WorkerPool`'s provider
+/// map (Task 7: pool reads from SQL, not TOML).
 fn make_sidecar_supervisor(
     db: busytok_store::Database,
     tmp: &tempfile::TempDir,
     settings: BusytokSettings,
 ) -> BusytokSupervisor {
+    seed_providers_from_settings(&db, &settings);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -455,6 +503,7 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
     let settings = make_sidecar_settings();
     let sidecar_cfg = make_sidecar_config_with_memory_update();
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -648,6 +697,7 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     let paths = BusytokPaths::for_test(tmp.path());
     let mut settings = make_sidecar_settings();
     settings.subagent.pi_sidecar.max_hot_sessions = 1;
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1138,6 +1188,7 @@ async fn doctor_protocol_version_check_probes_sidecar_when_not_running() {
     let mut settings = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = true;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -1440,6 +1491,7 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
     let mut settings = make_sidecar_settings();
     // Short idle so the sidecar doesn't linger between test phases.
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1584,6 +1636,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
     let paths = BusytokPaths::for_test(tmp.path());
     let mut settings = make_sidecar_settings();
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1743,6 +1796,7 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
     let settings = make_sidecar_settings();
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1921,6 +1975,7 @@ async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
     let settings = make_sidecar_settings();
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -2145,6 +2200,7 @@ async fn pressure_response_force_kills_on_rss_limit_exceeded() {
     let mut settings = make_sidecar_settings();
     settings.subagent.resource_policy.monitor_interval_seconds = 1;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -2228,6 +2284,7 @@ async fn pressure_response_pauses_on_memory_pressure() {
     // available memory, so `is_under_pressure` returns true on every sample.
     settings.subagent.resource_policy.memory_pressure_free_mb = 999_999;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -2299,6 +2356,7 @@ async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
     // so a 0 threshold means pressure is never triggered by available memory.
     settings.subagent.resource_policy.memory_pressure_free_mb = 0;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_providers_from_settings(&db, &settings);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();

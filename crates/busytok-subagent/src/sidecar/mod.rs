@@ -8,7 +8,7 @@ pub mod supervisor;
 pub use client::SidecarRpcClient;
 pub use config::{resolve_base_sidecar_config, resolve_sidecar_config, SidecarConfig};
 pub use executor::SidecarTaskExecutor;
-pub use pool::{CredentialReader, ProviderLookup, ResponderFactory, WorkerPool};
+pub use pool::{inject_provider_env, ProviderRuntimeEntry, ResponderFactory, WorkerPool};
 pub use protocol::*;
 pub use supervisor::{
     PiSidecarSupervisor, PressureLevel, SharedDb, SidecarHandle, WorkerSnapshot, WorkerState,

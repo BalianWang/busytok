@@ -1,10 +1,10 @@
-//! Integration tests for `WorkerPool` (Task 2 — Phase 3).
+//! Integration tests for `WorkerPool` (Task 2 — Phase 3, updated Task 7).
 //!
-//! These tests verify the per-provider supervisor map, credential injection
-//! via the injected `credential_reader` seam (P1 fix), two-phase bootstrap
-//! via `set_responder_factory` (P1c fix), and async `remove_worker_and_kill`
-//! (P1b fix). They do NOT spawn real sidecar processes — they verify
-//! config/env construction and map lifecycle only.
+//! These tests verify the per-provider supervisor map, fixed env injection
+//! (`OPENAI_API_KEY` / `OPENAI_BASE_URL`), two-phase bootstrap via
+//! `set_responder_factory` (P1c fix), and async `remove_worker_and_kill` /
+//! `update_provider_and_kill_old` (P1b fix). They do NOT spawn real sidecar
+//! processes — they verify config/env construction and map lifecycle only.
 
 #![allow(clippy::unwrap_used)]
 
@@ -13,11 +13,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use busytok_config::{ProviderConfig, ProviderKind, SubagentResourcePolicyConfig};
+use busytok_config::SubagentResourcePolicyConfig;
 use busytok_subagent::pressure::{PressureGate, PressureResponder};
 use busytok_subagent::sidecar::{
-    CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, SidecarConfig,
-    SidecarError, SidecarTaskExecutor, WorkerPool,
+    PiSidecarSupervisor, ProviderRuntimeEntry, ResponderFactory, SidecarConfig, SidecarError,
+    SidecarTaskExecutor, WorkerPool,
 };
 
 /// Build a base `SidecarConfig` for tests. Uses `/usr/bin/true` as the node
@@ -44,56 +44,31 @@ fn base_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     }
 }
 
-fn deepseek_provider() -> ProviderConfig {
-    ProviderConfig {
-        id: "deepseek".to_string(),
-        name: "DeepSeek".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
+fn deepseek_entry() -> ProviderRuntimeEntry {
+    ProviderRuntimeEntry {
+        provider_id: "deepseek".to_string(),
+        api_key: "test-key".to_string(),
         base_url: "https://api.deepseek.com/v1".to_string(),
-        api_key_env_name: "DEEPSEEK_API_KEY".to_string(),
-        base_url_env_name: Some("DEEPSEEK_BASE_URL".to_string()),
-        models: vec!["deepseek-chat".to_string()],
-        enabled: true,
     }
 }
 
-fn openai_provider() -> ProviderConfig {
-    ProviderConfig {
-        id: "openai".to_string(),
-        name: "OpenAI".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
+fn openai_entry() -> ProviderRuntimeEntry {
+    ProviderRuntimeEntry {
+        provider_id: "openai".to_string(),
+        api_key: "test-key".to_string(),
         base_url: "https://api.openai.com/v1".to_string(),
-        api_key_env_name: "OPENAI_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["gpt-4o".to_string()],
-        enabled: true,
     }
 }
 
-/// Build a providers closure that knows about `deepseek` and `openai`.
-fn make_providers() -> ProviderLookup {
-    Arc::new(|pid: &str| -> Option<ProviderConfig> {
-        match pid {
-            "deepseek" => Some(deepseek_provider()),
-            "openai" => Some(openai_provider()),
-            "disabled-prov" => Some(ProviderConfig {
-                enabled: false,
-                ..openai_provider()
-            }),
-            _ => None,
-        }
-    })
-}
-
-/// Build a credential_reader closure that always returns `Ok(Some("test-key"))`.
-fn canned_credential_reader() -> CredentialReader {
-    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+/// Build a providers map that knows about `deepseek` and `openai`.
+fn make_providers() -> HashMap<String, ProviderRuntimeEntry> {
+    let mut m = HashMap::new();
+    m.insert("deepseek".to_string(), deepseek_entry());
+    m.insert("openai".to_string(), openai_entry());
+    m
 }
 
 /// Build a responder_factory that constructs a real `PressureResponder` and
@@ -133,15 +108,12 @@ fn make_responder_factory(
 /// Returns `(pool, gate, executor)` — the executor must be kept alive by
 /// the caller so the `Weak<SidecarTaskExecutor>` in each responder stays
 /// upgradeable (two-phase bootstrap: pool → executor → factory → pool).
-fn make_test_pool_with_creds(
-    credential_reader: CredentialReader,
-) -> (Arc<WorkerPool>, Arc<PressureGate>, Arc<SidecarTaskExecutor>) {
+fn make_test_pool() -> (Arc<WorkerPool>, Arc<PressureGate>, Arc<SidecarTaskExecutor>) {
     let gate = Arc::new(PressureGate::new());
     let pool = Arc::new(WorkerPool::new(
         base_config(),
         None,
         make_providers(),
-        credential_reader,
         Some(Arc::clone(&gate)),
         SubagentResourcePolicyConfig::default(),
     ));
@@ -152,12 +124,6 @@ fn make_test_pool_with_creds(
     let (factory, _holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
     pool.set_responder_factory(factory);
     (pool, gate, executor)
-}
-
-/// Convenience wrapper: `make_test_pool_with_creds` with the canned
-/// credential reader.
-fn make_test_pool() -> (Arc<WorkerPool>, Arc<PressureGate>, Arc<SidecarTaskExecutor>) {
-    make_test_pool_with_creds(canned_credential_reader())
 }
 
 // --- Step 1 test cases (per task-2-brief.md) ---
@@ -178,9 +144,9 @@ fn ensure_worker_creates_supervisor_lazily() {
 }
 
 /// `ensure_worker_injects_credentials` — verify env map contains
-/// `OPENAI_API_KEY` + the provider's `api_key_env_name` + `OPENAI_BASE_URL`
-/// + the provider's `base_url_env_name` (when set) + the base config's
-///   `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS`.
+/// `OPENAI_API_KEY` + `OPENAI_BASE_URL` + the base config's
+/// `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS`. Sidecar only recognizes these fixed
+/// env names (Task 7).
 #[test]
 fn ensure_worker_injects_credentials() {
     let (pool, _gate, _exec) = make_test_pool();
@@ -192,35 +158,21 @@ fn ensure_worker_injects_credentials() {
         "OPENAI_API_KEY must be set to the credential value"
     );
     assert_eq!(
-        env.get("DEEPSEEK_API_KEY"),
-        Some(&"test-key".to_string()),
-        "provider's api_key_env_name must be set to the credential value"
-    );
-    assert_eq!(
         env.get("OPENAI_BASE_URL"),
         Some(&"https://api.deepseek.com/v1".to_string()),
         "OPENAI_BASE_URL must be set to the provider base_url"
-    );
-    assert_eq!(
-        env.get("DEEPSEEK_BASE_URL"),
-        Some(&"https://api.deepseek.com/v1".to_string()),
-        "provider's base_url_env_name must be set to the provider base_url"
     );
     assert_eq!(
         env.get("BUSYTOK_SIDECAR_MAX_HOT_SESSIONS"),
         Some(&"3".to_string()),
         "base config env vars must be preserved"
     );
-    // Config metadata fields (observability — Phase 3 Task 1).
-    assert_eq!(sup.config().provider_id, "deepseek");
-    assert_eq!(sup.config().api_key_env_name, "DEEPSEEK_API_KEY");
-    assert_eq!(sup.config().base_url_env_name, "DEEPSEEK_BASE_URL");
 }
 
-/// `ensure_worker_injects_credentials` for a provider with
-/// `base_url_env_name = None` — should default to `OPENAI_BASE_URL`.
+/// `ensure_worker_injects_credentials` for the openai provider — same
+/// fixed env names (`OPENAI_API_KEY` + `OPENAI_BASE_URL`).
 #[test]
-fn ensure_worker_injects_credentials_default_base_url_env_name() {
+fn ensure_worker_injects_credentials_openai() {
     let (pool, _gate, _exec) = make_test_pool();
     let sup = pool.ensure_worker("openai").expect("ensure_worker");
     let env = &sup.config().env;
@@ -234,8 +186,6 @@ fn ensure_worker_injects_credentials_default_base_url_env_name() {
         Some(&"https://api.openai.com/v1".to_string()),
         "OPENAI_BASE_URL must be set to provider base_url"
     );
-    // Config metadata: base_url_env_name defaults to OPENAI_BASE_URL when None.
-    assert_eq!(sup.config().base_url_env_name, "OPENAI_BASE_URL");
 }
 
 /// `ensure_worker_sets_pressure_responder` — after ensure_worker, the
@@ -252,40 +202,29 @@ fn ensure_worker_sets_pressure_responder() {
 }
 
 /// `remove_worker_then_ensure_creates_new_supervisor` — after remove, a
-/// new ensure_worker creates a NEW supervisor (with fresh keychain read).
+/// new ensure_worker creates a NEW supervisor.
 #[tokio::test]
 async fn remove_worker_then_ensure_creates_new_supervisor() {
-    // Use a counting credential_reader to verify fresh reads.
-    let call_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let count_for_closure = Arc::clone(&call_count);
-    let credential_reader: CredentialReader = Arc::new(move |_pid: &str| {
-        *count_for_closure.lock().unwrap() += 1;
-        Ok(Some("test-key".to_string()))
-    });
-
-    let (pool, _gate, _exec) = make_test_pool_with_creds(credential_reader);
+    let (pool, _gate, _exec) = make_test_pool();
 
     let sup1 = pool.ensure_worker("deepseek").expect("first ensure");
-    assert_eq!(
-        *call_count.lock().unwrap(),
-        1,
-        "first ensure reads credential"
-    );
 
     pool.remove_worker_and_kill("deepseek")
         .await
         .expect("remove_worker_and_kill");
 
-    let sup2 = pool.ensure_worker("deepseek").expect("second ensure");
-    assert_eq!(
-        *call_count.lock().unwrap(),
-        2,
-        "second ensure reads credential again (fresh keychain read)"
-    );
-    assert!(
-        !Arc::ptr_eq(&sup1, &sup2),
-        "second ensure must create a NEW supervisor (different Arc)"
-    );
+    // After remove_worker_and_kill, the provider entry is also removed.
+    // ensure_worker should fail with "unknown provider".
+    match pool.ensure_worker("deepseek") {
+        Err(SidecarError::Spawn(msg)) => {
+            assert!(
+                msg.contains("unknown provider"),
+                "error should mention 'unknown provider', got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected SidecarError::Spawn, got {other:?}"),
+        Ok(_) => panic!("unknown provider should error after remove_worker_and_kill"),
+    }
 }
 
 /// `worker_snapshots_returns_all_workers` — multiple providers → multiple
@@ -304,7 +243,7 @@ async fn worker_snapshots_returns_all_workers() {
 }
 
 /// `ensure_worker_fails_for_unknown_provider` — provider_id not in
-/// providers → error.
+/// providers map → error.
 #[test]
 fn ensure_worker_fails_for_unknown_provider() {
     let (pool, _gate, _exec) = make_test_pool();
@@ -317,66 +256,6 @@ fn ensure_worker_fails_for_unknown_provider() {
         }
         Err(other) => panic!("expected SidecarError::Spawn, got {other:?}"),
         Ok(_) => panic!("unknown provider should error"),
-    }
-}
-
-/// `ensure_worker_fails_for_disabled_provider` — provider.enabled = false
-/// → error.
-#[test]
-fn ensure_worker_fails_for_disabled_provider() {
-    let (pool, _gate, _exec) = make_test_pool();
-    match pool.ensure_worker("disabled-prov") {
-        Err(SidecarError::Spawn(msg)) => {
-            assert!(
-                msg.contains("disabled"),
-                "error should mention 'disabled', got: {msg}"
-            );
-        }
-        Err(other) => panic!("expected SidecarError::Spawn, got {other:?}"),
-        Ok(_) => panic!("disabled provider should error"),
-    }
-}
-
-/// `ensure_worker_fails_for_missing_api_key` — keyring has no key → error
-/// (`Ok(None)` from credential_reader).
-#[test]
-fn ensure_worker_fails_for_missing_api_key() {
-    let credential_reader: CredentialReader = Arc::new(|_| Ok(None));
-    let (pool, _gate, _exec) = make_test_pool_with_creds(credential_reader);
-
-    match pool.ensure_worker("deepseek") {
-        Err(SidecarError::Spawn(msg)) => {
-            assert!(
-                msg.contains("no API key"),
-                "error should mention 'no API key', got: {msg}"
-            );
-        }
-        Err(other) => panic!("expected SidecarError::Spawn, got {other:?}"),
-        Ok(_) => panic!("missing API key should error"),
-    }
-}
-
-/// `ensure_worker_fails_for_keychain_error` — `get_key` returns `Err(...)`
-/// → `SidecarError::Spawn("keychain read failed: ...")`.
-#[test]
-fn ensure_worker_fails_for_keychain_error() {
-    let credential_reader: CredentialReader =
-        Arc::new(|_| Err(anyhow::anyhow!("simulated keychain failure")));
-    let (pool, _gate, _exec) = make_test_pool_with_creds(credential_reader);
-
-    match pool.ensure_worker("deepseek") {
-        Err(SidecarError::Spawn(msg)) => {
-            assert!(
-                msg.contains("keychain read failed"),
-                "error should mention 'keychain read failed', got: {msg}"
-            );
-            assert!(
-                msg.contains("simulated keychain failure"),
-                "error should include the underlying cause, got: {msg}"
-            );
-        }
-        Err(other) => panic!("expected SidecarError::Spawn, got {other:?}"),
-        Ok(_) => panic!("keychain error should propagate"),
     }
 }
 
@@ -414,7 +293,6 @@ fn ensure_worker_panics_if_responder_factory_unset() {
         base_config(),
         None,
         make_providers(),
-        canned_credential_reader(),
         Some(gate),
         SubagentResourcePolicyConfig::default(),
     );
@@ -480,7 +358,6 @@ fn set_responder_factory_called_twice_is_ignored() {
         base_config(),
         None,
         make_providers(),
-        canned_credential_reader(),
         Some(Arc::clone(&gate)),
         SubagentResourcePolicyConfig::default(),
     ));
@@ -494,7 +371,8 @@ fn set_responder_factory_called_twice_is_ignored() {
     let sup = pool2
         .ensure_worker("deepseek")
         .expect("ensure_worker after double set");
-    assert!(sup.config().provider_id == "deepseek");
+    let env = &sup.config().env;
+    assert_eq!(env.get("OPENAI_API_KEY"), Some(&"test-key".to_string()));
 }
 
 /// `remove_worker_and_kill` when no worker exists for the given provider_id
@@ -528,5 +406,44 @@ async fn supervisor_for_session_with_no_db_returns_first() {
     assert!(
         pid == "deepseek" || pid == "openai",
         "fallback must return a known provider, got {pid}"
+    );
+}
+
+/// `update_provider_and_kill_old` (Task 7): updating a provider's entry
+/// kills the old worker and lets `ensure_worker` re-spawn with the new
+/// credentials/base_url.
+#[tokio::test]
+async fn update_provider_and_kill_old_respawns_with_new_credentials() {
+    let (pool, _gate, _exec) = make_test_pool();
+    let sup1 = pool.ensure_worker("deepseek").expect("first ensure");
+    assert_eq!(
+        sup1.config().env.get("OPENAI_BASE_URL"),
+        Some(&"https://api.deepseek.com/v1".to_string())
+    );
+
+    // Update the provider entry with a new base_url + api_key.
+    pool.update_provider_and_kill_old(ProviderRuntimeEntry {
+        provider_id: "deepseek".to_string(),
+        api_key: "new-key".to_string(),
+        base_url: "https://api.updated.example.com/v1".to_string(),
+    })
+    .await
+    .expect("update_provider_and_kill_old");
+
+    // Re-spawn — must reflect the new credentials.
+    let sup2 = pool.ensure_worker("deepseek").expect("re-spawn after update");
+    assert!(
+        !Arc::ptr_eq(&sup1, &sup2),
+        "re-spawned supervisor must be a NEW Arc"
+    );
+    assert_eq!(
+        sup2.config().env.get("OPENAI_API_KEY"),
+        Some(&"new-key".to_string()),
+        "re-spawned worker must use the updated api_key"
+    );
+    assert_eq!(
+        sup2.config().env.get("OPENAI_BASE_URL"),
+        Some(&"https://api.updated.example.com/v1".to_string()),
+        "re-spawned worker must use the updated base_url"
     );
 }

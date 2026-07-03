@@ -26,11 +26,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Once, Weak};
 use std::time::Duration;
 
-use busytok_config::{ProviderConfig, ProviderKind, SubagentResourcePolicyConfig};
+use busytok_config::SubagentResourcePolicyConfig;
 use busytok_store::Database;
 use busytok_subagent::pressure::{PressureAction, PressureGate, PressureResponder};
 use busytok_subagent::sidecar::{
-    CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, SidecarConfig,
+    PiSidecarSupervisor, ProviderRuntimeEntry, ResponderFactory, SidecarConfig,
     SidecarError, SidecarRpcClient, SidecarTaskExecutor, WorkerPool,
 };
 use tokio::process::Command;
@@ -62,30 +62,19 @@ fn init_subscriber() {
 
 const TEST_PROVIDER_ID: &str = "test-prov";
 
-fn test_provider() -> ProviderConfig {
-    ProviderConfig {
-        id: TEST_PROVIDER_ID.to_string(),
-        name: "Test".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://test.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    }
-}
-
-fn make_providers() -> ProviderLookup {
-    Arc::new(|pid: &str| -> Option<ProviderConfig> {
-        match pid {
-            TEST_PROVIDER_ID => Some(test_provider()),
-            _ => None,
-        }
-    })
-}
-
-fn canned_credential_reader() -> CredentialReader {
-    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+/// Build the provider runtime entries map (Task 7: replaces the old
+/// `ProviderLookup` + `CredentialReader` closures).
+fn make_providers() -> HashMap<String, ProviderRuntimeEntry> {
+    let mut map = HashMap::new();
+    map.insert(
+        TEST_PROVIDER_ID.to_string(),
+        ProviderRuntimeEntry {
+            provider_id: TEST_PROVIDER_ID.to_string(),
+            api_key: "test-key".to_string(),
+            base_url: "https://test.example.com/v1".to_string(),
+        },
+    );
+    map
 }
 
 fn mock_config_and_db() -> (SidecarConfig, Arc<std::sync::Mutex<Database>>) {
@@ -103,9 +92,6 @@ fn mock_config_and_db() -> (SidecarConfig, Arc<std::sync::Mutex<Database>>) {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     (config, db)
 }
@@ -125,9 +111,6 @@ fn live_sidecar_config_and_db() -> (SidecarConfig, Arc<std::sync::Mutex<Database
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     (config, db)
 }
@@ -159,9 +142,6 @@ fn live_sidecar_config_with_env(
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     (config, db)
 }
@@ -174,7 +154,6 @@ fn make_dummy_executor(db: Arc<std::sync::Mutex<Database>>) -> Arc<SidecarTaskEx
         config,
         Some(Arc::clone(&db)),
         make_providers(),
-        canned_credential_reader(),
         None,
         SubagentResourcePolicyConfig::default(),
     ));
@@ -192,7 +171,6 @@ fn make_no_db_executor() -> (Arc<SidecarTaskExecutor>, Arc<WorkerPool>) {
         config,
         Some(db),
         make_providers(),
-        canned_credential_reader(),
         None,
         SubagentResourcePolicyConfig::default(),
     ));

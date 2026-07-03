@@ -19,9 +19,7 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use tracing::{debug, error, info, warn};
 
-use busytok_config::{
-    BusytokPaths, BusytokSettings, ProviderCredentialStore, ProviderKind,
-};
+use busytok_config::{BusytokPaths, BusytokSettings};
 use busytok_control::dispatch::{MethodDispatchError, RuntimeControl};
 use busytok_domain::{now_ms, ReportingTimezone};
 use busytok_events::AppEventBus;
@@ -332,9 +330,9 @@ impl BusytokSupervisor {
         }
         // Either use the injected config (test path) or resolve the base
         // (unbound) config from settings + paths. `resolve_base_sidecar_config`
-        // produces a config with empty `provider_id` / env names — the pool
-        // clones it and sets per-provider fields before constructing each
-        // supervisor.
+        // produces a config without provider-specific env — the pool injects
+        // `OPENAI_API_KEY` / `OPENAI_BASE_URL` per provider via
+        // `inject_provider_env` before constructing each supervisor.
         let config_result = match sidecar_config_override {
             Some(cfg) => Ok(cfg),
             None => {
@@ -346,42 +344,52 @@ impl BusytokSupervisor {
             Ok(sidecar_config) => {
                 let gate = Arc::new(busytok_subagent::PressureGate::new());
 
-                // Build the providers lookup closure that reads LIVE settings
-                // (not a startup snapshot). Captures an `Arc::clone` of the
-                // shared settings store; each invocation locks briefly, finds
-                // the provider by id, and clones it out. This ensures that
-                // `provider_update` (which mutates `self.settings` under the
-                // same lock) is visible to `ensure_worker` when it re-spawns a
-                // worker — the respawned supervisor picks up the updated
-                // `base_url` / `base_url_env_name` / `models` / `enabled`.
-                let settings_for_providers = Arc::clone(settings);
-                let providers: busytok_subagent::sidecar::ProviderLookup =
-                    Arc::new(move |pid: &str| {
-                        let s = settings_for_providers.lock().unwrap();
-                        s.providers.iter().find(|p| p.id == pid).cloned()
-                    });
-
-                // Build the credential reader closure from
-                // `ProviderCredentialStore` (OS keychain). E2E tests set
-                // `BUSYTOK_TEST_API_KEY` to bypass the keychain (which may
-                // not be accessible in CI/headless environments).
-                let credential_reader: busytok_subagent::sidecar::CredentialReader =
-                    Arc::new(|pid: &str| {
-                        if let Ok(key) = std::env::var("BUSYTOK_TEST_API_KEY") {
-                            return Ok(Some(key));
-                        }
-                        ProviderCredentialStore::get_key(pid)
-                    });
+                // Build the providers map from SQL (Task 7: sidecar no longer
+                // reads from `settings.providers` TOML — it reads from the
+                // SQL-backed provider catalog). Only enabled providers with a
+                // non-None api_key are included; `provider_changed` updates
+                // this map at runtime via `update_provider_and_kill_old`.
+                let providers: std::collections::HashMap<
+                    String,
+                    busytok_subagent::sidecar::ProviderRuntimeEntry,
+                > = {
+                    let db = db.lock().unwrap();
+                    db.list_providers()
+                        .map_err(|e| {
+                            error!(
+                                event_code = "subagent.sidecar.list_providers_failed",
+                                error = %e,
+                                "failed to list providers from SQL during construct_sidecar"
+                            );
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|s| {
+                            let p = db.get_provider_with_secret(&s.id).ok()??;
+                            if !p.enabled {
+                                return None;
+                            }
+                            let api_key = p.api_key?;
+                            Some((
+                                p.id.clone(),
+                                busytok_subagent::sidecar::ProviderRuntimeEntry {
+                                    provider_id: p.id,
+                                    api_key,
+                                    base_url: p.base_url,
+                                },
+                            ))
+                        })
+                        .collect()
+                };
 
                 // Build the pool. The base config is cloned per-provider by
-                // `ensure_worker`, with env overridden (API key + base URL
-                // injected).
+                // `ensure_worker`, with env overridden (OPENAI_API_KEY +
+                // OPENAI_BASE_URL injected via `inject_provider_env`).
                 let resource_policy = settings.lock().unwrap().subagent.resource_policy.clone();
                 let pool = Arc::new(busytok_subagent::sidecar::WorkerPool::new(
                     sidecar_config,
                     Some(Arc::clone(db)),
                     providers,
-                    credential_reader,
                     Some(Arc::clone(&gate)),
                     resource_policy,
                 ));
@@ -426,17 +434,18 @@ impl BusytokSupervisor {
                 // Eagerly `ensure_worker` the first enabled provider so the
                 // `sidecar_supervisor` field has a supervisor for doctor
                 // checks, shutdown, and runtime status. If no providers are
-                // configured (or the first provider's credential is
-                // missing), `sidecar_supervisor` stays `None` — delegate
-                // calls will fail with "profile not bound to a provider"
-                // or "no API key" (surfaced via the executor's error path).
-                let first_enabled_provider = settings
-                    .lock()
-                    .unwrap()
-                    .providers
-                    .iter()
-                    .find(|p| p.enabled)
-                    .map(|p| p.id.clone());
+                // configured (or all lack credentials), `sidecar_supervisor`
+                // stays `None` — delegate calls will fail with "profile not
+                // bound to a provider" or "unknown provider" (surfaced via
+                // the executor's error path).
+                let first_enabled_provider = {
+                    let db = db.lock().unwrap();
+                    db.list_providers()
+                        .ok()
+                        .and_then(|summaries| {
+                            summaries.into_iter().find(|s| s.enabled).map(|s| s.id)
+                        })
+                };
                 let sidecar_supervisor =
                     first_enabled_provider.and_then(|pid| match pool.ensure_worker(&pid) {
                         Ok(sup) => Some(sup),
@@ -869,39 +878,75 @@ impl BusytokSupervisor {
         self.sidecar_runtime.read().unwrap().worker_pool.clone()
     }
 
-    /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
-    /// so the next delegate re-spawns it with fresh credentials/config.
+    /// Phase 3 Task 4 (P1b fix) + Task 7 (SQL-backed provider_changed):
+    /// Re-read the provider from SQL and either update the pool's
+    /// `ProviderRuntimeEntry` + kill the old worker (provider enabled with
+    /// api_key) or remove the provider entry + kill the worker (provider
+    /// disabled / missing / no api_key). Both paths use async kill methods
+    /// (`update_provider_and_kill_old` / `remove_worker_and_kill`) so the
+    /// old sidecar child process is explicitly `force_kill`'d (pool.rs:20-24
+    /// invariant — no `Drop` fallback).
+    ///
     /// Called by `provider_update` (covers both metadata changes AND key
     /// rotations) and `provider_create` (defensive — typically a no-op
     /// since no worker exists yet for a brand-new provider).
-    ///
-    /// Self-contained: callers don't need to remember to kill — this
-    /// method delegates to `pool.remove_worker_and_kill(provider_id)`
-    /// which does the remove + `force_kill().await` outside the map lock.
-    /// If no worker exists for `provider_id`, this is a logged no-op.
-    /// If the sidecar is disabled (`worker_pool` is `None`), this is a
-    /// logged no-op.
     pub async fn provider_changed(&self, provider_id: &str) {
-        if let Some(pool) = self.worker_pool() {
-            info!(
-                event_code = "subagent.provider_changed",
-                provider_id = %provider_id,
-                "provider changed — killing worker for lazy re-spawn with fresh credentials"
-            );
-            if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
-                warn!(
-                    event_code = "subagent.provider_changed_kill_failed",
-                    provider_id = %provider_id,
-                    error = %e,
-                    "failed to kill worker after provider change (best-effort)"
-                );
-            }
-        } else {
+        let Some(pool) = self.worker_pool() else {
             debug!(
                 event_code = "subagent.provider_changed_noop",
                 provider_id = %provider_id,
                 "provider_changed called but sidecar is disabled — no-op"
             );
+            return;
+        };
+        // Re-read provider from SQL to decide update vs remove.
+        let entry = {
+            let db = self.db.lock().unwrap();
+            db.get_provider_with_secret(provider_id).ok().flatten()
+        };
+        match entry {
+            Some(p) if p.enabled && p.api_key.is_some() => {
+                info!(
+                    event_code = "subagent.provider_changed",
+                    provider_id = %provider_id,
+                    "provider changed — updating entry + killing old worker for lazy re-spawn"
+                );
+                if let Err(e) = pool
+                    .update_provider_and_kill_old(
+                        busytok_subagent::sidecar::ProviderRuntimeEntry {
+                            provider_id: p.id,
+                            api_key: p.api_key.unwrap(),
+                            base_url: p.base_url,
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        event_code = "subagent.provider_changed_kill_failed",
+                        provider_id = %provider_id,
+                        error = %e,
+                        "failed to update+kill worker after provider change (best-effort)"
+                    );
+                }
+            }
+            _ => {
+                // Provider disabled / missing / no api_key — kill + remove
+                // (also removes the provider entry from the pool's map so
+                // ensure_worker won't re-spawn with stale credentials).
+                info!(
+                    event_code = "subagent.provider_changed_remove",
+                    provider_id = %provider_id,
+                    "provider changed (disabled/missing/no-key) — removing worker + provider entry"
+                );
+                if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
+                    warn!(
+                        event_code = "subagent.provider_changed_kill_failed",
+                        provider_id = %provider_id,
+                        error = %e,
+                        "failed to kill worker after provider change (best-effort)"
+                    );
+                }
+            }
         }
     }
 

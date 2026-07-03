@@ -16,10 +16,11 @@ use crate::sidecar::SidecarError;
 
 /// Resolved sidecar configuration — everything needed to spawn and supervise.
 ///
-/// `Clone` so the WorkerPool (Task 2) can clone the base config produced by
-/// `resolve_base_sidecar_config` and override `provider_id` +
-/// `api_key_env_name` / `base_url_env_name` per provider before spawning
-/// (Phase 3 multi-provider routing). All fields are `Clone`-able.
+/// `Clone` so the WorkerPool can clone the base config produced by
+/// `resolve_base_sidecar_config` and override `env` per provider before
+/// spawning (Phase 3 multi-provider routing). Provider-specific credentials
+/// are injected into `env` via `inject_provider_env` (fixed env names
+/// `OPENAI_API_KEY` / `OPENAI_BASE_URL`). All fields are `Clone`-able.
 #[derive(Clone)]
 pub struct SidecarConfig {
     pub node_binary: PathBuf,
@@ -44,30 +45,15 @@ pub struct SidecarConfig {
     /// Hard RSS limit (MB) — at/above this, write `rss_limit_exceeded`
     /// event; existing crash path will restart (spec §8.3 step 5).
     pub memory_hard_limit_mb: u32,
-    /// Phase 3: provider this supervisor runs tasks for. Empty in the base
-    /// config produced by `resolve_base_sidecar_config`; the WorkerPool
-    /// (Task 2) clones the base and sets this per provider before spawning.
-    /// Empty string means "unbound base" — never spawn directly with this.
-    pub provider_id: String,
-    /// Phase 3: name of the env var holding the provider API key. Empty in
-    /// the base config; WorkerPool sets it (e.g. `OPENAI_API_KEY`) so the
-    /// supervisor can inject the env var at spawn without re-resolving
-    /// provider config. Kept on the config for observability — log/metric
-    /// labels can reference it without re-reading provider settings.
-    pub api_key_env_name: String,
-    /// Phase 3: name of the env var holding the provider base URL. Same
-    /// lifecycle as `api_key_env_name` — empty in base, set per-provider.
-    pub base_url_env_name: String,
 }
 
 /// Resolve a base `SidecarConfig` from settings + paths.
 ///
-/// Produces a config with empty `provider_id` / env-name placeholders.
-/// The WorkerPool (Task 2) clones this and overrides `provider_id` +
-/// `api_key_env_name` / `base_url_env_name` per provider before spawning.
-/// Existing callers that don't care about provider binding (Plan 1/2 tests,
-/// single-supervisor paths) can use this directly or via
-/// `resolve_sidecar_config` (which delegates here).
+/// Produces a config without provider-specific env (the WorkerPool injects
+/// `OPENAI_API_KEY` / `OPENAI_BASE_URL` into `env` per provider at spawn
+/// time via `inject_provider_env`). Existing callers that don't care about
+/// provider binding (Plan 1/2 tests, single-supervisor paths) can use this
+/// directly or via `resolve_sidecar_config` (which delegates here).
 ///
 /// Explicit mode selection — NO silent fallback. Spec §10.1/§5.1.
 /// `node_runtime = "bundled"` requires the bundled node binary to exist;
@@ -133,13 +119,6 @@ pub fn resolve_base_sidecar_config(
         max_hot_sessions: settings.max_hot_sessions,
         memory_soft_limit_mb: settings.memory_soft_limit_mb,
         memory_hard_limit_mb: settings.memory_hard_limit_mb,
-        // Phase 3: provider binding is set per-supervisor by the WorkerPool
-        // (Task 2). The base config ships unbound — `provider_id` empty,
-        // env names empty placeholders. WorkerPool clones this, then sets
-        // `provider_id` + the provider-specific env names before spawning.
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     })
 }
 
@@ -181,24 +160,24 @@ mod tests {
         }
     }
 
-    /// `resolve_base_sidecar_config` produces a base config with empty
-    /// `provider_id` and empty env-name placeholders. This is the contract
-    /// the WorkerPool (Task 2) relies on: clone → override → spawn.
+    /// `resolve_base_sidecar_config` produces a base config without
+    /// provider-specific env. This is the contract the WorkerPool relies
+    /// on: clone → inject provider env → spawn.
     #[test]
-    fn resolve_base_sidecar_config_produces_empty_provider_fields() {
+    fn resolve_base_sidecar_config_produces_no_provider_env() {
         let tmp = TempDir::new().unwrap();
         let paths = BusytokPaths::for_test(tmp.path());
         let settings = system_settings(&tmp);
 
         let cfg = resolve_base_sidecar_config(&settings, &paths).unwrap();
-        assert_eq!(cfg.provider_id, "", "base config provider_id must be empty");
-        assert_eq!(
-            cfg.api_key_env_name, "",
-            "base config api_key_env_name must be empty"
+        // No provider-specific env injected at the base level.
+        assert!(
+            !cfg.env.contains_key("OPENAI_API_KEY"),
+            "base config must not contain OPENAI_API_KEY"
         );
-        assert_eq!(
-            cfg.base_url_env_name, "",
-            "base config base_url_env_name must be empty"
+        assert!(
+            !cfg.env.contains_key("OPENAI_BASE_URL"),
+            "base config must not contain OPENAI_BASE_URL"
         );
         // harness_name still set so the WorkerPool can clone+override without
         // re-resolving the runtime pieces.
@@ -215,9 +194,6 @@ mod tests {
 
         let via_resolve = resolve_sidecar_config(&settings, &paths).unwrap();
         let via_base = resolve_base_sidecar_config(&settings, &paths).unwrap();
-        assert_eq!(via_resolve.provider_id, via_base.provider_id);
-        assert_eq!(via_resolve.api_key_env_name, via_base.api_key_env_name);
-        assert_eq!(via_resolve.base_url_env_name, via_base.base_url_env_name);
         assert_eq!(via_resolve.harness_name, via_base.harness_name);
         assert_eq!(via_resolve.bundle_path, via_base.bundle_path);
         assert_eq!(via_resolve.node_binary, via_base.node_binary);
