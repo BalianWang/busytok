@@ -1,10 +1,11 @@
 //! Provider / Model / Tag domain model for the SQL-backed catalog.
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Provider kind. MVP only supports OpenAI-compatible.
 /// Kept in domain (not config) because it is wire-level vocabulary
 /// shared by protocol, store, and runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub enum ProviderKind {
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,

@@ -2,6 +2,7 @@
 #[cfg(test)]
 mod tests {
     use crate::dto;
+    use busytok_domain::ProviderKind;
     use std::fs;
     use std::path::PathBuf;
     use ts_rs::TS;
@@ -190,6 +191,7 @@ mod tests {
             dto::ReceiptDailyRequestDto::decl(),
             dto::ReceiptDailyDto::decl(),
             // Provider (credential foundation)
+            ProviderKind::decl(),
             dto::ProviderDto::decl(),
             dto::ProviderCreateRequestDto::decl(),
             dto::ProviderUpdateRequestDto::decl(),
@@ -197,6 +199,14 @@ mod tests {
             dto::ProviderDeleteRequestDto::decl(),
             dto::ProviderTestConnectionRequestDto::decl(),
             dto::ProviderTestConnectionResponseDto::decl(),
+            // Model catalog (Phase 3: Provider/Model Catalog Refactor)
+            dto::ModelCatalogEntryDto::decl(),
+            dto::ModelCreateRequestDto::decl(),
+            dto::ModelUpdateRequestDto::decl(),
+            dto::ModelDeleteRequestDto::decl(),
+            dto::ModelListRequestDto::decl(),
+            dto::ModelListResponseDto::decl(),
+            dto::ModelTagUpdateDto::decl(),
             // Profiles (Phase 4: Profile/Model Configuration UI)
             dto::ProfileDto::decl(),
             dto::ProfileCreateRequestDto::decl(),

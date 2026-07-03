@@ -590,6 +590,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tracing",
+ "ts-rs",
 ]
 
 [[package]]
@@ -667,6 +668,7 @@ name = "busytok-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "busytok-domain",
  "serde",
  "serde_json",
  "ts-rs",

@@ -1,5 +1,22 @@
+use busytok_domain::ProviderKind;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+
+/// Deserialize helper for three-state `Option<Option<T>>` fields.
+///
+/// With plain `#[serde(default)]`, JSON `null` collapses to `None` (indistinguishable
+/// from an absent field), which breaks three-state patch semantics. Wrapping the
+/// inner deserialize in `Some(...)` preserves the distinction:
+///   - field absent  → `None`            (default; means "unchanged")
+///   - `null`        → `Some(None)`      (means "clear")
+///   - `"value"`     → `Some(Some(v))`   (means "update to v")
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 // ---------------------------------------------------------------------------
 // Request / Response envelope
@@ -1535,31 +1552,21 @@ pub struct ReceiptBrandDto {
 pub struct ProviderDto {
     pub id: String,
     pub name: String,
+    pub provider_kind: ProviderKind,
     pub base_url: String,
-    pub api_key_env_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url_env_name: Option<String>,
-    pub models: Vec<String>,
     pub enabled: bool,
-    /// True if an API key is stored in the keychain for this provider.
     pub has_api_key: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
-// NOTE: provider_kind is NOT exposed in the wire DTOs for MVP. The service
-// always uses ProviderKind::OpenAiCompatible internally. When more provider
-// kinds are added (Phase 3+), the DTO can expose an enum field.
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderCreateRequestDto {
-    pub id: String,
     pub name: String,
+    pub provider_kind: ProviderKind,
     pub base_url: String,
-    pub api_key_env_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url_env_name: Option<String>,
-    pub models: Vec<String>,
-    /// The actual API key. Stored in keychain, never persisted to settings.toml.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub api_key: Option<String>,
 }
 
@@ -1571,19 +1578,75 @@ pub struct ProviderUpdateRequestDto {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// Env var name the sidecar reads for the API key. Editable provider field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_env_name: Option<String>,
-    /// Optional env var name for base URL override. Editable provider field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url_env_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// If provided, replaces the stored key. If None, key is unchanged.
+    // None=不改, Some(None)=清除, Some(Some(k))=更新
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_some")]
+    pub api_key: Option<Option<String>>,
+}
+
+// ─── Model Catalog DTOs (Phase 3: Provider/Model Catalog Refactor) ───────
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelCatalogEntryDto {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_kind: ProviderKind,
+    pub provider_enabled: bool,
+    pub model_db_id: String,
+    pub model_id: String,
+    pub model_enabled: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelCreateRequestDto {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelUpdateRequestDto {
+    pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelDeleteRequestDto {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelListRequestDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelListResponseDto {
+    pub models: Vec<ModelCatalogEntryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelTagUpdateDto {
+    pub model_id: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1718,58 +1781,243 @@ mod tests {
         let dto = ProviderDto {
             id: "deepseek-prod".to_string(),
             name: "DeepSeek".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.deepseek.com/v1".to_string(),
-            api_key_env_name: "DEEPSEEK_API_KEY".to_string(),
-            base_url_env_name: None,
-            models: vec!["deepseek-chat".to_string()],
             enabled: true,
             has_api_key: true,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
         };
-        let json = serde_json::to_string(&dto).unwrap();
-        let parsed: ProviderDto = serde_json::from_str(&json).unwrap();
+        let json_str = serde_json::to_string(&dto).unwrap();
+        let parsed: ProviderDto = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.id, "deepseek-prod");
         assert!(parsed.has_api_key);
+        assert_eq!(parsed.provider_kind, ProviderKind::OpenAiCompatible);
+        // No bare `api_key` field on the wire — only `has_api_key`.
+        assert!(!json_str.contains("\"api_key\""));
+        let json: serde_json::Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["provider_kind"], "openai_compatible");
     }
 
     #[test]
-    fn provider_update_request_dto_round_trips_with_env_name_fields() {
-        // Spec §3.1: name, base_url, api_key_env_name and base_url_env_name are
-        // editable provider fields. The update DTO must carry the env-name fields
-        // so the edit-provider UI can patch them.
-        let dto = ProviderUpdateRequestDto {
-            id: "deepseek-prod".to_string(),
-            name: Some("DeepSeek".to_string()),
-            base_url: Some("https://api.deepseek.com/v1".to_string()),
-            api_key_env_name: Some("DEEPSEEK_API_KEY".to_string()),
-            base_url_env_name: Some("DEEPSEEK_BASE_URL".to_string()),
-            models: Some(vec!["deepseek-chat".to_string()]),
+    fn provider_dto_does_not_expose_api_key_field() {
+        // 严禁输出 api_key: ProviderDto has no api_key field at all.
+        let dto = ProviderDto {
+            id: "p".to_string(),
+            name: "P".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://example.com".to_string(),
+            enabled: true,
+            has_api_key: false,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        // The only api_key-ish field is `has_api_key` (a bool flag).
+        assert!(json.get("api_key").is_none());
+        assert_eq!(json["has_api_key"], false);
+    }
+
+    #[test]
+    fn provider_create_request_dto_omits_id_and_defaults_api_key() {
+        // No `id` field: system generates UUID. api_key defaults to None.
+        let minimal: ProviderCreateRequestDto = serde_json::from_str(
+            r#"{"name":"DeepSeek","provider_kind":"openai_compatible","base_url":"https://api.deepseek.com/v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.name, "DeepSeek");
+        assert_eq!(minimal.provider_kind, ProviderKind::OpenAiCompatible);
+        assert!(minimal.api_key.is_none());
+
+        // `id` is not a known field — JSON with `id` must still deserialize
+        // (serde ignores unknown fields by default for these DTOs, but more
+        // importantly the struct itself has no `id` field).
+        let with_id: ProviderCreateRequestDto = serde_json::from_str(
+            r#"{"id":"should-be-ignored","name":"X","provider_kind":"openai_compatible","base_url":"u","api_key":"k"}"#,
+        )
+        .unwrap();
+        assert_eq!(with_id.name, "X");
+        assert_eq!(with_id.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn provider_update_request_dto_api_key_three_state() {
+        // None = unchanged: field omitted on wire.
+        let unchanged = ProviderUpdateRequestDto {
+            id: "p".to_string(),
+            name: None,
+            base_url: None,
             enabled: None,
             api_key: None,
         };
-        let json = serde_json::to_value(&dto).unwrap();
-        // snake_case wire names.
-        assert_eq!(json["id"], "deepseek-prod");
-        assert_eq!(json["api_key_env_name"], "DEEPSEEK_API_KEY");
-        assert_eq!(json["base_url_env_name"], "DEEPSEEK_BASE_URL");
-        // `None` fields are skipped on serialize (skip_serializing_if).
-        assert!(json.get("enabled").is_none());
+        let json = serde_json::to_value(&unchanged).unwrap();
         assert!(json.get("api_key").is_none());
+        assert!(json.get("name").is_none());
 
-        let parsed: ProviderUpdateRequestDto = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.id, "deepseek-prod");
-        assert_eq!(parsed.api_key_env_name.as_deref(), Some("DEEPSEEK_API_KEY"));
-        assert_eq!(
-            parsed.base_url_env_name.as_deref(),
-            Some("DEEPSEEK_BASE_URL")
-        );
+        // Some(None) = clear: serializes as JSON null.
+        let clear = ProviderUpdateRequestDto {
+            id: "p".to_string(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            api_key: Some(None),
+        };
+        let json = serde_json::to_value(&clear).unwrap();
+        assert_eq!(json["api_key"], serde_json::Value::Null);
 
-        // An update payload that omits the env-name fields must still deserialize
-        // (they default to None — patch semantics: absent == unchanged).
-        let minimal: ProviderUpdateRequestDto =
-            serde_json::from_str(r#"{"id":"p","name":"P"}"#).unwrap();
-        assert_eq!(minimal.id, "p");
-        assert!(minimal.api_key_env_name.is_none());
-        assert!(minimal.base_url_env_name.is_none());
+        // Some(Some(k)) = update: serializes as the new key string.
+        let update = ProviderUpdateRequestDto {
+            id: "p".to_string(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            api_key: Some(Some("new-key".to_string())),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["api_key"], "new-key");
+
+        // Round-trip each state.
+        let parsed_clear: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p","api_key":null}"#).unwrap();
+        assert_eq!(parsed_clear.api_key, Some(None));
+
+        let parsed_update: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p","api_key":"k"}"#).unwrap();
+        assert_eq!(parsed_update.api_key, Some(Some("k".to_string())));
+
+        // Absent on the wire deserializes to None (unchanged).
+        let parsed_absent: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p"}"#).unwrap();
+        assert_eq!(parsed_absent.api_key, None);
+    }
+
+    #[test]
+    fn provider_kind_serializes_as_openai_compatible() {
+        let json = serde_json::to_value(ProviderKind::OpenAiCompatible).unwrap();
+        assert_eq!(json, "openai_compatible");
+        let parsed: ProviderKind = serde_json::from_str("\"openai_compatible\"").unwrap();
+        assert_eq!(parsed, ProviderKind::OpenAiCompatible);
+    }
+
+    #[test]
+    fn model_catalog_entry_dto_round_trips() {
+        let dto = ModelCatalogEntryDto {
+            provider_id: "prov-1".to_string(),
+            provider_name: "OpenAI".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "model-db-1".to_string(),
+            model_id: "gpt-4o".to_string(),
+            model_enabled: true,
+            tags: vec!["fast".to_string(), "cheap".to_string()],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["provider_id"], "prov-1");
+        assert_eq!(json["provider_kind"], "openai_compatible");
+        assert_eq!(json["model_db_id"], "model-db-1");
+        assert_eq!(json["model_id"], "gpt-4o");
+        assert_eq!(json["tags"][0], "fast");
+        let parsed: ModelCatalogEntryDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.model_id, "gpt-4o");
+        assert_eq!(parsed.tags.len(), 2);
+    }
+
+    #[test]
+    fn model_create_request_dto_defaults() {
+        // enabled + tags default when omitted.
+        let minimal: ModelCreateRequestDto =
+            serde_json::from_str(r#"{"provider_id":"p","model_id":"m"}"#).unwrap();
+        assert_eq!(minimal.provider_id, "p");
+        assert_eq!(minimal.model_id, "m");
+        assert!(minimal.enabled.is_none());
+        assert!(minimal.tags.is_empty());
+
+        let full: ModelCreateRequestDto = serde_json::from_str(
+            r#"{"provider_id":"p","model_id":"m","enabled":true,"tags":["t1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(full.enabled, Some(true));
+        assert_eq!(full.tags, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn model_update_request_dto_patch_semantics() {
+        let noop: ModelUpdateRequestDto = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
+        assert_eq!(noop.id, "m");
+        assert!(noop.enabled.is_none());
+
+        let patch = ModelUpdateRequestDto {
+            id: "m".to_string(),
+            enabled: Some(false),
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["enabled"], false);
+        let parsed: ModelUpdateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.enabled, Some(false));
+    }
+
+    #[test]
+    fn model_delete_request_dto_round_trips() {
+        let dto = ModelDeleteRequestDto {
+            id: "m".to_string(),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json, serde_json::json!({"id": "m"}));
+        let back: ModelDeleteRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id, "m");
+    }
+
+    #[test]
+    fn model_list_request_dto_defaults() {
+        let minimal: ModelListRequestDto = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(minimal.provider_id.is_none());
+        assert!(minimal.tags.is_empty());
+        assert!(!minimal.include_disabled);
+
+        let full: ModelListRequestDto = serde_json::from_str(
+            r#"{"provider_id":"p","tags":["fast"],"include_disabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(full.provider_id.as_deref(), Some("p"));
+        assert_eq!(full.tags, vec!["fast".to_string()]);
+        assert!(full.include_disabled);
+
+        // provider_id=None is skipped on serialize.
+        let json = serde_json::to_value(&minimal).unwrap();
+        assert!(json.get("provider_id").is_none());
+    }
+
+    #[test]
+    fn model_list_response_dto_round_trips() {
+        let dto = ModelListResponseDto {
+            models: vec![ModelCatalogEntryDto {
+                provider_id: "p".to_string(),
+                provider_name: "P".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                provider_enabled: true,
+                model_db_id: "mdb".to_string(),
+                model_id: "m".to_string(),
+                model_enabled: true,
+                tags: vec![],
+            }],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["models"][0]["model_id"], "m");
+        let parsed: ModelListResponseDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.models.len(), 1);
+    }
+
+    #[test]
+    fn model_tag_update_dto_round_trips() {
+        let dto = ModelTagUpdateDto {
+            model_id: "m".to_string(),
+            tags: vec!["a".to_string(), "b".to_string()],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["model_id"], "m");
+        assert_eq!(json["tags"][0], "a");
+        let back: ModelTagUpdateDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.tags, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]

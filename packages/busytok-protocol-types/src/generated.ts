@@ -376,31 +376,13 @@ export type ReceiptDailyDto = { date: string,
  */
 date_label: string, timezone: string, metrics: ReceiptMetricsDto, top_models: Array<ReceiptModelSliceDto>, brand: ReceiptBrandDto, };
 
-export type ProviderDto = { id: string, name: string, base_url: string, api_key_env_name: string, base_url_env_name: string | null, models: Array<string>, enabled: boolean, 
-/**
- * True if an API key is stored in the keychain for this provider.
- */
-has_api_key: boolean, };
+export type ProviderKind = "openai_compatible";
 
-export type ProviderCreateRequestDto = { id: string, name: string, base_url: string, api_key_env_name: string, base_url_env_name: string | null, models: Array<string>, 
-/**
- * The actual API key. Stored in keychain, never persisted to settings.toml.
- */
-api_key: string | null, };
+export type ProviderDto = { id: string, name: string, provider_kind: ProviderKind, base_url: string, enabled: boolean, has_api_key: boolean, created_at_ms: number, updated_at_ms: number, };
 
-export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, 
-/**
- * Env var name the sidecar reads for the API key. Editable provider field.
- */
-api_key_env_name: string | null, 
-/**
- * Optional env var name for base URL override. Editable provider field.
- */
-base_url_env_name: string | null, models: Array<string> | null, enabled: boolean | null, 
-/**
- * If provided, replaces the stored key. If None, key is unchanged.
- */
-api_key: string | null, };
+export type ProviderCreateRequestDto = { name: string, provider_kind: ProviderKind, base_url: string, api_key: string | null, };
+
+export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, enabled: boolean | null, api_key: string | null | null, };
 
 export type ProviderListResponseDto = { providers: Array<ProviderDto>, };
 
@@ -409,6 +391,20 @@ export type ProviderDeleteRequestDto = { id: string, };
 export type ProviderTestConnectionRequestDto = { id: string, };
 
 export type ProviderTestConnectionResponseDto = { ok: boolean, error: string | null, models_detected: Array<string> | null, };
+
+export type ModelCatalogEntryDto = { provider_id: string, provider_name: string, provider_kind: ProviderKind, provider_enabled: boolean, model_db_id: string, model_id: string, model_enabled: boolean, tags: Array<string>, };
+
+export type ModelCreateRequestDto = { provider_id: string, model_id: string, enabled: boolean | null, tags: Array<string>, };
+
+export type ModelUpdateRequestDto = { id: string, enabled: boolean | null, };
+
+export type ModelDeleteRequestDto = { id: string, };
+
+export type ModelListRequestDto = { provider_id: string | null, tags: Array<string>, include_disabled: boolean, };
+
+export type ModelListResponseDto = { models: Array<ModelCatalogEntryDto>, };
+
+export type ModelTagUpdateDto = { model_id: string, tags: Array<string>, };
 
 export type ProfileDto = { id: string, 
 /**
