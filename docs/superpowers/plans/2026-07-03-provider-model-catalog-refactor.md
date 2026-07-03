@@ -2051,22 +2051,49 @@ pub fn inject_provider_env(env: &mut HashMap<String, String>, entry: &ProviderRu
 
 `ensure_worker` 方法中，从 `self.providers` lock 中取 entry，调用 `inject_provider_env` 注入 env。
 
-新增 `update_provider` 方法供 supervisor 调用：
+新增 `update_provider_and_kill_old` 方法供 supervisor 调用。
+
+> **不变量（pool.rs:20-24）：** `PiSidecarSupervisor` 没有 `Drop` fallback，kill 必须显式且 awaited。同步 `workers.remove(&pid)` 只从 map 摘掉对象，不会终止 sidecar 子进程，会重新引入孤儿进程——本仓库已在 P1b 修复中收紧过这条规则。因此本方法必须是 `async`，drop lock 后调用 `force_kill().await`，与 `remove_worker_and_kill` / `shutdown_all` 一致。
 
 ```rust
-    /// Update or insert a provider's runtime entry. Called by supervisor
-    /// on provider_changed. Kills the old worker so next delegate re-spawns.
-    pub fn update_provider(&self, entry: ProviderRuntimeEntry) {
+    /// Update or insert a provider's runtime entry, then force-kill the
+    /// existing worker (if any) so the next delegate re-spawns with the
+    /// new credentials/base_url. Called by supervisor on provider_changed.
+    ///
+    /// MUST be async: `force_kill().await` waits for `child.wait()` and
+    /// must not be skipped (no `Drop` fallback in `PiSidecarSupervisor`).
+    /// Drops the map lock BEFORE `.await` (don't hold sync `Mutex` across
+    /// await — see pool.rs:20-24 invariant).
+    pub async fn update_provider_and_kill_old(&self, entry: ProviderRuntimeEntry) -> Result<()> {
         let pid = entry.provider_id.clone();
         {
             let mut providers = self.providers.lock().unwrap();
             providers.insert(pid.clone(), entry);
         }
-        // Kill existing worker — lazy re-spawn on next delegate
-        let mut workers = self.workers.lock().unwrap();
-        workers.remove(&pid);
+        // Take the old worker out of the map, then force-kill it OUTSIDE
+        // the lock (force_kill awaits child.wait()).
+        let old = {
+            let mut workers = self.workers.lock().unwrap();
+            workers.remove(&pid)
+        };
+        if let Some(sup) = old {
+            info!(
+                event_code = "subagent.worker_pool.update_provider_kill",
+                provider_id = %pid,
+                "update_provider_and_kill_old: force-killing old supervisor"
+            );
+            sup.force_kill().await;
+            info!(
+                event_code = "subagent.worker_pool.update_provider_killed",
+                provider_id = %pid,
+                "update_provider_and_kill_old: old supervisor killed"
+            );
+        }
+        Ok(())
     }
 ```
+
+> **禁止引入同步 `remove_worker(provider_id)` 变体**——这是 P1b 已删除的旧 API。supervisor 的 `provider_changed` 只能调用 `update_provider_and_kill_old` 或 `remove_worker_and_kill`（均 async）。
 
 - [ ] **Step 4: 更新 supervisor 构造 WorkerPool 的代码**
 
@@ -2091,33 +2118,36 @@ let providers: HashMap<String, ProviderRuntimeEntry> = {
 };
 ```
 
-更新 `provider_changed` 方法，改为调用 `worker_pool.update_provider(entry)` 而非 `remove_worker_and_kill`：
+更新 `provider_changed` 方法，改为 `.await` 调用 `worker_pool.update_provider_and_kill_old(entry)` 或 `worker_pool.remove_worker_and_kill(provider_id)`——两者均为 async，确保旧 sidecar 子进程被显式 kill（pool.rs:20-24 不变量）：
 
 ```rust
     async fn provider_changed(&self, provider_id: &str) {
-        if let Some(pool) = self.worker_pool() {
-            // Re-read provider from SQL and update pool
-            let entry = {
-                let db = self.db.lock().unwrap();
-                db.get_provider_with_secret(provider_id).ok().flatten()
-            };
-            if let Some(p) = entry {
-                if p.enabled {
-                    if let Some(api_key) = p.api_key {
-                        pool.update_provider(ProviderRuntimeEntry {
-                            provider_id: p.id,
-                            api_key,
-                            base_url: p.base_url,
-                        });
-                        return;
-                    }
-                }
+        let Some(pool) = self.worker_pool() else { return; };
+        // Re-read provider from SQL
+        let entry = {
+            let db = self.db.lock().unwrap();
+            db.get_provider_with_secret(provider_id).ok().flatten()
+        };
+        match entry {
+            Some(p) if p.enabled && p.api_key.is_some() => {
+                // Update entry + kill old worker (force_kill awaited)
+                pool.update_provider_and_kill_old(ProviderRuntimeEntry {
+                    provider_id: p.id,
+                    api_key: p.api_key.unwrap(),
+                    base_url: p.base_url,
+                }).await
+                  .ok(); // error logged inside; next delegate will re-spawn
             }
-            // Provider disabled or no api_key — remove from pool
-            pool.remove_worker(provider_id);
+            _ => {
+                // Provider disabled / missing / no api_key — kill + remove
+                pool.remove_worker_and_kill(provider_id).await
+                    .ok();
+            }
         }
     }
 ```
+
+> **不要**简化为 `pool.update_provider(...)` 或 `pool.remove_worker(provider_id)`——这两种同步变体在 P1b 已删除，会绕过 `force_kill`，重新引入孤儿 sidecar 进程。
 
 - [ ] **Step 5: 运行测试验证通过**
 
@@ -2260,19 +2290,23 @@ git commit -m "feat(cli): add 'busytok models' command with table/json output an
 
 ---
 
-## Task 9: GUI 改造（ProvidersPage 简化 + ModelsSection 新增）
+## Task 9: GUI 改造（ProvidersPage 简化 + ModelsSection 新增 + ProfilesSection 全链路切换）
 
 **Files:**
 - Modify: `apps/gui/src/api/busytokClient.ts`
-- Modify: `apps/gui/src/pages/ProvidersPage.tsx`
-- Create: `apps/gui/src/components/ModelsSection.tsx`
-- Modify: `apps/gui/src/components/ProfilesSection.tsx`（model 选择改为从 catalog 读）
+- Modify: `apps/gui/src/api/useBusytokData.ts`（新增 `useModels` / `useModelMutations` hooks）
+- Modify: `apps/gui/src/pages/ProvidersPage.tsx`（删 env name / models / id 输入框）
+- Create: `apps/gui/src/components/ModelsSection.tsx`（CRUD + tags 管理）
+- Modify: `apps/gui/src/components/ProfilesSection.tsx`（**5 条旧逻辑全切换**：显示态 + 编辑态 + cascade + degraded path + stale/save gating）
+- Test: `apps/gui/src/components/ModelsSection.test.tsx`（新增）
+- Test: `apps/gui/src/pages/ProvidersPage.test.tsx`（扩写）
+- Test: `apps/gui/src/components/ProfilesSection.test.tsx`（扩写 stale/disabled/cascade 用例）
 
 **Interfaces:**
 - Consumes: Task 3 重新生成的 TS 类型
-- Produces: 简化的 ProvidersPage（无 env name / models 编辑），新增 ModelsSection（CRUD + tags 管理）
+- Produces: 简化的 ProvidersPage（无 env name / models / id 输入），新增 ModelsSection（CRUD + tags 管理），ProfilesSection 完整切换到 SQL catalog 读模型
 
-> GUI 改动以 React 组件为主。测试用 vitest（如果 GUI 有测试配置）或手动验证。
+> **GUI 验证门禁（强制）：** Task 9 不允许仅靠 `pnpm run build` 验收。仓库已有 vitest + `@vitest/coverage-v8` + 现成测试文件（`ProvidersPage.test.tsx` / `ProfilesSection.test.tsx`），见 `apps/gui/package.json:13` 的 `test:coverage` 脚本和仓库根 `package.json:12` 的 `coverage:gui` 脚本。本任务 Step 7 必须运行覆盖率命令并通过 90% lines 阈值。
 
 - [ ] **Step 1: 在 busytokClient.ts 添加 model.* 方法**
 
@@ -2304,16 +2338,52 @@ git commit -m "feat(cli): add 'busytok models' command with table/json output an
   ModelUpdateRequestDto,
 ```
 
-- [ ] **Step 2: 简化 ProvidersPage**
+- [ ] **Step 2: 新增 `useModels` / `useModelMutations` hooks**
+
+在 `apps/gui/src/api/useBusytokData.ts` 中参照 `useProviders` / `useProviderMutations` 模式新增：
+
+```ts
+export function useModels(filter: { providerId?: string; tags?: string[]; includeDisabled?: boolean }) {
+  return useQuery({
+    queryKey: ["models", filter],
+    queryFn: () => busytokClient.modelList({
+      provider_id: filter.providerId ?? null,
+      tags: filter.tags ?? [],
+      include_disabled: filter.includeDisabled ?? false,
+    }),
+  });
+}
+
+export function useModelMutations() {
+  const qc = useQueryClient();
+  const create = useMutation({
+    mutationFn: (req: ModelCreateRequestDto) => busytokClient.modelCreate(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["models"] }),
+  });
+  // ... update / delete / tagsUpdate 同模式，均 invalidate ["models"] 和 ["providers"]
+  return { create, update, delete: del, tagsUpdate };
+}
+```
+
+- [ ] **Step 3: 简化 ProvidersPage（删 env name / models / id 输入框）**
 
 在 `apps/gui/src/pages/ProvidersPage.tsx` 中：
-- 删除 `api_key_env_name` 输入框
-- 删除 `base_url_env_name` 输入框
-- 删除 `models` 字符串数组编辑
-- 表单只保留：id, name, base_url, enabled, api_key（密码框）
-- 列表展示列：name, provider_kind, base_url, enabled, has_api_key
 
-- [ ] **Step 3: 创建 ModelsSection 组件**
+**3a. 删除字段（spec §3.2: id 系统生成 UUID，不由用户输入）：**
+- 删除 `ProviderFormState.id` 字段及 `EMPTY_FORM.id`
+- 删除 create 表单的 "Provider ID" 输入框（现第 74-90 行）—— id 由后端 `provider_create` 生成 UUID v4，前端不再采集
+- 删除 `api_key_env_name` / `base_url_env_name` / `models` 输入框
+- 编辑视图：id 改为**只读展示**（`SettingsValue` tone="muted"），或不展示（任选其一，保持一致）
+
+**3b. 表单最终字段（create）：** `name, base_url, enabled, api_key`（密码框）。**无 id 字段**。
+
+**3c. 列表展示列：** `name, provider_kind, base_url, enabled, has_api_key`（id 列保留，作为只读标识）。
+
+**3d. create 调用改为不传 id：** `busytokClient.providerCreate({ name, base_url, enabled, api_key, provider_kind })`，从响应读回系统生成的 id。
+
+**3e. 删除 `modelsLabel` 辅助函数（第 25-27 行）**——models 不再在 provider 上。
+
+- [ ] **Step 4: 创建 ModelsSection 组件**
 
 `apps/gui/src/components/ModelsSection.tsx`:
 
@@ -2346,21 +2416,80 @@ export function ModelsSection() {
 }
 ```
 
-- [ ] **Step 4: 更新 ProfilesSection 的 model 选择**
+- [ ] **Step 5: 重写 ProfilesSection —— 5 条旧逻辑全切换到 SQL catalog**
 
-在 `apps/gui/src/components/ProfilesSection.tsx` 中，把 model 下拉选择从 provider.models 改为调用 `busytokClient.modelList({ provider_id, ... })` 获取该 provider 下的模型列表。
+> **背景：** `ProfilesSection.tsx` 当前依赖 `provider.models: string[]` 的地方有 5 处（不是只有下拉一处）。如果只改下拉，stale warning / save gating 会继续读旧字段，但 `ProviderDto.models` 已在 Task 3 删除，会编译失败或读到 undefined。本 Step 必须替换全部 5 处。
 
-- [ ] **Step 5: 验证 GUI 构建**
+逐项替换（行号以当前 main 为准，实现者按实际代码定位）：
 
-Run: `cd apps/gui && pnpm run build`
-Expected: 构建成功，无 TS 类型错误
+**5a. 显示态 stale 判定（`isStaleModel`，第 25-31 行）：**
+- 旧：`provider.models.includes(profile.model)`
+- 新：从 `useModels({ providerId: profile.provider_id, includeDisabled: false })` 取模型列表，判定 `!models.some(m => m.model_id === profile.model)`
+- 注意：`useStaleModel` 需要按 profile 粒度调用 hook，可拆出 `<ProfileModelStatus providerId={...} modelId={...} />` 子组件避免 hook 顺序问题
 
-- [ ] **Step 6: Commit**
+**5b. 编辑态 `availableModels`（第 82-86 行）：**
+- 旧：`providers.filter(...).find(...).models`
+- 新：`useModels({ providerId: editProviderId, includeDisabled: false })` 的 `data.models`，取 `m.model_id` 数组
+
+**5c. cascade reset（`handleEditChange`，第 293-294 行）：**
+- 旧：`newProvider?.models[0] ?? ""`
+- 新：用 5b 的 hook 数据，`models[0]?.model_id ?? ""`（如无模型则空串）
+
+**5d. degraded path（第 76-79 行）：**
+- 保留 `providersDegraded` 跳过 stale/disabled 检查的逻辑，但新增 `modelsDegraded`（来自 `useModels` 的 `isError`），编辑态下若 models 查询失败也跳过 `isEditModelStale` 判定（避免假阳性 disable Save）
+
+**5e. save gating `isEditModelStale`（第 90-91 行）：**
+- 旧：`!availableModels.includes(editModel)`
+- 新：`editProviderId !== "" && editModel !== "" && !availableModels.includes(editModel)`（editModel 为空时也应 disable Save，保留原约束）
+
+> **禁止**只改 5b 下拉而不改 5a/5c/5d/5e——否则页面能编但 stale warning / save 按钮会失真。Self-Review 表会逐项验证 5a-5e。
+
+- [ ] **Step 6: 扩写 GUI 测试**
+
+**6a. 新增 `apps/gui/src/components/ModelsSection.test.tsx`：**
+- mock `busytokClient.modelList` 返回 fixture
+- 验证：表格渲染（provider_name, model_id, enabled, tags 列）
+- 验证：filterProvider / filterTag / showAll 触发 refetch
+- 验证：create 表单提交调用 `modelCreate`
+- 验证：toggle enabled 调用 `modelUpdate`
+- 验证：delete 调用 `modelDelete`
+- 验证：tags 编辑调用 `modelTagsUpdate`
+
+**6b. 扩写 `apps/gui/src/pages/ProvidersPage.test.tsx`：**
+- 删除依赖 `id` 输入框的旧用例（如 "rejects empty id" / "rejects uppercase id"）
+- 新增：create 表单**无 id 输入框**（`queryByLabelText("Provider ID")` 返回 null）
+- 新增：create 提交不传 `id`，从响应读回系统生成 id
+- 新增：列表展示 `provider_kind` 列
+- 删除依赖 `api_key_env_name` / `base_url_env_name` / `models` 输入框的旧用例
+
+**6c. 扩写 `apps/gui/src/components/ProfilesSection.test.tsx`：**
+- 新增：stale warning 显示（`useModels` 返回不含 `profile.model`，断言 "⚠ Stale Model" 出现）
+- 新增：stale warning 不显示（`useModels` 返回含 `profile.model`）
+- 新增：cascade reset（切换 provider 后 `editModel` reset 到新 provider 第一个 model_id）
+- 新增：save gating（`isEditModelStale` 时 Save 按钮 disabled）
+- 新增：degraded path（`useModels` isError 时 Save 按钮 enabled，不假阳性 disable）
+- 删除依赖 `provider.models` 的旧用例
+
+- [ ] **Step 7: 运行 GUI 测试 + 覆盖率门禁**
+
+Run: `pnpm --filter @busytok/gui test:coverage`
+Expected: vitest 全部 PASS，coverage lines ≥ 90%（脚本见 `apps/gui/package.json:13`）
+
+> 仓库根 `package.json:12` 也提供 `pnpm coverage:gui` 别名，等价于上述命令并额外带 `--coverage.thresholds.lines 90`。两个命令任选其一，**必须通过**。仅 `pnpm run build` 不构成验收。
+
+- [ ] **Step 8: 类型检查 + 构建**
+
+Run: `pnpm --filter @busytok/gui typecheck && pnpm --filter @busytok/gui build`
+Expected: 无 TS 类型错误，vite build 成功
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add apps/gui/src/api/busytokClient.ts apps/gui/src/pages/ProvidersPage.tsx \
-  apps/gui/src/components/ModelsSection.tsx apps/gui/src/components/ProfilesSection.tsx
-git commit -m "feat(gui): simplify ProvidersPage + add ModelsSection + profile model select from catalog"
+git add apps/gui/src/api/busytokClient.ts apps/gui/src/api/useBusytokData.ts \
+  apps/gui/src/pages/ProvidersPage.tsx apps/gui/src/pages/ProvidersPage.test.tsx \
+  apps/gui/src/components/ModelsSection.tsx apps/gui/src/components/ModelsSection.test.tsx \
+  apps/gui/src/components/ProfilesSection.tsx apps/gui/src/components/ProfilesSection.test.tsx
+git commit -m "feat(gui): simplify ProvidersPage (no id/env-name inputs) + add ModelsSection + ProfilesSection full catalog switch"
 ```
 
 ---
@@ -2598,6 +2727,10 @@ git commit -m "chore: remove ProviderConfig/keychain/env-name remnants + add gre
 | set_model_tags 无变化时跳过 updated_at_ms | Task 2 Step 5 |
 | TestRuntimeControl model_list stub 统一 bail! | Task 4 Step 3 |
 | providers.rs 旧测试模块删除 | Task 10 Step 1 |
+| WorkerPool kill 语义（async force_kill，禁止同步 remove） | Task 7 Step 3 (`update_provider_and_kill_old` async) + Step 4 (`provider_changed` `.await` 调用 `update_provider_and_kill_old` / `remove_worker_and_kill`) |
+| ProfilesSection 5 条旧逻辑全切换 SQL catalog | Task 9 Step 5 (5a 显示态 stale + 5b 编辑态 availableModels + 5c cascade reset + 5d degraded path + 5e save gating) |
+| GUI ProvidersPage create 表单无 id 输入框（spec §3.2） | Task 9 Step 3 (3a 删 ProviderFormState.id + 3b create 字段无 id + 3d providerCreate 不传 id) |
+| GUI 验证门禁 vitest + coverage ≥ 90% | Task 9 Step 6 (新增/扩写 3 个测试文件) + Step 7 (`pnpm --filter @busytok/gui test:coverage`) |
 
 **2. 占位符扫描：** 无 TBD/TODO。Task 5 Step 3f 的 test_connection fallback 已补全完整 HTTP 调用代码（参考现有 supervisor.rs 的 /chat/completions 探针逻辑），不再有"保留现有逻辑"占位。Task 5/6 测试中的 `/* ... p1 ... */` 占位符已全部替换为完整的 DTO 构造代码。
 
@@ -2695,4 +2828,54 @@ git commit -m "chore: remove ProviderConfig/keychain/env-name remnants + add gre
 - 移除 `id` 字段后，所有相关引用同步更新：Task 2 测试（`sample_provider_req` + 5 个测试函数）、Task 3 DTO、Task 5 `provider_create`、Task 5/6 测试代码。
 - `api_key` 三态化后，Task 2 测试 `provider_crud_round_trip` 的 `api_key` 改为 `Some(Some(...))`。
 - Self-Review 检查表新增 8 行覆盖新修复项；占位符扫描说明更新为"已补全完整代码"。
+
+---
+
+## Review Fix Log (R2 — 用户四点收紧)
+
+> 本节记录用户在 R1 修复后指出的 4 个 P1 问题（2026-07-03），全部已修复。
+
+### P1-1: Task 7 WorkerPool kill 语义（防止孤儿 sidecar 进程）
+
+- **问题：** R1 plan 在 Task 7 Step 3 定义的 `update_provider()` 是同步 `workers.remove(&pid)`，没有显式 `force_kill().await`；Step 4 的 `provider_changed` 又用了已删除的同步 `pool.remove_worker(provider_id)`。这会绕过 pool.rs:20-24 的不变量（`PiSidecarSupervisor` 无 `Drop` fallback，kill 必须显式且 awaited），重新引入孤儿 sidecar 进程——本仓库 P1b 修复曾专门收紧过这条规则。
+- **修复：**
+  - Task 7 Step 3 的 `update_provider` → 改为 `pub async fn update_provider_and_kill_old`，drop lock 后调用 `sup.force_kill().await`，并加注释引用 pool.rs:20-24 不变量。
+  - Task 7 Step 4 的 `provider_changed` 改为 `.await` 调用 `pool.update_provider_and_kill_old(entry)`（enabled 分支）或 `pool.remove_worker_and_kill(provider_id).await`（disabled/missing 分支）。
+  - 显式禁止引入同步 `remove_worker(provider_id)` 变体（P1b 已删除的旧 API）。
+  - 新增两个 observation log 事件：`subagent.worker_pool.update_provider_kill` / `subagent.worker_pool.update_provider_killed`。
+
+### P1-2: Task 9 ProfilesSection 5 条旧逻辑全切换
+
+- **问题：** R1 plan 在 Task 9 Step 4 只写"把 model 下拉改成 `modelList`"，但 `ProfilesSection.tsx` 当前依赖 `provider.models` 的地方有 5 处（`isStaleModel` / `availableModels` / `isEditModelStale` / `handleEditChange` cascade / degraded path），只改下拉会导致 stale warning 与 save gating 失真。
+- **修复：**
+  - Task 9 Step 5 重写为"5 条旧逻辑全切换"，逐项给出旧/新代码对照：5a 显示态 stale、5b 编辑态 availableModels、5c cascade reset、5d degraded path（新增 `modelsDegraded`）、5e save gating。
+  - 新增 Step 2 `useModels` / `useModelMutations` hooks 作为 5a/5b 的数据源。
+  - 加"禁止只改 5b"警示。
+  - Self-Review 表新增一行覆盖。
+
+### P1-3: Task 9 ProvidersPage create 表单删除 id 输入框
+
+- **问题：** R1 plan 在 Task 9 Step 2 写"表单只保留：id, name, base_url, enabled, api_key"，与 spec §3.2（id 系统生成 UUID，不由用户输入）矛盾，会把已决定删除的旧心智带回 GUI。当前 `ProvidersPage.tsx:74-90` 确有 create 模式的 "Provider ID" 输入框需要删除。
+- **修复：**
+  - Task 9 Step 3 拆为 5 个子步骤（3a-3e），3a 显式删除 `ProviderFormState.id` + create 表单 id 输入框 + `EMPTY_FORM.id`。
+  - 3b create 表单最终字段为 `name, base_url, enabled, api_key`（无 id）。
+  - 3d `providerCreate` 调用不传 id，从响应读回系统生成 id。
+  - 3e 删除 `modelsLabel` 辅助函数。
+  - Step 6b 测试用例同步：删除依赖 id 输入框的旧用例，新增 `queryByLabelText("Provider ID")` 返回 null 的断言。
+
+### P1-4: GUI 验证门禁收紧到 vitest + coverage ≥ 90%
+
+- **问题：** R1 plan 在 Task 9 写"vitest（如果有）或手动验证"+ Step 5 只要求 `pnpm run build`。但仓库 `apps/gui/package.json:13` 有 `test:coverage` 脚本，根 `package.json:12` 有 `coverage:gui` 别名，且已有 `ProvidersPage.test.tsx` / `ProfilesSection.test.tsx` 现成测试，仅 build 不足以兜住 UI 回归。
+- **修复：**
+  - Task 9 顶部加"GUI 验证门禁（强制）"callout，引用 `apps/gui/package.json:13` 和根 `package.json:12`。
+  - 新增 Step 6 扩写测试：6a 新增 `ModelsSection.test.tsx`（6 个用例），6b 扩写 `ProvidersPage.test.tsx`，6c 扩写 `ProfilesSection.test.tsx`（5 个新用例覆盖 stale/cascade/save gating/degraded）。
+  - Step 7 强制运行 `pnpm --filter @busytok/gui test:coverage`，coverage lines ≥ 90%。
+  - Step 8 才是 `typecheck && build`（次要）。
+  - 明确"仅 `pnpm run build` 不构成验收"。
+
+### R2 内部一致性同步
+
+- Self-Review 检查表新增 4 行覆盖 R2 修复项。
+- Task 9 Files 列表新增 `useBusytokData.ts` + 3 个测试文件。
+- Task 9 步骤数从 6 增至 9（Step 2 hooks / Step 5 ProfilesSection 5 条 / Step 6 测试 / Step 7 coverage / Step 8 typecheck+build）。
 
