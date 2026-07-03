@@ -457,7 +457,14 @@ describe("ModelsSection", () => {
   });
 
   it("Save Tags button calls tagsUpdate.mutate with parsed tags and exits edit mode", () => {
-    const tagsUpdateMutate = vi.fn();
+    const tagsUpdateMutate = vi.fn(
+      (
+        _payload: unknown,
+        opts?: { onSuccess?: () => void; onError?: (e: Error) => void },
+      ) => {
+        opts?.onSuccess?.();
+      },
+    );
     mockUseModelMutations.mockReturnValue(mockMutations({ tagsUpdateMutate }));
     mockUseModels.mockReturnValue(
       mockModelsQuery(
@@ -475,6 +482,11 @@ describe("ModelsSection", () => {
       { modelId: "deepseek-chat", tags: ["chat", "reasoning"] },
       expect.anything(),
     );
+    // Edit mode exited: tag input is gone, view-mode label is shown.
+    expect(screen.queryByLabelText(/tags for deepseek-chat/i)).toBeNull();
+    expect(screen.getByText("chat")).toBeTruthy();
+    // Edit Tags button re-rendered (so the user can edit again).
+    expect(screen.getByRole("button", { name: /edit tags/i })).toBeTruthy();
   });
 
   it("Cancel button exits tag edit mode without calling tagsUpdate.mutate", () => {

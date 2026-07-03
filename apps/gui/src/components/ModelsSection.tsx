@@ -30,7 +30,11 @@ interface ModelRowProps {
   isTagsSaving: boolean;
   onToggle: (model: ModelCatalogEntryDto) => void;
   onDelete: (model: ModelCatalogEntryDto) => void;
-  onSaveTags: (model: ModelCatalogEntryDto, newTags: string[]) => void;
+  onSaveTags: (
+    model: ModelCatalogEntryDto,
+    newTags: string[],
+    onDone: () => void,
+  ) => void;
 }
 
 function ModelRow({
@@ -57,7 +61,10 @@ function ModelRow({
   };
 
   const submitTags = () => {
-    onSaveTags(model, parseTags(tagDraft));
+    onSaveTags(model, parseTags(tagDraft), () => {
+      setEditingTags(false);
+      setTagDraft(model.tags.join(", "));
+    });
   };
 
   return (
@@ -275,11 +282,16 @@ export function ModelsSection() {
   );
 
   const handleSaveTags = useCallback(
-    (model: ModelCatalogEntryDto, newTags: string[]) => {
+    (
+      model: ModelCatalogEntryDto,
+      newTags: string[],
+      onDone: () => void,
+    ) => {
       setMutationError(null);
       tagsUpdate.mutate(
         { modelId: model.model_id, tags: newTags },
         {
+          onSuccess: onDone,
           onError: (err: unknown) => {
             setMutationError((err as Error)?.message ?? String(err));
           },
