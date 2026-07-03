@@ -37,6 +37,7 @@ use busytok_control::transport::ControlTransport;
 use busytok_control::{
     ControlClient, ControlDispatcher, ControlServer, RuntimeControl, TestRuntimeControl,
 };
+use busytok_domain::ProviderKind;
 use busytok_events::{AppEvent, AppEventBus, PublishedEvent};
 use busytok_protocol::dto::*;
 use busytok_protocol::{ControlRequest, ControlResponse};
@@ -431,12 +432,9 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
     // TestRuntimeControl, but the blanket impl body still executes.
     let _ = runtime
         .provider_create(ProviderCreateRequestDto {
-            id: "p1".to_string(),
             name: "P".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "http://x".to_string(),
-            api_key_env_name: "KEY".to_string(),
-            base_url_env_name: None,
-            models: vec![],
             api_key: None,
         })
         .await;
@@ -447,9 +445,6 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
             id: "p1".to_string(),
             name: None,
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
             api_key: None,
         })
@@ -714,11 +709,9 @@ async fn dispatcher_routes_provider_create_returns_error() {
     let runtime = TestRuntimeControl::with_claude_fixture().await.unwrap();
     let dispatcher = ControlDispatcher::new(runtime);
     let params = serde_json::json!({
-        "id": "p1",
         "name": "P",
-        "base_url": "http://x",
-        "api_key_env_name": "KEY",
-        "models": []
+        "provider_kind": "openai_compatible",
+        "base_url": "http://x"
     });
     let result = dispatcher
         .dispatch(ControlRequest::new("provider.create", params))
@@ -1100,6 +1093,21 @@ impl RuntimeControl for SettingsValidationRuntime {
         req: ProviderTestConnectionRequestDto,
     ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
         self.inner.provider_test_connection(req).await
+    }
+    async fn model_create(&self, req: ModelCreateRequestDto) -> anyhow::Result<ModelCatalogEntryDto> {
+        self.inner.model_create(req).await
+    }
+    async fn model_list(&self, req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {
+        self.inner.model_list(req).await
+    }
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+        self.inner.model_update(req).await
+    }
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.model_delete(req).await
+    }
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> anyhow::Result<()> {
+        self.inner.model_tags_update(req).await
     }
     async fn pi_sidecar_locator_update(
         &self,
@@ -1610,6 +1618,21 @@ impl RuntimeControl for RuntimeWithLatestSeq {
         req: ProviderTestConnectionRequestDto,
     ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
         self.inner.provider_test_connection(req).await
+    }
+    async fn model_create(&self, req: ModelCreateRequestDto) -> anyhow::Result<ModelCatalogEntryDto> {
+        self.inner.model_create(req).await
+    }
+    async fn model_list(&self, req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {
+        self.inner.model_list(req).await
+    }
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+        self.inner.model_update(req).await
+    }
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.model_delete(req).await
+    }
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> anyhow::Result<()> {
+        self.inner.model_tags_update(req).await
     }
     async fn pi_sidecar_locator_update(
         &self,

@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use busytok_control::dispatch::MethodDispatchError;
 use busytok_control::{ControlDispatcher, RuntimeControl, TestRuntimeControl};
+use busytok_domain::ProviderKind;
 use busytok_events::AppEventBus;
 use busytok_protocol::dto::*;
 use busytok_protocol::{ControlRequest, ControlResponse};
@@ -98,12 +99,12 @@ fn stub_provider_dto() -> ProviderDto {
     ProviderDto {
         id: "p-stub".to_string(),
         name: "Stub Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "http://stub.example".to_string(),
-        api_key_env_name: "STUB_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["stub-model".to_string()],
         enabled: true,
         has_api_key: false,
+        created_at_ms: 0,
+        updated_at_ms: 0,
     }
 }
 
@@ -359,6 +360,22 @@ impl RuntimeControl for SuccessRuntime {
         self.inner.provider_test_connection(req).await
     }
 
+    async fn model_create(&self, req: ModelCreateRequestDto) -> anyhow::Result<ModelCatalogEntryDto> {
+        self.inner.model_create(req).await
+    }
+    async fn model_list(&self, req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {
+        self.inner.model_list(req).await
+    }
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+        self.inner.model_update(req).await
+    }
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+        self.inner.model_delete(req).await
+    }
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> anyhow::Result<()> {
+        self.inner.model_tags_update(req).await
+    }
+
     async fn pi_sidecar_locator_update(
         &self,
         req: PiSidecarLocatorUpdateRequestDto,
@@ -401,11 +418,9 @@ async fn dispatcher_routes_provider_create_returns_ok() {
     let runtime = success_runtime().await;
     let dispatcher = ControlDispatcher::new(runtime);
     let params = serde_json::json!({
-        "id": "p1",
         "name": "P",
-        "base_url": "http://x",
-        "api_key_env_name": "KEY",
-        "models": []
+        "provider_kind": "openai_compatible",
+        "base_url": "http://x"
     });
     let response = dispatcher
         .dispatch(ControlRequest::new("provider.create", params))
@@ -839,6 +854,25 @@ impl RuntimeControl for AllErrorRuntime {
         Err(anyhow::anyhow!("runtime error"))
     }
 
+    async fn model_create(
+        &self,
+        _req: ModelCreateRequestDto,
+    ) -> anyhow::Result<ModelCatalogEntryDto> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_list(&self, _req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_update(&self, _req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_delete(&self, _req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+
     async fn pi_sidecar_locator_update(
         &self,
         _req: PiSidecarLocatorUpdateRequestDto,
@@ -960,8 +994,7 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
         (
             "provider.create",
             serde_json::json!({
-                "id": "p1", "name": "P", "base_url": "http://x",
-                "api_key_env_name": "KEY", "models": []
+                "name": "P", "provider_kind": "openai_compatible", "base_url": "http://x"
             }),
         ),
         ("provider.update", serde_json::json!({"id": "p1"})),

@@ -210,6 +210,13 @@ pub trait RuntimeControl: Send + Sync {
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto>;
 
+    // Models (Phase: Provider/Model Catalog Refactor)
+    async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto>;
+    async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto>;
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()>;
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()>;
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> Result<()>;
+
     // Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
     async fn pi_sidecar_locator_update(
         &self,
@@ -557,6 +564,38 @@ impl ControlDispatcher {
                     })?;
                 let dto = self.runtime.provider_test_connection(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+
+            // Models (Phase: Provider/Model Catalog Refactor)
+            "model.create" => {
+                let req: ModelCreateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for model.create: {e}"))?;
+                let dto = self.runtime.model_create(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "model.list" => {
+                let req: ModelListRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for model.list: {e}"))?;
+                let dto = self.runtime.model_list(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "model.update" => {
+                let req: ModelUpdateRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for model.update: {e}"))?;
+                self.runtime.model_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
+            }
+            "model.delete" => {
+                let req: ModelDeleteRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for model.delete: {e}"))?;
+                self.runtime.model_delete(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
+            }
+            "model.tags.update" => {
+                let req: ModelTagUpdateDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for model.tags.update: {e}"))?;
+                self.runtime.model_tags_update(req).await?;
+                ControlResponse::ok(serde_json::to_value(())?)
             }
 
             // Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
@@ -1249,6 +1288,24 @@ impl RuntimeControl for TestRuntimeControl {
         })
     }
 
+    // ── Models (Phase: Provider/Model Catalog Refactor) ─────────────
+
+    async fn model_create(&self, _req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_list(&self, _req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_update(&self, _req: ModelUpdateRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_delete(&self, _req: ModelDeleteRequestDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+    async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> Result<()> {
+        anyhow::bail!("not yet implemented")
+    }
+
     // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update)
 
     async fn pi_sidecar_locator_update(
@@ -1484,6 +1541,21 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto> {
         (**self).provider_test_connection(req).await
+    }
+    async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+        (**self).model_create(req).await
+    }
+    async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+        (**self).model_list(req).await
+    }
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
+        (**self).model_update(req).await
+    }
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()> {
+        (**self).model_delete(req).await
+    }
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> Result<()> {
+        (**self).model_tags_update(req).await
     }
     async fn pi_sidecar_locator_update(
         &self,

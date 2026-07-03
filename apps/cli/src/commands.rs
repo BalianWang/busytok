@@ -1842,6 +1842,21 @@ mod tests {
         ) -> Result<ProviderTestConnectionResponseDto> {
             self.inner.provider_test_connection(req).await
         }
+        async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+            self.inner.model_create(req).await
+        }
+        async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+            self.inner.model_list(req).await
+        }
+        async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
+            self.inner.model_update(req).await
+        }
+        async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()> {
+            self.inner.model_delete(req).await
+        }
+        async fn model_tags_update(&self, req: ModelTagUpdateDto) -> Result<()> {
+            self.inner.model_tags_update(req).await
+        }
         async fn pi_sidecar_locator_update(
             &self,
             req: PiSidecarLocatorUpdateRequestDto,
