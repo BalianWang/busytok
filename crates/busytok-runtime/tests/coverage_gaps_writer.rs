@@ -28,7 +28,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
 use busytok_config::BusytokPaths;
 use busytok_domain::{
     now_ms, AgentKind, NormalizedUsageEvent, OperationalDiagnosticEvent, ToolEvent,
@@ -46,6 +45,7 @@ use busytok_runtime::writer::{
 use busytok_runtime::ServiceApp;
 use busytok_store::write_queries;
 use busytok_store::{CodexTokenSnapshotRow, Database, LogSourceRow};
+use serial_test::serial;
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
 
