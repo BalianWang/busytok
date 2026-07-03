@@ -1,17 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Protocol adapter kind. Determines how the sidecar communicates with the provider.
-/// MVP supports only OpenAI-compatible providers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderKind {
-    // serde's `snake_case` would split on EACH uppercase boundary and emit
-    // "open_ai_compatible"; the spec (§3.1) requires "openai_compatible" (no
-    // underscore between "openai" and "compatible"). The explicit rename keeps
-    // the wire format stable regardless of future variant additions.
-    #[serde(rename = "openai_compatible")]
-    OpenAiCompatible,
-}
+// ProviderKind has migrated to busytok-domain. Re-exported here temporarily
+// to minimize breakage during the refactor; Task 7 removes this entirely.
+pub use busytok_domain::ProviderKind;
 
 /// Non-sensitive provider metadata. Stored in settings.toml as `[[providers]]`.
 /// API keys are stored separately in the OS keychain (see ProviderCredentialStore).
