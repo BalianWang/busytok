@@ -5956,25 +5956,128 @@ impl RuntimeControl for BusytokSupervisor {
 
     // ── Models (Phase: Provider/Model Catalog Refactor) ─────────────
     //
-    // Stubs — Task 6 implements these fully against the SQL store. The
-    // `RuntimeControl` trait requires all 5 methods; returning `not yet
-    // implemented` lets the dispatcher compile + route `model.*` RPCs to a
-    // clean error rather than a method-not-found response.
+    // SQL-backed model CRUD. The store layer (`busytok_store::provider_catalog`)
+    // owns all SQL; the supervisor handlers below are thin adapters that
+    // translate DTO ↔ store requests, drop the db lock before any `.await`
+    // (the `RuntimeControl` trait requires `Send` futures), and emit
+    // structured tracing events.
+    //
+    // `model_id` is immutable after creation — `ModelUpdateRequestDto` only
+    // carries `id` + `enabled`. `model_delete` is blocking: profile refs are
+    // collected from settings and the store rejects the delete if any profile
+    // references this (provider_id, model_id) pair.
 
-    async fn model_create(&self, _req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
-        anyhow::bail!("not yet implemented")
+    async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+        // Create the model row + initial tags atomically (store layer
+        // transaction). `model_id` immutability is enforced at the store
+        // layer via UNIQUE(provider_id, model_id).
+        let model = {
+            let db = self.db.lock().unwrap();
+            db.create_model(busytok_store::CreateModelReq {
+                provider_id: req.provider_id.clone(),
+                model_id: req.model_id.clone(),
+                enabled: req.enabled.unwrap_or(true),
+                tags: req.tags.clone(),
+            })?
+        };
+        tracing::info!(
+            event_code = "model.created",
+            model_id = %model.model_id,
+            provider_id = %model.provider_id,
+            model_db_id = %model.id,
+            "model created"
+        );
+        // Re-fetch via the catalog join so the DTO carries provider_name /
+        // provider_kind / provider_enabled / tags in one shot. The store
+        // returns the full joined row.
+        let entries = {
+            let db = self.db.lock().unwrap();
+            db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                provider_id: Some(model.provider_id.clone()),
+                tags: vec![],
+                include_disabled: true,
+            })?
+        };
+        entries
+            .into_iter()
+            .find(|e| e.model_db_id == model.id)
+            .map(catalog_entry_to_dto)
+            .ok_or_else(|| anyhow::anyhow!("model not found after create"))
     }
-    async fn model_list(&self, _req: ModelListRequestDto) -> Result<ModelListResponseDto> {
-        anyhow::bail!("not yet implemented")
+
+    async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+        // No settings lock — model catalog lives entirely in SQL. Tag filter
+        // uses AND semantics (a model must have ALL selected tags).
+        let entries = {
+            let db = self.db.lock().unwrap();
+            db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                provider_id: req.provider_id,
+                tags: req.tags,
+                include_disabled: req.include_disabled,
+            })?
+        };
+        tracing::info!(
+            event_code = "model.catalog.listed",
+            count = entries.len(),
+            "model catalog listed"
+        );
+        Ok(ModelListResponseDto {
+            models: entries.iter().map(catalog_entry_to_dto_ref).collect(),
+        })
     }
-    async fn model_update(&self, _req: ModelUpdateRequestDto) -> Result<()> {
-        anyhow::bail!("not yet implemented")
+
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
+        // Only `enabled` is patchable — `model_id` is immutable. The store
+        // layer's `update_model` enforces "model not found" via row-count
+        // check (rows == 0 → bail).
+        let updated = {
+            let db = self.db.lock().unwrap();
+            db.update_model(&req.id, busytok_store::UpdateModelPatch {
+                enabled: req.enabled,
+            })?
+        };
+        tracing::info!(
+            event_code = "model.updated",
+            model_db_id = %updated.id,
+            model_id = %updated.model_id,
+            enabled = updated.enabled,
+            "model updated"
+        );
+        Ok(())
     }
-    async fn model_delete(&self, _req: ModelDeleteRequestDto) -> Result<()> {
-        anyhow::bail!("not yet implemented")
+
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()> {
+        // Blocking delete: collect profile refs from settings (profiles still
+        // live in TOML) and pass them to the store. The store rejects the
+        // delete if any profile references this (provider_id, model_id) — no
+        // auto-unbind. The caller must unbind profiles first.
+        let profile_refs = self.collect_profile_refs();
+        {
+            let db = self.db.lock().unwrap();
+            db.delete_model(&req.id, &profile_refs)?;
+        }
+        tracing::info!(
+            event_code = "model.deleted",
+            model_db_id = %req.id,
+            "model deleted"
+        );
+        Ok(())
     }
-    async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> Result<()> {
-        anyhow::bail!("not yet implemented")
+
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> Result<()> {
+        // Replace-all semantics: the store diffs against existing tags and
+        // only writes the delta (insert new, remove stale) inside a
+        // transaction. `model_id` here is the models.id (DB PK), not the
+        // immutable model_id string — same param name, different meaning.
+        let db = self.db.lock().unwrap();
+        db.set_model_tags(&req.model_id, &req.tags)?;
+        tracing::info!(
+            event_code = "model.tags_updated",
+            model_db_id = %req.model_id,
+            tag_count = req.tags.len(),
+            "model tags updated"
+        );
+        Ok(())
     }
 
     // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update) ──
@@ -6398,6 +6501,32 @@ fn provider_summary_to_dto(s: &busytok_domain::ProviderSummary) -> ProviderDto {
         created_at_ms: s.created_at_ms,
         updated_at_ms: s.updated_at_ms,
     }
+}
+
+/// Maps a `busytok_domain::ModelCatalogEntry` (SQL joined row) to a
+/// `ModelCatalogEntryDto` (wire type). Consumes the entry — used by
+/// `model_create` which already owns the row from a fresh SQL fetch.
+///
+/// No `api_key` field anywhere in this mapping (only provider metadata +
+/// model + tags) — safe to expose to the GUI/CLI.
+fn catalog_entry_to_dto(e: busytok_domain::ModelCatalogEntry) -> ModelCatalogEntryDto {
+    ModelCatalogEntryDto {
+        provider_id: e.provider_id,
+        provider_name: e.provider_name,
+        provider_kind: e.provider_kind,
+        provider_enabled: e.provider_enabled,
+        model_db_id: e.model_db_id,
+        model_id: e.model_id,
+        model_enabled: e.model_enabled,
+        tags: e.tags,
+    }
+}
+
+/// By-reference variant used by `model_list`, which iterates over the
+/// borrowed `Vec<ModelCatalogEntry>` from the store. Clones once (the DTO
+/// owns its strings) — acceptable for catalog-sized lists.
+fn catalog_entry_to_dto_ref(e: &busytok_domain::ModelCatalogEntry) -> ModelCatalogEntryDto {
+    catalog_entry_to_dto(e.clone())
 }
 
 /// Extracts the provider_id from a profile config (Phase 3 Task 4).

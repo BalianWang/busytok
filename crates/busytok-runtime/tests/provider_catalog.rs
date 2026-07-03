@@ -23,11 +23,17 @@
 //! mirrors `supervisor_control.rs::make_supervisor` — a real supervisor
 //! backed by an in-memory SQLite database and a temp config dir.
 
-use busytok_config::{BusytokPaths, BusytokSettings, ProviderKind, SubagentProfileConfig};
+use busytok_config::{
+    BusytokPaths, BusytokSettings, ProviderConfig, ProviderKind, SubagentProfileConfig,
+};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
 use busytok_store::Database;
+use busytok_subagent::sidecar::SidecarConfig;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
 fn make_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
     let paths = BusytokPaths::for_test(tmp.path());
@@ -36,6 +42,112 @@ fn make_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .ok();
     BusytokSupervisor::new(db, paths)
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar-wired harness (mirrors helpers from supervisor_control.rs).
+// Used by the delegate re-validation test, which needs `worker_pool().is_some()`
+// so the supervisor-side SQL re-validation block actually runs.
+// ---------------------------------------------------------------------------
+
+fn sidecar_shell_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            return PathBuf::from(program_files)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+        }
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/bin/bash")
+    }
+}
+
+fn mock_sidecar_path() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(format!(
+        "{manifest}/../busytok-subagent/tests/fixtures/mock-sidecar.sh"
+    ))
+}
+
+fn mock_sidecar_bundle_path() -> PathBuf {
+    let path = mock_sidecar_path();
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = raw.split_once(":/") {
+            let drive = drive.to_ascii_lowercase();
+            return PathBuf::from(format!("/{drive}/{rest}"));
+        }
+        PathBuf::from(raw)
+    }
+
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+fn make_sidecar_config_for_tests() -> SidecarConfig {
+    SidecarConfig {
+        node_binary: sidecar_shell_path(),
+        bundle_path: mock_sidecar_bundle_path(),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(30),
+        task_timeout: Duration::from_secs(30),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_secs(1),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+        provider_id: String::new(),
+        api_key_env_name: String::new(),
+        base_url_env_name: String::new(),
+    }
+}
+
+/// Build sidecar-enabled settings (mirrors `make_unbound_sidecar_settings`
+/// from supervisor_control.rs but stays self-contained for this test file).
+fn make_sidecar_settings() -> BusytokSettings {
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+    // Add a placeholder provider so the WorkerPool can construct. The actual
+    // provider catalog used by delegate validation is the SQL table — this
+    // settings entry just keeps the pool wiring happy.
+    settings.providers.push(ProviderConfig {
+        id: "pool-placeholder".to_string(),
+        name: "Pool Placeholder".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.placeholder.example.com/v1".to_string(),
+        api_key_env_name: "POOL_PLACEHOLDER_KEY".to_string(),
+        base_url_env_name: None,
+        models: vec!["placeholder-model".to_string()],
+        enabled: true,
+    });
+    std::env::set_var("BUSYTOK_POOL_PLACEHOLDER_KEY", "placeholder");
+    settings
+}
+
+/// Construct a sidecar-stopped supervisor (pool wired, sidecar child not
+/// started) from arbitrary settings. Mirrors
+/// `make_sidecar_stopped_supervisor_with_settings` from supervisor_control.rs.
+fn make_sidecar_supervisor(
+    db: Database,
+    tmp: &tempfile::TempDir,
+    settings: BusytokSettings,
+) -> BusytokSupervisor {
+    let paths = BusytokPaths::for_test(tmp.path());
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+    BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config_for_tests())
 }
 
 #[tokio::test]
@@ -152,4 +264,663 @@ async fn provider_test_connection_no_enabled_model_skips_fallback() {
     }
 
     sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: model handlers (model_create / model_list / model_update /
+// model_delete / model_tags_update) — SQL-backed CRUD round-trips.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn model_create_and_list_round_trip() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+    let pid = provider.id.clone();
+
+    let created = sup
+        .model_create(ModelCreateRequestDto {
+            provider_id: pid.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: Some(true),
+            tags: vec!["fast".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.model_id, "gpt-4o");
+    assert_eq!(created.provider_id, pid);
+    assert!(created.model_enabled);
+    assert!(created.provider_enabled);
+    assert_eq!(created.provider_name, "Test");
+    assert_eq!(created.provider_kind, ProviderKind::OpenAiCompatible);
+    assert!(created.tags.contains(&"fast".to_string()));
+
+    let list = sup
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(list.models.len(), 1);
+    assert_eq!(list.models[0].model_id, "gpt-4o");
+    assert!(list.models[0].tags.contains(&"fast".to_string()));
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// Compile-time guarantee that `ModelUpdateRequestDto` has no `model_id`
+/// field — `model_id` is immutable after creation (no rename). If the DTO
+/// ever regains a `model_id` field, this test will fail to compile.
+#[tokio::test]
+async fn model_update_rejects_model_id_change() {
+    let dto = ModelUpdateRequestDto {
+        id: "model_x".into(),
+        enabled: Some(false),
+    };
+    // If this compiles, model_id is not in the DTO — success.
+    let _ = dto;
+}
+
+#[tokio::test]
+async fn model_create_defaults_enabled_to_true_when_omitted() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+
+    // `enabled: None` — store should default to true.
+    let created = sup
+        .model_create(ModelCreateRequestDto {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: None,
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(
+        created.model_enabled,
+        "model_create must default enabled=true when omitted"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_create_rejects_duplicate_model_id_per_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+    let pid = provider.id.clone();
+
+    sup.model_create(ModelCreateRequestDto {
+        provider_id: pid.clone(),
+        model_id: "gpt-4o".into(),
+        enabled: Some(true),
+        tags: vec![],
+    })
+    .await
+    .unwrap();
+
+    // Same (provider_id, model_id) must fail with "already exists".
+    let err = sup
+        .model_create(ModelCreateRequestDto {
+            provider_id: pid,
+            model_id: "gpt-4o".into(),
+            enabled: Some(true),
+            tags: vec![],
+        })
+        .await
+        .expect_err("duplicate (provider_id, model_id) must error");
+    assert!(
+        format!("{err}").contains("already exists"),
+        "expected 'already exists' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_update_toggles_enabled() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+    let pid = provider.id.clone();
+
+    let created = sup
+        .model_create(ModelCreateRequestDto {
+            provider_id: pid,
+            model_id: "gpt-4o".into(),
+            enabled: Some(true),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(created.model_enabled);
+
+    // Disable it.
+    sup.model_update(ModelUpdateRequestDto {
+        id: created.model_db_id.clone(),
+        enabled: Some(false),
+    })
+    .await
+    .unwrap();
+
+    // list with include_disabled=false should NOT show it.
+    let list = sup
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        list.models.iter().all(|m| m.model_db_id != created.model_db_id),
+        "disabled model must be filtered out when include_disabled=false"
+    );
+
+    // list with include_disabled=true SHOULD show it, with model_enabled=false.
+    let list_all = sup
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: true,
+        })
+        .await
+        .unwrap();
+    let m = list_all
+        .models
+        .iter()
+        .find(|m| m.model_db_id == created.model_db_id)
+        .expect("disabled model must appear when include_disabled=true");
+    assert!(!m.model_enabled);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_update_unknown_id_returns_error() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .model_update(ModelUpdateRequestDto {
+            id: "nonexistent-model-id".into(),
+            enabled: Some(false),
+        })
+        .await
+        .expect_err("update on unknown id must error");
+    assert!(
+        format!("{err}").contains("model not found"),
+        "expected 'model not found' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_delete_blocked_by_profile_reference() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+    let pid = provider.id.clone();
+
+    let created = sup
+        .model_create(ModelCreateRequestDto {
+            provider_id: pid.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: Some(true),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let model_db_id = created.model_db_id.clone();
+
+    // Inject a profile referencing (pid, "gpt-4o") into settings.
+    {
+        let settings_arc = sup.settings_for_test();
+        let mut settings = settings_arc.lock().unwrap();
+        let profile = SubagentProfileConfig {
+            write_access: false,
+            tools: vec![],
+            model: "gpt-4o".into(),
+            context_budget_tokens: 3000,
+            timeout_seconds: 120,
+            provider_id: Some(pid.clone()),
+        };
+        settings
+            .subagent
+            .profiles
+            .insert("test-profile".into(), profile);
+    }
+
+    let err = sup
+        .model_delete(ModelDeleteRequestDto {
+            id: model_db_id.clone(),
+        })
+        .await
+        .expect_err("model_delete must be blocked when a profile references it");
+    assert!(
+        format!("{err}").contains("profile(s) still reference"),
+        "expected 'profile(s) still reference' error, got: {err}"
+    );
+
+    // After unbinding the profile, delete should succeed.
+    {
+        let settings_arc = sup.settings_for_test();
+        let mut settings = settings_arc.lock().unwrap();
+        settings.subagent.profiles.remove("test-profile");
+    }
+    sup.model_delete(ModelDeleteRequestDto {
+        id: model_db_id.clone(),
+    })
+    .await
+    .expect("delete must succeed after profile unbound");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_delete_unknown_id_returns_error() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .model_delete(ModelDeleteRequestDto {
+            id: "nonexistent-model-id".into(),
+        })
+        .await
+        .expect_err("delete on unknown id must error");
+    assert!(
+        format!("{err}").contains("model not found"),
+        "expected 'model not found' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_tags_update_replaces_tags() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+    let pid = provider.id.clone();
+
+    let created = sup
+        .model_create(ModelCreateRequestDto {
+            provider_id: pid,
+            model_id: "gpt-4o".into(),
+            enabled: Some(true),
+            tags: vec!["fast".into(), "cheap".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.tags.len(), 2);
+
+    // Replace tags: drop "cheap", add "expensive", keep "fast".
+    sup.model_tags_update(ModelTagUpdateDto {
+        model_id: created.model_db_id.clone(),
+        tags: vec!["fast".into(), "expensive".into()],
+    })
+    .await
+    .unwrap();
+
+    let list = sup
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: true,
+        })
+        .await
+        .unwrap();
+    let m = list
+        .models
+        .iter()
+        .find(|m| m.model_db_id == created.model_db_id)
+        .expect("model must still exist after tag update");
+    assert!(m.tags.contains(&"fast".to_string()));
+    assert!(m.tags.contains(&"expensive".to_string()));
+    assert!(
+        !m.tags.contains(&"cheap".to_string()),
+        "stale tag must be removed"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_list_filters_by_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let p1 = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "P1".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.p1.com".into(),
+            api_key: Some("sk-p1".into()),
+        })
+        .await
+        .unwrap();
+    let p2 = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "P2".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.p2.com".into(),
+            api_key: Some("sk-p2".into()),
+        })
+        .await
+        .unwrap();
+
+    sup.model_create(ModelCreateRequestDto {
+        provider_id: p1.id.clone(),
+        model_id: "p1-model".into(),
+        enabled: Some(true),
+        tags: vec![],
+    })
+    .await
+    .unwrap();
+    sup.model_create(ModelCreateRequestDto {
+        provider_id: p2.id.clone(),
+        model_id: "p2-model".into(),
+        enabled: Some(true),
+        tags: vec![],
+    })
+    .await
+    .unwrap();
+
+    let p1_only = sup
+        .model_list(ModelListRequestDto {
+            provider_id: Some(p1.id.clone()),
+            tags: vec![],
+            include_disabled: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1_only.models.len(), 1);
+    assert_eq!(p1_only.models[0].model_id, "p1-model");
+    assert_eq!(p1_only.models[0].provider_id, p1.id);
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn model_list_filters_by_tag_and_semantics() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            api_key: Some("sk-test".into()),
+        })
+        .await
+        .unwrap();
+    let pid = provider.id.clone();
+
+    // m1: tags = [fast, cheap]
+    sup.model_create(ModelCreateRequestDto {
+        provider_id: pid.clone(),
+        model_id: "m1".into(),
+        enabled: Some(true),
+        tags: vec!["fast".into(), "cheap".into()],
+    })
+    .await
+    .unwrap();
+    // m2: tags = [fast]
+    sup.model_create(ModelCreateRequestDto {
+        provider_id: pid.clone(),
+        model_id: "m2".into(),
+        enabled: Some(true),
+        tags: vec!["fast".into()],
+    })
+    .await
+    .unwrap();
+
+    // Filter: tags=[fast] → both m1 and m2.
+    let fast = sup
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec!["fast".into()],
+            include_disabled: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(fast.models.len(), 2);
+
+    // Filter: tags=[fast, cheap] → only m1 (AND semantics).
+    let fast_cheap = sup
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec!["fast".into(), "cheap".into()],
+            include_disabled: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(fast_cheap.models.len(), 1);
+    assert_eq!(fast_cheap.models[0].model_id, "m1");
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Delegate 二次校验: runtime re-validates provider+model from SQL before
+// spawning a worker. Uses the sidecar-wired harness so `worker_pool().is_some()`
+// and the supervisor-side validation block actually runs. Mirrors
+// `delegate_fails_for_disabled_provider` in supervisor_control.rs but lives
+// here per the Task 6 brief.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delegate_rejects_when_provider_disabled() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut settings = make_sidecar_settings();
+    // Bind the built-in pi/search-cheap profile to the test provider; we'll
+    // create + then disable that provider in SQL.
+    {
+        let profile = settings
+            .subagent
+            .profiles
+            .get_mut("pi/search-cheap")
+            .unwrap();
+        profile.provider_id = Some("test-provider".to_string());
+        profile.model = "gpt-4o".to_string();
+    }
+    let sup = make_sidecar_supervisor(db, &tmp, settings);
+
+    // Seed SQL: provider enabled=false, model "gpt-4o" enabled=true. The
+    // delegate's SQL re-validation must reject with "provider disabled".
+    seed_provider_to_sql(&sup, "test-provider", "Test", "https://api.test.com", None, false);
+    seed_model_to_sql(&sup, "test-provider", "gpt-4o", true);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("disabled provider must fail SQL re-validation");
+    assert!(
+        format!("{err}").contains("provider disabled: test-provider"),
+        "expected 'provider disabled: test-provider' error, got: {err}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+#[tokio::test]
+async fn delegate_rejects_when_model_not_in_whitelist() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut settings = make_sidecar_settings();
+    // Bind profile to test-provider with a model NOT in the SQL whitelist.
+    {
+        let profile = settings
+            .subagent
+            .profiles
+            .get_mut("pi/search-cheap")
+            .unwrap();
+        profile.provider_id = Some("test-provider".to_string());
+        profile.model = "wrong-model".to_string();
+    }
+    let sup = make_sidecar_supervisor(db, &tmp, settings);
+
+    seed_provider_to_sql(&sup, "test-provider", "Test", "https://api.test.com", None, true);
+    seed_model_to_sql(&sup, "test-provider", "real-model", true);
+
+    let err = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "reviewer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+        })
+        .await
+        .expect_err("model not in whitelist must fail SQL re-validation");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("model 'wrong-model' not in provider 'test-provider' whitelist"),
+        "expected whitelist violation error, got: {msg}"
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Local SQL seed helpers (self-contained for this test file — the equivalent
+// helpers in supervisor_control.rs are private). Used by the delegate
+// re-validation tests above.
+// ---------------------------------------------------------------------------
+
+fn seed_provider_to_sql(
+    sup: &BusytokSupervisor,
+    id: &str,
+    name: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+    enabled: bool,
+) {
+    use rusqlite::params;
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db.conn()
+        .execute(
+            "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                id,
+                name,
+                serde_json::to_string(&ProviderKind::OpenAiCompatible).unwrap(),
+                base_url,
+                enabled as i64,
+                api_key,
+                now,
+            ],
+        )
+        .expect("seed provider to SQL");
+}
+
+fn seed_model_to_sql(sup: &BusytokSupervisor, provider_id: &str, model_id: &str, enabled: bool) {
+    use rusqlite::params;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    let id = format!(
+        "seed-model-{}-{}",
+        now,
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    db.conn()
+        .execute(
+            "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, provider_id, model_id, enabled as i64, now],
+        )
+        .expect("seed model to SQL");
 }
