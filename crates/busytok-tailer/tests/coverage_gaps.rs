@@ -108,6 +108,12 @@ fn poll_events_returns_empty_on_timeout_when_idle() {
     let temp = tempfile::tempdir().unwrap();
     let watch_dir = temp.path().canonicalize().unwrap();
     service.watch_path(&watch_dir).unwrap();
+    // Give the watcher a moment to settle — on macOS, FSEvents may deliver
+    // an initial Created event for the watched directory itself when the
+    // watch is first established. Draining these before the idle poll
+    // ensures the timeout branch is actually exercised.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = service.poll_events(Duration::from_millis(50));
     // No file activity; should return empty within the timeout. This
     // exercises the `RecvTimeoutError::Timeout` arm of `poll_events`.
     let events = service.poll_events(Duration::from_millis(150));

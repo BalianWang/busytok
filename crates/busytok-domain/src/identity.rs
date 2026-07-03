@@ -389,30 +389,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_accepts_absolute() {
         let result = normalize_project_path("/var/log/foo").unwrap();
         assert_eq!(result, "/var/log/foo");
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_strips_curdir_segments() {
         let result = normalize_project_path("/var/./log/foo").unwrap();
         assert_eq!(result, "/var/log/foo");
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_resolves_parent_segments() {
         let result = normalize_project_path("/var/log/../foo").unwrap();
         assert_eq!(result, "/var/foo");
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_handles_root_only() {
         let result = normalize_project_path("/").unwrap();
         assert_eq!(result, "/");
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_handles_root_with_parent_segments() {
         // "/.." should resolve to "/" (cannot go above root).
         let result = normalize_project_path("/..").unwrap();
@@ -420,6 +425,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_expands_tilde() {
         // "~/foo" should be expanded using the home directory.
         let result = normalize_project_path("~/foo").unwrap();
@@ -437,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_expands_bare_tilde() {
         // "~" alone should be expanded to the home directory.
         let result = normalize_project_path("~").unwrap();
@@ -448,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_project_path_handles_complex_segments() {
         let result = normalize_project_path("/a/b/../c/./d/e/../f").unwrap();
         assert_eq!(result, "/a/c/d/f");
