@@ -1722,8 +1722,8 @@ async fn subscription_receives_and_serializes_every_event_variant() {
     assert_eq!(batch.events[0].payload["tokens_per_sec"], 150.5);
     assert_eq!(batch.events[0].payload["transient"], false);
     // LiveSample is ephemeral, so is_exact should be false.
-    assert_eq!(batch.events[0].ephemeral, true);
-    assert_eq!(batch.events[0].is_exact, false);
+    assert!(batch.events[0].ephemeral);
+    assert!(!batch.events[0].is_exact);
 
     // 3. SubscriptionConnected (covers server.rs lines 466-469).
     event_bus_ref
@@ -1809,8 +1809,8 @@ async fn subscription_receives_and_serializes_every_event_variant() {
     assert_eq!(batch.events[0].event_seq, Some(42));
     assert_eq!(batch.events[0].generation_id.as_deref(), Some("gen-1"));
     // Non-ephemeral with generation_id => is_exact = true.
-    assert_eq!(batch.events[0].ephemeral, false);
-    assert_eq!(batch.events[0].is_exact, true);
+    assert!(!batch.events[0].ephemeral);
+    assert!(batch.events[0].is_exact);
 
     drop(client);
     server.shutdown();

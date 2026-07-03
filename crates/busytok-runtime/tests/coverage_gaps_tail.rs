@@ -2523,7 +2523,6 @@ async fn start_tailing_writer_shutdown_covers_send_error_and_rescan_error() {
                     }
                 }
             })
-            .to_string()
         )
         .expect("append hb3a");
         f.sync_all().expect("sync append a");

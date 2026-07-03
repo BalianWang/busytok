@@ -999,12 +999,8 @@ async fn run_initial_scan_with_codex_default_paths_enabled_exercises_codex_disco
     // The dev/CI host may or may not have a real Codex installation, so the
     // discovered source count is environment-dependent. The goal of this
     // test is to exercise the codex discovery code path without erroring;
-    // a non-negative source count proves the path ran end-to-end.
-    assert!(
-        stats.sources >= 0,
-        "source count should be non-negative, got {}",
-        stats.sources
-    );
+    // a successful unwrap proves the path ran end-to-end.
+    let _ = stats.sources;
 }
 
 #[tokio::test]

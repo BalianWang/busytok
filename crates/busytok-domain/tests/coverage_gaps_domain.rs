@@ -148,7 +148,7 @@ fn normalize_tilde_only_expands_to_home() {
     // If home_dir is available, result is the home dir (absolute). If not,
     // it falls back to "~" which is NOT absolute and would error.
     // On most systems HOME is set, so result should be the home path.
-    if let Some(home) = std::env::var("HOME").ok() {
+    if let Ok(home) = std::env::var("HOME") {
         assert_eq!(result, home, "tilde-only must expand to HOME");
     } else {
         // No HOME — normalize_project_path("~") returns "~" which is
@@ -164,7 +164,7 @@ fn normalize_tilde_only_expands_to_home() {
 fn normalize_tilde_slash_path_expands() {
     // "~/foo" should expand to "$HOME/foo".
     let result = normalize_project_path("~/foo").unwrap();
-    if let Some(home) = std::env::var("HOME").ok() {
+    if let Ok(home) = std::env::var("HOME") {
         assert_eq!(result, format!("{home}/foo"));
     } else {
         // Without HOME, expand_tilde returns the path unchanged.

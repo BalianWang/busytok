@@ -1,6 +1,8 @@
 #![allow(
     clippy::unwrap_used,
     clippy::uninlined_format_args,
+    clippy::await_holding_lock,
+    clippy::type_complexity,
     unused_imports,
     unused_variables,
     dead_code
@@ -801,14 +803,9 @@ async fn writer_lag_threshold_transitions_warning_to_critical() {
         .expect("send warning trigger");
     // Drain the warning event.
     let _ = tokio::time::timeout(Duration::from_millis(200), async {
-        loop {
-            match rx.recv().await {
-                Ok(evt) => {
-                    if matches!(evt.event, AppEvent::WriterLagThreshold { .. }) {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(evt) = rx.recv().await {
+            if matches!(evt.event, AppEvent::WriterLagThreshold { .. }) {
+                break;
             }
         }
     })

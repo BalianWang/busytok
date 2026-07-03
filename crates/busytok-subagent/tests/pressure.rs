@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::uninlined_format_args,
+    clippy::type_complexity
+)]
 use busytok_config::{ProviderConfig, ProviderKind, SubagentResourcePolicyConfig};
 use busytok_store::Database;
 use busytok_subagent::pressure::{PressureAction, PressureGate, PressureResponder};
@@ -204,7 +208,7 @@ async fn evict_lru_hibernates_oldest_hot_binding() {
         api_key_env_name: String::new(),
         base_url_env_name: String::new(),
     };
-    let sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
+    let _sup = PiSidecarSupervisor::new(config, Some(Arc::clone(&db)));
     let _exec = make_dummy_executor(Arc::clone(&db));
 
     // Seed 2 subagents with hot bindings, oldest first.

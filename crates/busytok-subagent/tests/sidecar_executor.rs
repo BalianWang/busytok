@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::type_complexity, dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

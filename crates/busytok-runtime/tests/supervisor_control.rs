@@ -6644,7 +6644,7 @@ async fn profile_create_applies_defaults_for_omitted_fields() {
         .unwrap();
 
     // Defaults: write_access=false, tools=[], budget=3000, timeout=120.
-    assert_eq!(dto.write_access, false);
+    assert!(!dto.write_access);
     assert_eq!(dto.tools, Vec::<String>::new());
     assert_eq!(dto.context_budget_tokens, 3000);
     assert_eq!(dto.timeout_seconds, 120);

@@ -128,7 +128,7 @@ fn canonicalize_is_idempotent() {
     assert_eq!(settings.subagent.profiles.len(), count_after_first);
     // Each built-in appears exactly once.
     for name in &["pi/search-cheap", "pi/review-cheap", "pi/plan-cheap"] {
-        assert_eq!(settings.subagent.profiles.contains_key(*name), true);
+        assert!(settings.subagent.profiles.contains_key(*name));
     }
 }
 
