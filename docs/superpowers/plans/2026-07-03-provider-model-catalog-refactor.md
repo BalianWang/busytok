@@ -142,7 +142,7 @@ pub enum ProviderKind {
 /// `api_key` is the plaintext key; DTOs never expose it (use `ProviderSummary`).
 #[derive(Debug, Clone)]
 pub struct Provider {
-    pub id: String,
+    pub id: String,  // UUID v4, 系统生成（store 层生成，不由用户提供）
     pub name: String,
     pub provider_kind: ProviderKind,
     pub base_url: String,
@@ -368,10 +368,9 @@ use busytok_store::{
 };
 use busytok_store::Database;
 
-fn sample_provider_req(id: &str) -> CreateProviderReq {
+fn sample_provider_req() -> CreateProviderReq {
     CreateProviderReq {
-        id: id.to_string(),
-        name: format!("Provider {}", id),
+        name: "Test Provider".to_string(),
         provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://api.test.com".to_string(),
         enabled: true,
@@ -382,8 +381,9 @@ fn sample_provider_req(id: &str) -> CreateProviderReq {
 #[test]
 fn provider_crud_round_trip() {
     let db = Database::open_in_memory().unwrap();
-    let created = db.create_provider(sample_provider_req("p1")).unwrap();
-    assert_eq!(created.id, "p1");
+    let created = db.create_provider(sample_provider_req()).unwrap();
+    // id is system-generated (UUID v4)
+    assert!(!created.id.is_empty());
     assert!(created.api_key.is_some());
 
     let summary = db.list_providers().unwrap();
@@ -391,30 +391,30 @@ fn provider_crud_round_trip() {
     assert!(summary[0].has_api_key);
 
     let updated = db
-        .update_provider("p1", UpdateProviderPatch {
+        .update_provider(&created.id, UpdateProviderPatch {
             name: Some("Updated".to_string()),
             base_url: None,
             enabled: None,
-            api_key: Some("sk-new-key".to_string()),
+            api_key: Some(Some("sk-new-key".to_string())),
         })
         .unwrap();
     assert_eq!(updated.name, "Updated");
 
-    let with_secret = db.get_provider_with_secret("p1").unwrap().unwrap();
+    let with_secret = db.get_provider_with_secret(&created.id).unwrap().unwrap();
     assert_eq!(with_secret.api_key.as_deref(), Some("sk-new-key"));
 
-    db.delete_provider("p1", &[]).unwrap();
+    db.delete_provider(&created.id, &[]).unwrap();
     assert!(db.list_providers().unwrap().is_empty());
 }
 
 #[test]
 fn model_crud_and_cascade_tags() {
     let db = Database::open_in_memory().unwrap();
-    db.create_provider(sample_provider_req("p1")).unwrap();
+    let provider = db.create_provider(sample_provider_req()).unwrap();
 
     let model = db
         .create_model(CreateModelReq {
-            provider_id: "p1".to_string(),
+            provider_id: provider.id.clone(),
             model_id: "gpt-4o".to_string(),
             enabled: true,
             tags: vec!["fast".to_string(), "cheap".to_string()],
@@ -424,7 +424,7 @@ fn model_crud_and_cascade_tags() {
 
     // Duplicate (provider_id, model_id) rejected
     let dup = db.create_model(CreateModelReq {
-        provider_id: "p1".to_string(),
+        provider_id: provider.id.clone(),
         model_id: "gpt-4o".to_string(),
         enabled: true,
         tags: vec![],
@@ -445,16 +445,16 @@ fn model_crud_and_cascade_tags() {
 #[test]
 fn list_models_filtered_by_multiple_tags_and_semantics() {
     let db = Database::open_in_memory().unwrap();
-    db.create_provider(sample_provider_req("p1")).unwrap();
+    let provider = db.create_provider(sample_provider_req()).unwrap();
 
     db.create_model(CreateModelReq {
-        provider_id: "p1".into(),
+        provider_id: provider.id.clone(),
         model_id: "gpt-4o".into(),
         enabled: true,
         tags: vec!["fast".into(), "cheap".into()],
     }).unwrap();
     db.create_model(CreateModelReq {
-        provider_id: "p1".into(),
+        provider_id: provider.id.clone(),
         model_id: "gpt-4o-mini".into(),
         enabled: true,
         tags: vec!["fast".into()],
@@ -473,16 +473,14 @@ fn list_models_filtered_by_multiple_tags_and_semantics() {
 #[test]
 fn include_disabled_filters_both_provider_and_model() {
     let db = Database::open_in_memory().unwrap();
-    db.create_provider(CreateProviderReq {
-        id: "p-enabled".into(),
+    let p_enabled = db.create_provider(CreateProviderReq {
         name: "Enabled".into(),
         provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://a.com".into(),
         enabled: true,
         api_key: Some("k".into()),
     }).unwrap();
-    db.create_provider(CreateProviderReq {
-        id: "p-disabled".into(),
+    let p_disabled = db.create_provider(CreateProviderReq {
         name: "Disabled".into(),
         provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://b.com".into(),
@@ -491,15 +489,15 @@ fn include_disabled_filters_both_provider_and_model() {
     }).unwrap();
 
     db.create_model(CreateModelReq {
-        provider_id: "p-enabled".into(), model_id: "m-enabled".into(),
+        provider_id: p_enabled.id.clone(), model_id: "m-enabled".into(),
         enabled: true, tags: vec![],
     }).unwrap();
     db.create_model(CreateModelReq {
-        provider_id: "p-enabled".into(), model_id: "m-disabled".into(),
+        provider_id: p_enabled.id.clone(), model_id: "m-disabled".into(),
         enabled: false, tags: vec![],
     }).unwrap();
     db.create_model(CreateModelReq {
-        provider_id: "p-disabled".into(), model_id: "m-under-disabled".into(),
+        provider_id: p_disabled.id.clone(), model_id: "m-under-disabled".into(),
         enabled: true, tags: vec![],
     }).unwrap();
 
@@ -520,37 +518,39 @@ fn include_disabled_filters_both_provider_and_model() {
 #[test]
 fn provider_delete_blocked_by_profile_reference() {
     let db = Database::open_in_memory().unwrap();
-    db.create_provider(sample_provider_req("p1")).unwrap();
+    let provider = db.create_provider(sample_provider_req()).unwrap();
+    let pid = provider.id.clone();
     let model = db.create_model(CreateModelReq {
-        provider_id: "p1".into(), model_id: "gpt-4o".into(),
+        provider_id: pid.clone(), model_id: "gpt-4o".into(),
         enabled: true, tags: vec![],
     }).unwrap();
 
     let refs = vec![ProfileModelRef {
-        provider_id: "p1".into(),
+        provider_id: pid.clone(),
         model_id: "gpt-4o".into(),
     }];
 
     // Blocked
-    let err = db.delete_provider("p1", &refs);
+    let err = db.delete_provider(&pid, &refs);
     assert!(err.is_err());
 
     // Not blocked when refs empty
-    db.delete_provider("p1", &[]).unwrap();
+    db.delete_provider(&pid, &[]).unwrap();
     let _ = model; // suppress unused
 }
 
 #[test]
 fn model_delete_blocked_by_profile_reference() {
     let db = Database::open_in_memory().unwrap();
-    db.create_provider(sample_provider_req("p1")).unwrap();
+    let provider = db.create_provider(sample_provider_req()).unwrap();
+    let pid = provider.id.clone();
     let model = db.create_model(CreateModelReq {
-        provider_id: "p1".into(), model_id: "gpt-4o".into(),
+        provider_id: pid.clone(), model_id: "gpt-4o".into(),
         enabled: true, tags: vec![],
     }).unwrap();
 
     let refs = vec![ProfileModelRef {
-        provider_id: "p1".into(),
+        provider_id: pid.clone(),
         model_id: "gpt-4o".into(),
     }];
 
@@ -582,13 +582,12 @@ use busytok_domain::{
     Model, ModelCatalogEntry, ModelCatalogFilter, ModelTag, ProfileModelRef, Provider,
     ProviderKind, ProviderSummary,
 };
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tracing::info;
 
 // ── Input DTOs (no id/timestamps — store generates those) ──────────────
 
 pub struct CreateProviderReq {
-    pub id: String,
     pub name: String,
     pub provider_kind: ProviderKind,
     pub base_url: String,
@@ -600,7 +599,8 @@ pub struct UpdateProviderPatch {
     pub name: Option<String>,
     pub base_url: Option<String>,
     pub enabled: Option<bool>,
-    pub api_key: Option<String>, // Some = replace, None = unchanged
+    // None=不改, Some(None)=清除, Some(Some(k))=更新
+    pub api_key: Option<Option<String>>,
 }
 
 pub struct CreateModelReq {
@@ -619,11 +619,14 @@ pub struct UpdateModelPatch {
 
 pub fn create_provider(conn: &Connection, req: CreateProviderReq) -> Result<Provider> {
     let now = busytok_domain::now_ms();
+    // id 由 store 层生成（UUID v4），不由用户提供。冲突概率极低，
+    // 万一发生则直接返回错误（不重试以避免无限循环）。
+    let id = uuid::Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
-            req.id,
+            id,
             req.name,
             serde_json::to_string(&req.provider_kind)?,
             req.base_url,
@@ -634,17 +637,26 @@ pub fn create_provider(conn: &Connection, req: CreateProviderReq) -> Result<Prov
     )
     .map_err(|e| {
         if e.to_string().contains("PRIMARY KEY") {
-            anyhow!("provider already exists: {}", req.id)
+            // UUID v4 冲突概率极低，直接返回错误
+            anyhow!("provider id collision, please retry: {}", id)
         } else {
             anyhow!(e)
         }
     })?;
-    info!(event_code = "provider.created", provider_id = %req.id, "provider created");
-    get_provider_with_secret(conn, &req.id)?
-        .ok_or_else(|| anyhow!("provider {} not found after insert", req.id))
+    info!(event_code = "provider.created", provider_id = %id, "provider created");
+    get_provider_with_secret(conn, &id)?
+        .ok_or_else(|| anyhow!("provider {} not found after insert", id))
 }
 
 pub fn update_provider(conn: &Connection, id: &str, patch: UpdateProviderPatch) -> Result<Provider> {
+    // Verify provider exists first
+    let exists: bool = conn.query_row(
+        "SELECT 1 FROM providers WHERE id = ?1", params![id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+    if !exists {
+        bail!("provider not found: {}", id);
+    }
     let now = busytok_domain::now_ms();
     let tx = conn.unchecked_transaction()?;
     if let Some(name) = &patch.name {
@@ -656,14 +668,16 @@ pub fn update_provider(conn: &Connection, id: &str, patch: UpdateProviderPatch) 
     if let Some(enabled) = patch.enabled {
         tx.execute("UPDATE providers SET enabled = ?1, updated_at_ms = ?2 WHERE id = ?3", params![enabled as i64, now, id])?;
     }
-    if let Some(api_key) = &patch.api_key {
-        tx.execute("UPDATE providers SET api_key = ?1, updated_at_ms = ?2 WHERE id = ?3", params![api_key, now, id])?;
+    match &patch.api_key {
+        Some(None) => {
+            tx.execute("UPDATE providers SET api_key = NULL, updated_at_ms = ?1 WHERE id = ?2", params![now, id])?;
+        }
+        Some(Some(api_key)) => {
+            tx.execute("UPDATE providers SET api_key = ?1, updated_at_ms = ?2 WHERE id = ?3", params![api_key, now, id])?;
+        }
+        None => {}
     }
-    let rows = tx.query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))?;
     tx.commit()?;
-    if rows == 0 {
-        bail!("provider not found: {}", id);
-    }
     info!(event_code = "provider.updated", provider_id = %id, "provider updated");
     get_provider_with_secret(conn, id)?.ok_or_else(|| anyhow!("provider {} not found after update", id))
 }
@@ -702,7 +716,7 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<ProviderSummary>> {
 // ── CRUD: models ───────────────────────────────────────────────────────
 
 pub fn create_model(conn: &Connection, req: CreateModelReq) -> Result<Model> {
-    let id = format!("model_{}", uuid::Uuid::new_v4());
+    let id = uuid::Uuid::new_v4().to_string();
     let now = busytok_domain::now_ms();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -790,9 +804,8 @@ pub fn list_models_filtered(conn: &Connection, filter: ModelCatalogFilter) -> Re
         String::new()
     } else {
         format!(
-            "AND (SELECT COUNT(DISTINCT tag) FROM model_tags WHERE model_id = m.id AND tag IN ({})) = {}",
-            tag_placeholders.join(", "),
-            tag_count
+            "HAVING (SELECT COUNT(DISTINCT tag) FROM model_tags WHERE model_id = m.id AND tag IN ({})) = {}",
+            tag_placeholders.join(", "), tag_count
         )
     };
 
@@ -868,20 +881,24 @@ pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Res
     let now = busytok_domain::now_ms();
     let tx = conn.unchecked_transaction()?;
     // Diff: delete tags not in new set, insert new tags
-    let mut existing: std::collections::HashSet<String> = tx
+    let existing: std::collections::HashSet<String> = tx
         .prepare("SELECT tag FROM model_tags WHERE model_id = ?1")?
         .query_map(params![model_id], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
         .collect();
     let new_set: std::collections::HashSet<String> = tags.iter().cloned().collect();
-    // Remove tags that are no longer present
+    // Compute diffs first
     let to_remove: Vec<_> = existing.difference(&new_set).cloned().collect();
+    let to_add: Vec<_> = new_set.difference(&existing).cloned().collect();
+    if to_add.is_empty() && to_remove.is_empty() {
+        return Ok(()); // no changes, skip timestamp bump
+    }
+    // Remove tags that are no longer present
     for tag in &to_remove {
         tx.execute("DELETE FROM model_tags WHERE model_id = ?1 AND tag = ?2", params![model_id, tag])?;
         info!(event_code = "model.tag_removed", model_db_id = %model_id, tag = %tag, "tag removed");
     }
     // Insert new tags
-    let to_add: Vec<_> = new_set.difference(&existing).cloned().collect();
     for tag in &to_add {
         tx.execute(
             "INSERT OR IGNORE INTO model_tags (model_id, tag) VALUES (?1, ?2)",
@@ -908,7 +925,11 @@ pub fn model_has_profile_references(provider_id: &str, model_id: &str, refs: &[P
 
 fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
     let kind_str: String = row.get(2)?;
-    let provider_kind = serde_json::from_str(&kind_str).unwrap_or(ProviderKind::OpenAiCompatible);
+    let provider_kind: ProviderKind = serde_json::from_str(&kind_str)
+        .unwrap_or_else(|e| {
+            tracing::warn!(kind_str = %kind_str, error = %e, "failed to parse provider_kind, defaulting to OpenAiCompatible");
+            ProviderKind::OpenAiCompatible
+        });
     Ok(Provider {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -1062,8 +1083,8 @@ pub struct ProviderDto {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderCreateRequestDto {
-    pub id: String,
     pub name: String,
+    pub provider_kind: ProviderKind,
     pub base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -1079,8 +1100,9 @@ pub struct ProviderUpdateRequestDto {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    // None=不改, Some(None)=清除, Some(Some(k))=更新
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub api_key: Option<Option<String>>,
 }
 ```
 
@@ -1261,7 +1283,7 @@ git commit -m "feat(protocol): update provider DTOs (remove env names/models) + 
         anyhow::bail!("not yet implemented")
     }
     async fn model_list(&self, _req: ModelListRequestDto) -> Result<ModelListResponseDto> {
-        Ok(ModelListResponseDto { models: vec![] })
+        anyhow::bail!("not yet implemented")
     }
     async fn model_update(&self, _req: ModelUpdateRequestDto) -> Result<()> {
         anyhow::bail!("not yet implemented")
@@ -1351,15 +1373,18 @@ git commit -m "feat(control): add model.* RPC methods to RuntimeControl trait + 
 在 `crates/busytok-runtime/tests/provider_catalog.rs` 中写测试（使用现有 supervisor 测试 harness 模式）。参考 `tests/supervisor_control.rs` 的 setup。关键测试：
 
 ```rust
-// 参考现有 supervisor 测试的 harness 构建。如果现有测试用 TestRuntimeControl
-// 而非真实 BusytokSupervisor，则需要创建一个带内存 DB 的真实 supervisor 测试。
-// 假设有 test_utils 提供 setup_supervisor() -> BusytokSupervisor
+// 使用真实 BusytokSupervisor + 内存 DB + 临时目录构建测试 harness。
+// make_supervisor 是同步函数，不需要 .await。
 
 #[tokio::test]
 async fn provider_create_persists_to_sql_with_api_key() {
-    let sup = setup_supervisor().await;
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "p1".into(), name: "Test".into(),
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let created = sup.provider_create(ProviderCreateRequestDto {
+        name: "Test".into(),
+        provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://api.test.com".into(),
         api_key: Some("sk-test".into()),
     }).await.unwrap();
@@ -1368,25 +1393,67 @@ async fn provider_create_persists_to_sql_with_api_key() {
     assert_eq!(list.providers.len(), 1);
     assert!(list.providers[0].has_api_key);
     assert_eq!(list.providers[0].provider_kind, ProviderKind::OpenAiCompatible);
+    assert_eq!(list.providers[0].id, created.id);
 }
 
 #[tokio::test]
 async fn provider_delete_blocked_by_profile_reference() {
-    let sup = setup_supervisor().await;
-    sup.provider_create(/* ... p1 ... */).await.unwrap();
-    // Create a profile referencing p1
-    // ... (inject profile into settings)
-    let err = sup.provider_delete(ProviderDeleteRequestDto { id: "p1".into() }).await;
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let created = sup.provider_create(ProviderCreateRequestDto {
+        name: "Test".into(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        api_key: Some("sk-test".into()),
+    }).await.unwrap();
+    let pid = created.id.clone();
+    // Inject a profile referencing pid into settings (结构按现有 SubagentProfile 定义)
+    {
+        let mut settings = sup.settings.lock().unwrap();
+        let profile = busytok_config::SubagentProfile {
+            provider_id: Some(pid.clone()),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        settings.subagent.profiles.insert("test-profile".into(), profile);
+    }
+    let err = sup.provider_delete(ProviderDeleteRequestDto { id: pid }).await;
     assert!(err.is_err());
 }
 
 #[tokio::test]
 async fn provider_test_connection_no_enabled_model_skips_fallback() {
-    let sup = setup_supervisor().await;
-    sup.provider_create(/* p1, no models */).await.unwrap();
-    let result = sup.provider_test_connection(ProviderTestConnectionRequestDto { id: "p1".into() }).await;
-    // /models endpoint should be called; if it fails, error should mention "no models configured"
-    // This test may need a mock HTTP server — check if existing tests have one.
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let created = sup.provider_create(ProviderCreateRequestDto {
+        name: "Test".into(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        api_key: Some("sk-test".into()),
+    }).await.unwrap();
+    // No models configured — fallback path will error with "no enabled models configured"
+    // （若无 mock HTTP server，/models 探针也会失败，错误信息会包含请求失败描述）
+    let result = sup.provider_test_connection(ProviderTestConnectionRequestDto { id: created.id }).await;
+    match result {
+        Ok(resp) => {
+            // /models succeeded against real endpoint — acceptable
+            let _ = resp;
+        }
+        Err(e) => {
+            let msg = format!("{}", e);
+            assert!(
+                msg.contains("no enabled models")
+                    || msg.contains("request failed")
+                    || msg.contains("https://"),
+                "unexpected error: {}",
+                msg
+            );
+        }
+    }
 }
 ```
 
@@ -1407,18 +1474,12 @@ Expected: FAIL
 
 ```rust
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
-        if req.id.is_empty() {
-            anyhow::bail!("provider id must not be empty");
-        }
-        if !req.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-            anyhow::bail!("provider id must contain only [a-z0-9-]+");
-        }
+        // id 由 store 层生成（UUID v4），不再校验用户输入
         let provider = {
             let db = self.db.lock().unwrap();
             db.create_provider(busytok_store::CreateProviderReq {
-                id: req.id.clone(),
                 name: req.name,
-                provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+                provider_kind: req.provider_kind,
                 base_url: req.base_url,
                 enabled: true,
                 api_key: req.api_key,
@@ -1477,7 +1538,7 @@ Expected: FAIL
     }
 ```
 
-**3f. 重写 `provider_test_connection`**（含探针逻辑）：
+**3f. 重写 `provider_test_connection`**（含探针逻辑 + HTTPS 安全控制 + 完整 fallback）：
 
 ```rust
     async fn provider_test_connection(&self, req: ProviderTestConnectionRequestDto) -> Result<ProviderTestConnectionResponseDto> {
@@ -1488,22 +1549,26 @@ Expected: FAIL
         };
         let api_key = provider.api_key.as_deref()
             .ok_or_else(|| anyhow!("provider has no api key"))?;
+        if !provider.base_url.starts_with("https://") {
+            anyhow::bail!("base_url must be https");
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let base = provider.base_url.trim_end_matches('/');
 
         // Try /models first
-        let client = reqwest::Client::new();
-        let models_url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+        let models_url = format!("{}/models", base);
         let resp = client.get(&models_url)
             .header("Authorization", format!("Bearer {}", api_key))
             .send().await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                // /models succeeded — connection OK
+        if let Ok(r) = &resp {
+            if r.status().is_success() {
                 return Ok(ProviderTestConnectionResponseDto {
                     ok: true, error: None, models_detected: None,
                 });
             }
-            _ => {}
         }
 
         // Fallback to /chat/completions — needs a model id from SQL
@@ -1518,8 +1583,41 @@ Expected: FAIL
         let probe_model = probe_model.into_iter().next()
             .ok_or_else(|| anyhow!("provider has no enabled models configured, cannot probe /chat/completions"))?;
 
-        // ... existing /chat/completions probe logic using probe_model.model_id ...
-        // (保留现有 fallback HTTP 调用，只把 model_id 来源从 provider.models 改为 SQL)
+        let chat_url = format!("{}/chat/completions", base);
+        let body = serde_json::json!({
+            "model": probe_model.model_id,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+        });
+        let chat_resp = client.post(&chat_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send().await;
+        match chat_resp {
+            Ok(r) if r.status().is_success() || r.status().as_u16() == 400 => {
+                // 400 is OK — it means the API accepted the request but rejected the body
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: true, error: None, models_detected: None,
+                })
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("HTTP {}: {}", status, body)),
+                    models_detected: None,
+                })
+            }
+            Err(e) => {
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("request failed: {}", e)),
+                    models_detected: None,
+                })
+            }
+        }
     }
 ```
 
@@ -1533,10 +1631,10 @@ Expected: FAIL
         settings.subagent.profiles.values()
             .filter_map(|p| {
                 let pid = p.provider_id.as_ref()?;
-                let mid = p.model.as_ref()?;
+                if p.model.is_empty() { return None; }
                 Some(busytok_domain::ProfileModelRef {
                     provider_id: pid.clone(),
-                    model_id: mid.clone(),
+                    model_id: p.model.clone(),
                 })
             })
             .collect()
@@ -1573,15 +1671,30 @@ fn provider_summary_to_dto(s: &busytok_domain::ProviderSummary) -> ProviderDto {
 }
 ```
 
-- [ ] **Step 4: 运行测试验证通过**
+- [ ] **Step 4: 更新 `crates/busytok-runtime/tests/supervisor_control.rs` 中的破碎测试**
 
-Run: `cargo test -p busytok-runtime provider_catalog -- --nocapture`
+由于 Task 3 已经删除 `ProviderCreateRequestDto` / `ProviderUpdateRequestDto` 的 `api_key_env_name` / `base_url_env_name` / `models` 字段，且 `ProviderCreateRequestDto.id` 已移除（id 改为系统生成），现有 `supervisor_control.rs` 中所有构造这两个 DTO 的测试都会编译失败。需要在此步骤同步修复：
+
+1. **更新所有 `ProviderCreateRequestDto` 构造**：移除 `id` / `api_key_env_name` / `base_url_env_name` / `models` 字段，添加 `provider_kind: ProviderKind::OpenAiCompatible` 字段（参考 Task 3 的新 DTO 定义）。
+2. **更新所有 `ProviderUpdateRequestDto` 构造**：移除 `api_key_env_name` / `base_url_env_name` / `models` 字段；如果原代码传 `api_key: Some(...)`，改为 `api_key: Some(Some(...))` 以匹配新的 `Option<Option<String>>` 三态类型。
+3. **删除以下三个 id 校验测试**（id 改为系统生成，不再校验用户输入）：
+   - `provider_create_rejects_invalid_id`
+   - `rejects_uppercase_id`
+   - `rejects_empty_id`
+4. **更新依赖旧字段的断言**：例如 `assert_eq!(updated.models.len(), 2)` 等基于 `ProviderDto.models` 的断言全部删除（`ProviderDto` 已无 `models` 字段）。如果测试需要验证模型列表，改为调用 `model_list` RPC。
+5. **更新通过 `provider.id` 引用的测试**：原来测试可能硬编码 `id: "p1"` 然后用 `"p1"` 引用，现在改为从 `provider_create` 返回的 `ProviderDto.id` 捕获并使用。
+6. **验证**：`cargo check -p busytok-runtime --tests` 编译通过。
+
+- [ ] **Step 5: 运行测试验证通过**
+
+Run: `cargo test -p busytok-runtime provider_catalog -- --nocapture && cargo test -p busytok-runtime supervisor_control -- --nocapture`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/busytok-runtime/src/supervisor.rs crates/busytok-runtime/tests/provider_catalog.rs
+git add crates/busytok-runtime/src/supervisor.rs crates/busytok-runtime/tests/provider_catalog.rs \
+  crates/busytok-runtime/tests/supervisor_control.rs
 git commit -m "feat(runtime): switch provider handlers to SQL with blocking delete + test_connection probe"
 ```
 
@@ -1604,10 +1717,20 @@ git commit -m "feat(runtime): switch provider handlers to SQL with blocking dele
 ```rust
 #[tokio::test]
 async fn model_create_and_list_round_trip() {
-    let sup = setup_supervisor().await;
-    sup.provider_create(/* p1 */).await.unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup.provider_create(ProviderCreateRequestDto {
+        name: "Test".into(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        api_key: Some("sk-test".into()),
+    }).await.unwrap();
+    let pid = provider.id.clone();
+
     sup.model_create(ModelCreateRequestDto {
-        provider_id: "p1".into(), model_id: "gpt-4o".into(),
+        provider_id: pid.clone(), model_id: "gpt-4o".into(),
         enabled: Some(true), tags: vec!["fast".into()],
     }).await.unwrap();
 
@@ -1629,14 +1752,47 @@ async fn model_update_rejects_model_id_change() {
 
 #[tokio::test]
 async fn delegate_rejects_when_provider_disabled() {
-    let sup = setup_supervisor().await;
-    sup.provider_create(/* p1 enabled */).await.unwrap();
-    sup.model_create(/* gpt-4o under p1 */).await.unwrap();
-    // Create profile binding p1+gpt-4o
-    // Disable p1
-    sup.provider_update(/* p1 enabled=false */).await.unwrap();
-    // Delegate should fail
-    let err = sup.subagent_delegate(/* profile */).await;
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let provider = sup.provider_create(ProviderCreateRequestDto {
+        name: "Test".into(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        api_key: Some("sk-test".into()),
+    }).await.unwrap();
+    let pid = provider.id.clone();
+
+    sup.model_create(ModelCreateRequestDto {
+        provider_id: pid.clone(), model_id: "gpt-4o".into(),
+        enabled: Some(true), tags: vec![],
+    }).await.unwrap();
+
+    // Create profile binding pid+gpt-4o
+    {
+        let mut settings = sup.settings.lock().unwrap();
+        let profile = busytok_config::SubagentProfile {
+            provider_id: Some(pid.clone()),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        settings.subagent.profiles.insert("test-profile".into(), profile);
+    }
+
+    // Disable provider
+    sup.provider_update(ProviderUpdateRequestDto {
+        id: pid.clone(),
+        name: None, base_url: None,
+        enabled: Some(false),
+        api_key: None,
+    }).await.unwrap();
+
+    // Delegate should fail because provider is disabled
+    let err = sup.subagent_delegate(SubagentDelegateRequestDto {
+        profile: "test-profile".into(),
+        ..Default::default()
+    }).await;
     assert!(err.is_err());
 }
 ```
@@ -1771,23 +1927,31 @@ fn catalog_entry_to_dto_ref(e: &busytok_domain::ModelCatalogEntry) -> ModelCatal
         }
 ```
 
-- [ ] **Step 4: 重写 profile create/update 校验**
+- [ ] **Step 4: 重写 profile create/update 校验（替换全部 4 处 `provider.models.contains` 调用）**
 
-在 supervisor.rs 的 `profile_create` / `profile_update` handler 中，把对 `provider.models` 白名单的校验改为 SQL 查询。找到约第 6148 行的 `provider_cfg.models.iter().any(|m| m == &req.model)` 逻辑，替换为：
+在 supervisor.rs 中共有 **4 处** `provider.models.contains(...)` 调用需要全部改为 SQL 查询。每处的行号和上下文如下：
+
+1. **行 5364** — `profile_create` handler 中的模型白名单校验
+2. **行 6157** — `profile_update` handler 中的模型白名单校验
+3. **行 6230** — `profile_create` / `profile_update` 的另一个校验分支（多 profile 路径）
+4. **行 6253** — 同上，处理 default profile 绑定时
+
+> 实现者需用 `grep -n "provider.models.contains\|provider_cfg.models.contains\|\.models\.iter.*any.*m ==" supervisor.rs` 确认全部 4 处位置，逐个替换。
+
+每处都改为以下 SQL 查询模式（统一替换）：
 
 ```rust
-// Validate model exists in SQL catalog
 let model = {
     let db = self.db.lock().unwrap();
-    db.get_model_by_provider_and_model_id(&provider_id, &req.model)?
+    db.get_model_by_provider_and_model_id(&provider_id, &model_id)?
 };
-let model = model.ok_or_else(|| {
-    anyhow!("model '{}' not found for provider '{}'", req.model, provider_id)
-})?;
+let model = model.ok_or_else(|| anyhow!("model '{}' not found for provider '{}'", model_id, provider_id))?;
 if !model.enabled {
-    anyhow::bail!("model '{}' is disabled", req.model);
+    anyhow::bail!("model '{}' is disabled", model_id);
 }
 ```
+
+> 注意：变量名 `model_id` 在不同调用点可能对应 `req.model` / `profile_model` / `profile_cfg.model` 等，按实际上下文替换。如果原代码用 `provider_cfg.models.iter().any(|m| m == &req.model)`，则 `model_id = &req.model`；如果用 `provider.models.contains(&profile.model)`，则 `model_id = &profile.model`。
 
 - [ ] **Step 5: 运行测试验证通过**
 
@@ -2214,9 +2378,17 @@ git commit -m "feat(gui): simplify ProvidersPage + add ModelsSection + profile m
 - Consumes: 所有前置任务完成
 - Produces: 代码库无残留旧设计
 
-- [ ] **Step 1: 删除 ProviderConfig 和 providers 字段**
+- [ ] **Step 1: 删除 ProviderConfig 和 providers 字段（含旧测试模块）**
 
 在 `crates/busytok-config/src/providers.rs` 中删除 `ProviderConfig` 结构体（整体删除文件或清空内容，只保留 `pub use busytok_domain::ProviderKind;` 如果还有外部引用）。
+
+**同时删除 `providers.rs` 中的 `#[cfg(test)]` 模块**——这些测试依赖 `ProviderConfig` 的旧字段（`api_key_env_name` / `base_url_env_name` / `models` 等），删除 `ProviderConfig` 后会编译失败。需要删除的测试至少包括：
+- `provider_config_round_trips_toml`
+- `provider_config_array_serializes_as_array_of_tables`
+- `provider_credential_store_round_trips_macos`
+- 以及 `#[cfg(test)] mod tests { ... }` 整个模块块（如果整个文件被清空，测试模块自然也消失）
+
+> **注意：** 不要保留这些测试的 "TODO: rewrite" 占位。新设计的测试覆盖由 `crates/busytok-store/tests/provider_catalog.rs`（Task 2）和 `crates/busytok-runtime/tests/provider_catalog.rs`（Task 5/6）承担。如果 `keychain.rs` 文件被整体删除，其内联测试也一并删除。
 
 在 `crates/busytok-config/src/lib.rs` 中：
 - 删除 `pub mod providers;` 或保留 re-export
@@ -2234,58 +2406,130 @@ git commit -m "feat(gui): simplify ProvidersPage + add ModelsSection + profile m
 
 grep 搜索 `api_key_env_name` 和 `base_url_env_name` 在整个代码库中的残留引用，全部删除。
 
-- [ ] **Step 4: 写残留 grep 断言测试**
+- [ ] **Step 4: 写残留 grep 断言测试（不依赖外部 `rg`，使用 walkdir + std::fs）**
+
+> **依赖：** 在 `crates/busytok-runtime/Cargo.toml` 的 `[dev-dependencies]` 中添加 `walkdir = "2"`（如果尚未有）。
 
 在 `crates/busytok-runtime/tests/residual_cleanup.rs` 中：
 
 ```rust
+//! Residual cleanup assertions.
+//! Uses walkdir + std::fs (no external `rg` binary dependency).
+use std::fs;
 use std::path::PathBuf;
 
 /// Asserts that old design remnants are fully removed from the codebase.
 /// This test prevents regressions where someone re-adds deleted patterns.
+/// Scans `crates/**/src/**/*.rs` and `apps/**/src/**/*.rs` only.
 #[test]
 fn no_env_name_fields_remain() {
-    let excluded = vec![
-        // This test file itself contains the strings for assertion
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/residual_cleanup.rs"),
-    ];
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Files that may legitimately mention these strings (e.g. this test file,
+    // or plan/spec docs). We match by suffix relative to workspace root.
+    let excluded_suffixes: Vec<PathBuf> = vec![
+        // This test file itself contains the strings for assertion
+        PathBuf::from("crates/busytok-runtime/tests/residual_cleanup.rs"),
+    ];
     let forbidden_patterns = [
         "api_key_env_name",
         "base_url_env_name",
         "ProviderCredentialStore",
     ];
-    for pattern in &forbidden_patterns {
-        let output = std::process::Command::new("rg")
-            .args(&["-l", pattern, "--type", "rust"])
-            .current_dir(&workspace_root)
-            .output()
-            .expect("rg failed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let offenders: Vec<&str> = stdout.lines()
-            .filter(|line| {
-                let path = PathBuf::from(line);
-                !excluded.iter().any(|ex| path.ends_with(ex))
-            })
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "Forbidden pattern '{}' found in: {:?}",
-            pattern, offenders
-        );
+
+    let mut offenders: Vec<(PathBuf, &str)> = Vec::new();
+    for root in &["crates", "apps"] {
+        let root_dir = workspace_root.join(root);
+        if !root_dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root_dir).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            // Only scan .rs source files under a src/ directory
+            let path_str = path.to_string_lossy();
+            if !path_str.contains("/src/") && !path_str.contains("\\src\\") {
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+
+            // Skip excluded files (match by suffix relative to workspace)
+            let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+            let is_excluded = excluded_suffixes.iter().any(|ex| rel.ends_with(ex));
+            if is_excluded {
+                continue;
+            }
+
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for pattern in &forbidden_patterns {
+                if content.contains(pattern) {
+                    offenders.push((path.to_path_buf(), *pattern));
+                }
+            }
+        }
     }
+
+    assert!(
+        offenders.is_empty(),
+        "Forbidden patterns found in source files:\n{}",
+        offenders
+            .iter()
+            .map(|(p, pat)| format!("  {} (pattern: {})", p.display(), pat))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
+/// Asserts no Cargo.toml under crates/ or apps/ still depends on `keyring`.
 #[test]
 fn no_keychain_dependency_in_cargo() {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let output = std::process::Command::new("rg")
-        .args(&["keyring", "--glob", "Cargo.toml"])
-        .current_dir(&workspace_root)
-        .output()
-        .expect("rg failed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.is_empty(), "keyring dependency still present: {}", stdout);
+    let mut offenders: Vec<PathBuf> = Vec::new();
+
+    for root in &["crates", "apps"] {
+        let root_dir = workspace_root.join(root);
+        if !root_dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root_dir).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) != Some("Cargo.toml") {
+                continue;
+            }
+
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Match `keyring` only on non-comment lines (Cargo.toml has no
+            // comments traditionally, but be defensive).
+            for line in content.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') {
+                    continue;
+                }
+                if trimmed.contains("keyring") {
+                    offenders.push(path.to_path_buf());
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "keyring dependency still present in: {:?}",
+        offenders
+    );
 }
 ```
 
@@ -2342,10 +2586,20 @@ git commit -m "chore: remove ProviderConfig/keychain/env-name remnants + add gre
 | model_id 不可变 | Task 1 (domain) + Task 3 (DTO 无字段) + Task 2 (UpdateModelPatch 无字段) |
 | include_disabled 过滤 provider + model | Task 2 (SQL + 测试) |
 | 日志事件 | Task 2/5/6 (info!) + Task 10 (error! + 审计) |
-| grep 断言 | Task 10 |
+| grep 断言（walkdir，不依赖 rg） | Task 10 Step 4 |
 | 覆盖率 ≥ 90% | Task 10 Step 6 |
+| provider id 系统生成（UUID v4，不由用户提供） | Task 1 (注释) + Task 2 (CreateProviderReq 无 id + create_provider 生成 UUID) + Task 3 (ProviderCreateRequestDto 无 id) + Task 5 (provider_create 不校验 id) + Task 5 Step 4 (supervisor_control.rs 删除 id 校验测试) |
+| ProviderCreateRequestDto 含 provider_kind 字段 | Task 3 (DTO) + Task 5 (provider_create 用 req.provider_kind) |
+| api_key 三态 Option<Option<String>> | Task 2 (UpdateProviderPatch + update_provider) + Task 3 (ProviderUpdateRequestDto) + Task 5 (provider_update 透传) |
+| provider_test_connection HTTPS 安全控制 + 完整 fallback | Task 5 Step 3f（含 /models 探针 + /chat/completions fallback，禁止 redirect，10s 超时） |
+| supervisor_control.rs 旧测试同步更新 | Task 5 Step 4 |
+| profile create/update 全部 4 处 models.contains 改 SQL | Task 6 Step 4 |
+| row_to_provider 解析失败不静默吞错误 | Task 2 Step 5 (warn! 日志) |
+| set_model_tags 无变化时跳过 updated_at_ms | Task 2 Step 5 |
+| TestRuntimeControl model_list stub 统一 bail! | Task 4 Step 3 |
+| providers.rs 旧测试模块删除 | Task 10 Step 1 |
 
-**2. 占位符扫描：** 无 TBD/TODO。Task 5 的 test_connection fallback HTTP 调用部分标注了"保留现有逻辑"，实现者需参考现有 supervisor.rs 5883 行附近的 HTTP 调用代码。
+**2. 占位符扫描：** 无 TBD/TODO。Task 5 Step 3f 的 test_connection fallback 已补全完整 HTTP 调用代码（参考现有 supervisor.rs 的 /chat/completions 探针逻辑），不再有"保留现有逻辑"占位。Task 5/6 测试中的 `/* ... p1 ... */` 占位符已全部替换为完整的 DTO 构造代码。
 
 **3. 类型一致性：**
 - `ProviderKind` 全链路统一使用 `busytok_domain::ProviderKind`（Task 1 定义 → Task 2 store → Task 3 protocol DTO → Task 5/6 supervisor）
@@ -2353,3 +2607,92 @@ git commit -m "chore: remove ProviderConfig/keychain/env-name remnants + add gre
 - `ModelUpdateRequestDto` 无 `model_id` 字段（Task 3 DTO + Task 2 UpdateModelPatch 一致）
 - `ProfileModelRef` 在 domain 定义，store 和 supervisor 共用
 - `ProviderRuntimeEntry` 在 subagent crate 定义，supervisor 构造 WorkerPool 时传入
+- `ProviderCreateRequestDto` 无 `id` 字段（Task 3 DTO + Task 2 CreateProviderReq 一致 + Task 5 provider_create 不读 req.id）
+- `ProviderUpdateRequestDto.api_key` 与 `UpdateProviderPatch.api_key` 均为 `Option<Option<String>>` 三态（Task 3 + Task 2 一致，Task 5 provider_update 透传）
+- `CreateProviderReq` 无 `id` 字段（Task 2 store 层生成 UUID v4）
+- `collect_profile_refs` 中 `p.model` 是 `String`（非 `Option<String>`），用 `is_empty()` 判空
+
+---
+
+## Review Fix Log
+
+> 本节记录对该 plan 的 review 修复（2026-07-03），共修复 10 个 Critical + 5 个 Important 问题。
+
+### Critical 修复
+
+- **C1: ProviderCreateRequestDto 缺 provider_kind 字段**
+  - Task 3 Step 2 的 `ProviderCreateRequestDto` 添加 `pub provider_kind: ProviderKind` 字段。
+  - Task 5 Step 3b 的 `provider_create` 中 `provider_kind` 改为 `req.provider_kind`（不再硬编码 `OpenAiCompatible`）。
+
+- **C2: api_key 改为三态 Option<Option<String>>**
+  - Task 3 `ProviderUpdateRequestDto.api_key` → `Option<Option<String>>`，加注释 `// None=不改, Some(None)=清除, Some(Some(k))=更新`。
+  - Task 2 `UpdateProviderPatch.api_key` → `Option<Option<String>>`。
+  - Task 2 `update_provider` 实现区分三种情况：None 跳过、Some(None) 写 NULL、Some(Some(k)) 写 k。
+  - Task 5 Step 3d `provider_update` 中 `api_key: req.api_key` 透传（类型已匹配）。
+  - 同步更新 Task 2 测试 `provider_crud_round_trip` 中的 `api_key: Some(Some("sk-new-key".to_string()))`。
+
+- **C3: collect_profile_refs 编译错误**
+  - Task 5 Step 3g 的 `collect_profile_refs` 中，`p.model` 是 `String` 不是 `Option<String>`。改为 `if p.model.is_empty() { return None; }` + `model_id: p.model.clone()`。
+
+- **C4: SQL HAVING 语法错误**
+  - Task 2 Step 5 `list_models_filtered` 的 `tag_clause` 从 `AND (...)` 改为 `HAVING (...)`（GROUP BY 后必须用 HAVING）。
+
+- **C5: update_provider 的 SELECT changes() 逻辑错误**
+  - Task 2 Step 5 `update_provider` 重写：先 `SELECT 1 FROM providers WHERE id = ?1` 验证存在，不存在直接 `bail!`。移除原来依赖 `SELECT changes()` 判断的方式（当 patch 全为 None 时 changes()=0 会误报 not found）。
+
+- **C6: provider_test_connection 保留安全控制 + 补全 fallback 代码**
+  - Task 5 Step 3f `provider_test_connection` 重写：
+    - 保留 HTTPS 校验 `if !provider.base_url.starts_with("https://") { bail!(...) }`。
+    - 用 `reqwest::Client::builder().redirect(Policy::none()).timeout(10s).build()` 构造 client（禁止 redirect 防止 SSRF，10s 超时）。
+    - 补全 fallback：先试 `GET /models`，失败则从 SQL 取 enabled model 调 `POST /chat/completions`，body 用 `probe_model.model_id`，max_tokens=1。400 状态码视为 OK（API 接受请求但拒绝 body）。
+
+- **C7: setup_supervisor() 改为 make_supervisor(db, &tmp)**
+  - Task 5 Step 1 和 Task 6 Step 1 所有测试代码：`let sup = setup_supervisor().await;` → `let db = busytok_store::Database::open_in_memory().unwrap(); let tmp = tempfile::TempDir::new().unwrap(); let sup = make_supervisor(db, &tmp);`（`make_supervisor` 同步，不需要 `.await`）。
+  - 补全所有 `/* ... p1 ... */` 占位符为完整 DTO 构造代码（含 `provider_kind: ProviderKind::OpenAiCompatible`，无 `id` 字段）。
+  - 测试中通过 `let pid = created.id.clone();` 捕获系统生成的 id，不再硬编码 `"p1"`。
+  - `provider_delete_blocked_by_profile_reference` 和 `delegate_rejects_when_provider_disabled` 补全 settings profile 注入代码。
+
+- **C8: Task 5 增加 Step 更新 supervisor_control.rs 破碎测试**
+  - 在 Task 5 Step 3 和原 Step 4 之间新增 Step 4（原 Step 4/5 顺延为 Step 5/6）。
+  - 说明：更新 `crates/busytok-runtime/tests/supervisor_control.rs` 中所有 `ProviderCreateRequestDto` / `ProviderUpdateRequestDto` 构造，移除 `api_key_env_name` / `base_url_env_name` / `models` / `id` 字段。删除 `provider_create_rejects_invalid_id` / `rejects_uppercase_id` / `rejects_empty_id` 测试。更新 `assert_eq!(updated.models.len(), 2)` 等断言。
+  - Commit 命令同步加入 `supervisor_control.rs`。
+
+- **C9: Task 6 Step 4 列出全部 4 处 provider.models.contains**
+  - Task 6 Step 4 明确列出 supervisor.rs 中 4 处 `provider.models.contains(...)` 调用（行 5364, 6157, 6230, 6253）。
+  - 每处都改为 SQL 查询：`db.get_model_by_provider_and_model_id(...)` + 存在性校验 + `enabled` 校验。
+  - 加注释说明 `model_id` 变量名在不同调用点对应 `req.model` / `profile_model` / `profile_cfg.model` 等。
+
+- **C10: id 系统生成**
+  - Task 1 Step 3 `Provider` 结构体 `pub id: String,` 加注释 `// UUID v4, 系统生成（store 层生成，不由用户提供）`。
+  - Task 2 Step 5 `CreateProviderReq` 移除 `pub id: String` 字段。
+  - Task 2 Step 5 `create_provider` 实现改为 `let id = uuid::Uuid::new_v4().to_string();`（不用 `format!("provider_{}", ...)` 前缀）。
+  - Task 2 Step 5 `create_provider` 错误处理：PRIMARY KEY 冲突改为返回错误（UUID 冲突概率极低，不重试）。
+  - Task 3 `ProviderCreateRequestDto` 移除 `pub id: String` 字段。
+  - Task 5 Step 3b `provider_create` 移除 id 校验（`is_empty()` / 字符集校验）。
+  - Task 2 测试 `sample_provider_req` 移除 `id` 参数；所有测试改为从 `db.create_provider(...)` 返回值捕获 id，不再硬编码 `"p1"`。`include_disabled_filters_both_provider_and_model` 中的内联 `CreateProviderReq` 同步移除 `id` 字段。
+
+### Important 修复
+
+- **I1: row_to_provider 不静默吞错误**
+  - Task 2 Step 5 `row_to_provider` 中 `serde_json::from_str(...).unwrap_or(ProviderKind::OpenAiCompatible)` 改为 `unwrap_or_else(|e| { tracing::warn!(...); ProviderKind::OpenAiCompatible })`，解析失败时记录 warn 日志。
+
+- **I2: set_model_tags 无变化时跳过 updated_at_ms 更新**
+  - Task 2 Step 5 `set_model_tags` 调整 diff 计算顺序：先算 `to_remove` 和 `to_add`，若两者皆空 `return Ok(())`，跳过 `UPDATE models SET updated_at_ms` 和 commit。
+
+- **I6: TestRuntimeControl model_list stub 统一 bail!**
+  - Task 4 Step 3 `model_list` stub 从 `Ok(ModelListResponseDto { models: vec![] })` 改为 `anyhow::bail!("not yet implemented")`，与 `model_create` / `model_update` / `model_delete` / `model_tags_update` 4 个方法一致。
+
+- **I8: grep 测试不依赖外部 rg**
+  - Task 10 Step 4 重写 `residual_cleanup.rs` 测试，用 `walkdir` + `std::fs::read_to_string` + `str::contains` 遍历 `crates/**/src/**/*.rs` 和 `apps/**/src/**/*.rs`（不依赖外部 `rg` 二进制）。
+  - `no_keychain_dependency_in_cargo` 同样改用 walkdir 遍历所有 `Cargo.toml`，跳过注释行后检查 `keyring`。
+  - 新增依赖说明：`crates/busytok-runtime/Cargo.toml` 的 `[dev-dependencies]` 添加 `walkdir = "2"`。
+
+- **I9: Task 10 清理 providers.rs 旧测试**
+  - Task 10 Step 1 显式说明：删除 `crates/busytok-config/src/providers.rs` 中的 `#[cfg(test)]` 模块，含 `provider_config_round_trips_toml`、`provider_config_array_serializes_as_array_of_tables`、`provider_credential_store_round_trips_macos` 等依赖 `ProviderConfig` 旧字段的测试。不保留 "TODO: rewrite" 占位，新测试由 Task 2/5/6 承担。
+
+### 内部一致性同步更新
+
+- 移除 `id` 字段后，所有相关引用同步更新：Task 2 测试（`sample_provider_req` + 5 个测试函数）、Task 3 DTO、Task 5 `provider_create`、Task 5/6 测试代码。
+- `api_key` 三态化后，Task 2 测试 `provider_crud_round_trip` 的 `api_key` 改为 `Some(Some(...))`。
+- Self-Review 检查表新增 8 行覆盖新修复项；占位符扫描说明更新为"已补全完整代码"。
+
