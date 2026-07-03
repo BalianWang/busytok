@@ -111,6 +111,22 @@ enum Command {
     /// Calls the existing `settings.diagnostics` RPC and pretty-prints
     /// the subagent section. No new RPC method.
     Doctor,
+
+    /// List models in the catalog
+    Models {
+        /// Filter by provider id
+        #[arg(long)]
+        provider: Option<String>,
+        /// Filter by tag (repeatable, AND semantics)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Include disabled models and disabled-provider models
+        #[arg(long)]
+        all: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -435,6 +451,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Delegate { .. } => "delegate",
         Command::Subagent { .. } => "subagent",
         Command::Doctor => "doctor",
+        Command::Models { .. } => "models",
     }
 }
 
@@ -614,6 +631,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
             } => commands_subagent::handle_delete(name, id, cwd, hard, yes).await,
         },
 
+        Command::Models {
+            provider,
+            tags,
+            all,
+            json,
+        } => commands::models::handle_models(provider, tags, all, json).await,
+
         Command::Doctor => commands::handle_doctor().await,
     }
 }
@@ -726,6 +750,17 @@ mod tests {
     #[test]
     fn command_name_returns_doctor_for_doctor_variant() {
         assert_eq!(command_name(&Command::Doctor), "doctor");
+    }
+
+    #[test]
+    fn command_name_returns_models_for_models_variant() {
+        let cmd = Command::Models {
+            provider: None,
+            tags: vec![],
+            all: false,
+            json: false,
+        };
+        assert_eq!(command_name(&cmd), "models");
     }
 
     // ── parse_discovery_default ─────────────────────────────────────────
@@ -890,6 +925,56 @@ mod tests {
     fn args_parses_doctor_subcommand() {
         let args = Args::try_parse_from(["busytok", "doctor"]).unwrap();
         assert!(matches!(args.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn args_parses_models_subcommand_with_defaults() {
+        let args = Args::try_parse_from(["busytok", "models"]).unwrap();
+        match args.command {
+            Some(Command::Models {
+                provider,
+                tags,
+                all,
+                json,
+            }) => {
+                assert!(provider.is_none());
+                assert!(tags.is_empty());
+                assert!(!all);
+                assert!(!json);
+            }
+            other => panic!("expected Models, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_models_subcommand_with_all_flags() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "models",
+            "--provider",
+            "p1",
+            "--tag",
+            "chat",
+            "--tag",
+            "fast",
+            "--all",
+            "--json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Models {
+                provider,
+                tags,
+                all,
+                json,
+            }) => {
+                assert_eq!(provider.as_deref(), Some("p1"));
+                assert_eq!(tags, vec!["chat".to_string(), "fast".to_string()]);
+                assert!(all);
+                assert!(json);
+            }
+            other => panic!("expected Models with flags, got: {other:?}"),
+        }
     }
 
     #[test]
