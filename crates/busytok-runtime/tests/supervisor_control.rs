@@ -5701,15 +5701,14 @@ async fn e2e_auth_failure_kills_worker() {
     );
 
     // Next ensure_worker creates a new worker (slot was freed). The auth-fail
-    // kill path calls `remove_worker_and_kill` which removes BOTH the worker
-    // AND the provider entry from the pool's map (Task 7: pool uses a
-    // HashMap, not a closure). To re-spawn, `provider_changed` must re-add
-    // the entry first — simulating the production recovery path (the provider
-    // is still configured in SQL, so `provider_changed` re-reads it and calls
-    // `update_provider_and_kill_old` to insert a fresh entry).
-    sup.provider_changed("test-provider").await;
+    // kill path calls `remove_worker_and_kill` which removes ONLY the worker
+    // (Task 7 fix: the provider entry stays in the pool's map so the next
+    // ensure_worker can re-spawn without any extra recovery step — matching
+    // production behavior, where the executor's auth-fail path does NOT call
+    // provider_changed). The provider is still configured in SQL and the
+    // pool's providers map still holds its entry.
     pool.ensure_worker("test-provider")
-        .expect("ensure_worker re-spawns");
+        .expect("ensure_worker re-spawns after auth-fail kill");
     assert_eq!(pool.worker_snapshots().await.len(), 1);
 
     sup.shutdown_writer().await.expect("writer shutdown");

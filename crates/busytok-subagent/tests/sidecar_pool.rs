@@ -202,7 +202,12 @@ fn ensure_worker_sets_pressure_responder() {
 }
 
 /// `remove_worker_then_ensure_creates_new_supervisor` — after remove, a
-/// new ensure_worker creates a NEW supervisor.
+/// new ensure_worker creates a NEW supervisor. The provider entry is LEFT
+/// IN PLACE by `remove_worker_and_kill` (Task 7 fix: only the worker is
+/// removed; the provider entry stays so ensure_worker can re-spawn — this
+/// matches the auth-fail kill recovery path in the executor, which does
+/// NOT call provider_changed). To drop the provider entry as well (for
+/// disabled / deleted providers), call `remove_provider_entry` separately.
 #[tokio::test]
 async fn remove_worker_then_ensure_creates_new_supervisor() {
     let (pool, _gate, _exec) = make_test_pool();
@@ -213,8 +218,24 @@ async fn remove_worker_then_ensure_creates_new_supervisor() {
         .await
         .expect("remove_worker_and_kill");
 
-    // After remove_worker_and_kill, the provider entry is also removed.
-    // ensure_worker should fail with "unknown provider".
+    // After remove_worker_and_kill, ONLY the worker is gone — the provider
+    // entry stays so ensure_worker can re-spawn (auth-fail recovery path).
+    let sup2 = pool
+        .ensure_worker("deepseek")
+        .expect("ensure_worker must re-spawn after remove_worker_and_kill");
+    assert!(
+        !Arc::ptr_eq(&sup1, &sup2),
+        "re-spawned supervisor must be a NEW Arc (not the killed one)"
+    );
+    assert_eq!(
+        pool.worker_snapshots().await.len(),
+        1,
+        "pool must have one worker after re-spawn"
+    );
+
+    // After remove_provider_entry, ensure_worker fails with "unknown
+    // provider" (the disabled/deleted-provider path).
+    pool.remove_provider_entry("deepseek");
     match pool.ensure_worker("deepseek") {
         Err(SidecarError::Spawn(msg)) => {
             assert!(
@@ -223,7 +244,7 @@ async fn remove_worker_then_ensure_creates_new_supervisor() {
             );
         }
         Err(other) => panic!("expected SidecarError::Spawn, got {other:?}"),
-        Ok(_) => panic!("unknown provider should error after remove_worker_and_kill"),
+        Ok(_) => panic!("unknown provider should error after remove_provider_entry"),
     }
 }
 

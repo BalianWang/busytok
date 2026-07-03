@@ -280,16 +280,18 @@ impl WorkerPool {
     }
 
     /// Hard-remove + kill a worker (P1b fix). Self-contained: callers
-    /// don't need to remember to kill — this method does it. Also removes
-    /// the provider entry from the providers map so subsequent
-    /// `ensure_worker` calls fail with "unknown provider" (correct for
-    /// disabled / deleted providers).
+    /// don't need to remember to kill — this method does it. The provider
+    /// entry in the `providers` map is LEFT IN PLACE so the next
+    /// `ensure_worker` can re-spawn (e.g. after an auth-fail kill — the
+    /// credential may have been refreshed; the worker should be re-created
+    /// from the existing entry). To also remove the provider entry (for
+    /// disabled / deleted providers), call `remove_provider_entry`
+    /// separately.
     ///
     /// # Locking (I1 fix)
-    /// 1. Acquire providers map lock, remove entry.
-    /// 2. Acquire workers map lock, `remove` entry → `Option<Arc<...>>`.
-    /// 3. DROP both locks.
-    /// 4. If `Some(sup)`, `sup.force_kill().await` OUTSIDE the locks
+    /// 1. Acquire workers map lock, `remove` entry → `Option<Arc<...>>`.
+    /// 2. DROP the lock.
+    /// 3. If `Some(sup)`, `sup.force_kill().await` OUTSIDE the lock
     ///    (force_kill awaits `child.wait()` — must not hold sync mutex
     ///    across `.await`).
     ///
@@ -298,11 +300,6 @@ impl WorkerPool {
     /// If the supervisor was never started, `force_kill` is a no-op on
     /// `None` child (safe to call).
     pub async fn remove_worker_and_kill(&self, provider_id: &str) -> Result<()> {
-        // Remove the provider entry so ensure_worker won't re-spawn.
-        {
-            let mut providers = self.providers.lock().expect("providers map lock poisoned");
-            providers.remove(provider_id);
-        }
         let sup = {
             let mut workers = self.workers.lock().expect("workers map lock poisoned");
             workers.remove(provider_id)
@@ -327,6 +324,22 @@ impl WorkerPool {
             );
         }
         Ok(())
+    }
+
+    /// Remove ONLY the provider entry from the `providers` map (no kill).
+    /// Synchronous — no `.await`. Used by `provider_deleted` and the
+    /// disabled/missing branch of `provider_changed` to drop the provider
+    /// entry so subsequent `ensure_worker` calls fail with "unknown
+    /// provider" (correct for disabled / deleted providers). The worker
+    /// itself is killed separately via `remove_worker_and_kill`.
+    ///
+    /// NOTE: the auth-fail kill path in the executor calls
+    /// `remove_worker_and_kill` ONLY (not this method) — the provider
+    /// entry must stay so the next `ensure_worker` can re-spawn after a
+    /// bad-credential kill (the key may have been refreshed).
+    pub fn remove_provider_entry(&self, provider_id: &str) {
+        let mut providers = self.providers.lock().expect("providers map lock poisoned");
+        providers.remove(provider_id);
     }
 
     /// Update or insert a provider's runtime entry, then force-kill the

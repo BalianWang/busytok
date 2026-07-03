@@ -291,8 +291,10 @@ impl BusytokSupervisor {
     ///
     /// **Phase 3 Task 3:** the executor is rewired from a single
     /// `PiSidecarSupervisor` to `Arc<WorkerPool>`. The pool is constructed
-    /// with a providers lookup (from `settings.providers`) + credential
-    /// reader (from `ProviderCredentialStore`). Two-phase bootstrap:
+    /// with a `HashMap<String, ProviderRuntimeEntry>` populated from SQL
+    /// (the SQL-backed provider catalog — Task 7: the sidecar no longer
+    /// reads from `settings.providers` TOML or a `ProviderCredentialStore`).
+    /// Two-phase bootstrap:
     /// pool → executor → responder factory → `set_responder_factory` →
     /// `ensure_worker(first enabled provider)` → supervisor for the
     /// `sidecar_supervisor` field (used by doctor checks, shutdown, and
@@ -930,14 +932,21 @@ impl BusytokSupervisor {
                 }
             }
             _ => {
-                // Provider disabled / missing / no api_key — kill + remove
-                // (also removes the provider entry from the pool's map so
-                // ensure_worker won't re-spawn with stale credentials).
+                // Provider disabled / missing / no api_key — remove the
+                // provider entry (so ensure_worker won't re-spawn with
+                // stale credentials) AND kill + remove the worker. The
+                // entry is removed BEFORE the kill so a concurrent
+                // ensure_worker can't re-spawn between the two steps.
+                // NOTE: this is distinct from the auth-fail kill path in
+                // the executor, which calls remove_worker_and_kill ONLY
+                // (provider entry stays so the next ensure_worker can
+                // re-spawn after a credential refresh).
                 info!(
                     event_code = "subagent.provider_changed_remove",
                     provider_id = %provider_id,
                     "provider changed (disabled/missing/no-key) — removing worker + provider entry"
                 );
+                pool.remove_provider_entry(provider_id);
                 if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
                     warn!(
                         event_code = "subagent.provider_changed_kill_failed",
@@ -953,8 +962,9 @@ impl BusytokSupervisor {
     /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
     /// after the provider is deleted. Same mechanism as `provider_changed`
     /// but a distinct log event code so audit trails can distinguish
-    /// "changed" from "deleted". Called by `provider_delete` AFTER the
-    /// settings + keychain deletes succeed.
+    /// "changed" from "deleted". Called by `provider_delete` AFTER the SQL
+    /// delete succeeds. Removes the provider entry from the pool's map
+    /// (so ensure_worker won't re-spawn) AND kills + removes the worker.
     pub async fn provider_deleted(&self, provider_id: &str) {
         if let Some(pool) = self.worker_pool() {
             info!(
@@ -962,6 +972,9 @@ impl BusytokSupervisor {
                 provider_id = %provider_id,
                 "provider deleted — killing worker (if any) to release resources"
             );
+            // Remove the provider entry BEFORE the kill so a concurrent
+            // ensure_worker can't re-spawn between the two steps.
+            pool.remove_provider_entry(provider_id);
             if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
                 warn!(
                     event_code = "subagent.provider_deleted_kill_failed",
