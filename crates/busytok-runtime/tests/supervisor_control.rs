@@ -5804,7 +5804,11 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
             event_count, 0,
             "no usage_event row should exist for the queued task before dispatcher runs"
         );
-        let daily_count = count_rows(&db_ref, "daily_usage", "generation_id = 'gen-queued-bridge'");
+        let daily_count = count_rows(
+            &db_ref,
+            "daily_usage",
+            "generation_id = 'gen-queued-bridge'",
+        );
         assert_eq!(
             daily_count, 0,
             "no daily_usage rollup should exist before dispatcher runs"
@@ -5866,9 +5870,13 @@ async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
     // dedupe_key / generation_id), instead of just "left: None, right: Some".
     let all_subagent_events: Vec<(String, String)> = db_ref
         .conn()
-        .prepare("SELECT dedupe_key, generation_id FROM usage_events WHERE client_kind = 'subagent'")
+        .prepare(
+            "SELECT dedupe_key, generation_id FROM usage_events WHERE client_kind = 'subagent'",
+        )
         .unwrap()
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -5941,7 +5949,12 @@ async fn profile_crud_round_trips() {
     // Built-in profiles exist from default_settings.
     let snapshot = sup.settings_snapshot().await.unwrap();
     assert_eq!(snapshot.data.subagent.profiles.len(), 3);
-    assert!(snapshot.data.subagent.profiles.iter().any(|p| p.id == "pi/search-cheap"));
+    assert!(snapshot
+        .data
+        .subagent
+        .profiles
+        .iter()
+        .any(|p| p.id == "pi/search-cheap"));
     assert!(snapshot.data.subagent.profiles.iter().all(|p| p.is_builtin));
 
     // Create a user profile.
@@ -6138,7 +6151,7 @@ async fn profile_update_rejects_stale_model_on_rebind() {
         .profile_update(ProfileUpdateRequestDto {
             id: "pi/search-cheap".to_string(),
             provider_id: Some("test-p".to_string()), // re-bind same provider
-            model: None, // not changing model
+            model: None,                             // not changing model
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6205,7 +6218,7 @@ async fn profile_update_patches_tools_without_triggering_stale_check() {
         .profile_update(ProfileUpdateRequestDto {
             id: "pi/search-cheap".to_string(),
             provider_id: None, // unchanged
-            model: None, // unchanged
+            model: None,       // unchanged
             tools: Some(vec!["new-tool".to_string()]),
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6226,7 +6239,11 @@ async fn settings_snapshot_includes_subagent_profiles() {
     let snapshot = sup.settings_snapshot().await.unwrap();
     assert!(snapshot.data.subagent.enabled);
     assert_eq!(snapshot.data.subagent.profiles.len(), 3);
-    let search = snapshot.data.subagent.profiles.iter()
+    let search = snapshot
+        .data
+        .subagent
+        .profiles
+        .iter()
         .find(|p| p.id == "pi/search-cheap")
         .unwrap();
     assert!(search.is_builtin);
@@ -6436,7 +6453,14 @@ async fn profile_update_with_all_none_patch_is_noop() {
     let sup = make_supervisor(db, &tmp);
 
     // Capture the built-in search profile's pre-state.
-    let before = sup.settings_snapshot().await.unwrap().data.subagent.profiles.iter()
+    let before = sup
+        .settings_snapshot()
+        .await
+        .unwrap()
+        .data
+        .subagent
+        .profiles
+        .iter()
         .find(|p| p.id == "pi/search-cheap")
         .cloned()
         .unwrap();

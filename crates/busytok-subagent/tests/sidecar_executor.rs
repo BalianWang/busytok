@@ -484,7 +484,10 @@ async fn executor_auth_failure_kills_worker_from_pool() {
         .downcast_ref::<busytok_subagent::SubagentError>()
         .expect("error should downcast to SubagentError");
     assert!(
-        matches!(subagent_err, busytok_subagent::SubagentError::SidecarRpc { .. }),
+        matches!(
+            subagent_err,
+            busytok_subagent::SubagentError::SidecarRpc { .. }
+        ),
         "expected SidecarRpc (AUTH_FAILURE -32010), got {subagent_err:?}"
     );
     assert!(

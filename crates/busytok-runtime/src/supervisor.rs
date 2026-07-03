@@ -353,10 +353,7 @@ impl BusytokSupervisor {
             Some(cfg) => Ok(cfg),
             None => {
                 let pi_sidecar = settings.lock().unwrap().subagent.pi_sidecar.clone();
-                busytok_subagent::sidecar::config::resolve_base_sidecar_config(
-                    &pi_sidecar,
-                    paths,
-                )
+                busytok_subagent::sidecar::config::resolve_base_sidecar_config(&pi_sidecar, paths)
             }
         };
         match config_result {
@@ -454,8 +451,8 @@ impl BusytokSupervisor {
                     .iter()
                     .find(|p| p.enabled)
                     .map(|p| p.id.clone());
-                let sidecar_supervisor = first_enabled_provider.and_then(|pid| {
-                    match pool.ensure_worker(&pid) {
+                let sidecar_supervisor =
+                    first_enabled_provider.and_then(|pid| match pool.ensure_worker(&pid) {
                         Ok(sup) => Some(sup),
                         Err(e) => {
                             error!(
@@ -466,8 +463,7 @@ impl BusytokSupervisor {
                             );
                             None
                         }
-                    }
-                });
+                    });
 
                 // Get the first responder from the holder (if ensure_worker
                 // succeeded). This is stored in `BusytokSupervisor.pressure_responder`
@@ -572,9 +568,10 @@ impl BusytokSupervisor {
             Arc::clone(&event_bus),
         );
 
-        let generation_manager = Arc::new(
-            crate::generation_manager::GenerationManager::new(Arc::clone(&db), Arc::clone(&status)),
-        );
+        let generation_manager = Arc::new(crate::generation_manager::GenerationManager::new(
+            Arc::clone(&db),
+            Arc::clone(&status),
+        ));
 
         let (writer_handle, writer_join) = writer::try_spawn_writer(
             Arc::clone(&db),
@@ -623,13 +620,9 @@ impl BusytokSupervisor {
                 // Read the active generation ID fresh on each invocation so a
                 // later promotion is picked up by queued-task completion events.
                 let gen_id = hook_gen.active_generation_id();
-                if let Err(e) = bridge_subagent_usage(
-                    &hook_db,
-                    gen_id.as_deref(),
-                    &hook_settings,
-                    result,
-                    cwd,
-                ) {
+                if let Err(e) =
+                    bridge_subagent_usage(&hook_db, gen_id.as_deref(), &hook_settings, result, cwd)
+                {
                     tracing::warn!(
                         event_code = "subagent.usage_write_failed",
                         task_id = %result.task_id,
@@ -943,50 +936,53 @@ impl BusytokSupervisor {
         //    without a valid manifest.
         {
             let manifest_path = self.paths.sidecar_manifest_path(runtime_dir_ref);
-            let (status, detail) = match std::fs::read_to_string(&manifest_path) {
-                Ok(contents) => match serde_json::from_str::<busytok_config::SidecarManifest>(&contents) {
-                    Ok(m) => (
-                        "ok",
-                        format!(
+            let (status, detail) =
+                match std::fs::read_to_string(&manifest_path) {
+                    Ok(contents) => {
+                        match serde_json::from_str::<busytok_config::SidecarManifest>(&contents) {
+                            Ok(m) => (
+                                "ok",
+                                format!(
                             "manifest readable (version={}, protocol_version={}, node={}): {}",
                             m.version, m.protocol_version, m.node_runtime_version,
                             manifest_path.display()
                         ),
-                    ),
+                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    event_code = "subagent.doctor.manifest_invalid",
+                                    path = %manifest_path.display(),
+                                    error = %e,
+                                    "manifest at path is not a valid SidecarManifest"
+                                );
+                                (
+                                    "error",
+                                    format!(
+                                        "manifest at {} is not a valid SidecarManifest: {}",
+                                        manifest_path.display(),
+                                        e
+                                    ),
+                                )
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
-                            event_code = "subagent.doctor.manifest_invalid",
+                            event_code = "subagent.doctor.manifest_unreadable",
                             path = %manifest_path.display(),
                             error = %e,
-                            "manifest at path is not a valid SidecarManifest"
+                            "manifest not readable at path"
                         );
                         (
                             "error",
                             format!(
-                                "manifest at {} is not a valid SidecarManifest: {}",
+                                "manifest not readable at {}: {}",
                                 manifest_path.display(),
                                 e
                             ),
                         )
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        event_code = "subagent.doctor.manifest_unreadable",
-                        path = %manifest_path.display(),
-                        error = %e,
-                        "manifest not readable at path"
-                    );
-                    (
-                        "error",
-                        format!(
-                            "manifest not readable at {}: {}",
-                            manifest_path.display(),
-                            e
-                        ),
-                    )
-                }
-            };
+                };
             checks.push(DoctorCheckDto {
                 name: "bundle_manifest_readable".into(),
                 status: status.into(),
@@ -1671,13 +1667,7 @@ impl BusytokSupervisor {
         cwd: &str,
     ) -> Result<()> {
         let gen_id = self.generation_manager.active_generation_id();
-        bridge_subagent_usage(
-            &self.db,
-            gen_id.as_deref(),
-            &self.settings,
-            result,
-            cwd,
-        )
+        bridge_subagent_usage(&self.db, gen_id.as_deref(), &self.settings, result, cwd)
     }
 
     /// Gracefully drain and stop the writer actor.
@@ -5670,14 +5660,23 @@ impl RuntimeControl for BusytokSupervisor {
         // Reject built-in profile names — they're reserved.
         if busytok_config::is_builtin_profile(&req.id) {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "reserved_name", "name is reserved for built-in profiles");
-            anyhow::bail!("cannot create profile '{}': name is reserved for built-in profiles", req.id);
+            anyhow::bail!(
+                "cannot create profile '{}': name is reserved for built-in profiles",
+                req.id
+            );
         }
         if req.id.is_empty() {
-            tracing::warn!(event_code = "profile.create.rejected", reason = "empty_id", "profile id must not be empty");
+            tracing::warn!(
+                event_code = "profile.create.rejected",
+                reason = "empty_id",
+                "profile id must not be empty"
+            );
             anyhow::bail!("profile id must not be empty");
         }
         // Validate id format: [a-z0-9/_-]+ (allows namespacing like "pi/my-profile").
-        if !req.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-') {
+        if !req.id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-'
+        }) {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "invalid_id_format", "profile id must contain only [a-z0-9/_-]+");
             anyhow::bail!("profile id must contain only [a-z0-9/_-]+");
         }
@@ -5711,7 +5710,9 @@ impl RuntimeControl for BusytokSupervisor {
                 tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, model = %req.model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                 anyhow::bail!(
                     "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                    req.model, pid, provider.models
+                    req.model,
+                    pid,
+                    provider.models
                 );
             }
         }
@@ -5725,7 +5726,10 @@ impl RuntimeControl for BusytokSupervisor {
             timeout_seconds: req.timeout_seconds.unwrap_or(120),
         };
 
-        pending.subagent.profiles.insert(req.id.clone(), profile.clone());
+        pending
+            .subagent
+            .profiles
+            .insert(req.id.clone(), profile.clone());
         pending.save(&self.paths)?;
         {
             let mut settings = self.settings.lock().unwrap();
@@ -5769,13 +5773,19 @@ impl RuntimeControl for BusytokSupervisor {
             // model against that provider's whitelist (unless model is also
             // being updated this call — the model block below will validate).
             if let Some(ref new_pid) = new_provider_id {
-                let provider = pending.providers.iter().find(|p| &p.id == new_pid.as_str()).unwrap();
+                let provider = pending
+                    .providers
+                    .iter()
+                    .find(|p| &p.id == new_pid.as_str())
+                    .unwrap();
                 let effective_model = req.model.as_ref().unwrap_or(&profile.model);
                 if !provider.models.contains(effective_model) {
                     tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                     anyhow::bail!(
                         "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                        effective_model, new_pid, provider.models
+                        effective_model,
+                        new_pid,
+                        provider.models
                     );
                 }
             }
@@ -5791,7 +5801,9 @@ impl RuntimeControl for BusytokSupervisor {
                         tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
                         anyhow::bail!(
                             "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                            model, pid, provider.models
+                            model,
+                            pid,
+                            provider.models
                         );
                     }
                 }
@@ -5799,10 +5811,18 @@ impl RuntimeControl for BusytokSupervisor {
             profile.model = model.clone();
         }
 
-        if let Some(tools) = req.tools { profile.tools = tools; }
-        if let Some(budget) = req.context_budget_tokens { profile.context_budget_tokens = budget; }
-        if let Some(timeout) = req.timeout_seconds { profile.timeout_seconds = timeout; }
-        if let Some(write_access) = req.write_access { profile.write_access = write_access; }
+        if let Some(tools) = req.tools {
+            profile.tools = tools;
+        }
+        if let Some(budget) = req.context_budget_tokens {
+            profile.context_budget_tokens = budget;
+        }
+        if let Some(timeout) = req.timeout_seconds {
+            profile.timeout_seconds = timeout;
+        }
+        if let Some(write_access) = req.write_access {
+            profile.write_access = write_access;
+        }
 
         let profile_snapshot = profile.clone();
         pending.save(&self.paths)?;
@@ -5953,10 +5973,7 @@ fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Optio
 /// `provider_id` is extracted via the existing `profile_provider_id()`
 /// helper (supervisor.rs:5719) — the single source of truth for provider
 /// extraction, already used by `provider_delete`'s reference check.
-fn profile_to_dto(
-    name: &str,
-    profile: &busytok_config::SubagentProfileConfig,
-) -> ProfileDto {
+fn profile_to_dto(name: &str, profile: &busytok_config::SubagentProfileConfig) -> ProfileDto {
     ProfileDto {
         id: name.to_string(),
         is_builtin: busytok_config::is_builtin_profile(name),

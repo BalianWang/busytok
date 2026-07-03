@@ -67,8 +67,7 @@ context_budget_tokens = 9999
 timeout_seconds = 42
 write_access = false
 "#;
-    let mut settings =
-        busytok_config::BusytokSettings::load_from_str(toml_str).unwrap();
+    let mut settings = busytok_config::BusytokSettings::load_from_str(toml_str).unwrap();
     // Only pi/search-cheap is present; pi/review-cheap and pi/plan-cheap are missing.
     assert_eq!(settings.subagent.profiles.len(), 1);
 

@@ -31,8 +31,7 @@ pub struct SidecarManifest {
 impl SidecarManifest {
     /// Serialize to a pretty-printed JSON string for build-time generation.
     pub fn to_json_string(&self) -> String {
-        serde_json::to_string_pretty(self)
-            .expect("SidecarManifest serialization is infallible")
+        serde_json::to_string_pretty(self).expect("SidecarManifest serialization is infallible")
     }
 }
 
