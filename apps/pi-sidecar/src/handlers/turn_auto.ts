@@ -2,7 +2,7 @@ import { type TurnAutoParams, type TurnAutoResult } from '../types.js';
 import type { RequestHandler } from '../rpc.js';
 import { SidecarError } from '../errors.js';
 import type { SessionPool } from '../session_pool.js';
-import { PiSdkSession, type SdkSession, type SessionFactory } from '../pi_session.js';
+import { PiSdkSession, type SdkSession, type SessionFactory, type CreateSessionOpts } from '../pi_session.js';
 
 // Mock session id generator (used only when BUSYTOK_USE_MOCK_SIDECAR=1).
 let sessionCounter = 0;
@@ -18,7 +18,7 @@ function nextMockSessionId(): string {
  */
 const mockSessionFactory: SessionFactory = async (logical_subagent_id) => {
   const sid = nextMockSessionId();
-  return new PiSdkSession(noopSdkSession(sid), logical_subagent_id, sid);
+  return new PiSdkSession(noopSdkSession(sid), logical_subagent_id, sid, 'mock');
 };
 
 function noopSdkSession(id: string): SdkSession {
@@ -56,13 +56,39 @@ export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
 }
 
 /**
+ * Build `CreateSessionOpts` from `TurnAutoParams`. Used by both the mock and
+ * real paths so the pool always receives a complete opts object (the hit
+ * branch ignores it per spec §5.5; the miss branch threads it to the factory).
+ *
+ * `model` is optional on `TurnAutoParams` (mock path may omit it) but required
+ * on `CreateSessionOpts`; the mock path supplies a placeholder. The real path
+ * validates `model` is set before calling this helper.
+ */
+function buildSessionOpts(p: TurnAutoParams, modelFallback: string): CreateSessionOpts {
+  const opts: CreateSessionOpts = {
+    cwd: p.cwd,
+    model: p.model ?? modelFallback,
+    provider_id: p.provider_id,
+    provider_kind: p.provider_kind,
+    provider_base_url: p.provider_base_url,
+    provider_api_key: p.provider_api_key,
+    model_reasoning: p.model_reasoning,
+    model_context_window: p.model_context_window,
+    model_max_tokens: p.model_max_tokens,
+    ...(p.model_display_name ? { model_display_name: p.model_display_name } : {}),
+    ...(p.tools ? { tools: p.tools } : {}),
+  };
+  return opts;
+}
+
+/**
  * Mock path — preserves the Phase 1 mock behavior (hardcoded usage, mock
  * adapter_session_ids) so Rust-side e2e tests run without credentials.
  */
 async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
   const { session, reused } = await pool.ensure(
     p.logical_subagent_id,
-    { cwd: p.cwd, model: p.model, tools: p.tools },
+    buildSessionOpts(p, 'mock-model'),
     mockSessionFactory,
   );
   const now = Date.now();
@@ -102,12 +128,13 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
  * error codes by `PiSdkSession.sendTurn` (auth/rate-limit/network/timeout).
  */
 async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
-  const { session, reused } = await pool.ensure(p.logical_subagent_id, {
-    cwd: p.cwd,
-    model: p.model,
-    provider_id: p.provider_id,
-    tools: p.tools,
-  });
+  if (!p.model) {
+    throw new SidecarError('model is required for real SDK path', -32602);
+  }
+  const { session, reused } = await pool.ensure(
+    p.logical_subagent_id,
+    buildSessionOpts(p, p.model),
+  );
   const result = await session.sendTurn(p.prompt, {
     model: p.model,
     provider_id: p.provider_id,
