@@ -187,12 +187,26 @@ export function ModelsSection() {
   const { createModel, updateModel, deleteModel, tagsUpdate } =
     useModelMutations();
 
-  // Create-form state.
+  // Create-form state. `context_window` + `max_tokens` are required
+  // metadata (Spec §6.1) — the submit handler blocks create when either
+  // is missing. `display_name` + `reasoning` are optional.
   const [createForm, setCreateForm] = useState<{
     providerId: string;
     modelId: string;
     tags: string;
-  }>({ providerId: "", modelId: "", tags: "" });
+    context_window: number | undefined;
+    max_tokens: number | undefined;
+    display_name: string;
+    reasoning: boolean;
+  }>({
+    providerId: "",
+    modelId: "",
+    tags: "",
+    context_window: undefined,
+    max_tokens: undefined,
+    display_name: "",
+    reasoning: false,
+  });
   const [mutationError, setMutationError] = useState<string | null>(null);
 
   const providers = useMemo(
@@ -210,12 +224,24 @@ export function ModelsSection() {
       setMutationError("Model ID cannot be empty.");
       return;
     }
+    if (createForm.context_window === undefined) {
+      setMutationError("Context window is required.");
+      return;
+    }
+    if (createForm.max_tokens === undefined) {
+      setMutationError("Max tokens is required.");
+      return;
+    }
     setMutationError(null);
     const payload: ModelCreateRequestDto = {
       provider_id: createForm.providerId,
       model_id: modelId,
       enabled: true,
       tags: parseTags(createForm.tags),
+      context_window: createForm.context_window,
+      max_tokens: createForm.max_tokens,
+      display_name: createForm.display_name.trim() || null,
+      reasoning: createForm.reasoning,
     };
     createModel.mutate(payload, {
       onSuccess: (entry: ModelCatalogEntryDto) => {
@@ -228,7 +254,15 @@ export function ModelsSection() {
             model_id: entry.model_id,
           },
         });
-        setCreateForm({ providerId: "", modelId: "", tags: "" });
+        setCreateForm({
+          providerId: "",
+          modelId: "",
+          tags: "",
+          context_window: undefined,
+          max_tokens: undefined,
+          display_name: "",
+          reasoning: false,
+        });
       },
       onError: (err: unknown) => {
         setMutationError((err as Error)?.message ?? String(err));
@@ -239,10 +273,16 @@ export function ModelsSection() {
   const handleToggle = useCallback(
     (model: ModelCatalogEntryDto) => {
       setMutationError(null);
+      // Three-state contract: only `enabled` is patched; the metadata
+      // fields are sent as `null` (= "no change" on the wire).
       updateModel.mutate(
         {
           id: model.model_db_id,
           enabled: !model.model_enabled,
+          display_name: null,
+          reasoning: null,
+          context_window: null,
+          max_tokens: null,
         },
         {
           onError: (err: unknown) => {
@@ -397,7 +437,7 @@ export function ModelsSection() {
         <SettingsRow
           layout="vertical"
           label="Add Model"
-          description="Register a new OpenAI-style model ID under a provider."
+          description="Register a new model ID under a provider. Context window + max tokens are required metadata (spec §6.1)."
           control={
             <SettingsActionGroup direction="col">
               <select
@@ -427,6 +467,56 @@ export function ModelsSection() {
                   setCreateForm((prev) => ({ ...prev, modelId: v }));
                 }}
               />
+              <input
+                type="number"
+                className="input"
+                aria-label="Context window"
+                placeholder="Context window (required)"
+                value={createForm.context_window ?? ""}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({
+                    ...prev,
+                    context_window: v ? Number(v) : undefined,
+                  }));
+                }}
+              />
+              <input
+                type="number"
+                className="input"
+                aria-label="Max tokens"
+                placeholder="Max tokens (required)"
+                value={createForm.max_tokens ?? ""}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({
+                    ...prev,
+                    max_tokens: v ? Number(v) : undefined,
+                  }));
+                }}
+              />
+              <input
+                type="text"
+                className="input"
+                aria-label="Display name"
+                placeholder="Display name (optional, falls back to model id)"
+                value={createForm.display_name}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({ ...prev, display_name: v }));
+                }}
+              />
+              <label>
+                <input
+                  type="checkbox"
+                  checked={createForm.reasoning}
+                  onChange={(e) => {
+                    const v = e.currentTarget.checked;
+                    setCreateForm((prev) => ({ ...prev, reasoning: v }));
+                  }}
+                />
+                Reasoning
+              </label>
               <input
                 type="text"
                 className="input"

@@ -263,20 +263,52 @@ describe("createBusytokClient", () => {
   it("requests model create", async () => {
     const invoke = vi.fn().mockResolvedValue({ model_db_id: "m-1" });
     const client = createBusytokClient({ invoke });
-    await client.modelCreate({ provider_id: "deepseek", model_id: "deepseek-chat", enabled: true, tags: ["chat"] });
+    await client.modelCreate({
+      provider_id: "deepseek",
+      model_id: "deepseek-chat",
+      enabled: true,
+      tags: ["chat"],
+      context_window: 64000,
+      max_tokens: 8192,
+      display_name: null,
+      reasoning: false,
+    });
     expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
       method: "model.create",
-      params: { provider_id: "deepseek", model_id: "deepseek-chat", enabled: true, tags: ["chat"] },
+      params: {
+        provider_id: "deepseek",
+        model_id: "deepseek-chat",
+        enabled: true,
+        tags: ["chat"],
+        context_window: 64000,
+        max_tokens: 8192,
+        display_name: null,
+        reasoning: false,
+      },
     }));
   });
 
   it("requests model update", async () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
     const client = createBusytokClient({ invoke });
-    await client.modelUpdate({ id: "m-1", enabled: false });
+    await client.modelUpdate({
+      id: "m-1",
+      enabled: false,
+      display_name: null,
+      reasoning: null,
+      context_window: null,
+      max_tokens: null,
+    });
     expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
       method: "model.update",
-      params: { id: "m-1", enabled: false },
+      params: {
+        id: "m-1",
+        enabled: false,
+        display_name: null,
+        reasoning: null,
+        context_window: null,
+        max_tokens: null,
+      },
     }));
   });
 

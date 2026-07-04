@@ -53,6 +53,10 @@ function makeModel(overrides: Partial<ModelCatalogEntryDto> = {}): ModelCatalogE
     model_id: "deepseek-chat",
     model_enabled: true,
     tags: ["chat"],
+    display_name: null,
+    reasoning: false,
+    context_window: null,
+    max_tokens: null,
     ...overrides,
   };
 }
@@ -280,6 +284,90 @@ describe("ModelsSection", () => {
     expect(screen.getByText(/model id cannot be empty/i)).toBeTruthy();
   });
 
+  it("renders context_window and max_tokens as required inputs in the create form", () => {
+    renderSection();
+    expect(screen.getByPlaceholderText(/context window/i)).toBeTruthy();
+    expect(screen.getByPlaceholderText(/max tokens/i)).toBeTruthy();
+    // Optional metadata inputs are also rendered.
+    expect(screen.getByPlaceholderText(/display name/i)).toBeTruthy();
+    expect(screen.getByLabelText(/reasoning/i)).toBeTruthy();
+  });
+
+  it("blocks model create when context_window is missing", () => {
+    const createMutate = vi.fn();
+    mockUseModelMutations.mockReturnValue(mockMutations({ createMutate }));
+    renderSection();
+    fireEvent.change(screen.getByLabelText(/provider for new model/i), {
+      target: { value: "deepseek" },
+    });
+    fireEvent.change(screen.getByLabelText(/^model id$/i), {
+      target: { value: "deepseek-chat" },
+    });
+    // Fill max_tokens but leave context_window empty.
+    fireEvent.change(screen.getByLabelText(/max tokens/i), {
+      target: { value: "8192" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /add model/i }));
+    expect(screen.getByText(/context window is required/i)).toBeTruthy();
+    expect(createMutate).not.toHaveBeenCalled();
+  });
+
+  it("blocks model create when max_tokens is missing", () => {
+    const createMutate = vi.fn();
+    mockUseModelMutations.mockReturnValue(mockMutations({ createMutate }));
+    renderSection();
+    fireEvent.change(screen.getByLabelText(/provider for new model/i), {
+      target: { value: "deepseek" },
+    });
+    fireEvent.change(screen.getByLabelText(/^model id$/i), {
+      target: { value: "deepseek-chat" },
+    });
+    // Fill context_window but leave max_tokens empty.
+    fireEvent.change(screen.getByLabelText(/context window/i), {
+      target: { value: "64000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /add model/i }));
+    expect(screen.getByText(/max tokens is required/i)).toBeTruthy();
+    expect(createMutate).not.toHaveBeenCalled();
+  });
+
+  it("submits display_name + reasoning from the create form when provided", () => {
+    const createMutate = vi.fn(
+      (
+        _payload: unknown,
+        opts?: { onSuccess?: (entry: ModelCatalogEntryDto) => void },
+      ) => {
+        opts?.onSuccess?.(makeModel({ model_db_id: "m-new" }));
+      },
+    );
+    mockUseModelMutations.mockReturnValue(mockMutations({ createMutate }));
+    renderSection();
+    fireEvent.change(screen.getByLabelText(/provider for new model/i), {
+      target: { value: "deepseek" },
+    });
+    fireEvent.change(screen.getByLabelText(/^model id$/i), {
+      target: { value: "deepseek-chat" },
+    });
+    fireEvent.change(screen.getByLabelText(/context window/i), {
+      target: { value: "64000" },
+    });
+    fireEvent.change(screen.getByLabelText(/max tokens/i), {
+      target: { value: "8192" },
+    });
+    fireEvent.change(screen.getByLabelText(/display name/i), {
+      target: { value: "DeepSeek Chat" },
+    });
+    fireEvent.click(screen.getByLabelText(/reasoning/i));
+    fireEvent.click(screen.getByRole("button", { name: /add model/i }));
+    expect(createMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        display_name: "DeepSeek Chat",
+        reasoning: true,
+      }),
+      expect.anything(),
+    );
+  });
+
   it("submits the create form and calls createModel.mutate with the parsed payload", () => {
     const createMutate = vi.fn(
       (
@@ -300,6 +388,12 @@ describe("ModelsSection", () => {
     fireEvent.change(screen.getByLabelText(/^model id$/i), {
       target: { value: "deepseek-chat" },
     });
+    fireEvent.change(screen.getByLabelText(/context window/i), {
+      target: { value: "64000" },
+    });
+    fireEvent.change(screen.getByLabelText(/max tokens/i), {
+      target: { value: "8192" },
+    });
     fireEvent.change(screen.getByLabelText(/tags for new model/i), {
       target: { value: "chat, reasoning" },
     });
@@ -311,6 +405,10 @@ describe("ModelsSection", () => {
         model_id: "deepseek-chat",
         enabled: true,
         tags: ["chat", "reasoning"],
+        context_window: 64000,
+        max_tokens: 8192,
+        display_name: null,
+        reasoning: false,
       }),
       expect.anything(),
     );
@@ -336,6 +434,12 @@ describe("ModelsSection", () => {
     fireEvent.change(screen.getByLabelText(/^model id$/i), {
       target: { value: "deepseek-chat" },
     });
+    fireEvent.change(screen.getByLabelText(/context window/i), {
+      target: { value: "64000" },
+    });
+    fireEvent.change(screen.getByLabelText(/max tokens/i), {
+      target: { value: "8192" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /add model/i }));
     expect(screen.getByText("model create failed")).toBeTruthy();
   });
@@ -354,7 +458,14 @@ describe("ModelsSection", () => {
     const toggle = screen.getByLabelText(/toggle deepseek-chat/i);
     fireEvent.click(toggle);
     expect(updateMutate).toHaveBeenCalledWith(
-      { id: "m-1", enabled: false },
+      {
+        id: "m-1",
+        enabled: false,
+        display_name: null,
+        reasoning: null,
+        context_window: null,
+        max_tokens: null,
+      },
       expect.anything(),
     );
   });

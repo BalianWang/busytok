@@ -208,20 +208,56 @@ describe("ProvidersPage", () => {
     expect(screen.getByRole("button", { name: /add provider/i })).toBeTruthy();
   });
 
-  it("shows the create form with only Name, Base URL, API Key fields (no id/env-name/models)", () => {
+  it("shows the create form with Name, Base URL, API Key, Kind fields (no id/env-name/models)", () => {
     renderPage();
     fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
     // Editable fields present.
     expect(screen.getByLabelText(/^name$/i)).toBeTruthy();
     expect(screen.getByLabelText(/base url/i)).toBeTruthy();
     expect(screen.getByLabelText(/^api key$/i)).toBeTruthy();
+    expect(screen.getByLabelText(/^kind$/i)).toBeTruthy();
     // Removed fields are NOT rendered as inputs.
     expect(screen.queryByLabelText(/provider id/i)).toBeNull();
     expect(screen.queryByLabelText(/api key env name/i)).toBeNull();
     expect(screen.queryByLabelText(/^models$/i)).toBeNull();
   });
 
-  it("submits the create form with provider_kind hardcoded and no id/api_key_env_name/models", () => {
+  it("renders provider_kind selector with both options", () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
+    const selector = screen.getByLabelText(/^kind$/i) as HTMLSelectElement;
+    expect(selector).toBeTruthy();
+    const options = Array.from(selector.options);
+    const optionValues = options.map((o) => o.value);
+    expect(optionValues).toContain("openai_compatible");
+    expect(optionValues).toContain("anthropic_compatible");
+    // Default is empty (placeholder) — submit is blocked.
+    expect(selector.value).toBe("");
+  });
+
+  it("blocks create when provider_kind is not selected", () => {
+    const createMutate = vi.fn();
+    mockUseProviderMutations.mockReturnValue(
+      mockMutations({ createMutate }),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
+    fireEvent.change(screen.getByLabelText(/^name$/i), {
+      target: { value: "OpenAI" },
+    });
+    fireEvent.change(screen.getByLabelText(/base url/i), {
+      target: { value: "https://api.openai.com/v1" },
+    });
+    fireEvent.change(screen.getByLabelText(/^api key$/i), {
+      target: { value: "sk-test" },
+    });
+    // Leave provider_kind empty (default).
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(createMutate).not.toHaveBeenCalled();
+    expect(screen.getByText(/select a provider kind before saving/i)).toBeTruthy();
+  });
+
+  it("submits the create form with provider_kind from the selector", () => {
     const createMutate = vi.fn(
       (_payload: unknown, opts?: { onSuccess?: () => void }) => {
         opts?.onSuccess?.();
@@ -242,6 +278,9 @@ describe("ProvidersPage", () => {
     fireEvent.change(screen.getByLabelText(/^api key$/i), {
       target: { value: "sk-test" },
     });
+    fireEvent.change(screen.getByLabelText(/^kind$/i), {
+      target: { value: "anthropic_compatible" },
+    });
 
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
 
@@ -250,7 +289,7 @@ describe("ProvidersPage", () => {
     // Required fields.
     expect(arg).toMatchObject({
       name: "OpenAI",
-      provider_kind: "openai_compatible",
+      provider_kind: "anthropic_compatible",
       base_url: "https://api.openai.com/v1",
       api_key: "sk-test",
     });
@@ -276,6 +315,9 @@ describe("ProvidersPage", () => {
     });
     fireEvent.change(screen.getByLabelText(/base url/i), {
       target: { value: "https://api.example.com/v1" },
+    });
+    fireEvent.change(screen.getByLabelText(/^kind$/i), {
+      target: { value: "openai_compatible" },
     });
     // Leave api_key empty.
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
@@ -439,7 +481,7 @@ describe("ProvidersPage", () => {
     expect(arg.api_key).toBeUndefined();
   });
 
-  it("clicking Edit shows the inline form pre-filled (Name + Base URL only); Provider ID is read-only", () => {
+  it("clicking Edit shows the inline form pre-filled (Name + Base URL + Kind); Provider ID is read-only", () => {
     mockUseProviders.mockReturnValue(
       mockProvidersQuery(
         makeListResponse([
@@ -462,6 +504,10 @@ describe("ProvidersPage", () => {
     expect(
       (screen.getByLabelText(/base url/i) as HTMLInputElement).value,
     ).toBe("https://api.deepseek.com/v1");
+    // Provider kind selector is pre-filled.
+    expect(
+      (screen.getByLabelText(/^kind$/i) as HTMLSelectElement).value,
+    ).toBe("openai_compatible");
     // Provider ID is shown read-only as text (not as an input).
     expect(screen.getByText("deepseek-prod")).toBeTruthy();
     expect(screen.queryByLabelText(/provider id/i)).toBeNull();
@@ -472,7 +518,7 @@ describe("ProvidersPage", () => {
     expect(screen.queryByLabelText(/^models$/i)).toBeNull();
   });
 
-  it("submitting the edit form calls updateProvider.mutate with only id+name+base_url (omitted api_key/enabled)", () => {
+  it("submitting the edit form calls updateProvider.mutate with id+name+base_url+provider_kind (omitted api_key/enabled)", () => {
     const updateMutate = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     });
@@ -484,6 +530,7 @@ describe("ProvidersPage", () => {
             id: "deepseek-prod",
             name: "DeepSeek",
             base_url: "https://api.deepseek.com/v1",
+            provider_kind: "openai_compatible",
           }),
         ]),
       ),
@@ -494,16 +541,21 @@ describe("ProvidersPage", () => {
     fireEvent.change(screen.getByLabelText(/^name$/i), {
       target: { value: "DeepSeek Renamed" },
     });
+    fireEvent.change(screen.getByLabelText(/^kind$/i), {
+      target: { value: "anthropic_compatible" },
+    });
 
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
 
     expect(updateMutate).toHaveBeenCalledTimes(1);
     const arg = updateMutate.mock.calls[0][0] as Record<string, unknown>;
-    // Three-state api_key contract: only id + name + base_url in the patch.
+    // Three-state api_key contract: id + name + base_url + provider_kind in
+    // the patch.
     expect(arg).toMatchObject({
       id: "deepseek-prod",
       name: "DeepSeek Renamed",
       base_url: "https://api.deepseek.com/v1",
+      provider_kind: "anthropic_compatible",
     });
     // Omitted fields are absent (no api_key, no enabled, no env names, no models).
     expect(arg.api_key).toBeUndefined();
@@ -689,6 +741,9 @@ describe("ProvidersPage", () => {
     });
     fireEvent.change(screen.getByLabelText(/base url/i), {
       target: { value: "https://api.openai.com/v1" },
+    });
+    fireEvent.change(screen.getByLabelText(/^kind$/i), {
+      target: { value: "openai_compatible" },
     });
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
     expect(screen.getByText("create failed")).toBeTruthy();

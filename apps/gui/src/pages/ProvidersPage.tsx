@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import type {
   ProviderCreateRequestDto,
   ProviderDto,
+  ProviderKind,
   ProviderTestConnectionResponseDto,
   ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
@@ -17,21 +18,27 @@ import { reportFrontendEventSafely } from "../logging/safeReporter";
 
 // ── Provider form (inline add + inline edit) ────────────────────────
 //
-// Create fields (Spec §3.2): name, base_url, api_key (password).
-// `provider_kind` is hardcoded to "openai_compatible" (the only variant)
-// in the create payload — no UI input (YAGNI).
+// Create fields (Spec §3.2): name, base_url, api_key (password),
+// provider_kind (selector — openai_compatible / anthropic_compatible).
 // `id` is system-generated (UUID v4) by the backend; the form never
 // collects it.
 //
-// Edit fields: name, base_url only. `enabled` has its own toggle on the
-// row; `api_key` has its own Update Key flow; `provider_kind` / `id`
-// are immutable.
+// Edit fields: name, base_url, provider_kind. `enabled` has its own
+// toggle on the row; `api_key` has its own Update Key flow; `id` is
+// immutable. Per Spec §7.1, patching `provider_kind` is allowed and
+// kills the worker so the next delegate re-spawns with the new API
+// shape — so the edit form exposes it as a selector.
 
 interface ProviderFormState {
   name: string;
   base_url: string;
   api_key: string;
   enabled: boolean;
+  /**
+   * Empty string until the user picks a kind from the selector. The
+   * submit handler blocks create when this is "".
+   */
+  provider_kind: ProviderKind | "";
 }
 
 const EMPTY_FORM: ProviderFormState = {
@@ -39,6 +46,7 @@ const EMPTY_FORM: ProviderFormState = {
   base_url: "",
   api_key: "",
   enabled: true,
+  provider_kind: "",
 };
 
 interface ProviderFormProps {
@@ -113,6 +121,27 @@ function ProviderForm({
           }
         />
       )}
+      <SettingsRow
+        layout="vertical"
+        label="Kind"
+        description="API shape: OpenAI-compatible (chat/completions) or Anthropic-compatible (messages)."
+        control={
+          <select
+            className="input"
+            aria-label="Kind"
+            value={form.provider_kind}
+            onChange={(e) =>
+              onChange({
+                provider_kind: e.currentTarget.value as ProviderKind | "",
+              })
+            }
+          >
+            <option value="">— Select kind —</option>
+            <option value="openai_compatible">OpenAI Compatible</option>
+            <option value="anthropic_compatible">Anthropic Compatible</option>
+          </select>
+        }
+      />
       {mode === "create" && (
         <SettingsRow
           label="Enabled"
@@ -121,6 +150,7 @@ function ProviderForm({
             <ToggleSwitch
               checked={form.enabled}
               onChange={(checked) => onChange({ enabled: checked })}
+              aria-label="Enabled"
             />
           }
         />
@@ -367,12 +397,16 @@ export function ProvidersPage() {
   }, []);
 
   const handleFormSubmit = useCallback(() => {
-    // Create payload (Spec §3.2): name + base_url + api_key. provider_kind
-    // is hardcoded to the only variant; id is system-generated. Empty
-    // api_key is sent as null (Some(None) = "no key on create").
+    // Create payload (Spec §3.2): name + base_url + api_key + provider_kind.
+    // id is system-generated. Empty api_key is sent as null
+    // (Some(None) = "no key on create").
+    if (form.provider_kind === "") {
+      setMutationError("Select a provider kind before saving.");
+      return;
+    }
     const payload: ProviderCreateRequestDto = {
       name: form.name.trim(),
-      provider_kind: "openai_compatible",
+      provider_kind: form.provider_kind,
       base_url: form.base_url.trim(),
       enabled: form.enabled,
       api_key: form.api_key.length > 0 ? form.api_key : null,
@@ -407,6 +441,8 @@ export function ProvidersPage() {
       name: provider.name,
       base_url: provider.base_url,
       api_key: "", // unused in edit mode (separate Update Key flow)
+      enabled: provider.enabled,
+      provider_kind: provider.provider_kind,
     });
     setEditingId(provider.id);
   }, []);
@@ -418,16 +454,22 @@ export function ProvidersPage() {
   const handleEditSubmit = useCallback(() => {
     if (editingId === null) return;
     const id = editingId;
+    if (editForm.provider_kind === "") {
+      setMutationError("Select a provider kind before saving.");
+      return;
+    }
     setMutationError(null);
     // Three-state api_key contract: OMIT api_key/enabled from the patch
-    // so the backend treats them as "no change". Only name + base_url are
-    // editable in the inline form. Cast `as ProviderUpdateRequestDto` —
-    // the generated TS type marks the omitted fields as required (`|
-    // null`), but the wire protocol treats absent keys as `None`.
+    // so the backend treats them as "no change". Only name + base_url +
+    // provider_kind are editable in the inline form. Cast `as
+    // ProviderUpdateRequestDto` — the generated TS type marks the omitted
+    // fields as required (`| null`), but the wire protocol treats absent
+    // keys as `None`.
     const payload = {
       id,
       name: editForm.name.trim(),
       base_url: editForm.base_url.trim(),
+      provider_kind: editForm.provider_kind,
     } as ProviderUpdateRequestDto;
     updateProvider.mutate(payload, {
       onSuccess: () => {
