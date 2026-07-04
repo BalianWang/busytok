@@ -1029,7 +1029,10 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
             serde_json::json!({"provider_id": "p1", "model_id": "m1"}),
         ),
         ("model.list", serde_json::json!({})),
-        ("model.update", serde_json::json!({"id": "m1", "enabled": false})),
+        (
+            "model.update",
+            serde_json::json!({"id": "m1", "enabled": false}),
+        ),
         ("model.delete", serde_json::json!({"id": "m1"})),
         (
             "model.tags.update",

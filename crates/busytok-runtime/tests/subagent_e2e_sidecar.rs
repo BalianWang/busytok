@@ -1266,9 +1266,11 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
             .execute(
                 "INSERT INTO subagent_logical_subagents \
                  (id, name, project_id, repo_path, repo_hash, intent, default_profile, \
+                  bound_provider_id, bound_model_id, \
                   status, created_at_ms, updated_at_ms, last_active_at_ms) \
                  VALUES ('stale_sub', 'stale-test', 'proj', '/repo', 'hash', 'test', \
-                         'pi/search-cheap', 'warm', ?1, ?1, ?1)",
+                         'pi/search-cheap', 'legacy', 'legacy-model', \
+                         'warm', ?1, ?1, ?1)",
                 rusqlite::params![stale_ms],
             )
             .unwrap();
@@ -1857,6 +1859,8 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
                     intent: None,
                     default_profile: "pi/search-cheap".into(),
                     default_model: None,
+                    bound_provider_id: "test-provider".into(),
+                    bound_model_id: "test-model".into(),
                     status: "cold".into(),
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,

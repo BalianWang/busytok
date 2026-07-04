@@ -1583,7 +1583,11 @@ pub struct ProviderUpdateRequestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     // None=不改, Some(None)=清除, Some(Some(k))=更新
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_some")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
     #[ts(type = "string | null | undefined")]
     pub api_key: Option<Option<String>>,
 }
@@ -1977,10 +1981,9 @@ mod tests {
         assert!(minimal.tags.is_empty());
         assert!(!minimal.include_disabled);
 
-        let full: ModelListRequestDto = serde_json::from_str(
-            r#"{"provider_id":"p","tags":["fast"],"include_disabled":true}"#,
-        )
-        .unwrap();
+        let full: ModelListRequestDto =
+            serde_json::from_str(r#"{"provider_id":"p","tags":["fast"],"include_disabled":true}"#)
+                .unwrap();
         assert_eq!(full.provider_id.as_deref(), Some("p"));
         assert_eq!(full.tags, vec!["fast".to_string()]);
         assert!(full.include_disabled);

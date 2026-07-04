@@ -9,13 +9,15 @@ use ts_rs::TS;
 pub enum ProviderKind {
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "anthropic_compatible")]
+    AnthropicCompatible,
 }
 
 /// Provider — connection config + credential. Stored in SQL `providers` table.
 /// `api_key` is the plaintext key; DTOs never expose it (use `ProviderSummary`).
 #[derive(Debug, Clone)]
 pub struct Provider {
-    pub id: String,  // UUID v4, 系统生成（store 层生成，不由用户提供）
+    pub id: String, // UUID v4, 系统生成（store 层生成，不由用户提供）
     pub name: String,
     pub provider_kind: ProviderKind,
     pub base_url: String,
@@ -57,10 +59,14 @@ impl From<&Provider> for ProviderSummary {
 /// `model_id` is immutable after creation (no rename).
 #[derive(Debug, Clone)]
 pub struct Model {
-    pub id: String,           // DB primary key (UUID)
-    pub provider_id: String,  // FK -> providers.id
-    pub model_id: String,     // immutable, e.g. "gpt-4o"
+    pub id: String,          // DB primary key (UUID)
+    pub provider_id: String, // FK -> providers.id
+    pub model_id: String,    // immutable, e.g. "gpt-4o"
     pub enabled: bool,
+    pub display_name: Option<String>,
+    pub reasoning: bool,
+    pub context_window: Option<i64>,
+    pub max_tokens: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -68,7 +74,7 @@ pub struct Model {
 /// Tag row — many-to-many between models and tag strings.
 #[derive(Debug, Clone)]
 pub struct ModelTag {
-    pub model_id: String,  // FK -> models.id
+    pub model_id: String, // FK -> models.id
     pub tag: String,
 }
 
@@ -83,6 +89,10 @@ pub struct ModelCatalogEntry {
     pub model_id: String,
     pub model_enabled: bool,
     pub tags: Vec<String>,
+    pub display_name: Option<String>,
+    pub reasoning: bool,
+    pub context_window: Option<i64>,
+    pub max_tokens: Option<i64>,
 }
 
 /// Filter for `list_models_filtered`.
@@ -90,7 +100,7 @@ pub struct ModelCatalogEntry {
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalogFilter {
     pub provider_id: Option<String>,
-    pub tags: Vec<String>,      // AND semantics
+    pub tags: Vec<String>, // AND semantics
     pub include_disabled: bool,
 }
 
@@ -113,6 +123,35 @@ mod tests {
         assert_eq!(json, "\"openai_compatible\"");
         let parsed: ProviderKind = serde_json::from_str("\"openai_compatible\"").unwrap();
         assert_eq!(parsed, ProviderKind::OpenAiCompatible);
+    }
+
+    #[test]
+    fn provider_kind_serde_anthropic_compatible() {
+        let json = serde_json::to_string(&ProviderKind::AnthropicCompatible).unwrap();
+        assert_eq!(json, "\"anthropic_compatible\"");
+        let parsed: ProviderKind = serde_json::from_str("\"anthropic_compatible\"").unwrap();
+        assert_eq!(parsed, ProviderKind::AnthropicCompatible);
+    }
+
+    #[test]
+    fn model_struct_carries_metadata_fields() {
+        // Verifies the new fields exist on the Model struct (compile-time check)
+        let m = Model {
+            id: "db-1".into(),
+            provider_id: "p1".into(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            display_name: Some("GPT-4o".into()),
+            reasoning: false,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        };
+        assert_eq!(m.display_name.as_deref(), Some("GPT-4o"));
+        assert!(!m.reasoning);
+        assert_eq!(m.context_window, Some(128000));
+        assert_eq!(m.max_tokens, Some(16384));
     }
 
     #[test]

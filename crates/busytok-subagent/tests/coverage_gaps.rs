@@ -30,8 +30,8 @@ use busytok_config::SubagentResourcePolicyConfig;
 use busytok_store::Database;
 use busytok_subagent::pressure::{PressureAction, PressureGate, PressureResponder};
 use busytok_subagent::sidecar::{
-    PiSidecarSupervisor, ProviderRuntimeEntry, ResponderFactory, SidecarConfig,
-    SidecarError, SidecarRpcClient, SidecarTaskExecutor, WorkerPool,
+    PiSidecarSupervisor, ProviderRuntimeEntry, ResponderFactory, SidecarConfig, SidecarError,
+    SidecarRpcClient, SidecarTaskExecutor, WorkerPool,
 };
 use tokio::process::Command;
 

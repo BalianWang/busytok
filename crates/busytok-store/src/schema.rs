@@ -2,7 +2,7 @@
 ///
 /// The baseline schema is applied as a single migration when a new database
 /// is created. Future schema changes will increment from v1.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// SQL to create the schema version tracking table.
 pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
@@ -40,6 +40,13 @@ const SUBAGENT_TASK_ERROR_KIND_SQL: &str =
 /// SQL provider credential storage.
 const PROVIDER_CATALOG_SQL: &str = include_str!("../migrations/0006_provider_catalog.sql");
 
+/// v7 subagent-route-binding + model-metadata migration SQL — adds
+/// `display_name` / `reasoning` / `context_window` / `max_tokens` to `models`,
+/// and rebuilds `subagent_logical_subagents` with NOT NULL
+/// `bound_provider_id` + `bound_model_id` (drops `default_model`).
+const SUBAGENT_ROUTE_BINDING_AND_MODEL_METADATA_SQL: &str =
+    include_str!("../migrations/0007_subagent_route_binding_and_model_metadata.sql");
+
 /// All migrations in order, from the v1 baseline through the latest version.
 pub fn migrations() -> Vec<(u32, &'static str)> {
     vec![
@@ -49,5 +56,6 @@ pub fn migrations() -> Vec<(u32, &'static str)> {
         (4, SUBAGENT_TASK_FIELDS_SQL),
         (5, SUBAGENT_TASK_ERROR_KIND_SQL),
         (6, PROVIDER_CATALOG_SQL),
+        (7, SUBAGENT_ROUTE_BINDING_AND_MODEL_METADATA_SQL),
     ]
 }

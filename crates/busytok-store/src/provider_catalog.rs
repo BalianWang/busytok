@@ -23,6 +23,7 @@ pub struct UpdateProviderPatch {
     pub name: Option<String>,
     pub base_url: Option<String>,
     pub enabled: Option<bool>,
+    pub provider_kind: Option<ProviderKind>,
     // None=不改, Some(None)=清除, Some(Some(k))=更新
     pub api_key: Option<Option<String>>,
 }
@@ -32,11 +33,19 @@ pub struct CreateModelReq {
     pub model_id: String,
     pub enabled: bool,
     pub tags: Vec<String>,
+    pub display_name: Option<String>,
+    pub reasoning: Option<bool>,
+    pub context_window: Option<i64>,
+    pub max_tokens: Option<i64>,
 }
 
 // UpdateModelPatch only has enabled — model_id is immutable
 pub struct UpdateModelPatch {
     pub enabled: Option<bool>,
+    pub display_name: Option<String>,
+    pub reasoning: Option<bool>,
+    pub context_window: Option<i64>,
+    pub max_tokens: Option<i64>,
 }
 
 // ── CRUD: providers ────────────────────────────────────────────────────
@@ -72,44 +81,81 @@ pub fn create_provider(conn: &Connection, req: CreateProviderReq) -> Result<Prov
         .ok_or_else(|| anyhow!("provider {} not found after insert", id))
 }
 
-pub fn update_provider(conn: &Connection, id: &str, patch: UpdateProviderPatch) -> Result<Provider> {
+pub fn update_provider(
+    conn: &Connection,
+    id: &str,
+    patch: UpdateProviderPatch,
+) -> Result<Provider> {
     // Verify provider exists first
-    let exists: bool = conn.query_row(
-        "SELECT 1 FROM providers WHERE id = ?1", params![id],
-        |_| Ok(true)
-    ).optional()?.is_some();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM providers WHERE id = ?1", params![id], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .is_some();
     if !exists {
         bail!("provider not found: {}", id);
     }
     let now = busytok_domain::now_ms();
     let tx = conn.unchecked_transaction()?;
     if let Some(name) = &patch.name {
-        tx.execute("UPDATE providers SET name = ?1, updated_at_ms = ?2 WHERE id = ?3", params![name, now, id])?;
+        tx.execute(
+            "UPDATE providers SET name = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![name, now, id],
+        )?;
     }
     if let Some(base_url) = &patch.base_url {
-        tx.execute("UPDATE providers SET base_url = ?1, updated_at_ms = ?2 WHERE id = ?3", params![base_url, now, id])?;
+        tx.execute(
+            "UPDATE providers SET base_url = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![base_url, now, id],
+        )?;
     }
     if let Some(enabled) = patch.enabled {
-        tx.execute("UPDATE providers SET enabled = ?1, updated_at_ms = ?2 WHERE id = ?3", params![enabled as i64, now, id])?;
+        tx.execute(
+            "UPDATE providers SET enabled = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![enabled as i64, now, id],
+        )?;
+    }
+    if let Some(kind) = &patch.provider_kind {
+        let kind_json = serde_json::to_string(kind)
+            .map_err(|e| anyhow!("failed to serialize provider_kind: {}", e))?;
+        tx.execute(
+            "UPDATE providers SET provider_kind = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![kind_json, now, id],
+        )?;
     }
     match &patch.api_key {
         Some(None) => {
-            tx.execute("UPDATE providers SET api_key = NULL, updated_at_ms = ?1 WHERE id = ?2", params![now, id])?;
+            tx.execute(
+                "UPDATE providers SET api_key = NULL, updated_at_ms = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
         }
         Some(Some(api_key)) => {
-            tx.execute("UPDATE providers SET api_key = ?1, updated_at_ms = ?2 WHERE id = ?3", params![api_key, now, id])?;
+            tx.execute(
+                "UPDATE providers SET api_key = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                params![api_key, now, id],
+            )?;
         }
         None => {}
     }
     tx.commit()?;
     info!(event_code = "provider.updated", provider_id = %id, "provider updated");
-    get_provider_with_secret(conn, id)?.ok_or_else(|| anyhow!("provider {} not found after update", id))
+    get_provider_with_secret(conn, id)?
+        .ok_or_else(|| anyhow!("provider {} not found after update", id))
 }
 
-pub fn delete_provider(conn: &Connection, id: &str, profile_refs: &[ProfileModelRef]) -> Result<()> {
+pub fn delete_provider(
+    conn: &Connection,
+    id: &str,
+    profile_refs: &[ProfileModelRef],
+) -> Result<()> {
     if provider_has_profile_references(id, profile_refs) {
         let count = profile_refs.iter().filter(|r| r.provider_id == id).count();
-        bail!("cannot delete provider: {} profile(s) still reference it", count);
+        bail!(
+            "cannot delete provider: {} profile(s) still reference it",
+            count
+        );
     }
     let rows = conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
     if rows == 0 {
@@ -144,11 +190,22 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<ProviderSummary>> {
 pub fn create_model(conn: &Connection, req: CreateModelReq) -> Result<Model> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = busytok_domain::now_ms();
+    let reasoning = req.reasoning.unwrap_or(false) as i64;
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![id, req.provider_id, req.model_id, req.enabled as i64, now],
+        "INSERT INTO models (id, provider_id, model_id, enabled, display_name, reasoning, context_window, max_tokens, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![
+            id,
+            req.provider_id,
+            req.model_id,
+            req.enabled as i64,
+            req.display_name,
+            reasoning,
+            req.context_window,
+            req.max_tokens,
+            now,
+        ],
     )
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
@@ -175,23 +232,64 @@ pub fn create_model(conn: &Connection, req: CreateModelReq) -> Result<Model> {
 }
 
 pub fn update_model(conn: &Connection, id: &str, patch: UpdateModelPatch) -> Result<Model> {
+    let now = busytok_domain::now_ms();
+    let tx = conn.unchecked_transaction()?;
+    let mut dirty = false;
     if let Some(enabled) = patch.enabled {
-        let now = busytok_domain::now_ms();
-        let rows = conn.execute(
+        tx.execute(
             "UPDATE models SET enabled = ?1, updated_at_ms = ?2 WHERE id = ?3",
             params![enabled as i64, now, id],
         )?;
-        if rows == 0 {
-            bail!("model not found: {}", id);
-        }
-        info!(event_code = "model.updated", model_db_id = %id, enabled, "model updated");
+        dirty = true;
     }
+    if let Some(display_name) = &patch.display_name {
+        tx.execute(
+            "UPDATE models SET display_name = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![display_name, now, id],
+        )?;
+        dirty = true;
+    }
+    if let Some(reasoning) = patch.reasoning {
+        tx.execute(
+            "UPDATE models SET reasoning = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![reasoning as i64, now, id],
+        )?;
+        dirty = true;
+    }
+    if let Some(context_window) = patch.context_window {
+        tx.execute(
+            "UPDATE models SET context_window = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![context_window, now, id],
+        )?;
+        dirty = true;
+    }
+    if let Some(max_tokens) = patch.max_tokens {
+        tx.execute(
+            "UPDATE models SET max_tokens = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![max_tokens, now, id],
+        )?;
+        dirty = true;
+    }
+    if !dirty {
+        bail!("model update patch is empty");
+    }
+    // Verify the row exists (UPDATE may have affected 0 rows silently).
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM models WHERE id = ?1", params![id], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .is_some();
+    if !exists {
+        bail!("model not found: {}", id);
+    }
+    tx.commit()?;
+    info!(event_code = "model.updated", model_db_id = %id, "model updated");
     get_model_by_id(conn, id)?.ok_or_else(|| anyhow!("model {} not found after update", id))
 }
 
 pub fn delete_model(conn: &Connection, id: &str, profile_refs: &[ProfileModelRef]) -> Result<()> {
-    let model = get_model_by_id(conn, id)?
-        .ok_or_else(|| anyhow!("model not found: {}", id))?;
+    let model = get_model_by_id(conn, id)?.ok_or_else(|| anyhow!("model not found: {}", id))?;
     if model_has_profile_references(&model.provider_id, &model.model_id, profile_refs) {
         bail!("cannot delete model: profile(s) still reference it");
     }
@@ -205,7 +303,7 @@ pub fn delete_model(conn: &Connection, id: &str, profile_refs: &[ProfileModelRef
 
 pub fn get_model_by_id(conn: &Connection, id: &str) -> Result<Option<Model>> {
     let mut stmt = conn.prepare(
-        "SELECT id, provider_id, model_id, enabled, created_at_ms, updated_at_ms
+        "SELECT id, provider_id, model_id, enabled, display_name, reasoning, context_window, max_tokens, created_at_ms, updated_at_ms
          FROM models WHERE id = ?1",
     )?;
     Ok(stmt.query_row(params![id], row_to_model).optional()?)
@@ -217,15 +315,20 @@ pub fn get_model_by_provider_and_model_id(
     model_id: &str,
 ) -> Result<Option<Model>> {
     let mut stmt = conn.prepare(
-        "SELECT id, provider_id, model_id, enabled, created_at_ms, updated_at_ms
+        "SELECT id, provider_id, model_id, enabled, display_name, reasoning, context_window, max_tokens, created_at_ms, updated_at_ms
          FROM models WHERE provider_id = ?1 AND model_id = ?2",
     )?;
-    Ok(stmt.query_row(params![provider_id, model_id], row_to_model).optional()?)
+    Ok(stmt
+        .query_row(params![provider_id, model_id], row_to_model)
+        .optional()?)
 }
 
 // ── Catalog queries ────────────────────────────────────────────────────
 
-pub fn list_models_filtered(conn: &Connection, filter: ModelCatalogFilter) -> Result<Vec<ModelCatalogEntry>> {
+pub fn list_models_filtered(
+    conn: &Connection,
+    filter: ModelCatalogFilter,
+) -> Result<Vec<ModelCatalogEntry>> {
     let include_disabled = if filter.include_disabled { 1 } else { 0 };
     let provider_id = filter.provider_id.as_deref();
 
@@ -244,6 +347,7 @@ pub fn list_models_filtered(conn: &Connection, filter: ModelCatalogFilter) -> Re
     let sql = format!(
         "SELECT p.id, p.name, p.provider_kind, p.enabled,
                 m.id, m.model_id, m.enabled,
+                m.display_name, m.reasoning, m.context_window, m.max_tokens,
                 COALESCE(GROUP_CONCAT(mt.tag, ','), '') AS tags_csv
          FROM models m
          JOIN providers p ON p.id = m.provider_id
@@ -256,47 +360,63 @@ pub fn list_models_filtered(conn: &Connection, filter: ModelCatalogFilter) -> Re
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(include_disabled),
-        Box::new(provider_id),
-    ];
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(include_disabled), Box::new(provider_id)];
     for tag in &filter.tags {
         params_vec.push(Box::new(tag.clone()));
     }
-    let rows = stmt.query_map(params_from_iter(params_vec.iter().map(|b| b.as_ref())), |row| {
-        let tags_csv: String = row.get(7)?;
-        let tags: Vec<String> = if tags_csv.is_empty() {
-            vec![]
-        } else {
-            tags_csv.split(',').map(|s| s.to_string()).collect()
-        };
-        let kind_str: String = row.get(2)?;
-        let provider_kind: ProviderKind = serde_json::from_str(&kind_str).unwrap_or(ProviderKind::OpenAiCompatible);
-        Ok(ModelCatalogEntry {
-            provider_id: row.get(0)?,
-            provider_name: row.get(1)?,
-            provider_kind,
-            provider_enabled: row.get(3)?,
-            model_db_id: row.get(4)?,
-            model_id: row.get(5)?,
-            model_enabled: row.get(6)?,
-            tags,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params_from_iter(params_vec.iter().map(|b| b.as_ref())),
+        |row| {
+            let tags_csv: String = row.get(11)?;
+            let tags: Vec<String> = if tags_csv.is_empty() {
+                vec![]
+            } else {
+                tags_csv.split(',').map(|s| s.to_string()).collect()
+            };
+            let kind_str: String = row.get(2)?;
+            let provider_kind: ProviderKind =
+                serde_json::from_str(&kind_str).unwrap_or(ProviderKind::OpenAiCompatible);
+            Ok(ModelCatalogEntry {
+                provider_id: row.get(0)?,
+                provider_name: row.get(1)?,
+                provider_kind,
+                provider_enabled: row.get(3)?,
+                model_db_id: row.get(4)?,
+                model_id: row.get(5)?,
+                model_enabled: row.get(6)?,
+                display_name: row.get(7)?,
+                reasoning: row.get::<_, i64>(8)? != 0,
+                context_window: row.get(9)?,
+                max_tokens: row.get(10)?,
+                tags,
+            })
+        },
+    )?;
     let mut entries = Vec::new();
     for row in rows {
         entries.push(row?);
     }
-    debug!(event_code = "model.catalog.listed", entry_count = entries.len(), "model catalog listed");
+    debug!(
+        event_code = "model.catalog.listed",
+        entry_count = entries.len(),
+        "model catalog listed"
+    );
     Ok(entries)
 }
 
-pub fn list_models_by_provider(conn: &Connection, provider_id: &str) -> Result<Vec<ModelCatalogEntry>> {
-    list_models_filtered(conn, ModelCatalogFilter {
-        provider_id: Some(provider_id.to_string()),
-        tags: vec![],
-        include_disabled: true, // by-provider view shows all models
-    })
+pub fn list_models_by_provider(
+    conn: &Connection,
+    provider_id: &str,
+) -> Result<Vec<ModelCatalogEntry>> {
+    list_models_filtered(
+        conn,
+        ModelCatalogFilter {
+            provider_id: Some(provider_id.to_string()),
+            tags: vec![],
+            include_disabled: true, // by-provider view shows all models
+        },
+    )
 }
 
 pub fn list_tags(conn: &Connection) -> Result<Vec<String>> {
@@ -316,7 +436,11 @@ pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Res
     // concurrent delete would make "clear tags" (empty diff) silently succeed
     // on a non-existent model.
     let exists: bool = tx
-        .query_row("SELECT 1 FROM models WHERE id = ?1", params![model_id], |_| Ok(true))
+        .query_row(
+            "SELECT 1 FROM models WHERE id = ?1",
+            params![model_id],
+            |_| Ok(true),
+        )
         .unwrap_or(false);
     if !exists {
         bail!("model not found: {}", model_id);
@@ -335,7 +459,10 @@ pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Res
     }
     // Remove tags that are no longer present
     for tag in &to_remove {
-        tx.execute("DELETE FROM model_tags WHERE model_id = ?1 AND tag = ?2", params![model_id, tag])?;
+        tx.execute(
+            "DELETE FROM model_tags WHERE model_id = ?1 AND tag = ?2",
+            params![model_id, tag],
+        )?;
         info!(event_code = "model.tag_removed", model_db_id = %model_id, tag = %tag, "tag removed");
     }
     // Insert new tags
@@ -346,7 +473,10 @@ pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Res
         )?;
         info!(event_code = "model.tag_added", model_db_id = %model_id, tag = %tag, "tag added");
     }
-    tx.execute("UPDATE models SET updated_at_ms = ?1 WHERE id = ?2", params![now, model_id])?;
+    tx.execute(
+        "UPDATE models SET updated_at_ms = ?1 WHERE id = ?2",
+        params![now, model_id],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -357,8 +487,13 @@ pub fn provider_has_profile_references(provider_id: &str, refs: &[ProfileModelRe
     refs.iter().any(|r| r.provider_id == provider_id)
 }
 
-pub fn model_has_profile_references(provider_id: &str, model_id: &str, refs: &[ProfileModelRef]) -> bool {
-    refs.iter().any(|r| r.provider_id == provider_id && r.model_id == model_id)
+pub fn model_has_profile_references(
+    provider_id: &str,
+    model_id: &str,
+    refs: &[ProfileModelRef],
+) -> bool {
+    refs.iter()
+        .any(|r| r.provider_id == provider_id && r.model_id == model_id)
 }
 
 // ── Row mappers ────────────────────────────────────────────────────────
@@ -388,7 +523,11 @@ fn row_to_model(row: &rusqlite::Row) -> rusqlite::Result<Model> {
         provider_id: row.get(1)?,
         model_id: row.get(2)?,
         enabled: row.get::<_, i64>(3)? != 0,
-        created_at_ms: row.get(4)?,
-        updated_at_ms: row.get(5)?,
+        display_name: row.get(4)?,
+        reasoning: row.get::<_, i64>(5)? != 0,
+        context_window: row.get(6)?,
+        max_tokens: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
     })
 }

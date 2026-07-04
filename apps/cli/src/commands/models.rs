@@ -26,7 +26,10 @@ pub async fn handle_models(
     };
     let mut client = connect_client().await?;
     let response = client
-        .call(ControlRequest::new("model.list", serde_json::to_value(&req)?))
+        .call(ControlRequest::new(
+            "model.list",
+            serde_json::to_value(&req)?,
+        ))
         .await?;
     match response {
         ControlResponse::Ok(value) => {
@@ -51,14 +54,30 @@ fn print_models_table(models: &[ModelCatalogEntryDto]) {
         return;
     }
     // Column widths
-    let w_provider = models.iter().map(|m| m.provider_name.len()).max().unwrap_or(8).max(8);
-    let w_model = models.iter().map(|m| m.model_id.len()).max().unwrap_or(5).max(5);
+    let w_provider = models
+        .iter()
+        .map(|m| m.provider_name.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let w_model = models
+        .iter()
+        .map(|m| m.model_id.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
     let w_tags = 20;
 
     println!(
         "{:width_p$}  {:width_m$}  {:6}  {:6}  {:width_t$}",
-        "PROVIDER", "MODEL", "ENABLE", "P_ENABLE", "TAGS",
-        width_p = w_provider, width_m = w_model, width_t = w_tags
+        "PROVIDER",
+        "MODEL",
+        "ENABLE",
+        "P_ENABLE",
+        "TAGS",
+        width_p = w_provider,
+        width_m = w_model,
+        width_t = w_tags
     );
     for m in models {
         let tags = m.tags.join(",");
@@ -66,8 +85,14 @@ fn print_models_table(models: &[ModelCatalogEntryDto]) {
         let prov_en = if m.provider_enabled { "yes" } else { "no" };
         println!(
             "{:width_p$}  {:width_m$}  {:6}  {:8}  {:width_t$}",
-            m.provider_name, m.model_id, model_en, prov_en, tags,
-            width_p = w_provider, width_m = w_model, width_t = w_tags
+            m.provider_name,
+            m.model_id,
+            model_en,
+            prov_en,
+            tags,
+            width_p = w_provider,
+            width_m = w_model,
+            width_t = w_tags
         );
     }
 }
@@ -587,7 +612,10 @@ mod tests {
     #[tokio::test]
     async fn models_runtime_delegates_every_method_to_inner() {
         let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
-        let runtime = ModelsRuntime { inner, response: ModelListResponseDto { models: vec![] } };
+        let runtime = ModelsRuntime {
+            inner,
+            response: ModelListResponseDto { models: vec![] },
+        };
         let rt: &dyn RuntimeControl = &runtime;
 
         let _ = rt.service_health().await;
@@ -599,15 +627,27 @@ mod tests {
         let _ = rt.event_bus();
 
         let day = RangePresetDto::Day;
-        let _ = rt.overview_summary(OverviewSummaryRequestDto { range: day }).await;
         let _ = rt
-            .overview_trend(OverviewTrendRequestDto { range: day, granularity: None })
+            .overview_summary(OverviewSummaryRequestDto { range: day })
             .await;
-        let _ = rt.overview_heatmap(OverviewHeatmapRequestDto { range: day }).await;
-        let _ = rt.overview_rankings(OverviewRankingsRequestDto { range: day }).await;
+        let _ = rt
+            .overview_trend(OverviewTrendRequestDto {
+                range: day,
+                granularity: None,
+            })
+            .await;
+        let _ = rt
+            .overview_heatmap(OverviewHeatmapRequestDto { range: day })
+            .await;
+        let _ = rt
+            .overview_rankings(OverviewRankingsRequestDto { range: day })
+            .await;
         let _ = rt.receipt_daily(ReceiptDailyRequestDto::default()).await;
         let _ = rt
-            .activity_recent(ActivityRecentRequestDto { range: day, limit: None })
+            .activity_recent(ActivityRecentRequestDto {
+                range: day,
+                limit: None,
+            })
             .await;
         let _ = rt
             .activity_list(ActivityListRequestDto {
@@ -620,7 +660,9 @@ mod tests {
                 model_id: None,
             })
             .await;
-        let _ = rt.activity_detail(ActivityDetailRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .activity_detail(ActivityDetailRequestDto { id: "x".into() })
+            .await;
         let _ = rt
             .breakdown_list(BreakdownListRequestDto {
                 kind: BreakdownKindDto::Project,
@@ -645,7 +687,9 @@ mod tests {
             })
             .await;
         let _ = rt
-            .clients_detail(ClientSourceDetailRequestDto { source_id: "x".into() })
+            .clients_detail(ClientSourceDetailRequestDto {
+                source_id: "x".into(),
+            })
             .await;
         let _ = rt
             .settings_update(SettingsUpdateRequestDto {
@@ -661,13 +705,26 @@ mod tests {
                 id: SettingsRecoveryActionIdDto::RescanAll,
             })
             .await;
-        let _ = rt.live_window(LiveWindowRequestDto { window_seconds: None }).await;
         let _ = rt
-            .prompts_list(PromptListQueryDto { query: None, tag: None, sort: None, limit: None })
+            .live_window(LiveWindowRequestDto {
+                window_seconds: None,
+            })
+            .await;
+        let _ = rt
+            .prompts_list(PromptListQueryDto {
+                query: None,
+                tag: None,
+                sort: None,
+                limit: None,
+            })
             .await;
         let _ = rt.prompts_get(PromptGetRequestDto { id: "x".into() }).await;
         let _ = rt
-            .prompts_create(PromptCreateRequestDto { content: "c".into(), alias: None, tags: vec![] })
+            .prompts_create(PromptCreateRequestDto {
+                content: "c".into(),
+                alias: None,
+                tags: vec![],
+            })
             .await;
         let _ = rt
             .prompts_update(PromptUpdateRequestDto {
@@ -678,7 +735,9 @@ mod tests {
                 is_pinned: false,
             })
             .await;
-        let _ = rt.prompts_delete(PromptDeleteRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .prompts_delete(PromptDeleteRequestDto { id: "x".into() })
+            .await;
         let _ = rt
             .prompts_use(PromptUseRequestDto {
                 id: "x".into(),
@@ -689,7 +748,10 @@ mod tests {
             })
             .await;
         let _ = rt
-            .suggest_tags(PromptSuggestTagsRequestDto { query: None, limit: None })
+            .suggest_tags(PromptSuggestTagsRequestDto {
+                query: None,
+                limit: None,
+            })
             .await;
         let _ = rt
             .subagent_delegate(SubagentDelegateRequestDto {
@@ -706,18 +768,42 @@ mod tests {
                 source_session_id: None,
             })
             .await;
-        let _ = rt.subagent_list(SubagentListRequestDto { status: None, project: None, include_deleted: None }).await;
         let _ = rt
-            .subagent_show(SubagentResolveRequestDto { name: None, id: Some("sa".into()), cwd: None })
+            .subagent_list(SubagentListRequestDto {
+                status: None,
+                project: None,
+                include_deleted: None,
+            })
             .await;
         let _ = rt
-            .subagent_tasks(SubagentTasksRequestDto { name: None, id: Some("sa".into()), cwd: None, limit: None })
+            .subagent_show(SubagentResolveRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+            })
             .await;
         let _ = rt
-            .subagent_hibernate(SubagentResolveRequestDto { name: None, id: Some("sa".into()), cwd: None })
+            .subagent_tasks(SubagentTasksRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+                limit: None,
+            })
             .await;
         let _ = rt
-            .subagent_delete(SubagentDeleteRequestDto { name: None, id: Some("sa".into()), cwd: None, hard: None })
+            .subagent_hibernate(SubagentResolveRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_delete(SubagentDeleteRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+                hard: None,
+            })
             .await;
         let _ = rt
             .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
@@ -740,7 +826,9 @@ mod tests {
                 api_key: None,
             })
             .await;
-        let _ = rt.provider_delete(ProviderDeleteRequestDto { id: "p".into() }).await;
+        let _ = rt
+            .provider_delete(ProviderDeleteRequestDto { id: "p".into() })
+            .await;
         let _ = rt
             .provider_test_connection(ProviderTestConnectionRequestDto { id: "p".into() })
             .await;
@@ -752,10 +840,20 @@ mod tests {
                 tags: vec![],
             })
             .await;
-        let _ = rt.model_update(ModelUpdateRequestDto { id: "m".into(), enabled: None }).await;
-        let _ = rt.model_delete(ModelDeleteRequestDto { id: "m".into() }).await;
         let _ = rt
-            .model_tags_update(ModelTagUpdateDto { model_id: "m".into(), tags: vec![] })
+            .model_update(ModelUpdateRequestDto {
+                id: "m".into(),
+                enabled: None,
+            })
+            .await;
+        let _ = rt
+            .model_delete(ModelDeleteRequestDto { id: "m".into() })
+            .await;
+        let _ = rt
+            .model_tags_update(ModelTagUpdateDto {
+                model_id: "m".into(),
+                tags: vec![],
+            })
             .await;
         let _ = rt
             .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
@@ -785,6 +883,8 @@ mod tests {
                 write_access: None,
             })
             .await;
-        let _ = rt.profile_delete(ProfileDeleteRequestDto { id: "pr".into() }).await;
+        let _ = rt
+            .profile_delete(ProfileDeleteRequestDto { id: "pr".into() })
+            .await;
     }
 }

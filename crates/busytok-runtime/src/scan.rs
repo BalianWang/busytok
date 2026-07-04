@@ -3136,12 +3136,8 @@ mod tests {
         event.total_tokens = 10;
         event.model = Some("gpt-5.4".to_string());
 
-        busytok_store::write_queries::insert_usage_events_batch(
-            db.conn(),
-            &[event],
-            "gen-test",
-        )
-        .expect("seed event");
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-test")
+            .expect("seed event");
 
         // Resolution claims same model — backfill_codex_model_for_session
         // updates 0 rows (all already have the model) → Ok(0) → Ok(_) => {}
@@ -3205,12 +3201,8 @@ mod tests {
         event.total_tokens = 10;
         event.model = Some("o4-mini".to_string());
 
-        busytok_store::write_queries::insert_usage_events_batch(
-            db.conn(),
-            &[event],
-            "gen-test",
-        )
-        .expect("seed event");
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-test")
+            .expect("seed event");
 
         // turn_context says "gpt-5.4" but DB already has "o4-mini" → conflict.
         let tc = codex_turn_context_line("2026-05-20T07:16:24.000Z", "gpt-5.4");
@@ -3221,7 +3213,10 @@ mod tests {
         )];
 
         let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-conflict");
-        assert!(!changed, "must skip when DB model conflicts with turn_context");
+        assert!(
+            !changed,
+            "must skip when DB model conflicts with turn_context"
+        );
     }
 
     // ── rebuild_model_aggregates: success path (L322-384) ───────────────
@@ -3241,12 +3236,8 @@ mod tests {
         event.model = Some("gpt-5.4".to_string());
         event.timestamp_ms = 1_700_000_000_000;
 
-        busytok_store::write_queries::insert_usage_events_batch(
-            db.conn(),
-            &[event],
-            "gen-rebuild",
-        )
-        .expect("seed event");
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-rebuild")
+            .expect("seed event");
 
         // Should rebuild model_summary, sessions, daily_usage without error.
         rebuild_model_aggregates(&db, "Asia/Shanghai");
@@ -3276,7 +3267,12 @@ mod tests {
     use busytok_domain::UsageWritePolicy;
     use busytok_store::CodexTokenSnapshotRow;
 
-    fn make_codex_event(id: &str, file_id: &str, session: &str, model: Option<&str>) -> NormalizedUsageEvent {
+    fn make_codex_event(
+        id: &str,
+        file_id: &str,
+        session: &str,
+        model: Option<&str>,
+    ) -> NormalizedUsageEvent {
         let mut event = NormalizedUsageEvent::minimal_for_test(id, AgentKind::Codex);
         event.source_file_id = file_id.to_string();
         event.session_id = session.to_string();
@@ -3288,7 +3284,13 @@ mod tests {
         event
     }
 
-    fn make_codex_snapshot_row(id: &str, file_id: &str, session: &str, model: Option<&str>, total: i64) -> CodexTokenSnapshotRow {
+    fn make_codex_snapshot_row(
+        id: &str,
+        file_id: &str,
+        session: &str,
+        model: Option<&str>,
+        total: i64,
+    ) -> CodexTokenSnapshotRow {
         let now = busytok_domain::now_ms();
         CodexTokenSnapshotRow {
             id: id.to_string(),
@@ -3317,16 +3319,24 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Event with NULL model for (file-bf, sess-1)
         let null_event = make_codex_event("evt-null", "file-bf", "sess-1", None);
-        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce)
+            .unwrap();
         // Snapshot with model "gpt-5" for same (file, session)
         let snap = make_codex_snapshot_row("snap-bf", "file-bf", "sess-1", Some("gpt-5"), 200);
         db.upsert_codex_snapshot(&snap).unwrap();
 
         let updated = backfill_cross_batch_codex_models(
             &db,
-            &[("file-bf".to_string(), "sess-1".to_string(), "gpt-5".to_string())],
+            &[(
+                "file-bf".to_string(),
+                "sess-1".to_string(),
+                "gpt-5".to_string(),
+            )],
         );
-        assert!(updated, "should report updates when NULL model was backfilled");
+        assert!(
+            updated,
+            "should report updates when NULL model was backfilled"
+        );
         let after = db.get_usage_event("evt-null").unwrap().unwrap();
         assert_eq!(after.model.as_deref(), Some("gpt-5"));
     }
@@ -3336,13 +3346,18 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Event already has model "gpt-5" — no NULL to backfill.
         let event = make_codex_event("evt-set", "file-bf2", "sess-1", Some("gpt-5"));
-        db.write_usage_event(&event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
         let snap = make_codex_snapshot_row("snap-bf2", "file-bf2", "sess-1", Some("gpt-5"), 200);
         db.upsert_codex_snapshot(&snap).unwrap();
 
         let updated = backfill_cross_batch_codex_models(
             &db,
-            &[("file-bf2".to_string(), "sess-1".to_string(), "gpt-5".to_string())],
+            &[(
+                "file-bf2".to_string(),
+                "sess-1".to_string(),
+                "gpt-5".to_string(),
+            )],
         );
         assert!(!updated, "should report no updates when no NULL models");
     }
@@ -3351,13 +3366,18 @@ mod tests {
     fn backfill_cross_batch_skipped_when_multiple_models_in_session() {
         let db = Database::open_in_memory().unwrap();
         let event = make_codex_event("evt-a", "file-bf3", "sess-1", Some("gpt-5a"));
-        db.write_usage_event(&event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
         let snap = make_codex_snapshot_row("snap-a", "file-bf3", "sess-1", Some("gpt-5b"), 200);
         db.upsert_codex_snapshot(&snap).unwrap();
 
         let updated = backfill_cross_batch_codex_models(
             &db,
-            &[("file-bf3".to_string(), "sess-1".to_string(), "gpt-5a".to_string())],
+            &[(
+                "file-bf3".to_string(),
+                "sess-1".to_string(),
+                "gpt-5a".to_string(),
+            )],
         );
         assert!(!updated, "should skip when multiple distinct models exist");
     }
@@ -3366,13 +3386,21 @@ mod tests {
     fn backfill_cross_batch_skipped_when_db_model_differs_from_batch() {
         let db = Database::open_in_memory().unwrap();
         let event = make_codex_event("evt-m", "file-bf4", "sess-1", Some("gpt-5"));
-        db.write_usage_event(&event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
 
         let updated = backfill_cross_batch_codex_models(
             &db,
-            &[("file-bf4".to_string(), "sess-1".to_string(), "different-model".to_string())],
+            &[(
+                "file-bf4".to_string(),
+                "sess-1".to_string(),
+                "different-model".to_string(),
+            )],
         );
-        assert!(!updated, "should skip when DB model differs from batch model");
+        assert!(
+            !updated,
+            "should skip when DB model differs from batch model"
+        );
     }
 
     #[test]
@@ -3381,7 +3409,11 @@ mod tests {
         // No events or snapshots for (file-bf5, sess-1)
         let updated = backfill_cross_batch_codex_models(
             &db,
-            &[("file-bf5".to_string(), "sess-1".to_string(), "gpt-5".to_string())],
+            &[(
+                "file-bf5".to_string(),
+                "sess-1".to_string(),
+                "gpt-5".to_string(),
+            )],
         );
         assert!(!updated, "should report no updates when no data in DB");
     }
@@ -3409,9 +3441,10 @@ mod tests {
     #[test]
     fn cross_batch_backfill_from_turn_context_returns_false_when_no_null_model_sessions() {
         let db = Database::open_in_memory().unwrap();
-        let lines = vec![
-            make_tailed_line(r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#, 1),
-        ];
+        let lines = vec![make_tailed_line(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            1,
+        )];
         // No Codex events with NULL model in DB.
         let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
         assert!(!result, "should return false when no null-model sessions");
@@ -3422,13 +3455,18 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Seed a Codex event with NULL model for (file-tc, sess-tc).
         let null_event = make_codex_event("evt-tc-null", "file-tc", "sess-tc", None);
-        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce)
+            .unwrap();
 
-        let lines = vec![
-            make_tailed_line(r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#, 1),
-        ];
+        let lines = vec![make_tailed_line(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            1,
+        )];
         let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
-        assert!(result, "should backfill when null-model event exists and model matches");
+        assert!(
+            result,
+            "should backfill when null-model event exists and model matches"
+        );
         let after = db.get_usage_event("evt-tc-null").unwrap().unwrap();
         assert_eq!(after.model.as_deref(), Some("gpt-5"));
     }
@@ -3438,14 +3476,17 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Event with NULL model
         let null_event = make_codex_event("evt-tc-conf", "file-tc", "sess-tc", None);
-        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce)
+            .unwrap();
         // Snapshot with a DIFFERENT model
-        let snap = make_codex_snapshot_row("snap-conf", "file-tc", "sess-tc", Some("other-model"), 200);
+        let snap =
+            make_codex_snapshot_row("snap-conf", "file-tc", "sess-tc", Some("other-model"), 200);
         db.upsert_codex_snapshot(&snap).unwrap();
 
-        let lines = vec![
-            make_tailed_line(r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#, 1),
-        ];
+        let lines = vec![make_tailed_line(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            1,
+        )];
         let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
         assert!(!result, "should skip when DB has conflicting model");
     }
@@ -3471,17 +3512,15 @@ mod tests {
 
     #[test]
     fn extract_codex_turn_context_model_returns_none_for_non_turn_context() {
-        let model = extract_codex_turn_context_model(
-            r#"{"type":"usage","payload":{"model":"gpt-5"}}"#,
-        );
+        let model =
+            extract_codex_turn_context_model(r#"{"type":"usage","payload":{"model":"gpt-5"}}"#);
         assert!(model.is_none());
     }
 
     #[test]
     fn extract_codex_turn_context_model_returns_none_for_empty_model() {
-        let model = extract_codex_turn_context_model(
-            r#"{"type":"turn_context","payload":{"model":""}}"#,
-        );
+        let model =
+            extract_codex_turn_context_model(r#"{"type":"turn_context","payload":{"model":""}}"#);
         assert!(model.is_none(), "empty model string should be filtered out");
     }
 
@@ -3533,9 +3572,17 @@ mod tests {
         e5.model = None;
 
         let result = collect_codex_model_resolutions(&[e1, e2, e3, e4, e5]);
-        assert_eq!(result.len(), 2, "should dedupe by (file, session) and skip non-Codex/None");
-        assert!(result.iter().any(|(f, s, m)| f == "file-1" && s == "sess-1" && m == "gpt-5"));
-        assert!(result.iter().any(|(f, s, m)| f == "file-1" && s == "sess-2" && m == "gpt-5"));
+        assert_eq!(
+            result.len(),
+            2,
+            "should dedupe by (file, session) and skip non-Codex/None"
+        );
+        assert!(result
+            .iter()
+            .any(|(f, s, m)| f == "file-1" && s == "sess-1" && m == "gpt-5"));
+        assert!(result
+            .iter()
+            .any(|(f, s, m)| f == "file-1" && s == "sess-2" && m == "gpt-5"));
     }
 
     #[test]
@@ -3557,7 +3604,8 @@ mod tests {
     fn load_persisted_codex_model_falls_back_to_event_model() {
         let db = Database::open_in_memory().unwrap();
         let event = make_codex_event("evt-lp", "file-lp2", "sess-lp", Some("gpt-5-from-event"));
-        db.write_usage_event(&event, UsageWritePolicy::InsertOnce).unwrap();
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
         let model = load_persisted_codex_model(&db, "file-lp2");
         assert_eq!(model.as_deref(), Some("gpt-5-from-event"));
     }

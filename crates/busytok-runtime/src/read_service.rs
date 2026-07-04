@@ -657,15 +657,15 @@ mod tests {
 
     #[tokio::test]
     async fn run_returns_unavailable_when_permits_closed() {
-        let db = Arc::new(Mutex::new(busytok_store::Database::open_in_memory().unwrap()));
+        let db = Arc::new(Mutex::new(
+            busytok_store::Database::open_in_memory().unwrap(),
+        ));
         let service = ReadService::new_in_memory(db, 1);
         // Close the semaphore so acquire_owned() returns Err immediately.
         service.permits.close();
 
         let query = sample_query();
-        let result: Result<i64, ReadError> = service
-            .run(query, |_conn| Ok(42i64))
-            .await;
+        let result: Result<i64, ReadError> = service.run(query, |_conn| Ok(42i64)).await;
         let err = result.expect_err("should return error when permits closed");
         assert_eq!(err.kind(), ReadErrorKind::Unavailable);
         assert_eq!(err.message(), "read service closed");
@@ -675,7 +675,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_returns_timeout_when_deadline_exceeded_after_permit() {
-        let db = Arc::new(Mutex::new(busytok_store::Database::open_in_memory().unwrap()));
+        let db = Arc::new(Mutex::new(
+            busytok_store::Database::open_in_memory().unwrap(),
+        ));
         let service = ReadService::new_in_memory(db, 1);
 
         // Use a zero timeout: the deadline is already in the past by the time
@@ -684,9 +686,7 @@ mod tests {
         // Yield once so the deadline is definitely in the past.
         tokio::task::yield_now().await;
 
-        let result: Result<i64, ReadError> = service
-            .run(query, |_conn| Ok(42i64))
-            .await;
+        let result: Result<i64, ReadError> = service.run(query, |_conn| Ok(42i64)).await;
         let err = result.expect_err("should return timeout error");
         assert_eq!(err.kind(), ReadErrorKind::Timeout);
     }

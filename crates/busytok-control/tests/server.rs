@@ -340,7 +340,10 @@ impl RuntimeControl for MethodDispatchErrorRuntime {
         self.inner.provider_test_connection(req).await
     }
 
-    async fn model_create(&self, req: ModelCreateRequestDto) -> anyhow::Result<ModelCatalogEntryDto> {
+    async fn model_create(
+        &self,
+        req: ModelCreateRequestDto,
+    ) -> anyhow::Result<ModelCatalogEntryDto> {
         self.inner.model_create(req).await
     }
     async fn model_list(&self, req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {

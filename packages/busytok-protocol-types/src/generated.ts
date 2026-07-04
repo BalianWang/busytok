@@ -376,7 +376,7 @@ export type ReceiptDailyDto = { date: string,
  */
 date_label: string, timezone: string, metrics: ReceiptMetricsDto, top_models: Array<ReceiptModelSliceDto>, brand: ReceiptBrandDto, };
 
-export type ProviderKind = "openai_compatible";
+export type ProviderKind = "openai_compatible" | "anthropic_compatible";
 
 export type ProviderDto = { id: string, name: string, provider_kind: ProviderKind, base_url: string, enabled: boolean, has_api_key: boolean, created_at_ms: number, updated_at_ms: number, };
 

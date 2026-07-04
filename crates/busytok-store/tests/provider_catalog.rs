@@ -1,10 +1,10 @@
 #![allow(unused_imports)]
 use busytok_domain::{ModelCatalogFilter, ProfileModelRef, ProviderKind};
+use busytok_store::Database;
 use busytok_store::{
     CreateModelReq, CreateProviderReq, ModelCatalogEntry, Provider, ProviderSummary,
     UpdateModelPatch, UpdateProviderPatch,
 };
-use busytok_store::Database;
 
 fn sample_provider_req() -> CreateProviderReq {
     CreateProviderReq {
@@ -29,12 +29,16 @@ fn provider_crud_round_trip() {
     assert!(summary[0].has_api_key);
 
     let updated = db
-        .update_provider(&created.id, UpdateProviderPatch {
-            name: Some("Updated".to_string()),
-            base_url: None,
-            enabled: None,
-            api_key: Some(Some("sk-new-key".to_string())),
-        })
+        .update_provider(
+            &created.id,
+            UpdateProviderPatch {
+                name: Some("Updated".to_string()),
+                base_url: None,
+                enabled: None,
+                provider_kind: None,
+                api_key: Some(Some("sk-new-key".to_string())),
+            },
+        )
         .unwrap();
     assert_eq!(updated.name, "Updated");
 
@@ -56,6 +60,10 @@ fn model_crud_and_cascade_tags() {
             model_id: "gpt-4o".to_string(),
             enabled: true,
             tags: vec!["fast".to_string(), "cheap".to_string()],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
         })
         .unwrap();
     assert_eq!(model.model_id, "gpt-4o");
@@ -66,6 +74,10 @@ fn model_crud_and_cascade_tags() {
         model_id: "gpt-4o".to_string(),
         enabled: true,
         tags: vec![],
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
     });
     assert!(dup.is_err());
 
@@ -76,7 +88,9 @@ fn model_crud_and_cascade_tags() {
 
     // Delete model cascades tags
     db.delete_model(&model.id, &[]).unwrap();
-    let entries = db.list_models_filtered(ModelCatalogFilter::default()).unwrap();
+    let entries = db
+        .list_models_filtered(ModelCatalogFilter::default())
+        .unwrap();
     assert!(entries.is_empty());
 }
 
@@ -90,20 +104,32 @@ fn list_models_filtered_by_multiple_tags_and_semantics() {
         model_id: "gpt-4o".into(),
         enabled: true,
         tags: vec!["fast".into(), "cheap".into()],
-    }).unwrap();
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
+    })
+    .unwrap();
     db.create_model(CreateModelReq {
         provider_id: provider.id.clone(),
         model_id: "gpt-4o-mini".into(),
         enabled: true,
         tags: vec!["fast".into()],
-    }).unwrap();
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
+    })
+    .unwrap();
 
     // AND semantics: only model with both tags
-    let entries = db.list_models_filtered(ModelCatalogFilter {
-        provider_id: None,
-        tags: vec!["fast".into(), "cheap".into()],
-        include_disabled: false,
-    }).unwrap();
+    let entries = db
+        .list_models_filtered(ModelCatalogFilter {
+            provider_id: None,
+            tags: vec!["fast".into(), "cheap".into()],
+            include_disabled: false,
+        })
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].model_id, "gpt-4o");
 }
@@ -111,45 +137,78 @@ fn list_models_filtered_by_multiple_tags_and_semantics() {
 #[test]
 fn include_disabled_filters_both_provider_and_model() {
     let db = Database::open_in_memory().unwrap();
-    let p_enabled = db.create_provider(CreateProviderReq {
-        name: "Enabled".into(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://a.com".into(),
-        enabled: true,
-        api_key: Some("k".into()),
-    }).unwrap();
-    let p_disabled = db.create_provider(CreateProviderReq {
-        name: "Disabled".into(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://b.com".into(),
-        enabled: false,
-        api_key: None,
-    }).unwrap();
+    let p_enabled = db
+        .create_provider(CreateProviderReq {
+            name: "Enabled".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://a.com".into(),
+            enabled: true,
+            api_key: Some("k".into()),
+        })
+        .unwrap();
+    let p_disabled = db
+        .create_provider(CreateProviderReq {
+            name: "Disabled".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://b.com".into(),
+            enabled: false,
+            api_key: None,
+        })
+        .unwrap();
 
     db.create_model(CreateModelReq {
-        provider_id: p_enabled.id.clone(), model_id: "m-enabled".into(),
-        enabled: true, tags: vec![],
-    }).unwrap();
+        provider_id: p_enabled.id.clone(),
+        model_id: "m-enabled".into(),
+        enabled: true,
+        tags: vec![],
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
+    })
+    .unwrap();
     db.create_model(CreateModelReq {
-        provider_id: p_enabled.id.clone(), model_id: "m-disabled".into(),
-        enabled: false, tags: vec![],
-    }).unwrap();
+        provider_id: p_enabled.id.clone(),
+        model_id: "m-disabled".into(),
+        enabled: false,
+        tags: vec![],
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
+    })
+    .unwrap();
     db.create_model(CreateModelReq {
-        provider_id: p_disabled.id.clone(), model_id: "m-under-disabled".into(),
-        enabled: true, tags: vec![],
-    }).unwrap();
+        provider_id: p_disabled.id.clone(),
+        model_id: "m-under-disabled".into(),
+        enabled: true,
+        tags: vec![],
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
+    })
+    .unwrap();
 
     // include_disabled=false: only enabled provider + enabled model
-    let entries = db.list_models_filtered(ModelCatalogFilter {
-        provider_id: None, tags: vec![], include_disabled: false,
-    }).unwrap();
+    let entries = db
+        .list_models_filtered(ModelCatalogFilter {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: false,
+        })
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].model_id, "m-enabled");
 
     // include_disabled=true: all 3
-    let entries = db.list_models_filtered(ModelCatalogFilter {
-        provider_id: None, tags: vec![], include_disabled: true,
-    }).unwrap();
+    let entries = db
+        .list_models_filtered(ModelCatalogFilter {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: true,
+        })
+        .unwrap();
     assert_eq!(entries.len(), 3);
 }
 
@@ -158,10 +217,18 @@ fn provider_delete_blocked_by_profile_reference() {
     let db = Database::open_in_memory().unwrap();
     let provider = db.create_provider(sample_provider_req()).unwrap();
     let pid = provider.id.clone();
-    let model = db.create_model(CreateModelReq {
-        provider_id: pid.clone(), model_id: "gpt-4o".into(),
-        enabled: true, tags: vec![],
-    }).unwrap();
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: pid.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .unwrap();
 
     let refs = vec![ProfileModelRef {
         provider_id: pid.clone(),
@@ -182,10 +249,18 @@ fn model_delete_blocked_by_profile_reference() {
     let db = Database::open_in_memory().unwrap();
     let provider = db.create_provider(sample_provider_req()).unwrap();
     let pid = provider.id.clone();
-    let model = db.create_model(CreateModelReq {
-        provider_id: pid.clone(), model_id: "gpt-4o".into(),
-        enabled: true, tags: vec![],
-    }).unwrap();
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: pid.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .unwrap();
 
     let refs = vec![ProfileModelRef {
         provider_id: pid.clone(),
@@ -208,12 +283,18 @@ fn model_update_lookup_by_provider_and_tags_setter() {
     let provider = db.create_provider(sample_provider_req()).unwrap();
     let pid = provider.id.clone();
 
-    let model = db.create_model(CreateModelReq {
-        provider_id: pid.clone(),
-        model_id: "gpt-4o".into(),
-        enabled: true,
-        tags: vec!["fast".into()],
-    }).unwrap();
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: pid.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec!["fast".into()],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .unwrap();
 
     // get_model_by_provider_and_model_id finds it
     let found = db
@@ -224,28 +305,71 @@ fn model_update_lookup_by_provider_and_tags_setter() {
 
     // update_model: disable
     let disabled = db
-        .update_model(&model.id, UpdateModelPatch { enabled: Some(false) })
+        .update_model(
+            &model.id,
+            UpdateModelPatch {
+                enabled: Some(false),
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
+            },
+        )
         .unwrap();
     assert!(!disabled.enabled);
 
     // update_model: re-enable
     let reenabled = db
-        .update_model(&model.id, UpdateModelPatch { enabled: Some(true) })
+        .update_model(
+            &model.id,
+            UpdateModelPatch {
+                enabled: Some(true),
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
+            },
+        )
         .unwrap();
     assert!(reenabled.enabled);
 
-    // update_model: no-op patch (enabled=None) still returns the model
-    let noop = db
-        .update_model(&model.id, UpdateModelPatch { enabled: None })
-        .unwrap();
-    assert!(noop.enabled);
-
-    // update_model on missing id errors
-    let err = db.update_model("nonexistent", UpdateModelPatch { enabled: Some(true) });
+    // update_model: empty patch (all None) bails with "model update patch is empty"
+    let err = db.update_model(
+        &model.id,
+        UpdateModelPatch {
+            enabled: None,
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        },
+    );
     assert!(err.is_err());
 
-    // update_model no-op on missing id also errors (falls through to get_model_by_id)
-    let err = db.update_model("nonexistent", UpdateModelPatch { enabled: None });
+    // update_model on missing id errors
+    let err = db.update_model(
+        "nonexistent",
+        UpdateModelPatch {
+            enabled: Some(true),
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        },
+    );
+    assert!(err.is_err());
+
+    // update_model empty patch on missing id also errors (bails before existence check)
+    let err = db.update_model(
+        "nonexistent",
+        UpdateModelPatch {
+            enabled: None,
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        },
+    );
     assert!(err.is_err());
 
     // list_models_by_provider returns the model (include_disabled=true)
@@ -292,6 +416,7 @@ fn model_update_lookup_by_provider_and_tags_setter() {
                 name: None,
                 base_url: None,
                 enabled: None,
+                provider_kind: None,
                 api_key: Some(None),
             },
         )
@@ -306,6 +431,7 @@ fn model_update_lookup_by_provider_and_tags_setter() {
                 name: None,
                 base_url: None,
                 enabled: None,
+                provider_kind: None,
                 api_key: None,
             },
         )
@@ -320,6 +446,7 @@ fn model_update_lookup_by_provider_and_tags_setter() {
                 name: None,
                 base_url: Some("https://new.url".into()),
                 enabled: Some(false),
+                provider_kind: None,
                 api_key: None,
             },
         )
@@ -334,6 +461,7 @@ fn model_update_lookup_by_provider_and_tags_setter() {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         },
     );
@@ -353,7 +481,10 @@ fn model_update_lookup_by_provider_and_tags_setter() {
         .is_none());
 
     // get_provider_with_secret on missing id returns None
-    assert!(db.get_provider_with_secret("nonexistent").unwrap().is_none());
+    assert!(db
+        .get_provider_with_secret("nonexistent")
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -391,9 +522,7 @@ fn set_model_tags_errors_on_nonexistent_model() {
     let db = Database::open_in_memory().unwrap();
     // No model with this id exists — set_model_tags must reject, not
     // silently succeed (especially when the tag diff is empty).
-    let err = db
-        .set_model_tags("nonexistent-id", &[])
-        .unwrap_err();
+    let err = db.set_model_tags("nonexistent-id", &[]).unwrap_err();
     assert!(err.to_string().contains("model not found"));
 }
 
@@ -416,6 +545,10 @@ fn create_model_dedupes_duplicate_tags() {
             model_id: "m-1".into(),
             enabled: true,
             tags: vec!["chat".into(), "chat".into(), "fast".into()],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
         })
         .unwrap();
     let entries = db
@@ -427,4 +560,105 @@ fn create_model_dedupes_duplicate_tags() {
         .unwrap();
     let entry = entries.iter().find(|e| e.model_db_id == model.id).unwrap();
     assert_eq!(entry.tags, vec!["chat".to_string(), "fast".to_string()]);
+}
+
+#[test]
+fn model_metadata_round_trip() {
+    let db = Database::open_in_memory().unwrap();
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+    let m = db
+        .create_model(CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "claude-sonnet-4-5".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: Some("Claude Sonnet 4.5".into()),
+            reasoning: Some(true),
+            context_window: Some(200000),
+            max_tokens: Some(8192),
+        })
+        .unwrap();
+    assert_eq!(m.display_name.as_deref(), Some("Claude Sonnet 4.5"));
+    assert!(m.reasoning);
+    assert_eq!(m.context_window, Some(200000));
+    assert_eq!(m.max_tokens, Some(8192));
+    let fetched = db.get_model_by_id(&m.id).unwrap().unwrap();
+    assert_eq!(fetched.display_name, m.display_name);
+    assert_eq!(fetched.context_window, m.context_window);
+
+    // update_model can patch metadata fields
+    let patched = db
+        .update_model(
+            &m.id,
+            UpdateModelPatch {
+                enabled: None,
+                display_name: Some("Claude Sonnet 4.5 (renamed)".into()),
+                reasoning: Some(false),
+                context_window: Some(180000),
+                max_tokens: Some(4096),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        patched.display_name.as_deref(),
+        Some("Claude Sonnet 4.5 (renamed)")
+    );
+    assert!(!patched.reasoning);
+    assert_eq!(patched.context_window, Some(180000));
+    assert_eq!(patched.max_tokens, Some(4096));
+
+    // list_models_filtered surfaces metadata in the joined row
+    let entries = db
+        .list_models_filtered(ModelCatalogFilter {
+            provider_id: Some(provider.id.clone()),
+            tags: vec![],
+            include_disabled: true,
+        })
+        .unwrap();
+    let entry = entries.iter().find(|e| e.model_db_id == m.id).unwrap();
+    assert_eq!(
+        entry.display_name.as_deref(),
+        Some("Claude Sonnet 4.5 (renamed)")
+    );
+    assert!(!entry.reasoning);
+    assert_eq!(entry.context_window, Some(180000));
+    assert_eq!(entry.max_tokens, Some(4096));
+}
+
+#[test]
+fn update_provider_persists_provider_kind_patch() {
+    let db = Database::open_in_memory().unwrap();
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "P1".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+    let updated = db
+        .update_provider(
+            &provider.id,
+            UpdateProviderPatch {
+                name: None,
+                base_url: None,
+                enabled: None,
+                provider_kind: Some(ProviderKind::AnthropicCompatible),
+                api_key: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.provider_kind, ProviderKind::AnthropicCompatible);
+    // Verify round-trip via a fresh read.
+    let fetched = db.get_provider_with_secret(&provider.id).unwrap().unwrap();
+    assert_eq!(fetched.provider_kind, ProviderKind::AnthropicCompatible);
 }

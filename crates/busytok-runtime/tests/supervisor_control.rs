@@ -30,8 +30,7 @@ use std::time::{Duration, Instant};
 
 use busytok_adapters::AgentLogAdapter;
 use busytok_config::{
-    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig,
-    ProviderKind,
+    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig, ProviderKind,
 };
 use busytok_control::dispatch::RuntimeControl;
 use busytok_discovery::DiscoveredLogSource;
@@ -3743,11 +3742,9 @@ async fn provider_crud_round_trips_without_api_key() {
     assert!(!updated.has_api_key, "still no api_key after update");
 
     // Delete → list empty.
-    sup.provider_delete(ProviderDeleteRequestDto {
-        id: pid.clone(),
-    })
-    .await
-    .unwrap();
+    sup.provider_delete(ProviderDeleteRequestDto { id: pid.clone() })
+        .await
+        .unwrap();
     let list_after = sup.provider_list().await.unwrap();
     assert!(
         list_after.providers.is_empty(),
@@ -3853,9 +3850,7 @@ async fn provider_test_connection_errors_when_no_api_key() {
     let pid = created.id.clone();
 
     let err = sup
-        .provider_test_connection(ProviderTestConnectionRequestDto {
-            id: pid.clone(),
-        })
+        .provider_test_connection(ProviderTestConnectionRequestDto { id: pid.clone() })
         .await
         .unwrap_err()
         .to_string();
@@ -3865,11 +3860,9 @@ async fn provider_test_connection_errors_when_no_api_key() {
     );
 
     // Clean up.
-    sup.provider_delete(ProviderDeleteRequestDto {
-        id: pid,
-    })
-    .await
-    .unwrap();
+    sup.provider_delete(ProviderDeleteRequestDto { id: pid })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -3947,11 +3940,9 @@ async fn provider_update_three_state_api_key_semantics() {
     );
 
     // Delete cleans up the SQL row.
-    sup.provider_delete(ProviderDeleteRequestDto {
-        id: pid,
-    })
-    .await
-    .unwrap();
+    sup.provider_delete(ProviderDeleteRequestDto { id: pid })
+        .await
+        .unwrap();
     let list = sup.provider_list().await.unwrap();
     assert!(list.providers.is_empty());
 }
@@ -4843,9 +4834,7 @@ async fn provider_update_respawn_picks_up_live_config() {
 
     // Initial worker: ensure_worker reads the entry from the pool's map and
     // injects OPENAI_API_KEY + OPENAI_BASE_URL (fixed names).
-    let initial = pool
-        .ensure_worker(&pid)
-        .expect("ensure_worker (initial)");
+    let initial = pool.ensure_worker(&pid).expect("ensure_worker (initial)");
     let initial_cfg = initial.config();
     assert_eq!(
         initial_cfg.env.get("OPENAI_BASE_URL"),

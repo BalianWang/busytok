@@ -17,12 +17,14 @@ pub fn upsert_logical_subagent(conn: &Connection, row: &SubagentLogicalSubagentR
     conn.execute(
         "INSERT INTO subagent_logical_subagents \
              (id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
-              default_model, status, created_at_ms, updated_at_ms, last_active_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+              bound_provider_id, bound_model_id, status, created_at_ms, updated_at_ms, last_active_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(id) DO UPDATE SET \
              name=excluded.name, project_id=excluded.project_id, repo_path=excluded.repo_path, \
              repo_hash=excluded.repo_hash, branch=excluded.branch, intent=excluded.intent, \
-             default_profile=excluded.default_profile, default_model=excluded.default_model, \
+             default_profile=excluded.default_profile, \
+             bound_provider_id=excluded.bound_provider_id, \
+             bound_model_id=excluded.bound_model_id, \
              status=excluded.status, updated_at_ms=excluded.updated_at_ms, \
              last_active_at_ms=excluded.last_active_at_ms",
         params![
@@ -34,7 +36,8 @@ pub fn upsert_logical_subagent(conn: &Connection, row: &SubagentLogicalSubagentR
             row.branch,
             row.intent,
             row.default_profile,
-            row.default_model,
+            row.bound_provider_id,
+            row.bound_model_id,
             row.status,
             row.created_at_ms,
             row.updated_at_ms,
@@ -51,7 +54,7 @@ pub fn get_logical_subagent(
 ) -> Result<Option<SubagentLogicalSubagentRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
-                default_model, status, created_at_ms, updated_at_ms, last_active_at_ms \
+                bound_provider_id, bound_model_id, status, created_at_ms, updated_at_ms, last_active_at_ms \
          FROM subagent_logical_subagents WHERE id = ?1",
     )?;
     let row_opt = stmt
@@ -65,11 +68,13 @@ pub fn get_logical_subagent(
                 branch: row.get(5)?,
                 intent: row.get(6)?,
                 default_profile: row.get(7)?,
-                default_model: row.get(8)?,
-                status: row.get(9)?,
-                created_at_ms: row.get(10)?,
-                updated_at_ms: row.get(11)?,
-                last_active_at_ms: row.get(12)?,
+                default_model: None,
+                bound_provider_id: row.get(8)?,
+                bound_model_id: row.get(9)?,
+                status: row.get(10)?,
+                created_at_ms: row.get(11)?,
+                updated_at_ms: row.get(12)?,
+                last_active_at_ms: row.get(13)?,
             })
         })
         .ok();
@@ -82,7 +87,7 @@ pub fn list_active_by_repo(
 ) -> Result<Vec<SubagentLogicalSubagentRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
-                default_model, status, created_at_ms, updated_at_ms, last_active_at_ms \
+                bound_provider_id, bound_model_id, status, created_at_ms, updated_at_ms, last_active_at_ms \
          FROM subagent_logical_subagents \
          WHERE repo_hash = ?1 AND status != 'deleted' \
          ORDER BY last_active_at_ms DESC NULLS LAST",
@@ -98,11 +103,13 @@ pub fn list_active_by_repo(
                 branch: row.get(5)?,
                 intent: row.get(6)?,
                 default_profile: row.get(7)?,
-                default_model: row.get(8)?,
-                status: row.get(9)?,
-                created_at_ms: row.get(10)?,
-                updated_at_ms: row.get(11)?,
-                last_active_at_ms: row.get(12)?,
+                default_model: None,
+                bound_provider_id: row.get(8)?,
+                bound_model_id: row.get(9)?,
+                status: row.get(10)?,
+                created_at_ms: row.get(11)?,
+                updated_at_ms: row.get(12)?,
+                last_active_at_ms: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -123,7 +130,7 @@ pub fn find_by_name_in_repo(
     // reach soft-deleted rows, breaking hard-delete-by-name.
     let mut stmt = conn.prepare(
         "SELECT id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
-                default_model, status, created_at_ms, updated_at_ms, last_active_at_ms \
+                bound_provider_id, bound_model_id, status, created_at_ms, updated_at_ms, last_active_at_ms \
          FROM subagent_logical_subagents \
          WHERE project_id = ?1 AND repo_hash = ?2 AND name = ?3",
     )?;
@@ -138,11 +145,13 @@ pub fn find_by_name_in_repo(
                 branch: row.get(5)?,
                 intent: row.get(6)?,
                 default_profile: row.get(7)?,
-                default_model: row.get(8)?,
-                status: row.get(9)?,
-                created_at_ms: row.get(10)?,
-                updated_at_ms: row.get(11)?,
-                last_active_at_ms: row.get(12)?,
+                default_model: None,
+                bound_provider_id: row.get(8)?,
+                bound_model_id: row.get(9)?,
+                status: row.get(10)?,
+                created_at_ms: row.get(11)?,
+                updated_at_ms: row.get(12)?,
+                last_active_at_ms: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -159,7 +168,7 @@ pub fn list_filtered(
 ) -> Result<Vec<SubagentLogicalSubagentRow>> {
     let mut sql = String::from(
         "SELECT id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
-                default_model, status, created_at_ms, updated_at_ms, last_active_at_ms \
+                bound_provider_id, bound_model_id, status, created_at_ms, updated_at_ms, last_active_at_ms \
          FROM subagent_logical_subagents WHERE 1=1",
     );
     if !include_deleted {
@@ -196,11 +205,13 @@ pub fn list_filtered(
                 branch: row.get(5)?,
                 intent: row.get(6)?,
                 default_profile: row.get(7)?,
-                default_model: row.get(8)?,
-                status: row.get(9)?,
-                created_at_ms: row.get(10)?,
-                updated_at_ms: row.get(11)?,
-                last_active_at_ms: row.get(12)?,
+                default_model: None,
+                bound_provider_id: row.get(8)?,
+                bound_model_id: row.get(9)?,
+                status: row.get(10)?,
+                created_at_ms: row.get(11)?,
+                updated_at_ms: row.get(12)?,
+                last_active_at_ms: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1347,8 +1358,9 @@ mod phase2_tests {
         conn.execute(
             "INSERT INTO subagent_logical_subagents \
                  (id, name, project_id, repo_path, repo_hash, branch, intent, default_profile, \
-                  default_model, status, created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, 'proj', '/repo', 'hash', NULL, NULL, 'pi/review-cheap', NULL, \
+                  bound_provider_id, bound_model_id, status, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 'proj', '/repo', 'hash', NULL, NULL, 'pi/review-cheap', \
+                     'test-provider', 'test-model', \
                      'warm', 1000, 1000)",
             rusqlite::params![id, id],
         )

@@ -200,9 +200,10 @@ impl WorkerPool {
         // update_provider_and_kill_old).
         let entry = {
             let providers = self.providers.lock().expect("providers map lock poisoned");
-            providers.get(provider_id).cloned().ok_or_else(|| {
-                SidecarError::Spawn(format!("unknown provider: {provider_id}"))
-            })?
+            providers
+                .get(provider_id)
+                .cloned()
+                .ok_or_else(|| SidecarError::Spawn(format!("unknown provider: {provider_id}")))?
         };
 
         // (2) Acquire workers map lock + re-check (someone else may have
@@ -350,10 +351,7 @@ impl WorkerPool {
     /// must not be skipped (no `Drop` fallback in `PiSidecarSupervisor`).
     /// Drops the map lock BEFORE `.await` (don't hold sync `Mutex` across
     /// await — see pool.rs:20-24 invariant).
-    pub async fn update_provider_and_kill_old(
-        &self,
-        entry: ProviderRuntimeEntry,
-    ) -> Result<()> {
+    pub async fn update_provider_and_kill_old(&self, entry: ProviderRuntimeEntry) -> Result<()> {
         let pid = entry.provider_id.clone();
         {
             let mut providers = self.providers.lock().expect("providers map lock poisoned");

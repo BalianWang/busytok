@@ -51,8 +51,8 @@ fn table_info_map(
 #[test]
 fn baseline_plus_cache_metrics_migrations() {
     let migs = busytok_store::schema::migrations();
-    assert_eq!(migs.len(), 6);
-    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 6);
+    assert_eq!(migs.len(), 7);
+    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 7);
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(busytok_store::schema::CREATE_SCHEMA_VERSION_TABLE)
         .unwrap();
@@ -543,8 +543,8 @@ fn subagent_migration_creates_tables() {
 fn migrations_registered_in_order() {
     assert_eq!(
         schema::migrations().len(),
-        6,
-        "expected baseline + cache-metrics + subagent + subagent-task-fields + subagent-task-error-kind + provider-catalog migrations"
+        7,
+        "expected baseline + cache-metrics + subagent + subagent-task-fields + subagent-task-error-kind + provider-catalog + subagent-route-binding-and-model-metadata migrations"
     );
     assert_eq!(schema::migrations()[0].0, 1);
     assert_eq!(schema::migrations()[1].0, 2);
@@ -552,12 +552,13 @@ fn migrations_registered_in_order() {
     assert_eq!(schema::migrations()[3].0, 4);
     assert_eq!(schema::migrations()[4].0, 5);
     assert_eq!(schema::migrations()[5].0, 6);
-    assert_eq!(schema::SCHEMA_VERSION, 6);
+    assert_eq!(schema::migrations()[6].0, 7);
+    assert_eq!(schema::SCHEMA_VERSION, 7);
 }
 
 #[test]
-fn schema_version_is_six() {
-    assert_eq!(schema::SCHEMA_VERSION, 6);
+fn schema_version_is_seven() {
+    assert_eq!(schema::SCHEMA_VERSION, 7);
     let max_version = schema::migrations().iter().map(|(v, _)| *v).max().unwrap();
     assert_eq!(max_version, schema::SCHEMA_VERSION);
 }

@@ -449,7 +449,14 @@ pub struct SubagentLogicalSubagentRow {
     pub branch: Option<String>,
     pub intent: Option<String>,
     pub default_profile: String,
+    /// Legacy field retained for backward compatibility; the underlying SQL
+    /// column was dropped in migration 0007. Always `None` when read from DB.
+    /// Task 2 will remove this field entirely once all callers migrate to
+    /// `bound_provider_id` + `bound_model_id`.
     pub default_model: Option<String>,
+    /// Spec §2.3: NOT NULL bound routing target (replaces `default_model`).
+    pub bound_provider_id: String,
+    pub bound_model_id: String,
     pub status: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -470,6 +477,8 @@ impl SubagentLogicalSubagentRow {
             intent: None,
             default_profile: "pi/search-cheap".to_string(),
             default_model: None,
+            bound_provider_id: "test-provider".to_string(),
+            bound_model_id: "test-model".to_string(),
             status: "cold".to_string(),
             created_at_ms: now,
             updated_at_ms: now,

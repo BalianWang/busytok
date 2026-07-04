@@ -23,9 +23,7 @@
 //! mirrors `supervisor_control.rs::make_supervisor` — a real supervisor
 //! backed by an in-memory SQLite database and a temp config dir.
 
-use busytok_config::{
-    BusytokPaths, BusytokSettings, ProviderKind, SubagentProfileConfig,
-};
+use busytok_config::{BusytokPaths, BusytokSettings, ProviderKind, SubagentProfileConfig};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
@@ -447,7 +445,9 @@ async fn model_update_toggles_enabled() {
         .await
         .unwrap();
     assert!(
-        list.models.iter().all(|m| m.model_db_id != created.model_db_id),
+        list.models
+            .iter()
+            .all(|m| m.model_db_id != created.model_db_id),
         "disabled model must be filtered out when include_disabled=false"
     );
 
@@ -794,7 +794,14 @@ async fn delegate_rejects_when_provider_disabled() {
 
     // Seed SQL: provider enabled=false, model "gpt-4o" enabled=true. The
     // delegate's SQL re-validation must reject with "provider disabled".
-    seed_provider_to_sql(&sup, "test-provider", "Test", "https://api.test.com", None, false);
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test",
+        "https://api.test.com",
+        None,
+        false,
+    );
     seed_model_to_sql(&sup, "test-provider", "gpt-4o", true);
 
     let err = sup
@@ -838,7 +845,14 @@ async fn delegate_rejects_when_model_not_in_whitelist() {
     }
     let sup = make_sidecar_supervisor(db, &tmp, settings);
 
-    seed_provider_to_sql(&sup, "test-provider", "Test", "https://api.test.com", None, true);
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test",
+        "https://api.test.com",
+        None,
+        true,
+    );
     seed_model_to_sql(&sup, "test-provider", "real-model", true);
 
     let err = sup

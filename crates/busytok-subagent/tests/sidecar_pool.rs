@@ -452,7 +452,9 @@ async fn update_provider_and_kill_old_respawns_with_new_credentials() {
     .expect("update_provider_and_kill_old");
 
     // Re-spawn — must reflect the new credentials.
-    let sup2 = pool.ensure_worker("deepseek").expect("re-spawn after update");
+    let sup2 = pool
+        .ensure_worker("deepseek")
+        .expect("re-spawn after update");
     assert!(
         !Arc::ptr_eq(&sup1, &sup2),
         "re-spawned supervisor must be a NEW Arc"

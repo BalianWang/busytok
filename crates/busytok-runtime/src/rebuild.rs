@@ -928,7 +928,7 @@ mod tests {
                 "gen-drift2",
                 "file-d2",
                 100,
-                500, // different size
+                500,        // different size
                 Some(1000), // different mtime
                 Some("ok"),
                 None,
@@ -938,7 +938,10 @@ mod tests {
 
         let result = execute_promotion_barrier(&db, &status, "gen-drift2").unwrap();
 
-        assert!(!result.promoted, "promotion should be refused on mtime+size drift");
+        assert!(
+            !result.promoted,
+            "promotion should be refused on mtime+size drift"
+        );
         assert!(result.degradation_reason.is_some());
 
         let snap = status.try_read().unwrap();
@@ -962,7 +965,7 @@ mod tests {
                 "gen-nodrift",
                 "file-nd",
                 100,
-                500, // same size
+                500,        // same size
                 Some(1000), // different mtime — but size equal, so no drift
                 Some("ok"),
                 None,
@@ -971,7 +974,10 @@ mod tests {
         }
 
         let result = execute_promotion_barrier(&db, &status, "gen-nodrift").unwrap();
-        assert!(result.promoted, "promotion should succeed: same size means no drift");
+        assert!(
+            result.promoted,
+            "promotion should succeed: same size means no drift"
+        );
     }
 
     // ── initiate_rebuild ───────────────────────────────────────────────────

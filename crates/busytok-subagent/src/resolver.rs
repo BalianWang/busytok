@@ -159,6 +159,13 @@ fn create_subagent(
         intent: None,
         default_profile: default_profile.to_string(),
         default_model: default_model.map(|s| s.to_string()),
+        // Task 1 placeholder: bound_provider_id + bound_model_id are NOT NULL
+        // in the new schema. The real routing resolution (default_model →
+        // bound provider+model) is Task 2's scope. Until then, use the
+        // legacy `default_model` string as `bound_model_id` and a placeholder
+        // provider. Task 2 will replace this with proper profile→model binding.
+        bound_provider_id: "legacy".to_string(),
+        bound_model_id: default_model.unwrap_or("").to_string(),
         status: "cold".to_string(),
         created_at_ms: now,
         updated_at_ms: now,

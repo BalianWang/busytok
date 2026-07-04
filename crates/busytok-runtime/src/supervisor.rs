@@ -912,13 +912,11 @@ impl BusytokSupervisor {
                     "provider changed — updating entry + killing old worker for lazy re-spawn"
                 );
                 if let Err(e) = pool
-                    .update_provider_and_kill_old(
-                        busytok_subagent::sidecar::ProviderRuntimeEntry {
-                            provider_id: p.id,
-                            api_key: p.api_key.unwrap(),
-                            base_url: p.base_url,
-                        },
-                    )
+                    .update_provider_and_kill_old(busytok_subagent::sidecar::ProviderRuntimeEntry {
+                        provider_id: p.id,
+                        api_key: p.api_key.unwrap(),
+                        base_url: p.base_url,
+                    })
                     .await
                 {
                     warn!(
@@ -5436,7 +5434,8 @@ impl RuntimeControl for BusytokSupervisor {
                 // SQL-backed provider + model whitelist validation.
                 let (provider_enabled, model_ok) = {
                     let db = self.db.lock().unwrap();
-                    let provider = db.get_provider_with_secret(provider_id)?
+                    let provider = db
+                        .get_provider_with_secret(provider_id)?
                         .ok_or_else(|| anyhow::anyhow!("provider not found: {}", provider_id))?;
                     let model_ok = if profile_model.is_empty() {
                         false
@@ -5844,6 +5843,7 @@ impl RuntimeControl for BusytokSupervisor {
                 name: req.name,
                 base_url: req.base_url,
                 enabled: req.enabled,
+                provider_kind: None,
                 api_key: req.api_key,
             })
             .map_err(|e| {
@@ -5905,7 +5905,9 @@ impl RuntimeControl for BusytokSupervisor {
         if !base_url.starts_with("https://") {
             anyhow::bail!("provider base_url must use HTTPS (got: {})", base_url);
         }
-        let api_key = provider.api_key.as_deref()
+        let api_key = provider
+            .api_key
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("provider has no api key"))?;
         let url = format!("{}/models", base_url.trim_end_matches('/'));
         tracing::info!(
@@ -6056,6 +6058,10 @@ impl RuntimeControl for BusytokSupervisor {
                 model_id: req.model_id.clone(),
                 enabled: req.enabled.unwrap_or(true),
                 tags: req.tags.clone(),
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
             })
             .map_err(|e| {
                 tracing::error!(event_code = "model.sql_write_failed", provider_id = %req.provider_id, model_id = %req.model_id, error = %e, "create_model failed");
@@ -6124,6 +6130,10 @@ impl RuntimeControl for BusytokSupervisor {
             let db = self.db.lock().unwrap();
             db.update_model(&req.id, busytok_store::UpdateModelPatch {
                 enabled: req.enabled,
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
             })
             .map_err(|e| {
                 tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "update_model failed");
@@ -7078,6 +7088,10 @@ mod tests {
             model_id: "gpt-x".to_string(),
             model_enabled: false,
             tags: vec!["fast".to_string(), "cheap".to_string()],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
         };
         let dto = catalog_entry_to_dto(e.clone());
         assert_eq!(dto.provider_id, "pid");
@@ -7100,6 +7114,10 @@ mod tests {
             model_id: "gpt-x".to_string(),
             model_enabled: true,
             tags: vec![],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
         };
         let owned = catalog_entry_to_dto(e.clone());
         let by_ref = catalog_entry_to_dto_ref(&e);
@@ -7268,7 +7286,9 @@ mod tests {
 
     #[test]
     fn map_subagent_error_wraps_error_with_stable_code() {
-        let err = map_subagent_error(busytok_subagent::SubagentError::NotFound("sa-1".to_string()));
+        let err = map_subagent_error(busytok_subagent::SubagentError::NotFound(
+            "sa-1".to_string(),
+        ));
         let msg = err.to_string();
         assert!(msg.contains("logical subagent not found: sa-1"));
     }
@@ -7382,8 +7402,11 @@ mod tests {
 
     #[test]
     fn validate_runtime_dir_rejects_nonexistent_directory() {
-        let err = validate_runtime_dir("/nonexistent/dir/that/does/not/exist", "system").unwrap_err();
-        assert!(err.to_string().contains("does not exist or is not a directory"));
+        let err =
+            validate_runtime_dir("/nonexistent/dir/that/does/not/exist", "system").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not exist or is not a directory"));
     }
 
     #[test]
@@ -7482,7 +7505,10 @@ mod tests {
             std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let result = validate_runtime_dir(tmp.to_str().unwrap(), "bundled");
-        assert!(result.is_ok(), "bundled runtime with executable node should pass");
+        assert!(
+            result.is_ok(),
+            "bundled runtime with executable node should pass"
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 

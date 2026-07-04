@@ -78,9 +78,8 @@ fn find_by_name_in_repo_returns_matching_rows_including_deleted() {
 fn find_by_name_in_repo_returns_empty_when_no_match() {
     let db = db();
     seed_subagent(&db, "sa-a", "reviewer");
-    let rows =
-        subagent_queries::find_by_name_in_repo(db.conn(), "proj-h", "repo-h", "nonexistent")
-            .unwrap();
+    let rows = subagent_queries::find_by_name_in_repo(db.conn(), "proj-h", "repo-h", "nonexistent")
+        .unwrap();
     assert!(rows.is_empty());
 }
 
@@ -139,8 +138,7 @@ fn list_filtered_by_project_returns_matching() {
     db.subagent_upsert_logical(&a).unwrap();
     db.subagent_upsert_logical(&b).unwrap();
 
-    let rows =
-        subagent_queries::list_filtered(db.conn(), None, Some("proj-X"), false).unwrap();
+    let rows = subagent_queries::list_filtered(db.conn(), None, Some("proj-X"), false).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].project_id, "proj-X");
 }
@@ -218,7 +216,14 @@ fn hard_delete_logical_subagent_cascades_all_dependents() {
             "INSERT INTO subagent_resource_events \
              (id, event_type, target_id, rss_mb, cpu_percent, detail_json, created_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-            rusqlite::params![re.id, re.event_type, re.target_id, re.rss_mb, re.cpu_percent, re.created_at_ms],
+            rusqlite::params![
+                re.id,
+                re.event_type,
+                re.target_id,
+                re.rss_mb,
+                re.cpu_percent,
+                re.created_at_ms
+            ],
         )
         .unwrap();
 
@@ -320,7 +325,14 @@ fn set_task_status_cancelled_sets_completed_at() {
     let db = db();
     seed_subagent(&db, "sa-1", "r");
     seed_task(&db, "t-1", "sa-1", "go");
-    subagent_queries::set_task_status(db.conn(), "t-1", "cancelled", Some("cancelled reason".into()), Some("err".into())).unwrap();
+    subagent_queries::set_task_status(
+        db.conn(),
+        "t-1",
+        "cancelled",
+        Some("cancelled reason".into()),
+        Some("err".into()),
+    )
+    .unwrap();
     let got = db.subagent_get_task("t-1").unwrap().unwrap();
     assert_eq!(got.status, "cancelled");
     assert!(got.completed_at_ms.is_some());
@@ -333,7 +345,8 @@ fn set_task_status_failed_sets_completed_at() {
     let db = db();
     seed_subagent(&db, "sa-1", "r");
     seed_task(&db, "t-1", "sa-1", "go");
-    subagent_queries::set_task_status(db.conn(), "t-1", "failed", None, Some("boom".into())).unwrap();
+    subagent_queries::set_task_status(db.conn(), "t-1", "failed", None, Some("boom".into()))
+        .unwrap();
     let got = db.subagent_get_task("t-1").unwrap().unwrap();
     assert_eq!(got.status, "failed");
     assert!(got.completed_at_ms.is_some());
@@ -359,7 +372,8 @@ fn set_task_error_kind_sets_and_clears() {
     seed_subagent(&db, "sa-1", "r");
     seed_task(&db, "t-1", "sa-1", "go");
     // Set
-    db.subagent_set_task_error_kind("t-1", Some("SIDECAR_CRASHED")).unwrap();
+    db.subagent_set_task_error_kind("t-1", Some("SIDECAR_CRASHED"))
+        .unwrap();
     let got = db.subagent_get_task("t-1").unwrap().unwrap();
     assert_eq!(got.error_kind.as_deref(), Some("SIDECAR_CRASHED"));
     // Clear
@@ -626,7 +640,10 @@ fn reconcile_sidecar_crash_fails_running_tasks_and_releases_bindings() {
     assert_eq!(counts.bindings_released, 2);
 
     // 3. Live subagent status rolled back (warm/cold, not hot)
-    assert_eq!(counts.status_rolled_back, 1, "only non-deleted subagent rolled back");
+    assert_eq!(
+        counts.status_rolled_back, 1,
+        "only non-deleted subagent rolled back"
+    );
     let a_after = db.subagent_get_logical("sa-a").unwrap().unwrap();
     assert!(a_after.status == "warm" || a_after.status == "cold");
 
@@ -901,7 +918,8 @@ fn find_hot_binding_by_session_returns_matching_binding() {
 #[test]
 fn find_hot_binding_by_session_returns_none_when_not_found() {
     let db = db();
-    let row = subagent_queries::find_hot_binding_by_session(db.conn(), "no-such-sess", "pi").unwrap();
+    let row =
+        subagent_queries::find_hot_binding_by_session(db.conn(), "no-such-sess", "pi").unwrap();
     assert!(row.is_none());
 }
 
@@ -969,7 +987,8 @@ fn commit_hibernate_binding_and_status_sets_warm_and_releases_hot() {
 
     // commit_hibernate upserts the closed binding (same id → overwrites the
     // hot row) and rolls the logical subagent status to 'warm'.
-    db.subagent_commit_hibernate_binding_and_status(&closed_binding, "sa-chb", "warm").unwrap();
+    db.subagent_commit_hibernate_binding_and_status(&closed_binding, "sa-chb", "warm")
+        .unwrap();
 
     // Hot binding should no longer exist (the row was flipped to is_hot=0).
     let hot = subagent_queries::hot_binding(db.conn(), "sa-chb", "pi").unwrap();
@@ -1006,14 +1025,22 @@ fn release_hot_bindings_for_shutdown_releases_bindings_and_rolls_back_status() {
     assert_eq!(counts.bindings_released, 2);
 
     // Both subagents should roll back to 'cold' (no memory/hot_summary).
-    let l1 = subagent_queries::get_logical_subagent(db.conn(), "sa-shut1").unwrap().unwrap();
-    let l2 = subagent_queries::get_logical_subagent(db.conn(), "sa-shut2").unwrap().unwrap();
+    let l1 = subagent_queries::get_logical_subagent(db.conn(), "sa-shut1")
+        .unwrap()
+        .unwrap();
+    let l2 = subagent_queries::get_logical_subagent(db.conn(), "sa-shut2")
+        .unwrap()
+        .unwrap();
     assert_eq!(l1.status, "cold");
     assert_eq!(l2.status, "cold");
 
     // Hot bindings should be released.
-    assert!(subagent_queries::hot_binding(db.conn(), "sa-shut1", "pi").unwrap().is_none());
-    assert!(subagent_queries::hot_binding(db.conn(), "sa-shut2", "pi").unwrap().is_none());
+    assert!(subagent_queries::hot_binding(db.conn(), "sa-shut1", "pi")
+        .unwrap()
+        .is_none());
+    assert!(subagent_queries::hot_binding(db.conn(), "sa-shut2", "pi")
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -1031,6 +1058,8 @@ fn release_hot_bindings_for_shutdown_skips_deleted_tombstones() {
     assert_eq!(counts.bindings_released, 1);
 
     // Tombstone status should remain 'deleted' (not rolled back).
-    let logical = subagent_queries::get_logical_subagent(db.conn(), "sa-tomb").unwrap().unwrap();
+    let logical = subagent_queries::get_logical_subagent(db.conn(), "sa-tomb")
+        .unwrap()
+        .unwrap();
     assert_eq!(logical.status, "deleted");
 }

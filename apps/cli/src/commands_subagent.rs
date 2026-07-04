@@ -1262,15 +1262,27 @@ mod tests {
         let _ = rt.event_bus();
 
         let day = RangePresetDto::Day;
-        let _ = rt.overview_summary(OverviewSummaryRequestDto { range: day }).await;
         let _ = rt
-            .overview_trend(OverviewTrendRequestDto { range: day, granularity: None })
+            .overview_summary(OverviewSummaryRequestDto { range: day })
             .await;
-        let _ = rt.overview_heatmap(OverviewHeatmapRequestDto { range: day }).await;
-        let _ = rt.overview_rankings(OverviewRankingsRequestDto { range: day }).await;
+        let _ = rt
+            .overview_trend(OverviewTrendRequestDto {
+                range: day,
+                granularity: None,
+            })
+            .await;
+        let _ = rt
+            .overview_heatmap(OverviewHeatmapRequestDto { range: day })
+            .await;
+        let _ = rt
+            .overview_rankings(OverviewRankingsRequestDto { range: day })
+            .await;
         let _ = rt.receipt_daily(ReceiptDailyRequestDto::default()).await;
         let _ = rt
-            .activity_recent(ActivityRecentRequestDto { range: day, limit: None })
+            .activity_recent(ActivityRecentRequestDto {
+                range: day,
+                limit: None,
+            })
             .await;
         let _ = rt
             .activity_list(ActivityListRequestDto {
@@ -1283,7 +1295,9 @@ mod tests {
                 model_id: None,
             })
             .await;
-        let _ = rt.activity_detail(ActivityDetailRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .activity_detail(ActivityDetailRequestDto { id: "x".into() })
+            .await;
         let _ = rt
             .breakdown_list(BreakdownListRequestDto {
                 kind: BreakdownKindDto::Project,
@@ -1308,7 +1322,9 @@ mod tests {
             })
             .await;
         let _ = rt
-            .clients_detail(ClientSourceDetailRequestDto { source_id: "x".into() })
+            .clients_detail(ClientSourceDetailRequestDto {
+                source_id: "x".into(),
+            })
             .await;
         let _ = rt
             .settings_update(SettingsUpdateRequestDto {
@@ -1324,13 +1340,26 @@ mod tests {
                 id: SettingsRecoveryActionIdDto::RescanAll,
             })
             .await;
-        let _ = rt.live_window(LiveWindowRequestDto { window_seconds: None }).await;
         let _ = rt
-            .prompts_list(PromptListQueryDto { query: None, tag: None, sort: None, limit: None })
+            .live_window(LiveWindowRequestDto {
+                window_seconds: None,
+            })
+            .await;
+        let _ = rt
+            .prompts_list(PromptListQueryDto {
+                query: None,
+                tag: None,
+                sort: None,
+                limit: None,
+            })
             .await;
         let _ = rt.prompts_get(PromptGetRequestDto { id: "x".into() }).await;
         let _ = rt
-            .prompts_create(PromptCreateRequestDto { content: "c".into(), alias: None, tags: vec![] })
+            .prompts_create(PromptCreateRequestDto {
+                content: "c".into(),
+                alias: None,
+                tags: vec![],
+            })
             .await;
         let _ = rt
             .prompts_update(PromptUpdateRequestDto {
@@ -1341,7 +1370,9 @@ mod tests {
                 is_pinned: false,
             })
             .await;
-        let _ = rt.prompts_delete(PromptDeleteRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .prompts_delete(PromptDeleteRequestDto { id: "x".into() })
+            .await;
         let _ = rt
             .prompts_use(PromptUseRequestDto {
                 id: "x".into(),
@@ -1352,7 +1383,10 @@ mod tests {
             })
             .await;
         let _ = rt
-            .suggest_tags(PromptSuggestTagsRequestDto { query: None, limit: None })
+            .suggest_tags(PromptSuggestTagsRequestDto {
+                query: None,
+                limit: None,
+            })
             .await;
         let _ = rt
             .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
@@ -1375,7 +1409,9 @@ mod tests {
                 api_key: None,
             })
             .await;
-        let _ = rt.provider_delete(ProviderDeleteRequestDto { id: "p".into() }).await;
+        let _ = rt
+            .provider_delete(ProviderDeleteRequestDto { id: "p".into() })
+            .await;
         let _ = rt
             .provider_test_connection(ProviderTestConnectionRequestDto { id: "p".into() })
             .await;
@@ -1388,12 +1424,26 @@ mod tests {
             })
             .await;
         let _ = rt
-            .model_list(ModelListRequestDto { provider_id: None, tags: vec![], include_disabled: false })
+            .model_list(ModelListRequestDto {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: false,
+            })
             .await;
-        let _ = rt.model_update(ModelUpdateRequestDto { id: "m".into(), enabled: None }).await;
-        let _ = rt.model_delete(ModelDeleteRequestDto { id: "m".into() }).await;
         let _ = rt
-            .model_tags_update(ModelTagUpdateDto { model_id: "m".into(), tags: vec![] })
+            .model_update(ModelUpdateRequestDto {
+                id: "m".into(),
+                enabled: None,
+            })
+            .await;
+        let _ = rt
+            .model_delete(ModelDeleteRequestDto { id: "m".into() })
+            .await;
+        let _ = rt
+            .model_tags_update(ModelTagUpdateDto {
+                model_id: "m".into(),
+                tags: vec![],
+            })
             .await;
         let _ = rt
             .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
@@ -1423,7 +1473,9 @@ mod tests {
                 write_access: None,
             })
             .await;
-        let _ = rt.profile_delete(ProfileDeleteRequestDto { id: "pr".into() }).await;
+        let _ = rt
+            .profile_delete(ProfileDeleteRequestDto { id: "pr".into() })
+            .await;
     }
 
     /// Exercises every delegation method on `FailingListRuntime` so the
@@ -1444,15 +1496,27 @@ mod tests {
         let _ = rt.event_bus();
 
         let day = RangePresetDto::Day;
-        let _ = rt.overview_summary(OverviewSummaryRequestDto { range: day }).await;
         let _ = rt
-            .overview_trend(OverviewTrendRequestDto { range: day, granularity: None })
+            .overview_summary(OverviewSummaryRequestDto { range: day })
             .await;
-        let _ = rt.overview_heatmap(OverviewHeatmapRequestDto { range: day }).await;
-        let _ = rt.overview_rankings(OverviewRankingsRequestDto { range: day }).await;
+        let _ = rt
+            .overview_trend(OverviewTrendRequestDto {
+                range: day,
+                granularity: None,
+            })
+            .await;
+        let _ = rt
+            .overview_heatmap(OverviewHeatmapRequestDto { range: day })
+            .await;
+        let _ = rt
+            .overview_rankings(OverviewRankingsRequestDto { range: day })
+            .await;
         let _ = rt.receipt_daily(ReceiptDailyRequestDto::default()).await;
         let _ = rt
-            .activity_recent(ActivityRecentRequestDto { range: day, limit: None })
+            .activity_recent(ActivityRecentRequestDto {
+                range: day,
+                limit: None,
+            })
             .await;
         let _ = rt
             .activity_list(ActivityListRequestDto {
@@ -1465,7 +1529,9 @@ mod tests {
                 model_id: None,
             })
             .await;
-        let _ = rt.activity_detail(ActivityDetailRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .activity_detail(ActivityDetailRequestDto { id: "x".into() })
+            .await;
         let _ = rt
             .breakdown_list(BreakdownListRequestDto {
                 kind: BreakdownKindDto::Project,
@@ -1490,7 +1556,9 @@ mod tests {
             })
             .await;
         let _ = rt
-            .clients_detail(ClientSourceDetailRequestDto { source_id: "x".into() })
+            .clients_detail(ClientSourceDetailRequestDto {
+                source_id: "x".into(),
+            })
             .await;
         let _ = rt
             .settings_update(SettingsUpdateRequestDto {
@@ -1506,13 +1574,26 @@ mod tests {
                 id: SettingsRecoveryActionIdDto::RescanAll,
             })
             .await;
-        let _ = rt.live_window(LiveWindowRequestDto { window_seconds: None }).await;
         let _ = rt
-            .prompts_list(PromptListQueryDto { query: None, tag: None, sort: None, limit: None })
+            .live_window(LiveWindowRequestDto {
+                window_seconds: None,
+            })
+            .await;
+        let _ = rt
+            .prompts_list(PromptListQueryDto {
+                query: None,
+                tag: None,
+                sort: None,
+                limit: None,
+            })
             .await;
         let _ = rt.prompts_get(PromptGetRequestDto { id: "x".into() }).await;
         let _ = rt
-            .prompts_create(PromptCreateRequestDto { content: "c".into(), alias: None, tags: vec![] })
+            .prompts_create(PromptCreateRequestDto {
+                content: "c".into(),
+                alias: None,
+                tags: vec![],
+            })
             .await;
         let _ = rt
             .prompts_update(PromptUpdateRequestDto {
@@ -1523,7 +1604,9 @@ mod tests {
                 is_pinned: false,
             })
             .await;
-        let _ = rt.prompts_delete(PromptDeleteRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .prompts_delete(PromptDeleteRequestDto { id: "x".into() })
+            .await;
         let _ = rt
             .prompts_use(PromptUseRequestDto {
                 id: "x".into(),
@@ -1534,7 +1617,10 @@ mod tests {
             })
             .await;
         let _ = rt
-            .suggest_tags(PromptSuggestTagsRequestDto { query: None, limit: None })
+            .suggest_tags(PromptSuggestTagsRequestDto {
+                query: None,
+                limit: None,
+            })
             .await;
         let _ = rt
             .subagent_delegate(SubagentDelegateRequestDto {
@@ -1552,16 +1638,34 @@ mod tests {
             })
             .await;
         let _ = rt
-            .subagent_show(SubagentResolveRequestDto { name: None, id: Some("sa".into()), cwd: None })
+            .subagent_show(SubagentResolveRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+            })
             .await;
         let _ = rt
-            .subagent_tasks(SubagentTasksRequestDto { name: None, id: Some("sa".into()), cwd: None, limit: None })
+            .subagent_tasks(SubagentTasksRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+                limit: None,
+            })
             .await;
         let _ = rt
-            .subagent_hibernate(SubagentResolveRequestDto { name: None, id: Some("sa".into()), cwd: None })
+            .subagent_hibernate(SubagentResolveRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+            })
             .await;
         let _ = rt
-            .subagent_delete(SubagentDeleteRequestDto { name: None, id: Some("sa".into()), cwd: None, hard: None })
+            .subagent_delete(SubagentDeleteRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+                hard: None,
+            })
             .await;
         let _ = rt
             .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
@@ -1584,7 +1688,9 @@ mod tests {
                 api_key: None,
             })
             .await;
-        let _ = rt.provider_delete(ProviderDeleteRequestDto { id: "p".into() }).await;
+        let _ = rt
+            .provider_delete(ProviderDeleteRequestDto { id: "p".into() })
+            .await;
         let _ = rt
             .provider_test_connection(ProviderTestConnectionRequestDto { id: "p".into() })
             .await;
@@ -1597,12 +1703,26 @@ mod tests {
             })
             .await;
         let _ = rt
-            .model_list(ModelListRequestDto { provider_id: None, tags: vec![], include_disabled: false })
+            .model_list(ModelListRequestDto {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: false,
+            })
             .await;
-        let _ = rt.model_update(ModelUpdateRequestDto { id: "m".into(), enabled: None }).await;
-        let _ = rt.model_delete(ModelDeleteRequestDto { id: "m".into() }).await;
         let _ = rt
-            .model_tags_update(ModelTagUpdateDto { model_id: "m".into(), tags: vec![] })
+            .model_update(ModelUpdateRequestDto {
+                id: "m".into(),
+                enabled: None,
+            })
+            .await;
+        let _ = rt
+            .model_delete(ModelDeleteRequestDto { id: "m".into() })
+            .await;
+        let _ = rt
+            .model_tags_update(ModelTagUpdateDto {
+                model_id: "m".into(),
+                tags: vec![],
+            })
             .await;
         let _ = rt
             .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
@@ -1632,6 +1752,8 @@ mod tests {
                 write_access: None,
             })
             .await;
-        let _ = rt.profile_delete(ProfileDeleteRequestDto { id: "pr".into() }).await;
+        let _ = rt
+            .profile_delete(ProfileDeleteRequestDto { id: "pr".into() })
+            .await;
     }
 }

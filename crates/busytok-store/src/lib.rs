@@ -34,7 +34,9 @@ pub use provider_catalog::{
     UpdateProviderPatch,
 };
 // Re-export domain types that store consumers need
-pub use busytok_domain::{Model, ModelTag, ProfileModelRef, Provider, ProviderKind, ProviderSummary};
+pub use busytok_domain::{
+    Model, ModelTag, ProfileModelRef, Provider, ProviderKind, ProviderSummary,
+};
 pub use read_models::DailyUsageTrendRow;
 pub use repository::{
     CodexTokenSnapshotRow, DailyUsageRow, DiagnosticEventRow, LogFileRow, LogSourceRow,

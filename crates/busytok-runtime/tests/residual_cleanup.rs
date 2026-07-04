@@ -27,7 +27,10 @@ fn no_env_name_fields_remain() {
         if !root_dir.exists() {
             continue;
         }
-        for entry in walkdir::WalkDir::new(&root_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&root_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -82,7 +85,10 @@ fn no_keychain_dependency_in_cargo() {
         if !root_dir.exists() {
             continue;
         }
-        for entry in walkdir::WalkDir::new(&root_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&root_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if !path.is_file() {
                 continue;

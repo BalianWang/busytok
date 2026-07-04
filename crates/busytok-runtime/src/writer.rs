@@ -1969,7 +1969,9 @@ mod tests {
 
         // Verify codex_token_snapshots row.
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM codex_token_snapshots", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM codex_token_snapshots", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
     }

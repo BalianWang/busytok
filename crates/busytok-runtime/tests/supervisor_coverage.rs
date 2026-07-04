@@ -1081,9 +1081,7 @@ async fn subagent_runtime_status_returns_status() {
     let sup = make_supervisor(db, &tmp);
 
     let result = sup
-        .subagent_runtime_status(SubagentRuntimeStatusRequestDto {
-            project: None,
-        })
+        .subagent_runtime_status(SubagentRuntimeStatusRequestDto { project: None })
         .await;
     // Should return a status response — covers the handler path.
     let _ = result;
