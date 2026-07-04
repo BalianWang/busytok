@@ -144,6 +144,7 @@ async fn provider_create_persists_to_sql_with_api_key() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -172,6 +173,7 @@ async fn provider_delete_blocked_by_profile_reference() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -219,6 +221,7 @@ async fn provider_test_connection_no_enabled_model_skips_fallback() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -265,6 +268,7 @@ async fn model_create_and_list_round_trip() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -327,6 +331,7 @@ async fn model_create_defaults_enabled_to_true_when_omitted() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -361,6 +366,7 @@ async fn model_create_rejects_duplicate_model_id_per_provider() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -405,6 +411,7 @@ async fn model_update_toggles_enabled() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -495,6 +502,7 @@ async fn model_delete_blocked_by_profile_reference() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -587,6 +595,7 @@ async fn model_tags_update_replaces_tags() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await
@@ -646,6 +655,7 @@ async fn model_list_filters_by_provider() {
             name: "P1".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.p1.com".into(),
+            enabled: None,
             api_key: Some("sk-p1".into()),
         })
         .await
@@ -655,6 +665,7 @@ async fn model_list_filters_by_provider() {
             name: "P2".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.p2.com".into(),
+            enabled: None,
             api_key: Some("sk-p2".into()),
         })
         .await
@@ -703,6 +714,7 @@ async fn model_list_filters_by_tag_and_semantics() {
             name: "Test".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test.com".into(),
+            enabled: None,
             api_key: Some("sk-test".into()),
         })
         .await

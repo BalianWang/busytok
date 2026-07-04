@@ -157,11 +157,17 @@ pub fn create_model(conn: &Connection, req: CreateModelReq) -> Result<Model> {
             anyhow!(e)
         }
     })?;
+    // Dedup tags to avoid UNIQUE constraint violations on duplicate input
+    // (e.g. "chat, chat"). `set_model_tags` already uses a HashSet; this
+    // keeps the create path consistent.
+    let mut seen = std::collections::HashSet::new();
     for tag in &req.tags {
-        tx.execute(
-            "INSERT INTO model_tags (model_id, tag) VALUES (?1, ?2)",
-            params![id, tag],
-        )?;
+        if seen.insert(tag.clone()) {
+            tx.execute(
+                "INSERT INTO model_tags (model_id, tag) VALUES (?1, ?2)",
+                params![id, tag],
+            )?;
+        }
     }
     tx.commit()?;
     info!(event_code = "model.created", model_id = %req.model_id, provider_id = %req.provider_id, "model created");
@@ -306,6 +312,15 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<String>> {
 pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Result<()> {
     let now = busytok_domain::now_ms();
     let tx = conn.unchecked_transaction()?;
+    // Verify the model exists before diffing. Without this, a stale UI or
+    // concurrent delete would make "clear tags" (empty diff) silently succeed
+    // on a non-existent model.
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM models WHERE id = ?1", params![model_id], |_| Ok(true))
+        .unwrap_or(false);
+    if !exists {
+        bail!("model not found: {}", model_id);
+    }
     // Diff: delete tags not in new set, insert new tags
     let existing: std::collections::HashSet<String> = tx
         .prepare("SELECT tag FROM model_tags WHERE model_id = ?1")?

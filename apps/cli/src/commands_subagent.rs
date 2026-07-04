@@ -1362,6 +1362,7 @@ mod tests {
                 name: "p".into(),
                 provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
                 base_url: "https://x.example.com/v1".into(),
+                enabled: None,
                 api_key: None,
             })
             .await;
@@ -1570,6 +1571,7 @@ mod tests {
                 name: "p".into(),
                 provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
                 base_url: "https://x.example.com/v1".into(),
+                enabled: None,
                 api_key: None,
             })
             .await;

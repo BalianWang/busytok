@@ -380,7 +380,7 @@ export type ProviderKind = "openai_compatible";
 
 export type ProviderDto = { id: string, name: string, provider_kind: ProviderKind, base_url: string, enabled: boolean, has_api_key: boolean, created_at_ms: number, updated_at_ms: number, };
 
-export type ProviderCreateRequestDto = { name: string, provider_kind: ProviderKind, base_url: string, api_key: string | null, };
+export type ProviderCreateRequestDto = { name: string, provider_kind: ProviderKind, base_url: string, enabled: boolean | null, api_key: string | null, };
 
 export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, enabled: boolean | null, api_key: string | null | undefined, };
 

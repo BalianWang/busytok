@@ -387,7 +387,13 @@ export function useProviders() {
 export function useProviderMutations() {
   const client = useBusytokClient();
   const queryClient = useQueryClient();
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.providers() });
+  // Provider changes affect both the provider list and the model catalog
+  // (which filters on provider_enabled). Invalidate both to avoid stale
+  // model lists when a provider is disabled or deleted.
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.providers() });
+    queryClient.invalidateQueries({ queryKey: queryKeys.models() });
+  };
 
   const createProvider = useMutation({
     mutationFn: (req: ProviderCreateRequestDto) => client.providerCreate(req),

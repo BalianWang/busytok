@@ -359,7 +359,7 @@ export function ModelsSection() {
         <SettingsRow
           layout="vertical"
           label="Filter by tag"
-          description="Comma-separated tag list; models matching ANY tag are returned."
+          description="Comma-separated tag list; models matching ALL tags are returned."
           control={
             <input
               type="text"

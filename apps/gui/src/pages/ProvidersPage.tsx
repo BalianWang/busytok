@@ -31,12 +31,14 @@ interface ProviderFormState {
   name: string;
   base_url: string;
   api_key: string;
+  enabled: boolean;
 }
 
 const EMPTY_FORM: ProviderFormState = {
   name: "",
   base_url: "",
   api_key: "",
+  enabled: true,
 };
 
 interface ProviderFormProps {
@@ -107,6 +109,18 @@ function ProviderForm({
               placeholder="Enter API key"
               value={form.api_key}
               onChange={(e) => onChange({ api_key: e.currentTarget.value })}
+            />
+          }
+        />
+      )}
+      {mode === "create" && (
+        <SettingsRow
+          label="Enabled"
+          description="Disabled providers are excluded from the model catalog and sidecar routing."
+          control={
+            <ToggleSwitch
+              checked={form.enabled}
+              onChange={(checked) => onChange({ enabled: checked })}
             />
           }
         />
@@ -360,6 +374,7 @@ export function ProvidersPage() {
       name: form.name.trim(),
       provider_kind: "openai_compatible",
       base_url: form.base_url.trim(),
+      enabled: form.enabled,
       api_key: form.api_key.length > 0 ? form.api_key : null,
     };
     setMutationError(null);

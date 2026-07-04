@@ -3619,6 +3619,7 @@ fn provider_create_request(name: &str) -> ProviderCreateRequestDto {
         name: name.to_string(),
         provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://api.example.com/v1".to_string(),
+        enabled: None,
         api_key: None,
     }
 }
@@ -3888,6 +3889,7 @@ async fn provider_update_three_state_api_key_semantics() {
             name: "Three State".to_string(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
+            enabled: None,
             api_key: Some("sk-test-123".to_string()),
         })
         .await
@@ -4832,6 +4834,7 @@ async fn provider_update_respawn_picks_up_live_config() {
             name: "Test Provider".into(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.test-provider.example.com/v1".into(),
+            enabled: None,
             api_key: Some("test-key".into()),
         })
         .await

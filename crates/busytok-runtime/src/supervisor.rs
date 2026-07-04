@@ -350,6 +350,7 @@ impl BusytokSupervisor {
                 // providers with a non-None api_key are included;
                 // `provider_changed` updates this map at runtime via
                 // `update_provider_and_kill_old`.
+                let mut first_runnable_provider: Option<String> = None;
                 let providers: std::collections::HashMap<
                     String,
                     busytok_subagent::sidecar::ProviderRuntimeEntry,
@@ -371,6 +372,12 @@ impl BusytokSupervisor {
                                 return None;
                             }
                             let api_key = p.api_key?;
+                            // Capture the first runnable provider (in DB
+                            // order) for eager bootstrap below. HashMap
+                            // loses insertion order, so we capture here.
+                            if first_runnable_provider.is_none() {
+                                first_runnable_provider = Some(p.id.clone());
+                            }
                             Some((
                                 p.id.clone(),
                                 busytok_subagent::sidecar::ProviderRuntimeEntry {
@@ -432,23 +439,15 @@ impl BusytokSupervisor {
                 );
                 pool.set_responder_factory(factory);
 
-                // Eagerly `ensure_worker` the first enabled provider so the
+                // Eagerly `ensure_worker` the first runnable provider so the
                 // `sidecar_supervisor` field has a supervisor for doctor
                 // checks, shutdown, and runtime status. If no providers are
                 // configured (or all lack credentials), `sidecar_supervisor`
                 // stays `None` — delegate calls will fail with "profile not
                 // bound to a provider" or "unknown provider" (surfaced via
                 // the executor's error path).
-                let first_enabled_provider = {
-                    let db = db.lock().unwrap();
-                    db.list_providers()
-                        .ok()
-                        .and_then(|summaries| {
-                            summaries.into_iter().find(|s| s.enabled).map(|s| s.id)
-                        })
-                };
                 let sidecar_supervisor =
-                    first_enabled_provider.and_then(|pid| match pool.ensure_worker(&pid) {
+                    first_runnable_provider.and_then(|pid| match pool.ensure_worker(&pid) {
                         Ok(sup) => Some(sup),
                         Err(e) => {
                             error!(
@@ -5798,7 +5797,7 @@ impl RuntimeControl for BusytokSupervisor {
                 name: req.name,
                 provider_kind: req.provider_kind,
                 base_url: req.base_url,
-                enabled: true,
+                enabled: req.enabled.unwrap_or(true),
                 api_key: req.api_key,
             })
             .map_err(|e| {

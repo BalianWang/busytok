@@ -435,6 +435,7 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
             name: "P".to_string(),
             provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "http://x".to_string(),
+            enabled: None,
             api_key: None,
         })
         .await;

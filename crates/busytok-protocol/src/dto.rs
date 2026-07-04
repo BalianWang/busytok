@@ -1567,6 +1567,8 @@ pub struct ProviderCreateRequestDto {
     pub provider_kind: ProviderKind,
     pub base_url: String,
     #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
     pub api_key: Option<String>,
 }
 

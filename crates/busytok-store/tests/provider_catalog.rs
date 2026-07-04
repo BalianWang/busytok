@@ -385,3 +385,46 @@ fn row_to_provider_defaults_on_invalid_provider_kind() {
         .expect("provider should exist");
     assert_eq!(provider.provider_kind, ProviderKind::OpenAiCompatible);
 }
+
+#[test]
+fn set_model_tags_errors_on_nonexistent_model() {
+    let db = Database::open_in_memory().unwrap();
+    // No model with this id exists — set_model_tags must reject, not
+    // silently succeed (especially when the tag diff is empty).
+    let err = db
+        .set_model_tags("nonexistent-id", &[])
+        .unwrap_err();
+    assert!(err.to_string().contains("model not found"));
+}
+
+#[test]
+fn create_model_dedupes_duplicate_tags() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_provider(CreateProviderReq {
+        name: "P".into(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        enabled: true,
+        api_key: Some("sk-test".into()),
+    })
+    .unwrap();
+    let provider = db.list_providers().unwrap().pop().unwrap();
+    // Duplicate tags in the input — store must dedup, not hit UNIQUE.
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "m-1".into(),
+            enabled: true,
+            tags: vec!["chat".into(), "chat".into(), "fast".into()],
+        })
+        .unwrap();
+    let entries = db
+        .list_models_filtered(ModelCatalogFilter {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: true,
+        })
+        .unwrap();
+    let entry = entries.iter().find(|e| e.model_db_id == model.id).unwrap();
+    assert_eq!(entry.tags, vec!["chat".to_string(), "fast".to_string()]);
+}
