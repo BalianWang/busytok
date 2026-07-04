@@ -42,6 +42,11 @@ pub async fn handle_delegate(
         model_override: model,
         source_harness: Some("cli".to_string()),
         source_session_id: None,
+        // CLI does not yet expose bound-field flags; the reuse path uses the
+        // subagent's stored bound fields, and the create path will reject
+        // (both-absent) until the GUI/CLI add explicit bound-field args.
+        bound_provider_id: None,
+        bound_model_id: None,
     };
     let resp = client
         .call(ControlRequest::new(
@@ -1406,6 +1411,7 @@ mod tests {
                 name: None,
                 base_url: None,
                 enabled: None,
+                provider_kind: None,
                 api_key: None,
             })
             .await;
@@ -1421,6 +1427,10 @@ mod tests {
                 model_id: "m".into(),
                 enabled: None,
                 tags: vec![],
+                context_window: 8192,
+                max_tokens: 4096,
+                display_name: None,
+                reasoning: None,
             })
             .await;
         let _ = rt
@@ -1434,6 +1444,10 @@ mod tests {
             .model_update(ModelUpdateRequestDto {
                 id: "m".into(),
                 enabled: None,
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
             })
             .await;
         let _ = rt
@@ -1631,6 +1645,8 @@ mod tests {
                 model_override: None,
                 source_harness: None,
                 source_session_id: None,
+                bound_provider_id: None,
+                bound_model_id: None,
             })
             .await;
         let _ = rt
@@ -1681,6 +1697,7 @@ mod tests {
                 name: None,
                 base_url: None,
                 enabled: None,
+                provider_kind: None,
                 api_key: None,
             })
             .await;
@@ -1696,6 +1713,10 @@ mod tests {
                 model_id: "m".into(),
                 enabled: None,
                 tags: vec![],
+                context_window: 8192,
+                max_tokens: 4096,
+                display_name: None,
+                reasoning: None,
             })
             .await;
         let _ = rt
@@ -1709,6 +1730,10 @@ mod tests {
             .model_update(ModelUpdateRequestDto {
                 id: "m".into(),
                 enabled: None,
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
             })
             .await;
         let _ = rt

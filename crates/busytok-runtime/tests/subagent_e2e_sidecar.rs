@@ -144,12 +144,13 @@ fn seed_test_providers(db: &busytok_store::Database, seeds: &[TestProviderSeed])
 /// Returns the settings plus the list of `TestProviderSeed`s that must be
 /// seeded into SQL before constructing the supervisor.
 ///
-/// NOTE (Task 3 INTERIM): profiles no longer carry `provider_id` / `model`
-/// fields. Provider/model binding is now per-subagent via SQL catalog
-/// (`subagent.bound_provider_id` / `bound_model_id`). Until Task 4 wires
-/// the DTO bound-fields path and Task 5 threads `subagent.bound_provider_id`
-/// into `ExecutorInput`, e2e tests that depend on actual sidecar routing
-/// (worker spawn) are marked `#[ignore]`.
+/// NOTE (Task 4): profiles no longer carry `provider_id` / `model` fields.
+/// Provider/model binding is now per-subagent via SQL catalog
+/// (`subagent.bound_provider_id` / `bound_model_id`). The DTO
+/// `SubagentDelegateRequestDto` now carries `bound_provider_id` /
+/// `bound_model_id`, so e2e tests that create new subagents pass both
+/// fields (sourced from `TEST_PROVIDER_SEED`) and exercise the real
+/// sidecar spawn path.
 fn make_sidecar_settings() -> (BusytokSettings, Vec<TestProviderSeed>) {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
@@ -207,7 +208,6 @@ fn make_sidecar_supervisor(
     BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
 }
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
@@ -232,6 +232,8 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -373,7 +375,6 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
@@ -404,6 +405,8 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -505,7 +508,6 @@ fn make_sidecar_config_with_memory_update() -> SidecarConfig {
     cfg
 }
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
@@ -534,6 +536,8 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
             model_override: None,
             source_harness: Some("cli".to_string()),
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -577,6 +581,8 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
             model_override: None,
             source_harness: Some("cli".to_string()),
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -666,6 +672,8 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await;
 
@@ -695,7 +703,6 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
 // close → retries turn_auto. Verifies the evicted subagent lands at 'warm'
 // (memory written) and a `session_hibernate` resource event is recorded.
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_eviction_releases_lru_and_retries() {
@@ -734,6 +741,8 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -754,6 +763,8 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -1452,7 +1463,6 @@ async fn doctor_sqlite_check_failure_leaves_connection_usable() {
 // resp1.status == "completed". Using =2 makes the mock exit after the first
 // turn_auto response, matching the brief's behavioral expectations.
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
@@ -1490,6 +1500,8 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .expect("first delegate must complete (response sent before crash)");
@@ -1535,6 +1547,8 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .expect("second delegate must succeed after auto-restart");
@@ -1599,7 +1613,6 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
 // Flow: crash #1 → restart → crash #2 → restart → success. Asserts 2 crash
 // events + 2 restart events, proving the loop ran for both lifecycles.
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_double_crash_second_crash_still_detected() {
@@ -1632,6 +1645,8 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .expect("first delegate must complete");
@@ -1676,6 +1691,8 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .expect("second delegate must complete after restart");
@@ -1720,6 +1737,8 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .expect("third delegate must complete after second restart");
@@ -1870,6 +1889,8 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -1939,7 +1960,6 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
 // is a generous ceiling that catches catastrophic leaks without being
 // environment-sensitive.
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
@@ -1990,6 +2010,8 @@ async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -2168,7 +2190,6 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
 //    resource event, then the responder clears the gate to `Resume` so the
 //    next delegate() can lazy-restart the sidecar.
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn pressure_response_force_kills_on_rss_limit_exceeded() {
@@ -2203,6 +2224,8 @@ async fn pressure_response_force_kills_on_rss_limit_exceeded() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await;
 
@@ -2250,7 +2273,6 @@ async fn pressure_response_force_kills_on_rss_limit_exceeded() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn pressure_response_pauses_on_memory_pressure() {
@@ -2290,6 +2312,8 @@ async fn pressure_response_pauses_on_memory_pressure() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await;
 
@@ -2323,7 +2347,6 @@ async fn pressure_response_pauses_on_memory_pressure() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
-#[ignore = "Task 4: bound fields DTO path not yet wired"]
 #[tokio::test]
 #[serial]
 async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
@@ -2362,6 +2385,8 @@ async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await;
 

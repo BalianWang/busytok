@@ -378,6 +378,8 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -447,6 +449,7 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await;

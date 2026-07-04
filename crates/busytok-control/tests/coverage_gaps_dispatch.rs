@@ -118,6 +118,10 @@ fn stub_model_catalog_entry_dto() -> ModelCatalogEntryDto {
         model_id: "stub-model".to_string(),
         model_enabled: true,
         tags: vec![],
+        display_name: None,
+        reasoning: false,
+        context_window: None,
+        max_tokens: None,
     }
 }
 
@@ -1069,7 +1073,9 @@ async fn dispatcher_routes_model_create_returns_ok() {
     let dispatcher = ControlDispatcher::new(runtime);
     let params = serde_json::json!({
         "provider_id": "p-stub",
-        "model_id": "stub-model"
+        "model_id": "stub-model",
+        "context_window": 8192,
+        "max_tokens": 4096
     });
     let response = dispatcher
         .dispatch(ControlRequest::new("model.create", params))
@@ -1173,6 +1179,10 @@ async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
             model_id: "m1".to_string(),
             enabled: None,
             tags: vec![],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
         })
         .await;
     let _ = rt
@@ -1186,6 +1196,10 @@ async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
         .model_update(ModelUpdateRequestDto {
             id: "m1".to_string(),
             enabled: None,
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
         })
         .await;
     let _ = rt

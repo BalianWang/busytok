@@ -300,7 +300,14 @@ export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: s
  * the artifact store root) instead of the inline `prompt`. Mutually
  * exclusive with `prompt` — exactly one must be non-empty/Some.
  */
-prompt_artifact_ref: string | null, timeout_seconds: number | null, model_override: string | null, source_harness: string | null, source_session_id: string | null, };
+prompt_artifact_ref: string | null, timeout_seconds: number | null, model_override: string | null, source_harness: string | null, source_session_id: string | null, 
+/**
+ * Spec §3.3: when creating a new subagent, both must be provided
+ * together ("both or neither" rule). Ignored when reusing an existing
+ * subagent (by `subagent_id` or matched `subagent_name` + `cwd`) — the
+ * subagent's stored bound fields are used instead.
+ */
+bound_provider_id: string | null, bound_model_id: string | null, };
 
 export type SubagentListRequestDto = { 
 /**
@@ -308,7 +315,12 @@ export type SubagentListRequestDto = {
  */
 status: string | null, project: string | null, include_deleted: boolean | null, };
 
-export type SubagentDetailDto = { id: string, name: string, project_id: string, repo_path: string, repo_hash: string, branch: string | null, intent: string | null, default_profile: string, default_model: string | null, status: string, created_at_ms: number, updated_at_ms: number, last_active_at_ms: number | null, };
+export type SubagentDetailDto = { id: string, name: string, project_id: string, repo_path: string, repo_hash: string, branch: string | null, intent: string | null, default_profile: string, 
+/**
+ * Spec §3.3: per-subagent provider/model binding (NOT NULL in store).
+ * Replaces the former `default_model` field (Task 4).
+ */
+bound_provider_id: string, bound_model_id: string, status: string, created_at_ms: number, updated_at_ms: number, last_active_at_ms: number | null, };
 
 export type SubagentListResponseDto = { subagents: Array<SubagentDetailDto>, };
 
@@ -382,7 +394,14 @@ export type ProviderDto = { id: string, name: string, provider_kind: ProviderKin
 
 export type ProviderCreateRequestDto = { name: string, provider_kind: ProviderKind, base_url: string, enabled: boolean | null, api_key: string | null, };
 
-export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, enabled: boolean | null, api_key: string | null | undefined, };
+export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, enabled: boolean | null, 
+/**
+ * Spec §7.1: patch the provider's `provider_kind` (which determines the
+ * API shape — `openai_completions` vs `anthropic_messages`). Changing
+ * `provider_kind` kills the worker so the next delegate re-spawns it
+ * with the new API shape.
+ */
+provider_kind: ProviderKind | null, api_key: string | null | undefined, };
 
 export type ProviderListResponseDto = { providers: Array<ProviderDto>, };
 
@@ -392,11 +411,15 @@ export type ProviderTestConnectionRequestDto = { id: string, };
 
 export type ProviderTestConnectionResponseDto = { ok: boolean, error: string | null, models_detected: Array<string> | null, };
 
-export type ModelCatalogEntryDto = { provider_id: string, provider_name: string, provider_kind: ProviderKind, provider_enabled: boolean, model_db_id: string, model_id: string, model_enabled: boolean, tags: Array<string>, };
+export type ModelCatalogEntryDto = { provider_id: string, provider_name: string, provider_kind: ProviderKind, provider_enabled: boolean, model_db_id: string, model_id: string, model_enabled: boolean, tags: Array<string>, display_name: string | null, reasoning: boolean, context_window: number | null, max_tokens: number | null, };
 
-export type ModelCreateRequestDto = { provider_id: string, model_id: string, enabled: boolean | null, tags: Array<string>, };
+export type ModelCreateRequestDto = { provider_id: string, model_id: string, enabled: boolean | null, tags: Array<string>, 
+/**
+ * Required metadata (spec §6.1): caller must supply both at create time.
+ */
+context_window: number, max_tokens: number, display_name: string | null, reasoning: boolean | null, };
 
-export type ModelUpdateRequestDto = { id: string, enabled: boolean | null, };
+export type ModelUpdateRequestDto = { id: string, enabled: boolean | null, display_name: string | null, reasoning: boolean | null, context_window: number | null, max_tokens: number | null, };
 
 export type ModelDeleteRequestDto = { id: string, };
 

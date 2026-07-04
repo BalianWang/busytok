@@ -2843,8 +2843,6 @@ fn validate_runtime_dir(runtime_dir: &str, node_runtime: &str) -> Result<()> {
 
 fn delegate_request_from_dto(
     d: busytok_protocol::dto::SubagentDelegateRequestDto,
-    bound_provider_id: Option<String>,
-    bound_model_id: Option<String>,
 ) -> busytok_subagent::models::DelegateRequest {
     busytok_subagent::models::DelegateRequest {
         subagent_name: d.subagent_name,
@@ -2858,11 +2856,12 @@ fn delegate_request_from_dto(
         model_override: d.model_override,
         source_harness: d.source_harness,
         source_session_id: d.source_session_id,
-        // INTERIM (Task 2): thread bound fields from the profile config so
-        // the create path can validate provider + model. Task 4 will replace
-        // this by reading bound fields directly from the DTO.
-        bound_provider_id,
-        bound_model_id,
+        // Spec §3.3: bound fields come from the DTO. For the reuse path
+        // (existing subagent by name or subagent_id), the manager IGNORES
+        // these and uses the subagent's stored bound fields. For the create
+        // path, the manager enforces "both or neither".
+        bound_provider_id: d.bound_provider_id,
+        bound_model_id: d.bound_model_id,
     }
 }
 
@@ -2886,9 +2885,11 @@ fn subagent_detail(s: busytok_subagent::models::LogicalSubagent) -> SubagentDeta
         branch: s.branch,
         intent: s.intent,
         default_profile: s.default_profile,
-        // Task 4 replaces this DTO field with bound_provider_id/bound_model_id;
-        // until then we surface None so the conversion compiles.
-        default_model: None,
+        // Spec §3.3: per-subagent bound fields (NOT NULL in store) replace
+        // the former `default_model` field. Surfaced on the detail DTO so
+        // the GUI/CLI can show which provider+model the subagent is bound to.
+        bound_provider_id: s.bound_provider_id,
+        bound_model_id: s.bound_model_id,
         status: s.status.as_str().to_string(),
         created_at_ms: s.created_at_ms,
         updated_at_ms: s.updated_at_ms,
@@ -5367,14 +5368,12 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: busytok_protocol::dto::SubagentDelegateRequestDto,
     ) -> Result<SubagentDelegateResponseDto> {
-        // Task 3: Profile downgrade — profiles no longer carry provider_id /
-        // model, so the whitelist validation block (former Phase 3 Task 4)
-        // is gone. The new validation chain (Task 6) will use
-        // `bound_provider_id` + `effective_model_id` from the DTO + subagent.
-        // For now, the handler forwards to `subagent_manager().delegate()`
-        // with `(None, None)` for bound fields (INTERIM until Task 4 wires
-        // the DTO bound-fields path through `SubagentDelegateRequestDto`).
-
+        // Spec §3.3 + Task 4: bound_provider_id + bound_model_id are read
+        // from the DTO. For the reuse path (existing subagent by name or
+        // subagent_id), the manager IGNORES the DTO bound fields and uses
+        // the subagent's stored bound fields. For the create path, the
+        // manager enforces "both or neither" against the DTO bound fields.
+        //
         // Phase 3 Task 5: capture cwd before `req` is consumed by
         // `delegate_request_from_dto`, then bridge the subagent task's usage
         // into the unified `usage_events` pipeline after delegate returns.
@@ -5382,13 +5381,9 @@ impl RuntimeControl for BusytokSupervisor {
         // fail the task (the task result is already persisted; usage is
         // best-effort observability).
         let cwd = req.cwd.clone();
-        // INTERIM (Task 3): pass `(None, None)` for bound fields — the real
-        // bound fields will come from `SubagentDelegateRequestDto` once Task 4
-        // adds them to the DTO. The manager's bound-pair check accepts the
-        // both-absent branch, so the create path skips validation.
         let r = self
             .subagent_manager()
-            .delegate(delegate_request_from_dto(req, None, None))
+            .delegate(delegate_request_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
         // Only bridge usage for completed/failed tasks — queued tasks have
@@ -5754,7 +5749,11 @@ impl RuntimeControl for BusytokSupervisor {
                 name: req.name,
                 base_url: req.base_url,
                 enabled: req.enabled,
-                provider_kind: None,
+                // Spec §7.1: patching provider_kind changes the API shape
+                // (openai_completions vs anthropic_messages). The worker is
+                // killed below via `provider_changed` so the next delegate
+                // re-spawns it with the new API shape.
+                provider_kind: req.provider_kind,
                 api_key: req.api_key,
             })
             .map_err(|e| {
@@ -5960,7 +5959,9 @@ impl RuntimeControl for BusytokSupervisor {
     async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
         // Create the model row + initial tags atomically (store layer
         // transaction). `model_id` immutability is enforced at the store
-        // layer via UNIQUE(provider_id, model_id).
+        // layer via UNIQUE(provider_id, model_id). Spec §6.1: context_window
+        // + max_tokens are required at create time (enforced by the DTO);
+        // display_name + reasoning are optional.
         let model = {
             let db = self.db.lock().unwrap();
             db.create_model(busytok_store::CreateModelReq {
@@ -5968,10 +5969,10 @@ impl RuntimeControl for BusytokSupervisor {
                 model_id: req.model_id.clone(),
                 enabled: req.enabled.unwrap_or(true),
                 tags: req.tags.clone(),
-                display_name: None,
-                reasoning: None,
-                context_window: None,
-                max_tokens: None,
+                display_name: req.display_name.clone(),
+                reasoning: req.reasoning,
+                context_window: Some(req.context_window),
+                max_tokens: Some(req.max_tokens),
             })
             .map_err(|e| {
                 tracing::error!(event_code = "model.sql_write_failed", provider_id = %req.provider_id, model_id = %req.model_id, error = %e, "create_model failed");
@@ -6033,17 +6034,17 @@ impl RuntimeControl for BusytokSupervisor {
     }
 
     async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
-        // Only `enabled` is patchable — `model_id` is immutable. The store
-        // layer's `update_model` enforces "model not found" via row-count
-        // check (rows == 0 → bail).
+        // `model_id` is immutable — only enabled + metadata are patchable
+        // (spec §6.1). The store layer's `update_model` enforces "model not
+        // found" via row-count check (rows == 0 → bail).
         let updated = {
             let db = self.db.lock().unwrap();
             db.update_model(&req.id, busytok_store::UpdateModelPatch {
                 enabled: req.enabled,
-                display_name: None,
-                reasoning: None,
-                context_window: None,
-                max_tokens: None,
+                display_name: req.display_name,
+                reasoning: req.reasoning,
+                context_window: req.context_window,
+                max_tokens: req.max_tokens,
             })
             .map_err(|e| {
                 tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "update_model failed");
@@ -6434,6 +6435,13 @@ fn catalog_entry_to_dto(e: busytok_domain::ModelCatalogEntry) -> ModelCatalogEnt
         model_id: e.model_id,
         model_enabled: e.model_enabled,
         tags: e.tags,
+        // Spec §6.1: model metadata (display_name + reasoning + context_window
+        // + max_tokens) surfaced on the catalog entry so the GUI/CLI can show
+        // model capabilities without a separate fetch.
+        display_name: e.display_name,
+        reasoning: e.reasoning,
+        context_window: e.context_window,
+        max_tokens: e.max_tokens,
     }
 }
 
@@ -7073,9 +7081,10 @@ mod tests {
             model_override: Some("gpt-5".to_string()),
             source_harness: Some("gui".to_string()),
             source_session_id: Some("sess-1".to_string()),
+            bound_provider_id: Some("prov-1".to_string()),
+            bound_model_id: Some("gpt-5".to_string()),
         };
-        let req =
-            delegate_request_from_dto(dto, Some("prov-1".to_string()), Some("gpt-5".to_string()));
+        let req = delegate_request_from_dto(dto);
         assert_eq!(req.subagent_name, "sa");
         assert_eq!(req.subagent_id.as_deref(), Some("id-1"));
         assert_eq!(req.cwd, "/tmp");
@@ -7129,6 +7138,8 @@ mod tests {
         assert_eq!(dto.name, "sa");
         assert_eq!(dto.status, "hot");
         assert_eq!(dto.default_profile, "pi/search-cheap");
+        assert_eq!(dto.bound_provider_id, "prov-1");
+        assert_eq!(dto.bound_model_id, "gpt-5");
         assert_eq!(dto.last_active_at_ms, Some(150));
     }
 

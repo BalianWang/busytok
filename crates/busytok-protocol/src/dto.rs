@@ -1302,6 +1302,14 @@ pub struct SubagentDelegateRequestDto {
     pub model_override: Option<String>,
     pub source_harness: Option<String>,
     pub source_session_id: Option<String>,
+    /// Spec §3.3: when creating a new subagent, both must be provided
+    /// together ("both or neither" rule). Ignored when reusing an existing
+    /// subagent (by `subagent_id` or matched `subagent_name` + `cwd`) — the
+    /// subagent's stored bound fields are used instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1375,7 +1383,10 @@ pub struct SubagentDetailDto {
     pub branch: Option<String>,
     pub intent: Option<String>,
     pub default_profile: String,
-    pub default_model: Option<String>,
+    /// Spec §3.3: per-subagent provider/model binding (NOT NULL in store).
+    /// Replaces the former `default_model` field (Task 4).
+    pub bound_provider_id: String,
+    pub bound_model_id: String,
     pub status: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -1582,6 +1593,12 @@ pub struct ProviderUpdateRequestDto {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Spec §7.1: patch the provider's `provider_kind` (which determines the
+    /// API shape — `openai_completions` vs `anthropic_messages`). Changing
+    /// `provider_kind` kills the worker so the next delegate re-spawns it
+    /// with the new API shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<ProviderKind>,
     // None=不改, Some(None)=清除, Some(Some(k))=更新
     #[serde(
         default,
@@ -1605,6 +1622,10 @@ pub struct ModelCatalogEntryDto {
     pub model_id: String,
     pub model_enabled: bool,
     pub tags: Vec<String>,
+    pub display_name: Option<String>,
+    pub reasoning: bool,
+    pub context_window: Option<i64>,
+    pub max_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1616,6 +1637,13 @@ pub struct ModelCreateRequestDto {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Required metadata (spec §6.1): caller must supply both at create time.
+    pub context_window: i64,
+    pub max_tokens: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1624,6 +1652,14 @@ pub struct ModelUpdateRequestDto {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1843,6 +1879,7 @@ mod tests {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         };
         let json = serde_json::to_value(&unchanged).unwrap();
@@ -1855,6 +1892,7 @@ mod tests {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: Some(None),
         };
         let json = serde_json::to_value(&clear).unwrap();
@@ -1866,6 +1904,7 @@ mod tests {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: Some(Some("new-key".to_string())),
         };
         let json = serde_json::to_value(&update).unwrap();
@@ -1887,6 +1926,76 @@ mod tests {
     }
 
     #[test]
+    fn provider_update_request_dto_deserializes_provider_kind_patch() {
+        // Spec §7.1: `provider_kind` is a patch field — absent means
+        // unchanged, present updates the provider's API shape.
+        let json = serde_json::json!({
+            "id": "p1",
+            "provider_kind": "anthropic_compatible",
+        });
+        let dto: ProviderUpdateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(dto.provider_kind, Some(ProviderKind::AnthropicCompatible));
+
+        // Absent → None (unchanged).
+        let absent: ProviderUpdateRequestDto = serde_json::from_str(r#"{"id":"p1"}"#).unwrap();
+        assert_eq!(absent.provider_kind, None);
+    }
+
+    #[test]
+    fn delegate_request_dto_deserializes_bound_fields() {
+        // Spec §3.3: bound_provider_id + bound_model_id are optional on the
+        // wire (None = unchanged / reuse path). When creating a new subagent,
+        // the manager enforces "both or neither".
+        let json = serde_json::json!({
+            "subagent_name": "test",
+            "subagent_id": null,
+            "cwd": "/tmp",
+            "profile": "pi/search-cheap",
+            "intent": null,
+            "prompt": "hi",
+            "prompt_artifact_ref": null,
+            "timeout_seconds": null,
+            "model_override": null,
+            "source_harness": null,
+            "source_session_id": null,
+            "bound_provider_id": "prov-1",
+            "bound_model_id": "gpt-4o",
+        });
+        let dto: SubagentDelegateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(dto.bound_provider_id.as_deref(), Some("prov-1"));
+        assert_eq!(dto.bound_model_id.as_deref(), Some("gpt-4o"));
+
+        // Absent on the wire → None (reuse path or "both absent" create path).
+        let absent: SubagentDelegateRequestDto = serde_json::from_str(
+            r#"{"subagent_name":"t","subagent_id":null,"cwd":"/tmp","profile":"p","intent":null,"prompt":"hi","prompt_artifact_ref":null,"timeout_seconds":null,"model_override":null,"source_harness":null,"source_session_id":null}"#,
+        )
+        .unwrap();
+        assert!(absent.bound_provider_id.is_none());
+        assert!(absent.bound_model_id.is_none());
+
+        // `skip_serializing_if = Option::is_none` — None must NOT appear on
+        // the wire (keeps the JSON shape stable for old clients).
+        let none_dto = SubagentDelegateRequestDto {
+            subagent_name: "t".to_string(),
+            subagent_id: None,
+            cwd: "/tmp".to_string(),
+            profile: "p".to_string(),
+            intent: None,
+            prompt: "hi".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
+        };
+        let json = serde_json::to_value(&none_dto).unwrap();
+        assert!(json.get("bound_provider_id").is_none());
+        assert!(json.get("bound_model_id").is_none());
+    }
+
+    #[test]
     fn provider_kind_serializes_as_openai_compatible() {
         let json = serde_json::to_value(ProviderKind::OpenAiCompatible).unwrap();
         assert_eq!(json, "openai_compatible");
@@ -1905,6 +2014,10 @@ mod tests {
             model_id: "gpt-4o".to_string(),
             model_enabled: true,
             tags: vec!["fast".to_string(), "cheap".to_string()],
+            display_name: Some("GPT-4o".to_string()),
+            reasoning: true,
+            context_window: Some(128_000),
+            max_tokens: Some(16_384),
         };
         let json = serde_json::to_value(&dto).unwrap();
         assert_eq!(json["provider_id"], "prov-1");
@@ -1912,27 +2025,53 @@ mod tests {
         assert_eq!(json["model_db_id"], "model-db-1");
         assert_eq!(json["model_id"], "gpt-4o");
         assert_eq!(json["tags"][0], "fast");
+        assert_eq!(json["display_name"], "GPT-4o");
+        assert_eq!(json["reasoning"], true);
+        assert_eq!(json["context_window"], 128_000);
+        assert_eq!(json["max_tokens"], 16_384);
         let parsed: ModelCatalogEntryDto = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.model_id, "gpt-4o");
         assert_eq!(parsed.tags.len(), 2);
+        assert_eq!(parsed.reasoning, true);
+        assert_eq!(parsed.context_window, Some(128_000));
     }
 
     #[test]
     fn model_create_request_dto_defaults() {
-        // enabled + tags default when omitted.
-        let minimal: ModelCreateRequestDto =
-            serde_json::from_str(r#"{"provider_id":"p","model_id":"m"}"#).unwrap();
+        // context_window + max_tokens are required (no default). enabled +
+        // tags default when omitted; display_name + reasoning default to None.
+        let minimal: ModelCreateRequestDto = serde_json::from_str(
+            r#"{"provider_id":"p","model_id":"m","context_window":128000,"max_tokens":4096}"#,
+        )
+        .unwrap();
         assert_eq!(minimal.provider_id, "p");
         assert_eq!(minimal.model_id, "m");
         assert!(minimal.enabled.is_none());
         assert!(minimal.tags.is_empty());
+        assert_eq!(minimal.context_window, 128_000);
+        assert_eq!(minimal.max_tokens, 4_096);
+        assert!(minimal.display_name.is_none());
+        assert!(minimal.reasoning.is_none());
 
         let full: ModelCreateRequestDto = serde_json::from_str(
-            r#"{"provider_id":"p","model_id":"m","enabled":true,"tags":["t1"]}"#,
+            r#"{"provider_id":"p","model_id":"m","enabled":true,"tags":["t1"],"context_window":128000,"max_tokens":4096,"display_name":"GPT-4o","reasoning":true}"#,
         )
         .unwrap();
         assert_eq!(full.enabled, Some(true));
         assert_eq!(full.tags, vec!["t1".to_string()]);
+        assert_eq!(full.display_name.as_deref(), Some("GPT-4o"));
+        assert_eq!(full.reasoning, Some(true));
+    }
+
+    #[test]
+    fn model_create_request_dto_requires_metadata() {
+        // Missing context_window + max_tokens → should fail to deserialize.
+        let json = serde_json::json!({
+            "provider_id": "p1",
+            "model_id": "gpt-4o",
+        });
+        let result: Result<ModelCreateRequestDto, _> = serde_json::from_value(json);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1940,15 +2079,31 @@ mod tests {
         let noop: ModelUpdateRequestDto = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
         assert_eq!(noop.id, "m");
         assert!(noop.enabled.is_none());
+        assert!(noop.display_name.is_none());
+        assert!(noop.reasoning.is_none());
+        assert!(noop.context_window.is_none());
+        assert!(noop.max_tokens.is_none());
 
         let patch = ModelUpdateRequestDto {
             id: "m".to_string(),
             enabled: Some(false),
+            display_name: Some("GPT-4o".to_string()),
+            reasoning: Some(true),
+            context_window: Some(128_000),
+            max_tokens: Some(4_096),
         };
         let json = serde_json::to_value(&patch).unwrap();
         assert_eq!(json["enabled"], false);
+        assert_eq!(json["display_name"], "GPT-4o");
+        assert_eq!(json["reasoning"], true);
+        assert_eq!(json["context_window"], 128_000);
+        assert_eq!(json["max_tokens"], 4_096);
         let parsed: ModelUpdateRequestDto = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.enabled, Some(false));
+        assert_eq!(parsed.display_name.as_deref(), Some("GPT-4o"));
+        assert_eq!(parsed.reasoning, Some(true));
+        assert_eq!(parsed.context_window, Some(128_000));
+        assert_eq!(parsed.max_tokens, Some(4_096));
     }
 
     #[test]
@@ -1993,6 +2148,10 @@ mod tests {
                 model_id: "m".to_string(),
                 model_enabled: true,
                 tags: vec![],
+                display_name: None,
+                reasoning: false,
+                context_window: None,
+                max_tokens: None,
             }],
         };
         let json = serde_json::to_value(&dto).unwrap();

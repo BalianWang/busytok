@@ -3527,6 +3527,8 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -3729,6 +3731,7 @@ async fn provider_crud_round_trips_without_api_key() {
             name: Some("Acme Renamed".to_string()),
             base_url: None,
             enabled: Some(false),
+            provider_kind: None,
             api_key: None,
         })
         .await
@@ -3767,6 +3770,7 @@ async fn provider_update_with_none_api_key_is_a_noop_on_sql_store() {
             name: Some("Noop Renamed".to_string()),
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await
@@ -3787,6 +3791,7 @@ async fn provider_update_returns_error_for_unknown_id() {
             name: Some("Ghost".to_string()),
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await
@@ -3893,6 +3898,7 @@ async fn provider_update_three_state_api_key_semantics() {
             name: Some("Three State Renamed".to_string()),
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await
@@ -3910,6 +3916,7 @@ async fn provider_update_three_state_api_key_semantics() {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: Some(None),
         })
         .await
@@ -3926,6 +3933,7 @@ async fn provider_update_three_state_api_key_semantics() {
             name: None,
             base_url: None,
             enabled: None,
+            provider_kind: None,
             api_key: Some(Some("sk-new-456".to_string())),
         })
         .await
@@ -4556,6 +4564,7 @@ async fn provider_changed_removes_worker_then_respawns() {
         name: Some("Updated Name".to_string()),
         base_url: None,
         enabled: None,
+        provider_kind: None,
         api_key: None,
     })
     .await
@@ -4651,6 +4660,7 @@ async fn provider_update_respawn_picks_up_live_config() {
         name: None,
         base_url: Some("https://api.updated.example.com/v1".to_string()),
         enabled: None,
+        provider_kind: None,
         api_key: None,
     })
     .await
@@ -4784,6 +4794,7 @@ async fn provider_update_with_api_key_removes_worker_then_respawns() {
         name: None,
         base_url: None,
         enabled: None,
+        provider_kind: None,
         api_key: Some(Some("rotated-new-key".to_string())),
     })
     .await
@@ -4893,6 +4904,7 @@ async fn provider_update_kills_old_process() {
         name: Some("Updated".to_string()),
         base_url: None,
         enabled: None,
+        provider_kind: None,
         api_key: None,
     })
     .await
@@ -5056,6 +5068,8 @@ async fn write_usage_event_inserts_into_usage_events() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -5096,6 +5110,8 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -5165,6 +5181,8 @@ async fn write_usage_event_uses_active_generation_id() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -5203,6 +5221,8 @@ async fn write_usage_event_produces_real_rollup_rows() {
             model_override: Some("gpt-5".to_string()),
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -5264,6 +5284,8 @@ async fn write_usage_event_visible_in_overview_read_path() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -5358,6 +5380,8 @@ async fn e2e_usage_events_agent_kind_is_codex() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
     })
     .await
     .unwrap();

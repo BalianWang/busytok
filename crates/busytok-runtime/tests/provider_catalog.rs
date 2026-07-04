@@ -231,6 +231,10 @@ async fn model_create_and_list_round_trip() {
             model_id: "gpt-4o".into(),
             enabled: Some(true),
             tags: vec!["fast".into()],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -265,6 +269,10 @@ async fn model_update_rejects_model_id_change() {
     let dto = ModelUpdateRequestDto {
         id: "model_x".into(),
         enabled: Some(false),
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
     };
     // If this compiles, model_id is not in the DTO — success.
     let _ = dto;
@@ -294,6 +302,10 @@ async fn model_create_defaults_enabled_to_true_when_omitted() {
             model_id: "gpt-4o".into(),
             enabled: None,
             tags: vec![],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -328,6 +340,10 @@ async fn model_create_rejects_duplicate_model_id_per_provider() {
         model_id: "gpt-4o".into(),
         enabled: Some(true),
         tags: vec![],
+        context_window: 8192,
+        max_tokens: 4096,
+        display_name: None,
+        reasoning: None,
     })
     .await
     .unwrap();
@@ -339,6 +355,10 @@ async fn model_create_rejects_duplicate_model_id_per_provider() {
             model_id: "gpt-4o".into(),
             enabled: Some(true),
             tags: vec![],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
         })
         .await
         .expect_err("duplicate (provider_id, model_id) must error");
@@ -374,6 +394,10 @@ async fn model_update_toggles_enabled() {
             model_id: "gpt-4o".into(),
             enabled: Some(true),
             tags: vec![],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -383,6 +407,10 @@ async fn model_update_toggles_enabled() {
     sup.model_update(ModelUpdateRequestDto {
         id: created.model_db_id.clone(),
         enabled: Some(false),
+        display_name: None,
+        reasoning: None,
+        context_window: None,
+        max_tokens: None,
     })
     .await
     .unwrap();
@@ -432,6 +460,10 @@ async fn model_update_unknown_id_returns_error() {
         .model_update(ModelUpdateRequestDto {
             id: "nonexistent-model-id".into(),
             enabled: Some(false),
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
         })
         .await
         .expect_err("update on unknown id must error");
@@ -487,6 +519,10 @@ async fn model_tags_update_replaces_tags() {
             model_id: "gpt-4o".into(),
             enabled: Some(true),
             tags: vec!["fast".into(), "cheap".into()],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -555,6 +591,10 @@ async fn model_list_filters_by_provider() {
         model_id: "p1-model".into(),
         enabled: Some(true),
         tags: vec![],
+        context_window: 8192,
+        max_tokens: 4096,
+        display_name: None,
+        reasoning: None,
     })
     .await
     .unwrap();
@@ -563,6 +603,10 @@ async fn model_list_filters_by_provider() {
         model_id: "p2-model".into(),
         enabled: Some(true),
         tags: vec![],
+        context_window: 8192,
+        max_tokens: 4096,
+        display_name: None,
+        reasoning: None,
     })
     .await
     .unwrap();
@@ -606,6 +650,10 @@ async fn model_list_filters_by_tag_and_semantics() {
         model_id: "m1".into(),
         enabled: Some(true),
         tags: vec!["fast".into(), "cheap".into()],
+        context_window: 8192,
+        max_tokens: 4096,
+        display_name: None,
+        reasoning: None,
     })
     .await
     .unwrap();
@@ -615,6 +663,10 @@ async fn model_list_filters_by_tag_and_semantics() {
         model_id: "m2".into(),
         enabled: Some(true),
         tags: vec!["fast".into()],
+        context_window: 8192,
+        max_tokens: 4096,
+        display_name: None,
+        reasoning: None,
     })
     .await
     .unwrap();

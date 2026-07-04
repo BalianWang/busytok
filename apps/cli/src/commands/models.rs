@@ -131,6 +131,10 @@ mod tests {
                 model_id: "gpt-4".to_string(),
                 model_enabled: true,
                 tags: vec!["chat".to_string(), "fast".to_string()],
+                display_name: None,
+                reasoning: false,
+                context_window: None,
+                max_tokens: None,
             },
             ModelCatalogEntryDto {
                 provider_id: "p2".to_string(),
@@ -141,6 +145,10 @@ mod tests {
                 model_id: "deepseek-chat".to_string(),
                 model_enabled: false,
                 tags: vec![],
+                display_name: None,
+                reasoning: false,
+                context_window: None,
+                max_tokens: None,
             },
         ];
         print_models_table(&models);
@@ -160,6 +168,10 @@ mod tests {
             model_id: "y".to_string(),
             model_enabled: true,
             tags: vec![],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
         }];
         print_models_table(&models);
     }
@@ -525,6 +537,10 @@ mod tests {
                 model_id: "gpt-4".to_string(),
                 model_enabled: true,
                 tags: vec!["chat".to_string()],
+                display_name: None,
+                reasoning: false,
+                context_window: None,
+                max_tokens: None,
             },
             ModelCatalogEntryDto {
                 provider_id: "p1".to_string(),
@@ -535,6 +551,10 @@ mod tests {
                 model_id: "gpt-3.5".to_string(),
                 model_enabled: false,
                 tags: vec![],
+                display_name: None,
+                reasoning: false,
+                context_window: None,
+                max_tokens: None,
             },
         ]
     }
@@ -766,6 +786,8 @@ mod tests {
                 model_override: None,
                 source_harness: None,
                 source_session_id: None,
+                bound_provider_id: None,
+                bound_model_id: None,
             })
             .await;
         let _ = rt
@@ -823,6 +845,7 @@ mod tests {
                 name: None,
                 base_url: None,
                 enabled: None,
+                provider_kind: None,
                 api_key: None,
             })
             .await;
@@ -838,12 +861,20 @@ mod tests {
                 model_id: "m".into(),
                 enabled: None,
                 tags: vec![],
+                context_window: 8192,
+                max_tokens: 4096,
+                display_name: None,
+                reasoning: None,
             })
             .await;
         let _ = rt
             .model_update(ModelUpdateRequestDto {
                 id: "m".into(),
                 enabled: None,
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
             })
             .await;
         let _ = rt
