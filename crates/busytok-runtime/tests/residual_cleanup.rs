@@ -112,7 +112,6 @@ fn no_keychain_dependency_in_cargo() {
 
     assert!(
         offenders.is_empty(),
-        "keyring dependency still present in: {:?}",
-        offenders
+        "keyring dependency still present in: {offenders:?}"
     );
 }

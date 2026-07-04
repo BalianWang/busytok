@@ -1,5 +1,5 @@
 //! SQL repository for provider / model / model_tags catalog.
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 // `pub use` so lib.rs can re-export `ModelCatalogEntry` / `ModelCatalogFilter`
 // (and the rest of the catalog types) from `busytok_store::provider_catalog`.
 pub use busytok_domain::{
@@ -7,7 +7,7 @@ pub use busytok_domain::{
     ProviderKind, ProviderSummary,
 };
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use tracing::info;
+use tracing::{debug, info};
 
 // ── Input DTOs (no id/timestamps — store generates those) ──────────────
 
@@ -133,7 +133,9 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<ProviderSummary>> {
         "SELECT id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms
          FROM providers ORDER BY name",
     )?;
-    let providers: Vec<Provider> = stmt.query_map([], row_to_provider)?.filter_map(|r| r.ok()).collect();
+    let providers: Vec<Provider> = stmt
+        .query_map([], row_to_provider)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(providers.iter().map(ProviderSummary::from).collect())
 }
 
@@ -279,7 +281,7 @@ pub fn list_models_filtered(conn: &Connection, filter: ModelCatalogFilter) -> Re
     for row in rows {
         entries.push(row?);
     }
-    info!(event_code = "model.catalog.listed", entry_count = entries.len(), "model catalog listed");
+    debug!(event_code = "model.catalog.listed", entry_count = entries.len(), "model catalog listed");
     Ok(entries)
 }
 
@@ -308,8 +310,7 @@ pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Res
     let existing: std::collections::HashSet<String> = tx
         .prepare("SELECT tag FROM model_tags WHERE model_id = ?1")?
         .query_map(params![model_id], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     let new_set: std::collections::HashSet<String> = tags.iter().cloned().collect();
     // Compute diffs first
     let to_remove: Vec<_> = existing.difference(&new_set).cloned().collect();

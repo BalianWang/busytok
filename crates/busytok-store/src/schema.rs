@@ -37,7 +37,7 @@ const SUBAGENT_TASK_ERROR_KIND_SQL: &str =
 
 /// v6 provider-catalog migration SQL — creates the `providers`, `models`, and
 /// `model_tags` tables that replace settings.toml provider persistence +
-/// keychain credential storage.
+/// SQL provider credential storage.
 const PROVIDER_CATALOG_SQL: &str = include_str!("../migrations/0006_provider_catalog.sql");
 
 /// All migrations in order, from the v1 baseline through the latest version.

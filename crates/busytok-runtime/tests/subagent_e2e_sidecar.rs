@@ -806,7 +806,7 @@ async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     // Disable sidecar so doctor's `sidecar_launchable` check is "ok"
     // (no bundle to launch in unit tests).
     settings.subagent.pi_sidecar.enabled = false;
@@ -922,7 +922,7 @@ async fn doctor_bundled_node_arch_check_validates_arch_directory() {
 
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -954,7 +954,7 @@ async fn doctor_bundled_node_arch_check_errors_on_missing_node() {
     // Don't create the node binary — should error.
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -995,7 +995,7 @@ async fn doctor_bundle_manifest_readable_check_validates_manifest() {
 
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -1026,7 +1026,7 @@ async fn doctor_bundle_manifest_readable_check_fails_on_malformed_manifest() {
 
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -1052,7 +1052,7 @@ async fn doctor_default_model_config_check_validates_models() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.models.default_cheap_model = "".to_string(); // empty → error
     settings
@@ -1087,7 +1087,7 @@ async fn doctor_artifact_store_writable_check_writes_probe_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1121,7 +1121,7 @@ async fn doctor_protocol_version_check_is_warning_when_pi_sidecar_disabled() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1162,7 +1162,7 @@ async fn doctor_protocol_version_check_errors_when_enabled_but_bundle_missing() 
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = true;
     // No bundle installed → resolve_sidecar_config fails → init_error set.
     settings.subagent.pi_sidecar.runtime_dir =
@@ -1244,7 +1244,7 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1323,7 +1323,7 @@ async fn doctor_sqlite_check_errors_on_schema_version_mismatch() {
         .execute_batch("DELETE FROM _schema_version; INSERT INTO _schema_version (version, applied_at_ms) VALUES (999, 0);")
         .unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1368,7 +1368,7 @@ async fn doctor_sqlite_check_errors_on_readonly_database() {
     let db = busytok_store::Database::open_readonly(&db_path).unwrap();
 
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1419,7 +1419,7 @@ async fn doctor_sqlite_check_failure_leaves_connection_usable() {
     let db = busytok_store::Database::open_readonly(&db_path).unwrap();
 
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -2093,7 +2093,7 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let (mut settings, seeds) = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false; // mock executor
     settings.subagent.enabled = true;
     settings

@@ -355,3 +355,33 @@ fn model_update_lookup_by_provider_and_tags_setter() {
     // get_provider_with_secret on missing id returns None
     assert!(db.get_provider_with_secret("nonexistent").unwrap().is_none());
 }
+
+#[test]
+fn row_to_provider_defaults_on_invalid_provider_kind() {
+    // Covers the row_to_provider fallback: when the provider_kind column
+    // holds an unparseable JSON string, the row mapper logs a warning and
+    // defaults to OpenAiCompatible instead of panicking.
+    let db = Database::open_in_memory().unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO providers (id, name, provider_kind, base_url, enabled, \
+             api_key, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                "p-bad",
+                "Bad Kind Provider",
+                "not-valid-json",
+                "https://api.test.com",
+                1i64,
+                "sk-test",
+                1000i64,
+                1000i64,
+            ),
+        )
+        .unwrap();
+    let provider = db
+        .get_provider_with_secret("p-bad")
+        .unwrap()
+        .expect("provider should exist");
+    assert_eq!(provider.provider_kind, ProviderKind::OpenAiCompatible);
+}

@@ -3755,7 +3755,7 @@ async fn provider_crud_round_trips_without_api_key() {
 }
 
 #[tokio::test]
-async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
+async fn provider_update_with_none_api_key_is_a_noop_on_sql_store() {
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);

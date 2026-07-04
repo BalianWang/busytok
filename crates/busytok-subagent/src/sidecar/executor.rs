@@ -181,7 +181,7 @@ impl TaskExecutor for SidecarTaskExecutor {
                         );
                         // Auth-fail kill: hard-remove + kill the worker so the
                         // next execute() re-reads credentials (the bad key
-                        // might have been refreshed in the keychain).
+                        // might have been refreshed in the provider catalog).
                         if kind == TaskErrorKind::Auth {
                             if let Err(kill_err) =
                                 self.pool.remove_worker_and_kill(provider_id).await

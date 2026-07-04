@@ -98,7 +98,7 @@ function ProviderForm({
         <SettingsRow
           layout="vertical"
           label="API Key"
-          description="The actual API key. Stored in the system keychain, never written to settings.toml."
+          description="The actual API key. Stored in the provider catalog database, never written to settings.toml."
           control={
             <input
               type="password"

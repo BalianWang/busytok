@@ -130,4 +130,20 @@ mod tests {
         let s = ProviderSummary::from(&p);
         assert!(!s.has_api_key);
     }
+
+    #[test]
+    fn provider_summary_has_api_key_true_when_api_key_some() {
+        let p = Provider {
+            id: "p1".into(),
+            name: "Test".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        let s = ProviderSummary::from(&p);
+        assert!(s.has_api_key);
+    }
 }

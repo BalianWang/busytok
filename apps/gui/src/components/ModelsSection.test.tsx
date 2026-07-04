@@ -479,7 +479,7 @@ describe("ModelsSection", () => {
     fireEvent.change(input, { target: { value: "chat, reasoning, " } });
     fireEvent.click(screen.getByRole("button", { name: /save tags/i }));
     expect(tagsUpdateMutate).toHaveBeenCalledWith(
-      { modelId: "deepseek-chat", tags: ["chat", "reasoning"] },
+      { modelId: "m-1", tags: ["chat", "reasoning"] },
       expect.anything(),
     );
     // Edit mode exited: tag input is gone, view-mode label is shown.

@@ -104,7 +104,7 @@ fn list_filtered_no_filters_returns_all_non_deleted() {
 #[test]
 fn list_filtered_include_deleted_returns_all() {
     let db = db();
-    let mut a = seed_subagent(&db, "sa-a", "a");
+    let a = seed_subagent(&db, "sa-a", "a");
     let mut b = seed_subagent(&db, "sa-b", "b");
     b.status = "deleted".to_string();
     db.subagent_upsert_logical(&a).unwrap();

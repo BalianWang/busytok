@@ -289,7 +289,7 @@ export function ModelsSection() {
     ) => {
       setMutationError(null);
       tagsUpdate.mutate(
-        { modelId: model.model_id, tags: newTags },
+        { modelId: model.model_db_id, tags: newTags },
         {
           onSuccess: onDone,
           onError: (err: unknown) => {

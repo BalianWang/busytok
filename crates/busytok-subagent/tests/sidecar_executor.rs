@@ -481,7 +481,7 @@ async fn executor_auth_failure_kills_worker_from_pool() {
     // The kill: remove_worker_and_kill must have dropped the worker from the
     // pool map. worker_snapshots() reflects the live map, so it must now be
     // empty — the bad-credential worker is gone and the next execute() would
-    // re-spawn (re-reading credentials via the keychain).
+    // re-spawn (re-reading credentials from the provider catalog).
     let after = pool.worker_snapshots().await;
     assert!(
         after.is_empty(),

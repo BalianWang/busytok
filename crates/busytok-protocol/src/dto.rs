@@ -1545,8 +1545,8 @@ pub struct ReceiptBrandDto {
 
 // ─── Provider DTOs (Phase 1: Credential Foundation) ───────────────────────
 
-/// Provider as seen by the GUI. `has_api_key` indicates keychain state
-/// without exposing the key itself.
+/// Provider as seen by the GUI. `has_api_key` indicates whether a key is
+/// stored in the provider catalog, without exposing the key itself.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderDto {
@@ -1582,6 +1582,7 @@ pub struct ProviderUpdateRequestDto {
     pub enabled: Option<bool>,
     // None=不改, Some(None)=清除, Some(Some(k))=更新
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_some")]
+    #[ts(type = "string | null | undefined")]
     pub api_key: Option<Option<String>>,
 }
 
@@ -2018,6 +2019,29 @@ mod tests {
         assert_eq!(json["tags"][0], "a");
         let back: ModelTagUpdateDto = serde_json::from_value(json).unwrap();
         assert_eq!(back.tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn provider_list_response_dto_round_trips() {
+        let dto = ProviderListResponseDto {
+            providers: vec![ProviderDto {
+                id: "p1".to_string(),
+                name: "OpenAI".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                enabled: true,
+                has_api_key: true,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            }],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["providers"][0]["id"], "p1");
+        assert_eq!(json["providers"][0]["has_api_key"], true);
+        let back: ProviderListResponseDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.providers.len(), 1);
+        assert_eq!(back.providers[0].name, "OpenAI");
+        assert!(back.providers[0].has_api_key);
     }
 
     #[test]

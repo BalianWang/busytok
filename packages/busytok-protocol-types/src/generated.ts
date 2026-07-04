@@ -382,7 +382,7 @@ export type ProviderDto = { id: string, name: string, provider_kind: ProviderKin
 
 export type ProviderCreateRequestDto = { name: string, provider_kind: ProviderKind, base_url: string, api_key: string | null, };
 
-export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, enabled: boolean | null, api_key: string | null | null, };
+export type ProviderUpdateRequestDto = { id: string, name: string | null, base_url: string | null, enabled: boolean | null, api_key: string | null | undefined, };
 
 export type ProviderListResponseDto = { providers: Array<ProviderDto>, };
 
