@@ -1822,4 +1822,153 @@ mod tests {
         });
         assert_eq!(pending_event_count(&[cmd1, cmd2]), 3);
     }
+
+    #[test]
+    fn pending_event_count_counts_rebuild_batch_events() {
+        // Covers the `WriteCommand::RebuildBatch(c) => c.events.len()` arm (L364).
+        let cmd = WriteCommand::RebuildBatch(RebuildBatchCommand {
+            source_id: "s1".into(),
+            source_file_id: None,
+            source_file_agent: "a".into(),
+            source_file_path: "p".into(),
+            source_file_inode: None,
+            events: vec![
+                make_test_event("r1", 100, None),
+                make_test_event("r2", 200, None),
+                make_test_event("r3", 300, None),
+            ],
+            tool_events: vec![],
+            diagnostic_events: vec![],
+            codex_snapshots: vec![],
+            generation_id: "g".into(),
+            checkpoint_offset: None,
+            is_final_batch: false,
+            write_policy: busytok_domain::UsageWritePolicy::InsertOnce,
+        });
+        assert_eq!(pending_event_count(&[cmd]), 3);
+    }
+
+    #[test]
+    fn pending_event_count_returns_zero_for_non_batch_commands() {
+        // Covers the `_ => 0` arm (L365).
+        let cmds = vec![
+            WriteCommand::GenerationCreate(GenerationCreateCommand {
+                generation_id: "g1".into(),
+            }),
+            WriteCommand::TailReplayBatch(TailReplayBatchCommand { rows: vec![] }),
+            WriteCommand::RecordTailReplay(RecordTailReplayCommand {
+                source_file_id: "f".into(),
+                event_seq: 1,
+                event_data_json: "{}".into(),
+            }),
+            WriteCommand::ProgressCheckpoint(ProgressCheckpointCommand {
+                file_id: "f".into(),
+                source_id: "s".into(),
+                agent: "a".into(),
+                path: "p".into(),
+                inode: None,
+                offset_bytes: 0,
+                size_bytes: 0,
+                last_mtime_ms: None,
+                state: "ok".into(),
+            }),
+        ];
+        assert_eq!(pending_event_count(&cmds), 0);
+    }
+
+    // ── insert_supplementary_events tests (L889-987) ──────────────────────
+    // Exercises the three insertion loops (tool_events, diagnostic_events,
+    // codex_snapshots) against a real in-memory database transaction.
+
+    #[test]
+    fn insert_supplementary_events_inserts_all_kinds() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        let tool = ToolEvent {
+            id: "tool-1".to_string(),
+            agent: busytok_domain::AgentKind::ClaudeCode,
+            source_file_id: "sf-1".to_string(),
+            source_path: "/tmp/x.jsonl".to_string(),
+            source_line: 10,
+            source_offset_start: 0,
+            source_offset_end: 100,
+            session_id: "sess-1".to_string(),
+            message_id: Some("msg-1".to_string()),
+            tool_name: "Read".to_string(),
+            status: Some("ok".to_string()),
+            timestamp_ms: Some(1_000),
+            project_hash: Some("ph".to_string()),
+            created_at_ms: 1_000,
+        };
+
+        let diag = OperationalDiagnosticEvent {
+            id: "diag-1".to_string(),
+            agent: Some(busytok_domain::AgentKind::ClaudeCode),
+            source_id: Some("s-1".to_string()),
+            source_file_id: Some("sf-1".to_string()),
+            source_path: Some("/tmp/x.jsonl".to_string()),
+            source_line: Some(5),
+            category: "parser".to_string(),
+            severity: "warning".to_string(),
+            message: "malformed line".to_string(),
+            detail_json: Some(r#"{"line":5}"#.to_string()),
+            happened_at_ms: 1_000,
+            created_at_ms: 1_000,
+        };
+
+        let now = busytok_domain::now_ms();
+        let snap = CodexTokenSnapshotRow {
+            id: "snap-1".to_string(),
+            source_file_id: "sf-1".to_string(),
+            source_line: 1,
+            source_offset_start: 0,
+            source_offset_end: 100,
+            session_id: "sess-1".to_string(),
+            turn_id: Some("t-1".to_string()),
+            token_event_ordinal: 0,
+            input_tokens: 50,
+            cached_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_tokens: 0,
+            total_tokens: 100,
+            model: Some("gpt-4".to_string()),
+            raw_usage_json: "{}".to_string(),
+            emitted_event_id: Some("evt-1".to_string()),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_supplementary_events(&tx, &[tool], &[diag], &[snap]).unwrap();
+        tx.commit().unwrap();
+
+        // Verify tool_events row.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Verify diagnostic_events row.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM diagnostic_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Verify codex_token_snapshots row.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM codex_token_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insert_supplementary_events_empty_inputs_is_noop() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let tx = conn.unchecked_transaction().unwrap();
+        // Passing all-empty slices should succeed without inserting anything.
+        insert_supplementary_events(&tx, &[], &[], &[]).unwrap();
+        tx.commit().unwrap();
+    }
 }

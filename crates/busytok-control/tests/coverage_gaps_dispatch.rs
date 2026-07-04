@@ -1141,3 +1141,103 @@ async fn dispatcher_routes_model_tags_update_returns_ok_with_null() {
         .unwrap();
     assert!(matches!(response, ControlResponse::Ok(_)));
 }
+
+// ---------------------------------------------------------------------------
+// 5. Arc<T> blanket impl delegation (dispatch.rs lines 1545-1559)
+// ---------------------------------------------------------------------------
+//
+// `impl<T: RuntimeControl> RuntimeControl for Arc<T>` forwards every method
+// via `(**self).method(req).await`. The model_*, pi_sidecar_locator_update,
+// and profile_* forwarding lines (dispatch.rs L1545-1559) are uncovered
+// because no existing test calls these methods directly on an `Arc<T>`.
+// Calling each method through `Arc<TestRuntimeControl>` exercises the
+// blanket-impl forwarding bodies. The inner `TestRuntimeControl` returns
+// `Err` for model_*/profile_* (which is fine — the forwarding line is
+// covered regardless of the inner result) and `Ok` for pi_sidecar.
+
+#[tokio::test]
+async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
+    use std::sync::Arc;
+    // Covers dispatch.rs L1545-1559: `impl RuntimeControl for Arc<T>` forwarding
+    // bodies for model_create/model_list/model_update/model_delete/
+    // model_tags_update/pi_sidecar_locator_update/profile_create/
+    // profile_update/profile_delete.
+    let rt: Arc<TestRuntimeControl> =
+        Arc::new(TestRuntimeControl::with_claude_fixture().await.unwrap());
+
+    // model_* — TestRuntimeControl bails "not yet implemented"; the forwarding
+    // line is covered either way.
+    let _ = rt
+        .model_create(ModelCreateRequestDto {
+            provider_id: "p1".to_string(),
+            model_id: "m1".to_string(),
+            enabled: None,
+            tags: vec![],
+        })
+        .await;
+    let _ = rt
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: false,
+        })
+        .await;
+    let _ = rt
+        .model_update(ModelUpdateRequestDto {
+            id: "m1".to_string(),
+            enabled: None,
+        })
+        .await;
+    let _ = rt
+        .model_delete(ModelDeleteRequestDto {
+            id: "m1".to_string(),
+        })
+        .await;
+    let _ = rt
+        .model_tags_update(ModelTagUpdateDto {
+            model_id: "m1".to_string(),
+            tags: vec![],
+        })
+        .await;
+
+    // pi_sidecar_locator_update — TestRuntimeControl returns Ok.
+    let sidecar_resp = rt
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: "/tmp/sidecar".to_string(),
+            enabled: true,
+        })
+        .await
+        .expect("pi_sidecar_locator_update should succeed on TestRuntimeControl");
+    assert_eq!(sidecar_resp.runtime_dir, "/tmp/sidecar");
+    assert!(sidecar_resp.enabled);
+    assert!(sidecar_resp.in_memory_updated);
+
+    // profile_* — TestRuntimeControl bails "not yet implemented".
+    let _ = rt
+        .profile_create(ProfileCreateRequestDto {
+            id: "prof1".to_string(),
+            model: "m1".to_string(),
+            provider_id: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await;
+    let _ = rt
+        .profile_update(ProfileUpdateRequestDto {
+            id: "prof1".to_string(),
+            provider_id: None,
+            model: None,
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await;
+    let _ = rt
+        .profile_delete(ProfileDeleteRequestDto {
+            id: "prof1".to_string(),
+        })
+        .await;
+}

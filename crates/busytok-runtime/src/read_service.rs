@@ -487,3 +487,225 @@ fn log_timeout(query: &ReadQuery, timeout_ms: u64, elapsed_ms: u64, slow_after_m
         "read.query.timed_out"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn sample_query() -> ReadQuery {
+        ReadQuery::new("test_method", "test_family")
+            .timeout(Duration::from_secs(2))
+            .slow_after(Duration::from_millis(100))
+    }
+
+    // ── unavailable_error constructor (L421-428) ──────────────────────────
+
+    #[test]
+    fn unavailable_error_builds_unavailable_kind() {
+        let q = sample_query();
+        let err = unavailable_error(&q, "read service closed");
+        assert_eq!(err.kind(), ReadErrorKind::Unavailable);
+        assert_eq!(err.method(), "test_method");
+        assert_eq!(err.query_family(), "test_family");
+        assert_eq!(err.message(), "read service closed");
+        assert_eq!(err.code(), "read_model_unavailable");
+    }
+
+    // ── timeout_error constructor (L409-419) ──────────────────────────────
+
+    #[test]
+    fn timeout_error_builds_timeout_kind() {
+        let q = sample_query().timeout(Duration::from_millis(500));
+        let err = timeout_error(&q);
+        assert_eq!(err.kind(), ReadErrorKind::Timeout);
+        assert_eq!(err.method(), "test_method");
+        assert!(err.message().contains("500 ms"));
+        assert_eq!(err.code(), "read_timeout");
+    }
+
+    // ── internal_error constructor (L430-437) ─────────────────────────────
+
+    #[test]
+    fn internal_error_builds_internal_kind() {
+        let q = sample_query();
+        let err = internal_error(&q, "boom");
+        assert_eq!(err.kind(), ReadErrorKind::Internal);
+        assert_eq!(err.message(), "boom");
+        assert_eq!(err.code(), "read_internal_error");
+    }
+
+    // ── map_open_error DatabaseBusy arm (L362) ────────────────────────────
+
+    #[test]
+    fn map_open_error_classifies_database_busy() {
+        let q = sample_query();
+        let sqlite_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            None,
+        );
+        let err = map_open_error(&q, anyhow::Error::from(sqlite_err));
+        assert_eq!(err.kind(), ReadErrorKind::DatabaseBusy);
+        assert_eq!(err.code(), "database_busy");
+    }
+
+    #[test]
+    fn map_open_error_classifies_database_locked() {
+        let q = sample_query();
+        let sqlite_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseLocked,
+                extended_code: 6,
+            },
+            None,
+        );
+        let err = map_open_error(&q, anyhow::Error::from(sqlite_err));
+        assert_eq!(err.kind(), ReadErrorKind::DatabaseBusy);
+    }
+
+    #[test]
+    fn map_open_error_classifies_cannot_open_as_unavailable() {
+        let q = sample_query();
+        let sqlite_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::CannotOpen,
+                extended_code: 14,
+            },
+            None,
+        );
+        let err = map_open_error(&q, anyhow::Error::from(sqlite_err));
+        assert_eq!(err.kind(), ReadErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn map_open_error_classifies_permission_denied_as_unavailable() {
+        let q = sample_query();
+        let sqlite_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::PermissionDenied,
+                extended_code: 23,
+            },
+            None,
+        );
+        let err = map_open_error(&q, anyhow::Error::from(sqlite_err));
+        assert_eq!(err.kind(), ReadErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn map_open_error_falls_back_to_internal_for_unknown() {
+        let q = sample_query();
+        let err = map_open_error(&q, anyhow::Error::msg("some random error"));
+        assert_eq!(err.kind(), ReadErrorKind::Internal);
+    }
+
+    // ── map_read_error (L380-399) ─────────────────────────────────────────
+
+    #[test]
+    fn map_read_error_classifies_database_busy() {
+        let q = sample_query();
+        let sqlite_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            None,
+        );
+        let err = map_read_error(&q, anyhow::Error::from(sqlite_err));
+        assert_eq!(err.kind(), ReadErrorKind::DatabaseBusy);
+    }
+
+    #[test]
+    fn map_read_error_classifies_locked_via_message() {
+        // No rusqlite error code — just a message containing "database is locked".
+        let q = sample_query();
+        let err = map_read_error(&q, anyhow::Error::msg("database is locked"));
+        assert_eq!(err.kind(), ReadErrorKind::DatabaseBusy);
+    }
+
+    #[test]
+    fn map_read_error_classifies_busy_via_message() {
+        let q = sample_query();
+        let err = map_read_error(&q, anyhow::Error::msg("database is busy"));
+        assert_eq!(err.kind(), ReadErrorKind::DatabaseBusy);
+    }
+
+    #[test]
+    fn map_read_error_falls_back_to_internal() {
+        let q = sample_query();
+        let err = map_read_error(&q, anyhow::Error::msg("unknown cause"));
+        assert_eq!(err.kind(), ReadErrorKind::Internal);
+    }
+
+    // ── duration_ms_u64 (L439-441) ────────────────────────────────────────
+
+    #[test]
+    fn duration_ms_u64_normal() {
+        assert_eq!(duration_ms_u64(Duration::from_millis(1500)), 1500);
+    }
+
+    #[test]
+    fn duration_ms_u64_saturates_on_overflow() {
+        // u128::MAX would overflow u64 — should saturate to u64::MAX.
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(duration_ms_u64(huge), u64::MAX);
+    }
+
+    // ── run() permits-closed branch (L206-216) ────────────────────────────
+
+    #[tokio::test]
+    async fn run_returns_unavailable_when_permits_closed() {
+        let db = Arc::new(Mutex::new(busytok_store::Database::open_in_memory().unwrap()));
+        let service = ReadService::new_in_memory(db, 1);
+        // Close the semaphore so acquire_owned() returns Err immediately.
+        service.permits.close();
+
+        let query = sample_query();
+        let result: Result<i64, ReadError> = service
+            .run(query, |_conn| Ok(42i64))
+            .await;
+        let err = result.expect_err("should return error when permits closed");
+        assert_eq!(err.kind(), ReadErrorKind::Unavailable);
+        assert_eq!(err.message(), "read service closed");
+    }
+
+    // ── run() deadline-exceeded-after-permit branch (L230-238) ─────────────
+
+    #[tokio::test]
+    async fn run_returns_timeout_when_deadline_exceeded_after_permit() {
+        let db = Arc::new(Mutex::new(busytok_store::Database::open_in_memory().unwrap()));
+        let service = ReadService::new_in_memory(db, 1);
+
+        // Use a zero timeout: the deadline is already in the past by the time
+        // the permit is acquired, so the L230 check fires.
+        let query = sample_query().timeout(Duration::from_nanos(1));
+        // Yield once so the deadline is definitely in the past.
+        tokio::task::yield_now().await;
+
+        let result: Result<i64, ReadError> = service
+            .run(query, |_conn| Ok(42i64))
+            .await;
+        let err = result.expect_err("should return timeout error");
+        assert_eq!(err.kind(), ReadErrorKind::Timeout);
+    }
+
+    // ── log_completion / log_timeout (L443-489) ───────────────────────────
+    // These are pure side-effect (tracing) functions; calling them exercises
+    // their bodies.
+
+    #[test]
+    fn log_completion_does_not_panic() {
+        let q = sample_query();
+        log_completion(&q, 2000, 50, 100, Some(10), None);
+        let err = unavailable_error(&q, "test");
+        log_completion(&q, 2000, 50, 100, None, Some(&err));
+    }
+
+    #[test]
+    fn log_timeout_does_not_panic() {
+        let q = sample_query();
+        log_timeout(&q, 2000, 50, 100);
+    }
+}
