@@ -41,14 +41,16 @@ ALTER TABLE models ADD COLUMN max_tokens INTEGER;
 ```
 
 - SQL 允许 `NULL`（migration 安全）
-- 运行时 `create_model` RPC 必须要求 `context_window` / `max_tokens` 有值（`display_name` / `reasoning` 可选）
+- 本期所有 catalog model 一律必填 `context_window` / `max_tokens`（无内置/外置区分，无 `is_builtin` 字段）
+- `create_model` RPC 必须要求 `context_window` / `max_tokens` 有值（`display_name` / `reasoning` 可选）
+- `UpdateModelPatch` 的 `context_window` / `max_tokens` 是 `Option<i64>`，`None` = 不更新，`Some(v)` = 更新到 v；不支持清空为 `NULL`（即不存在 `Some(None)` 语义）
 - `reasoning` 默认 `0`（false）
 - `display_name` 可选
 
 同步更新以下类型/查询以读写新列：
 - `busytok-domain::provider_catalog::Model` domain struct（新增 `display_name: Option<String>` / `reasoning: bool` / `context_window: Option<i64>` / `max_tokens: Option<i64>`）
 - `busytok-store::provider_catalog::CreateModelReq`（新增对应字段）
-- `busytok-store::provider_catalog::UpdateModelPatch`（新增可选 patch 字段）
+- `busytok-store::provider_catalog::UpdateModelPatch`（新增 `context_window: Option<i64>` / `max_tokens: Option<i64>` / `display_name: Option<String>` / `reasoning: Option<bool>`，`None` = 不更新）
 - `busytok-store::provider_catalog` 的 `create_model` / `get_model_by_id` / `get_model_by_provider_and_model_id` / `list_models_filtered` / `row_to_model` 查询
 - `busytok-protocol::dto::ModelCreateRequestDto`（新增 `context_window` / `max_tokens` 必填，`display_name` / `reasoning` 可选）
 - `busytok-protocol::dto::ModelUpdateRequestDto`（新增可选 patch 字段）
@@ -98,10 +100,12 @@ CREATE UNIQUE INDEX idx_subagent_unique_active_name
     ON subagent_logical_subagents(project_id, repo_hash, name)
     WHERE status != 'deleted';
 
--- 3. Recreate child tables (same schema as 0003_subagent.sql; subagent_resource_events 无 FK 引用但一并重建)
---    完整 CREATE TABLE 语句复用 0003_subagent.sql 中 subagent_memory / subagent_tasks /
---    subagent_harness_bindings / subagent_usage_records / subagent_resource_events 的定义
---    及其索引。
+-- 3. Recreate child tables with schema equivalent to migrations 0003+0004+0005 applied
+--    (subagent_tasks 已被 0004 增加 timeout_seconds/model_override，被 0005 增加 error_kind；
+--     不得只复用 0003 定义，否则会丢失这些列)
+--    完整 CREATE TABLE 语句必须等价于当前 0003+0004+0005 叠加后的 subagent_memory /
+--    subagent_tasks / subagent_harness_bindings / subagent_usage_records /
+--    subagent_resource_events 的定义及其索引。
 ```
 
 不使用 `DEFAULT ''` 过渡态，不使用 `ALTER TABLE ADD COLUMN` + `DROP COLUMN`（无法添加 `NOT NULL` 无默认值的列）。
@@ -146,7 +150,7 @@ pub struct SubagentProfileConfig {
 }
 ```
 
-`SubagentModelsConfig`（`default_cheap_model` / `default_review_model` / `default_reasoning_model` / `default_coder_model`）整体删除。`profile_model()` 方法删除。`profile_create` / `profile_update` 的所有 provider/model whitelist 校验删除。
+`SubagentModelsConfig`（`default_cheap_model` / `default_review_model` / `default_reasoning_model` / `default_coder_model`）整体删除。`profile_model()` 方法删除。`profile_create` / `profile_update` 的所有 provider/model whitelist 校验删除。`collect_profile_refs()` 和 `ProfileModelRef` 删除（profile 不再有 provider/model 字段，引用检查无存在意义，删除语义改为 §7.5 定义的 dangling binding 模式）。
 
 同步更新以下 DTO 以删除 `provider_id` / `model` 字段：
 - `busytok-protocol::dto::ProfileDto`（删除 `provider_id` / `model`）
@@ -258,6 +262,15 @@ pub struct ExecutorInput {
 - 不写回 task row
 - 不进日志明文
 - 不进任何 DTO / response / diagnostic payload
+
+## 4.5 provider test-connection 适配
+
+当前 `provider_test_connection()` 固定走 OpenAI 格式（`GET /models` → fallback `POST /chat/completions`）。新增 `anthropic_compatible` 后必须按 `provider_kind` 分流：
+
+- `openai_compatible`：继续走现有 `GET /models` → fallback `POST /chat/completions`
+- `anthropic_compatible`：走 `POST /v1/messages` 最小请求探测（`max_tokens: 1`，`messages: [{ role: "user", content: "ping" }]`），2xx 视为连通，4xx/5xx 视为失败
+
+探测逻辑在 `busytok-runtime::supervisor::provider_test_connection()` 内部分流，不经过 sidecar / Pi SDK。
 
 ## 5. sidecar / Pi SDK 接入
 
@@ -407,6 +420,19 @@ provider 是共享连接对象。以下变更影响所有绑定该 provider 的 
 - model 禁用/删除不改变 subagent 的 `bound_model_id`
 - subagent 绑定创建后稳定不变，本期不提供 rebind
 
+### 7.5 provider/model 删除语义
+
+**决策：允许删除，subagent 留 dangling binding，delegate 时报错。**
+
+理由：本期不支持 rebind。如果删除前阻断（"有 subagent 绑定则拒绝删除"），用户会陷入"无法删除 provider/model，也无法 rebind subagent"的死锁。允许删除 + delegate 报错更合理——用户可以创建新的 subagent 绑定到其他 provider/model。
+
+具体改动：
+- 删除 `collect_profile_refs()` 和 `ProfileModelRef`（profile 不再有 provider/model 字段，引用检查无存在意义）
+- 删除 `provider_delete` / `model_delete` handler 中的引用阻断逻辑
+- provider/model 删除后，绑定该 provider/model 的 subagent 留 dangling binding
+- 后续 delegate 在 §4.3 校验链第 2/5 步失败，返回 `bound provider not found` / `bound model not found in provider`
+- GUI 删除 provider/model 时可选显示绑定 subagent 数量的 warning，但不阻断删除
+
 ## 8. 本次明确不做
 
 - 不做 subagent route snapshot
@@ -434,7 +460,7 @@ provider 是共享连接对象。以下变更影响所有绑定该 provider 的 
 9. 创建时只提供 `bound_provider_id` 不提供 `bound_model_id` → 失败 `must be provided together`
 10. 复用已有 subagent（name 路径）时传入 `bound_provider_id` / `bound_model_id` → 忽略，不覆盖 DB 值
 11. 复用已有 subagent（`subagent_id` 路径）时传入 `bound_provider_id` / `bound_model_id` → 忽略，不覆盖 DB 值
-12. `create_model` 对非内置模型缺少 `context_window` / `max_tokens` → 拒绝
+12. `create_model` 缺少 `context_window` / `max_tokens` → 拒绝
 
 ### 9.3 执行路径测试
 
@@ -454,21 +480,27 @@ provider 是共享连接对象。以下变更影响所有绑定该 provider 的 
 23. 禁用 provider → kill worker + delegate 失败
 24. 重新启用 provider → 下次 delegate 重建 worker/session
 25. model metadata 变更不触发 worker kill
+26. `provider_kind=openai_compatible` 时，`provider_test_connection()` 走 `GET /models` / `POST /chat/completions`
+27. `provider_kind=anthropic_compatible` 时，`provider_test_connection()` 走 `POST /v1/messages` 探测
+28. 删除 provider 后，绑定该 provider 的 subagent delegate 失败 `bound provider not found`
+29. 删除 model 后，绑定该 model 的 subagent delegate 失败 `bound model not found in provider`
+30. 删除 provider/model 时不阻断（无引用检查），`collect_profile_refs()` 已删除
 
 ### 9.5 sidecar / Pi SDK 测试
 
-26. `provider_kind=openai_compatible` 时，sidecar 用 `api: "openai-completions"` 注册 provider
-27. `provider_kind=anthropic_compatible` 时，sidecar 用 `api: "anthropic-messages"` 注册 provider
-28. 首次 delegate 把正确 model + metadata 传入 `createAgentSession()`
-29. 复用已有 hot session 时，继续沿用原有 model（忽略新路由参数）
-30. `AuthStorage.inMemory` 是 secret 唯一来源，`process.env` 不参与 secret 传递
-31. `ModelRegistry.create` + `registerProvider` 是 provider runtime 唯一来源，无文件 I/O
+31. `provider_kind=openai_compatible` 时，sidecar 用 `api: "openai-completions"` 注册 provider
+32. `provider_kind=anthropic_compatible` 时，sidecar 用 `api: "anthropic-messages"` 注册 provider
+33. 首次 delegate 把正确 model + metadata 传入 `createAgentSession()`
+34. 复用已有 hot session 时，继续沿用原有 model（忽略新路由参数）
+35. `AuthStorage.inMemory` 是 secret 唯一来源，`process.env` 不参与 secret 传递
+36. `ModelRegistry.create` + `registerProvider` 是 provider runtime 唯一来源，无文件 I/O
+37. 首次 miss 创建 session 时自定义 `base_url` 生效（真实集成测试，覆盖 [pi#2291](https://github.com/earendil-works/pi/issues/2291) 场景）
 
 ### 9.6 回归测试
 
-32. 现有 `provider_changed_removes_worker_then_respawns` 测试继续通过
-33. 现有 `e2e_multi_provider_creates_separate_workers` 测试继续通过
-34. 现有 `e2e_auth_failure_kills_worker` 测试继续通过
+38. 现有 `provider_changed_removes_worker_then_respawns` 测试继续通过
+39. 现有 `e2e_multi_provider_creates_separate_workers` 测试继续通过
+40. 现有 `e2e_auth_failure_kills_worker` 测试继续通过
 
 ## 10. 约束与已知边界
 
