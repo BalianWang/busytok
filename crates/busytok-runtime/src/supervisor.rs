@@ -6884,4 +6884,629 @@ mod tests {
             "expected an HTTP 429 message, got: {msg:?}"
         );
     }
+
+    // ── prompt_*_to_row enum conversion helpers ───────────────────────
+
+    #[test]
+    fn prompt_action_to_row_maps_all_variants() {
+        assert_eq!(
+            prompt_action_to_row(PromptActionDto::OnlyCopy),
+            busytok_store::PromptActionRow::Copy
+        );
+        assert_eq!(
+            prompt_action_to_row(PromptActionDto::OnlyPaste),
+            busytok_store::PromptActionRow::Paste
+        );
+        assert_eq!(
+            prompt_action_to_row(PromptActionDto::CopyAndPaste),
+            busytok_store::PromptActionRow::Paste
+        );
+    }
+
+    #[test]
+    fn prompt_sort_to_row_defaults_to_smart_and_maps_all_variants() {
+        assert_eq!(
+            prompt_sort_to_row(None),
+            busytok_store::PromptSortRow::Smart
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::Smart)),
+            busytok_store::PromptSortRow::Smart
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::RecentlyUsed)),
+            busytok_store::PromptSortRow::RecentlyUsed
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::MostUsed)),
+            busytok_store::PromptSortRow::MostUsed
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::RecentlyUpdated)),
+            busytok_store::PromptSortRow::RecentlyUpdated
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::Alphabetical)),
+            busytok_store::PromptSortRow::Alphabetical
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::PinnedFirst)),
+            busytok_store::PromptSortRow::PinnedFirst
+        );
+    }
+
+    #[test]
+    fn prompt_use_surface_to_row_maps_both_variants() {
+        assert_eq!(
+            prompt_use_surface_to_row(PromptUseSurfaceDto::Overlay),
+            busytok_store::PromptUseSurfaceRow::Overlay
+        );
+        assert_eq!(
+            prompt_use_surface_to_row(PromptUseSurfaceDto::Page),
+            busytok_store::PromptUseSurfaceRow::Page
+        );
+    }
+
+    #[test]
+    fn prompt_use_outcome_to_row_maps_all_variants() {
+        assert_eq!(
+            prompt_use_outcome_to_row(PromptUseOutcomeDto::Copy),
+            busytok_store::PromptUseOutcomeRow::Copy
+        );
+        assert_eq!(
+            prompt_use_outcome_to_row(PromptUseOutcomeDto::PasteAttempted),
+            busytok_store::PromptUseOutcomeRow::PasteAttempted
+        );
+        assert_eq!(
+            prompt_use_outcome_to_row(PromptUseOutcomeDto::PasteFellBackToCopy),
+            busytok_store::PromptUseOutcomeRow::PasteFellBackToCopy
+        );
+    }
+
+    #[test]
+    fn prompt_use_failure_reason_to_row_maps_all_variants() {
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::PermissionMissing),
+            busytok_store::PromptUseFailureReasonRow::PermissionMissing
+        );
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::FocusLost),
+            busytok_store::PromptUseFailureReasonRow::FocusLost
+        );
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::InjectionFailed),
+            busytok_store::PromptUseFailureReasonRow::InjectionFailed
+        );
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::UnsupportedPlatform),
+            busytok_store::PromptUseFailureReasonRow::UnsupportedPlatform
+        );
+    }
+
+    #[test]
+    fn prompt_list_query_to_row_applies_default_limit_when_none() {
+        let row = prompt_list_query_to_row(PromptListQueryDto {
+            query: Some("hello".to_string()),
+            tag: Some("work".to_string()),
+            sort: Some(PromptSortDto::MostUsed),
+            limit: None,
+        });
+        assert_eq!(row.query.as_deref(), Some("hello"));
+        assert_eq!(row.tag.as_deref(), Some("work"));
+        assert_eq!(row.sort, busytok_store::PromptSortRow::MostUsed);
+        assert_eq!(row.limit, PROMPT_LIST_DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn prompt_list_query_to_row_preserves_explicit_limit() {
+        let row = prompt_list_query_to_row(PromptListQueryDto {
+            query: None,
+            tag: None,
+            sort: None,
+            limit: Some(42),
+        });
+        assert_eq!(row.limit, 42);
+        assert_eq!(row.sort, busytok_store::PromptSortRow::Smart);
+    }
+
+    // ── provider / catalog DTO conversion helpers ─────────────────────
+
+    #[test]
+    fn provider_to_dto_hides_api_key_and_reports_has_key() {
+        let p = busytok_domain::Provider {
+            id: "pid".to_string(),
+            name: "Acme".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.acme.com".to_string(),
+            enabled: true,
+            api_key: Some("sk-secret".to_string()),
+            created_at_ms: 100,
+            updated_at_ms: 200,
+        };
+        let dto = provider_to_dto(&p);
+        assert_eq!(dto.id, "pid");
+        assert_eq!(dto.name, "Acme");
+        assert!(dto.enabled);
+        assert!(dto.has_api_key);
+        assert_eq!(dto.base_url, "https://api.acme.com");
+    }
+
+    #[test]
+    fn provider_to_dto_reports_no_key_when_absent() {
+        let p = busytok_domain::Provider {
+            id: "pid2".to_string(),
+            name: "NoKey".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.nokey.com".to_string(),
+            enabled: false,
+            api_key: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let dto = provider_to_dto(&p);
+        assert!(!dto.has_api_key);
+        assert!(!dto.enabled);
+    }
+
+    #[test]
+    fn provider_summary_to_dto_maps_all_fields() {
+        let s = busytok_domain::ProviderSummary {
+            id: "sid".to_string(),
+            name: "Summary".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://sum.com".to_string(),
+            enabled: true,
+            has_api_key: true,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+        let dto = provider_summary_to_dto(&s);
+        assert_eq!(dto.id, "sid");
+        assert_eq!(dto.name, "Summary");
+        assert!(dto.has_api_key);
+        assert!(dto.enabled);
+        assert_eq!(dto.created_at_ms, 10);
+    }
+
+    #[test]
+    fn catalog_entry_to_dto_maps_all_fields() {
+        let e = busytok_domain::ModelCatalogEntry {
+            provider_id: "pid".to_string(),
+            provider_name: "PName".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "mdb".to_string(),
+            model_id: "gpt-x".to_string(),
+            model_enabled: false,
+            tags: vec!["fast".to_string(), "cheap".to_string()],
+        };
+        let dto = catalog_entry_to_dto(e.clone());
+        assert_eq!(dto.provider_id, "pid");
+        assert_eq!(dto.provider_name, "PName");
+        assert!(dto.provider_enabled);
+        assert_eq!(dto.model_db_id, "mdb");
+        assert_eq!(dto.model_id, "gpt-x");
+        assert!(!dto.model_enabled);
+        assert_eq!(dto.tags, vec!["fast", "cheap"]);
+    }
+
+    #[test]
+    fn catalog_entry_to_dto_ref_produces_same_output_as_owned() {
+        let e = busytok_domain::ModelCatalogEntry {
+            provider_id: "pid".to_string(),
+            provider_name: "PName".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "mdb".to_string(),
+            model_id: "gpt-x".to_string(),
+            model_enabled: true,
+            tags: vec![],
+        };
+        let owned = catalog_entry_to_dto(e.clone());
+        let by_ref = catalog_entry_to_dto_ref(&e);
+        assert_eq!(owned.provider_id, by_ref.provider_id);
+        assert_eq!(owned.model_id, by_ref.model_id);
+        assert_eq!(owned.tags, by_ref.tags);
+    }
+
+    // ── profile helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn profile_provider_id_returns_bound_provider() {
+        let bound = busytok_config::SubagentProfileConfig {
+            write_access: false,
+            tools: vec![],
+            model: "gpt-5".to_string(),
+            context_budget_tokens: 1000,
+            timeout_seconds: 30,
+            provider_id: Some("prov-1".to_string()),
+        };
+        assert_eq!(profile_provider_id(&bound).as_deref(), Some("prov-1"));
+    }
+
+    #[test]
+    fn profile_provider_id_returns_none_for_unbound() {
+        let unbound = busytok_config::SubagentProfileConfig {
+            write_access: false,
+            tools: vec![],
+            model: String::new(),
+            context_budget_tokens: 1000,
+            timeout_seconds: 30,
+            provider_id: None,
+        };
+        assert!(profile_provider_id(&unbound).is_none());
+    }
+
+    #[test]
+    fn profile_to_dto_marks_builtin_profiles_and_forwards_fields() {
+        let profile = busytok_config::SubagentProfileConfig {
+            write_access: true,
+            tools: vec!["read".to_string()],
+            model: "gpt-5".to_string(),
+            context_budget_tokens: 4000,
+            timeout_seconds: 120,
+            provider_id: Some("prov-1".to_string()),
+        };
+        // Built-in profile name (shipped by default_profiles).
+        let dto = profile_to_dto("pi/search-cheap", &profile);
+        assert!(dto.is_builtin);
+        assert_eq!(dto.provider_id.as_deref(), Some("prov-1"));
+        assert_eq!(dto.model, "gpt-5");
+        assert!(dto.write_access);
+        assert_eq!(dto.tools, vec!["read"]);
+        assert_eq!(dto.context_budget_tokens, 4000);
+        assert_eq!(dto.timeout_seconds, 120);
+    }
+
+    #[test]
+    fn profile_to_dto_marks_custom_profiles_as_non_builtin() {
+        let profile = busytok_config::SubagentProfileConfig {
+            write_access: false,
+            tools: vec![],
+            model: String::new(),
+            context_budget_tokens: 1000,
+            timeout_seconds: 30,
+            provider_id: None,
+        };
+        let dto = profile_to_dto("my-custom-profile", &profile);
+        assert!(!dto.is_builtin);
+        assert!(dto.provider_id.is_none());
+    }
+
+    // ── to_store_exact_windows ────────────────────────────────────────
+
+    #[test]
+    fn to_store_exact_windows_maps_empty_and_non_empty() {
+        assert!(to_store_exact_windows(&[]).is_empty());
+        let windows = vec![
+            range::TrendBucketWindow {
+                start_ms: 0,
+                end_ms: 1000,
+                key: "w1".to_string(),
+                is_current: false,
+            },
+            range::TrendBucketWindow {
+                start_ms: 1000,
+                end_ms: 2000,
+                key: "w2".to_string(),
+                is_current: true,
+            },
+        ];
+        let out = to_store_exact_windows(&windows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].key, "w1");
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[0].end_ms, 1000);
+        assert_eq!(out[1].key, "w2");
+    }
+
+    // ── aggregate_trend_bucket ────────────────────────────────────────
+
+    #[test]
+    fn aggregate_trend_bucket_sums_only_rows_in_range() {
+        let bucket = range::TrendBucketWindow {
+            start_ms: 1000,
+            end_ms: 2000,
+            key: "b1".to_string(),
+            is_current: true,
+        };
+        let rows = vec![
+            busytok_store::read_models::OverviewTrendBucketRow {
+                key: "b1".to_string(),
+                start_ms: 1000, // in range
+                end_ms: 2000,
+                tokens: 100,
+                cost_usd: Some(0.5),
+                event_count: 2,
+                has_cost: true,
+                has_no_cost: false,
+            },
+            busytok_store::read_models::OverviewTrendBucketRow {
+                key: "b1".to_string(),
+                start_ms: 1500, // in range
+                end_ms: 2000,
+                tokens: 50,
+                cost_usd: None,
+                event_count: 1,
+                has_cost: false,
+                has_no_cost: true,
+            },
+            busytok_store::read_models::OverviewTrendBucketRow {
+                key: "b1".to_string(),
+                start_ms: 2000, // out of range (end-exclusive)
+                end_ms: 3000,
+                tokens: 999,
+                cost_usd: None,
+                event_count: 99,
+                has_cost: false,
+                has_no_cost: false,
+            },
+        ];
+        let dto = aggregate_trend_bucket(&bucket, &TrendBucketGranularityDto::Hour, &rows);
+        assert_eq!(dto.tokens, 150);
+        assert_eq!(dto.event_count, 3);
+        assert_eq!(dto.cost_usd, Some(0.5));
+        assert!(dto.is_current);
+    }
+
+    #[test]
+    fn aggregate_trend_bucket_returns_zero_tokens_for_no_matching_rows() {
+        let bucket = range::TrendBucketWindow {
+            start_ms: 10_000,
+            end_ms: 20_000,
+            key: "empty".to_string(),
+            is_current: false,
+        };
+        let rows: Vec<busytok_store::read_models::OverviewTrendBucketRow> = vec![];
+        let dto = aggregate_trend_bucket(&bucket, &TrendBucketGranularityDto::Day, &rows);
+        assert_eq!(dto.tokens, 0);
+        assert_eq!(dto.event_count, 0);
+        assert_eq!(dto.cost_usd, None);
+        assert!(!dto.is_current);
+    }
+
+    // ── map_subagent_error ────────────────────────────────────────────
+
+    #[test]
+    fn map_subagent_error_wraps_error_with_stable_code() {
+        let err = map_subagent_error(busytok_subagent::SubagentError::NotFound("sa-1".to_string()));
+        let msg = err.to_string();
+        assert!(msg.contains("logical subagent not found: sa-1"));
+    }
+
+    #[test]
+    fn map_subagent_error_preserves_disabled_variant() {
+        let err = map_subagent_error(busytok_subagent::SubagentError::Disabled);
+        assert!(err.to_string().contains("subagent feature is disabled"));
+    }
+
+    // ── delegate_request_from_dto / resolve_params_from_dto ───────────
+
+    #[test]
+    fn delegate_request_from_dto_forwards_all_fields() {
+        let dto = busytok_protocol::dto::SubagentDelegateRequestDto {
+            subagent_name: "sa".to_string(),
+            subagent_id: Some("id-1".to_string()),
+            cwd: "/tmp".to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: Some("find bugs".to_string()),
+            prompt: "do thing".to_string(),
+            prompt_artifact_ref: Some("art/123".to_string()),
+            timeout_seconds: Some(60),
+            model_override: Some("gpt-5".to_string()),
+            source_harness: Some("gui".to_string()),
+            source_session_id: Some("sess-1".to_string()),
+        };
+        let req = delegate_request_from_dto(dto);
+        assert_eq!(req.subagent_name, "sa");
+        assert_eq!(req.subagent_id.as_deref(), Some("id-1"));
+        assert_eq!(req.cwd, "/tmp");
+        assert_eq!(req.profile, "pi/search-cheap");
+        assert_eq!(req.intent.as_deref(), Some("find bugs"));
+        assert_eq!(req.prompt, "do thing");
+        assert_eq!(req.prompt_artifact_ref.as_deref(), Some("art/123"));
+        assert_eq!(req.timeout_seconds, Some(60));
+        assert_eq!(req.model_override.as_deref(), Some("gpt-5"));
+        assert_eq!(req.source_harness.as_deref(), Some("gui"));
+        assert_eq!(req.source_session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn resolve_params_from_dto_forwards_all_fields() {
+        let dto = busytok_protocol::dto::SubagentResolveRequestDto {
+            name: Some("sa".to_string()),
+            id: Some("id-1".to_string()),
+            cwd: Some("/tmp".to_string()),
+        };
+        let p = resolve_params_from_dto(dto);
+        assert_eq!(p.name.as_deref(), Some("sa"));
+        assert_eq!(p.id.as_deref(), Some("id-1"));
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+    }
+
+    // ── subagent_detail / subagent_task_summary ───────────────────────
+
+    #[test]
+    fn subagent_detail_maps_status_to_string_and_forwards_fields() {
+        let s = busytok_subagent::models::LogicalSubagent {
+            id: "id-1".to_string(),
+            name: "sa".to_string(),
+            project_id: "proj".to_string(),
+            repo_path: "/repo".to_string(),
+            repo_hash: "hash".to_string(),
+            branch: Some("main".to_string()),
+            intent: Some("fix".to_string()),
+            default_profile: "pi/search-cheap".to_string(),
+            default_model: Some("gpt-5".to_string()),
+            status: busytok_subagent::models::SubagentStatus::Hot,
+            created_at_ms: 100,
+            updated_at_ms: 200,
+            last_active_at_ms: Some(150),
+        };
+        let dto = subagent_detail(s);
+        assert_eq!(dto.id, "id-1");
+        assert_eq!(dto.name, "sa");
+        assert_eq!(dto.status, "hot");
+        assert_eq!(dto.default_profile, "pi/search-cheap");
+        assert_eq!(dto.last_active_at_ms, Some(150));
+    }
+
+    #[test]
+    fn subagent_task_summary_maps_status_to_string_and_forwards_fields() {
+        let t = busytok_subagent::models::SubagentTaskSummary {
+            id: "task-1".to_string(),
+            subagent_id: "sa-1".to_string(),
+            profile: "pi/search-cheap".to_string(),
+            status: busytok_subagent::models::TaskStatus::Completed,
+            prompt: Some("prompt".to_string()),
+            result_summary: Some("ok".to_string()),
+            error: None,
+            created_at_ms: 100,
+            completed_at_ms: Some(200),
+        };
+        let dto = subagent_task_summary(t);
+        assert_eq!(dto.id, "task-1");
+        assert_eq!(dto.subagent_id, "sa-1");
+        assert_eq!(dto.status, "completed");
+        assert_eq!(dto.result_summary.as_deref(), Some("ok"));
+        assert!(dto.error.is_none());
+        assert_eq!(dto.completed_at_ms, Some(200));
+    }
+
+    // ── validate_runtime_dir ──────────────────────────────────────────
+
+    #[test]
+    fn validate_runtime_dir_rejects_relative_path() {
+        let err = validate_runtime_dir("relative/path", "system").unwrap_err();
+        assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_nonexistent_directory() {
+        let err = validate_runtime_dir("/nonexistent/dir/that/does/not/exist", "system").unwrap_err();
+        assert!(err.to_string().contains("does not exist or is not a directory"));
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_dir_missing_bundle_and_manifest() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-empty");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("pi-sidecar.bundle.js"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_dir_with_bundle_but_no_manifest() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bundle-only");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("manifest.json"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_malformed_manifest() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bad-manifest");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(tmp.join("manifest.json"), "{ not valid json }").unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("not a valid SidecarManifest"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_manifest_bundle_drift() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-drift");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        // Manifest references a different bundle filename than what's on disk.
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"other.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("other.bundle.js"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_accepts_valid_system_runtime() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-valid-system");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let result = validate_runtime_dir(tmp.to_str().unwrap(), "system");
+        assert!(result.is_ok(), "valid system runtime should pass");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_bundled_node_missing_binary() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-no-node");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "bundled").unwrap_err();
+        assert!(err.to_string().contains("node"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_accepts_bundled_node_with_executable_binary() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bundled-ok");
+        let node_dir = tmp.join("node").join(std::env::consts::ARCH);
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        // Write a node binary and mark it executable.
+        let node_path = node_dir.join("node");
+        std::fs::write(&node_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let result = validate_runtime_dir(tmp.to_str().unwrap(), "bundled");
+        assert!(result.is_ok(), "bundled runtime with executable node should pass");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_bundled_node_non_executable_binary() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bundled-noexec");
+        let node_dir = tmp.join("node").join(std::env::consts::ARCH);
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let node_path = node_dir.join("node");
+        std::fs::write(&node_path, "not executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "bundled").unwrap_err();
+        assert!(err.to_string().contains("not executable"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }

@@ -882,4 +882,197 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    // ── Drift condition 2: mtime + size mismatch ───────────────────────────
+
+    /// Helper that seeds a checkpoint with an explicit mtime (the default
+    /// `seed_checkpoint` sets mtime to NULL, which cannot trigger condition 2).
+    fn seed_checkpoint_with_mtime(
+        db: &Database,
+        id: &str,
+        offset: i64,
+        size: i64,
+        mtime: Option<i64>,
+    ) {
+        let conn = db.conn();
+        let now = now_ms();
+        conn.execute(
+            "INSERT OR REPLACE INTO source_file_checkpoints \
+             (id, source_id, agent, path, inode, offset_bytes, size_bytes, \
+              last_mtime_ms, state, first_seen_at_ms, last_seen_at_ms, \
+              created_at_ms, updated_at_ms) \
+             VALUES (?1, 'src-1', 'claude_code', '/tmp/test.jsonl', NULL, \
+                     ?2, ?3, ?4, 'active', ?5, ?5, ?5, ?5)",
+            rusqlite::params![id, offset, size, mtime, now],
+        )
+        .unwrap();
+    }
+
+    /// Drift condition 2: observation mtime differs from checkpoint mtime AND
+    /// sizes differ (file replaced with a different version during scan).
+    /// The offset must NOT regress so condition 1 doesn't fire first.
+    #[test]
+    fn drift_detected_when_mtime_and_size_mismatch() {
+        let db = seeded_db();
+        let db = Arc::new(Mutex::new(db));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+
+        {
+            let d = db.lock().unwrap();
+            create_generation(&d, "gen-drift2").unwrap();
+            // Checkpoint: offset=100, size=600, mtime=2000
+            seed_checkpoint_with_mtime(&d, "file-d2", 100, 600, Some(2000));
+            // Observation: offset=100 (same — no regression), size=500, mtime=1000
+            write_queries::insert_generation_observation(
+                d.conn(),
+                "gen-drift2",
+                "file-d2",
+                100,
+                500, // different size
+                Some(1000), // different mtime
+                Some("ok"),
+                None,
+            )
+            .unwrap();
+        }
+
+        let result = execute_promotion_barrier(&db, &status, "gen-drift2").unwrap();
+
+        assert!(!result.promoted, "promotion should be refused on mtime+size drift");
+        assert!(result.degradation_reason.is_some());
+
+        let snap = status.try_read().unwrap();
+        assert!(matches!(snap.readiness, ReadinessStateDto::ReadyDegraded));
+    }
+
+    /// Drift condition 2 does NOT fire when mtime differs but sizes are equal
+    /// (the `obs_size != current_size` guard prevents false positives).
+    #[test]
+    fn no_drift_when_mtime_differs_but_size_same() {
+        let db = seeded_db();
+        let db = Arc::new(Mutex::new(db));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+
+        {
+            let d = db.lock().unwrap();
+            create_generation(&d, "gen-nodrift").unwrap();
+            seed_checkpoint_with_mtime(&d, "file-nd", 100, 500, Some(2000));
+            write_queries::insert_generation_observation(
+                d.conn(),
+                "gen-nodrift",
+                "file-nd",
+                100,
+                500, // same size
+                Some(1000), // different mtime — but size equal, so no drift
+                Some("ok"),
+                None,
+            )
+            .unwrap();
+        }
+
+        let result = execute_promotion_barrier(&db, &status, "gen-nodrift").unwrap();
+        assert!(result.promoted, "promotion should succeed: same size means no drift");
+    }
+
+    // ── initiate_rebuild ───────────────────────────────────────────────────
+
+    #[test]
+    fn initiate_rebuild_creates_generation_and_persists_frontiers() {
+        let db = seeded_db();
+        seed_checkpoint(&db, "file-init", 100, 500);
+
+        let frontier_set = initiate_rebuild(&db, "gen-init").unwrap();
+
+        assert_eq!(frontier_set.generation_id, "gen-init");
+        assert_eq!(frontier_set.frontiers.len(), 1);
+        assert_eq!(frontier_set.frontiers[0].source_file_id, "file-init");
+
+        // Generation row created in 'building' state.
+        let state: String = db
+            .conn()
+            .query_row(
+                "SELECT state FROM audit_generations WHERE generation_id = 'gen-init'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "building");
+
+        // Frontier persisted as a generation_file_observation row.
+        let obs_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM generation_file_observations WHERE generation_id = 'gen-init'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_count, 1);
+    }
+
+    // ── record_new_file_during_rebuild ─────────────────────────────────────
+
+    #[test]
+    fn record_new_file_during_rebuild_writes_observation() {
+        let db = seeded_db();
+        create_generation(&db, "gen-rndr").unwrap();
+
+        let frontier = RebuildFrontier {
+            source_file_id: "file-rndr".to_string(),
+            source_id: "src-rndr".to_string(),
+            agent: "claude_code".to_string(),
+            path: "/tmp/rndr.jsonl".to_string(),
+            offset_bytes: 0,
+            size_bytes: 200,
+            last_mtime_ms: None,
+        };
+
+        record_new_file_during_rebuild(&db, "gen-rndr", &frontier).unwrap();
+
+        // source_file_checkpoints row created.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM source_file_checkpoints WHERE id = 'file-rndr'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // generation_file_observations row with new_file scan_status.
+        let scan_status: String = db
+            .conn()
+            .query_row(
+                "SELECT scan_status FROM generation_file_observations \
+                 WHERE generation_id = 'gen-rndr' AND source_file_id = 'file-rndr'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scan_status, "new_file");
+    }
+
+    // ── record_rebuild_diagnostic ──────────────────────────────────────────
+
+    #[test]
+    fn record_rebuild_diagnostic_inserts_diagnostic_event() {
+        let db = seeded_db();
+        create_generation(&db, "gen-diag").unwrap();
+
+        record_rebuild_diagnostic(&db, "gen-diag", "warning", "slow scan detected").unwrap();
+
+        let (severity, message): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT severity, message FROM diagnostic_events \
+                 WHERE id LIKE 'rebuild-gen-diag-warning-%' \
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(severity, "warning");
+        assert_eq!(message, "slow scan detected");
+    }
 }
