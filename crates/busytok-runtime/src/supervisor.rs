@@ -5817,127 +5817,25 @@ impl RuntimeControl for BusytokSupervisor {
             .api_key
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("provider has no api key"))?;
-        let url = format!("{}/models", base_url.trim_end_matches('/'));
-        tracing::info!(
-            event_code = "provider.test_connection",
-            provider_id = %provider_id,
-            url = %url,
-            "testing provider connection"
-        );
-        // Disable redirects so the Authorization header is never forwarded to
-        // a cross-origin host (a compromised endpoint could otherwise redirect
-        // to an attacker-controlled host and exfiltrate the key).
+        // Disable redirects so credentials are never forwarded to a cross-origin
+        // host (a compromised endpoint could otherwise redirect to an attacker-
+        // controlled host and exfiltrate the key). Shared by both branches.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let resp = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "connection test succeeded");
-                Ok(ProviderTestConnectionResponseDto {
-                    ok: true,
-                    error: None,
-                    models_detected: None,
-                })
+        // Dispatch by provider kind. The Anthropic branch builds its request
+        // via `build_probe_request` (tested helper) so the request contract —
+        // path `/v1/messages`, `x-api-key`, `anthropic-version`, body shape —
+        // is locked by tests; no inline header/body duplication.
+        match provider.provider_kind {
+            busytok_domain::ProviderKind::OpenAiCompatible => {
+                self.test_connection_openai(&client, &provider_id, &base_url, api_key)
+                    .await
             }
-            Ok(r) => {
-                let status = r.status();
-                // Spec §4: if GET /v1/models is absent/unsupported (404/405/501),
-                // fall back to POST /v1/chat/completions with a 1-token prompt.
-                if models_probe_should_fallback(status) {
-                    tracing::debug!(
-                        event_code = "provider.test_connection.fallback",
-                        provider_id = %provider_id,
-                        models_status = %status,
-                        "falling back to /chat/completions"
-                    );
-                    // Probe model comes from the SQL models table (enabled only).
-                    let probe_model = {
-                        let db = self.db.lock().unwrap();
-                        db.list_models_filtered(busytok_domain::ModelCatalogFilter {
-                            provider_id: Some(provider_id.clone()),
-                            tags: vec![],
-                            include_disabled: false,
-                        })
-                        .map_err(|e| {
-                            tracing::error!(event_code = "model.sql_read_failed", provider_id = %provider_id, error = %e, "list_models_filtered for probe failed");
-                            e
-                        })?
-                    };
-                    let probe_model = probe_model.into_iter().next()
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "provider has no enabled models configured, cannot probe /chat/completions"
-                        ))?;
-                    let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-                    let body = serde_json::json!({
-                        "model": probe_model.model_id,
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": "ping"}],
-                    });
-                    let chat_resp = client
-                        .post(&chat_url)
-                        .header("Authorization", format!("Bearer {}", api_key))
-                        .json(&body)
-                        .send()
-                        .await;
-                    return match chat_resp {
-                        Ok(cr) => {
-                            let cstatus = cr.status();
-                            let (ok, error) = interpret_chat_probe(cstatus);
-                            if ok {
-                                tracing::info!(
-                                    event_code = "provider.test_connection.ok",
-                                    provider_id = %provider_id,
-                                    "connection test succeeded via /chat/completions fallback"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    event_code = "provider.test_connection.failed",
-                                    provider_id = %provider_id,
-                                    status = %cstatus,
-                                    "connection test failed via /chat/completions fallback"
-                                );
-                            }
-                            Ok(ProviderTestConnectionResponseDto {
-                                ok,
-                                error,
-                                models_detected: None,
-                            })
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                event_code = "provider.test_connection.error",
-                                provider_id = %provider_id,
-                                error = %e,
-                                "connection test error during /chat/completions fallback"
-                            );
-                            Ok(ProviderTestConnectionResponseDto {
-                                ok: false,
-                                error: Some(format!("request failed: {}", e)),
-                                models_detected: None,
-                            })
-                        }
-                    };
-                }
-                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "connection test failed");
-                Ok(ProviderTestConnectionResponseDto {
-                    ok: false,
-                    error: Some(format!("HTTP {}", status)),
-                    models_detected: None,
-                })
-            }
-            Err(e) => {
-                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "connection test error");
-                Ok(ProviderTestConnectionResponseDto {
-                    ok: false,
-                    error: Some(format!("request failed: {}", e)),
-                    models_detected: None,
-                })
+            busytok_domain::ProviderKind::AnthropicCompatible => {
+                self.test_connection_anthropic(&client, &provider_id, &base_url, api_key)
+                    .await
             }
         }
     }
@@ -6347,6 +6245,201 @@ impl RuntimeControl for BusytokSupervisor {
     }
 }
 
+/// `provider_test_connection` per-kind helpers. Lives in an inherent impl
+/// block (not the `RuntimeControl` trait impl) because these are private
+/// helpers, not trait methods. Both take `&self` for DB access where needed.
+impl BusytokSupervisor {
+    /// OpenAI-compatible probe: `GET /models`, with fallback to
+    /// `POST /chat/completions` (1-token ping) when /models is absent
+    /// (404/405/501). The fallback needs DB access for the probe model id,
+    /// so this helper takes `&self`.
+    async fn test_connection_openai(
+        &self,
+        client: &reqwest::Client,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        tracing::info!(
+            event_code = "provider.test_connection",
+            provider_id = %provider_id,
+            url = %url,
+            "testing provider connection"
+        );
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "connection test succeeded");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: true,
+                    error: None,
+                    models_detected: None,
+                })
+            }
+            Ok(r) => {
+                let status = r.status();
+                // Spec §4: if GET /v1/models is absent/unsupported (404/405/501),
+                // fall back to POST /v1/chat/completions with a 1-token prompt.
+                if models_probe_should_fallback(status) {
+                    tracing::debug!(
+                        event_code = "provider.test_connection.fallback",
+                        provider_id = %provider_id,
+                        models_status = %status,
+                        "falling back to /chat/completions"
+                    );
+                    // Probe model comes from the SQL models table (enabled only).
+                    let probe_model = {
+                        let db = self.db.lock().unwrap();
+                        db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                            provider_id: Some(provider_id.to_string()),
+                            tags: vec![],
+                            include_disabled: false,
+                        })
+                        .map_err(|e| {
+                            tracing::error!(event_code = "model.sql_read_failed", provider_id = %provider_id, error = %e, "list_models_filtered for probe failed");
+                            e
+                        })?
+                    };
+                    let probe_model = probe_model.into_iter().next()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "provider has no enabled models configured, cannot probe /chat/completions"
+                        ))?;
+                    let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                    let body = serde_json::json!({
+                        "model": probe_model.model_id,
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "ping"}],
+                    });
+                    let chat_resp = client
+                        .post(&chat_url)
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .json(&body)
+                        .send()
+                        .await;
+                    return match chat_resp {
+                        Ok(cr) => {
+                            let cstatus = cr.status();
+                            let (ok, error) = interpret_chat_probe(cstatus);
+                            if ok {
+                                tracing::info!(
+                                    event_code = "provider.test_connection.ok",
+                                    provider_id = %provider_id,
+                                    "connection test succeeded via /chat/completions fallback"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_code = "provider.test_connection.failed",
+                                    provider_id = %provider_id,
+                                    status = %cstatus,
+                                    "connection test failed via /chat/completions fallback"
+                                );
+                            }
+                            Ok(ProviderTestConnectionResponseDto {
+                                ok,
+                                error,
+                                models_detected: None,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event_code = "provider.test_connection.error",
+                                provider_id = %provider_id,
+                                error = %e,
+                                "connection test error during /chat/completions fallback"
+                            );
+                            Ok(ProviderTestConnectionResponseDto {
+                                ok: false,
+                                error: Some(format!("request failed: {}", e)),
+                                models_detected: None,
+                            })
+                        }
+                    };
+                }
+                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "connection test failed");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("HTTP {}", status)),
+                    models_detected: None,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "connection test error");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("request failed: {}", e)),
+                    models_detected: None,
+                })
+            }
+        }
+    }
+
+    /// Anthropic-compatible probe: `POST /v1/messages` with a 1-token ping.
+    /// The request contract (path, `x-api-key`, `anthropic-version`, body
+    /// shape) is built by `build_probe_request` — the same helper tested by
+    /// `build_probe_request_anthropic_uses_post_v1_messages_with_x_api_key_header`.
+    /// Do NOT inline headers/body here: that would bypass the test contract
+    /// and allow drift between the helper and the handler.
+    async fn test_connection_anthropic(
+        &self,
+        client: &reqwest::Client,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        let probe = build_probe_request(
+            busytok_domain::ProviderKind::AnthropicCompatible,
+            base_url,
+            api_key,
+        );
+        tracing::info!(
+            event_code = "provider.test_connection",
+            provider_id = %provider_id,
+            url = %probe.url,
+            "testing anthropic provider connection"
+        );
+        let mut req_builder = client.request(probe.method, &probe.url);
+        for (k, v) in &probe.headers {
+            req_builder = req_builder.header(k, v);
+        }
+        if probe.body != serde_json::Value::Null {
+            req_builder = req_builder.json(&probe.body);
+        }
+        let resp = req_builder.send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "anthropic connection test succeeded");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: true,
+                    error: None,
+                    models_detected: None,
+                })
+            }
+            Ok(r) => {
+                let status = r.status();
+                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "anthropic connection test failed");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("HTTP {}", status)),
+                    models_detected: None,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "anthropic connection test error");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("request failed: {}", e)),
+                    models_detected: None,
+                })
+            }
+        }
+    }
+}
+
 /// Pure decision helpers for `provider_test_connection`. Extracted so the
 /// fallback logic (which status codes trigger a fallback, how the POST probe
 /// status is interpreted) is unit-testable without standing up a TLS mock
@@ -6385,6 +6478,51 @@ fn interpret_chat_probe(status: reqwest::StatusCode) -> (bool, Option<String>) {
             _ => format!("HTTP {}", status),
         };
         (false, Some(msg))
+    }
+}
+
+/// A probe request contract built from a `ProviderKind`, without network I/O.
+/// Extracted so unit tests can assert method / path / headers / body without
+/// spinning up an HTTP server. Used by `provider_test_connection` to construct
+/// the actual HTTP call so the request contract is locked by tests.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProbeRequest {
+    pub method: reqwest::Method,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: serde_json::Value,
+}
+
+/// Build the probe request for a `ProviderKind`. Pure (no I/O). The Anthropic
+/// branch of `provider_test_connection` MUST call this helper so the request
+/// contract (path `/v1/messages`, `x-api-key`, `anthropic-version`, body shape)
+/// is verified by tests — do not inline headers/body in the handler.
+pub fn build_probe_request(
+    kind: busytok_domain::ProviderKind,
+    base_url: &str,
+    api_key: &str,
+) -> ProbeRequest {
+    let base = base_url.trim_end_matches('/');
+    match kind {
+        busytok_domain::ProviderKind::OpenAiCompatible => ProbeRequest {
+            method: reqwest::Method::GET,
+            url: format!("{}/models", base),
+            headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],
+            body: serde_json::Value::Null,
+        },
+        busytok_domain::ProviderKind::AnthropicCompatible => ProbeRequest {
+            method: reqwest::Method::POST,
+            url: format!("{}/v1/messages", base),
+            headers: vec![
+                ("x-api-key".into(), api_key.to_string()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            body: serde_json::json!({
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }),
+        },
     }
 }
 
@@ -6690,6 +6828,71 @@ mod tests {
             msg.as_deref().unwrap().starts_with("HTTP 429"),
             "expected an HTTP 429 message, got: {msg:?}"
         );
+    }
+
+    // ── build_probe_request: full request contract (method / path / headers / body) ──
+    // The runtime crate has no HTTP mock library (no wiremock / mockito), so
+    // testing "which branch was taken" would let a malformed request ship
+    // green. Instead we assert the full contract fields directly on the pure
+    // helper. Spec §4: OpenAI → GET /models + Bearer; Anthropic → POST
+    // /v1/messages + x-api-key + anthropic-version + minimal ping body.
+
+    #[test]
+    fn build_probe_request_openai_uses_get_models_with_bearer_auth() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::OpenAiCompatible,
+            "https://api.test.com",
+            "sk-test",
+        );
+        assert_eq!(req.method, reqwest::Method::GET);
+        assert_eq!(req.url, "https://api.test.com/models");
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "Authorization"),
+            Some(&("Authorization".into(), "Bearer sk-test".into())),
+            "OpenAI probe must carry Authorization: Bearer <key>"
+        );
+        assert_eq!(req.body, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_probe_request_anthropic_uses_post_v1_messages_with_x_api_key_header() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::AnthropicCompatible,
+            "https://api.anthropic.com",
+            "sk-ant-test",
+        );
+        assert_eq!(req.method, reqwest::Method::POST);
+        assert_eq!(req.url, "https://api.anthropic.com/v1/messages");
+        // Required headers — x-api-key (not Bearer), anthropic-version, content-type
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "x-api-key"),
+            Some(&("x-api-key".into(), "sk-ant-test".into())),
+            "Anthropic probe must use x-api-key header (not Bearer)"
+        );
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "anthropic-version"),
+            Some(&("anthropic-version".into(), "2023-06-01".into())),
+            "Anthropic probe must carry anthropic-version header"
+        );
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "content-type"),
+            Some(&("content-type".into(), "application/json".into())),
+            "Anthropic probe must carry content-type: application/json"
+        );
+        // Minimal body shape: max_tokens + messages[0].role + messages[0].content
+        assert_eq!(req.body["max_tokens"], 1);
+        assert_eq!(req.body["messages"][0]["role"], "user");
+        assert_eq!(req.body["messages"][0]["content"], "ping");
+    }
+
+    #[test]
+    fn build_probe_request_trims_trailing_slash_from_base_url() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::AnthropicCompatible,
+            "https://api.anthropic.com/",
+            "sk-test",
+        );
+        assert_eq!(req.url, "https://api.anthropic.com/v1/messages");
     }
 
     // ── prompt_*_to_row enum conversion helpers ───────────────────────
