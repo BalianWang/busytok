@@ -17,7 +17,9 @@
 - No file I/O for model registry — `ModelRegistry.create(authStorage)` + `registerProvider` only
 - `provider_api_key` is瞬态执行态数据: not written to task row, not logged in plaintext, not in any DTO/response/diagnostic
 - Tests must use TDD (write failing test first, then implementation, then commit)
-- Coverage must remain >90% (`cargo llvm-cov --workspace --fail-under-lines 90`)
+- Rust coverage must remain >90% (`cargo llvm-cov --workspace --fail-under-lines 90`)
+- GUI coverage must remain >90% (`pnpm coverage:gui` — vitest with `--coverage.thresholds.lines 90`; also enforces functions/branches/statements 90). This is a hard gate because Task 8 modifies `ProvidersPage.tsx` + `ModelsSection.tsx`.
+- `pi-sidecar` has no coverage script in this phase — its quality gate is `pnpm -F pi-sidecar test && pnpm -F pi-sidecar typecheck` only. Do NOT add a `lint` script (doesn't exist in `apps/pi-sidecar/package.json`).
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass
 - `cargo test --workspace` must pass
 - `cargo test -p busytok-protocol --features export-ts` then `pnpm -F busytok-protocol-types build` to regenerate TS types
@@ -715,24 +717,27 @@ git commit -m "feat(store): migration 0007 + ProviderKind::AnthropicCompatible +
 
 ---
 
-## Task 2: LogicalSubagent bound fields (drop default_model) + store row + queries
+## Task 2: LogicalSubagent bound fields + resolve_by_name validation chain (atomic migration — drop default_model)
 
 **Files:**
 - Modify: `crates/busytok-store/src/repository.rs` (`SubagentLogicalSubagentRow`)
 - Modify: `crates/busytok-store/src/subagent_queries.rs` (5 functions: upsert/get/find_by_name/list_active/list_filtered)
-- Modify: `crates/busytok-subagent/src/models.rs:83-98` (`LogicalSubagent`)
-- Modify: `crates/busytok-subagent/src/resolver.rs:140-197` (`create_subagent` + `row_to_model`)
+- Modify: `crates/busytok-subagent/src/models.rs:83-98` (`LogicalSubagent` + `DelegateRequest`)
+- Modify: `crates/busytok-subagent/src/resolver.rs:18-65` (`resolve_by_name` + `create_subagent` + `row_to_model`)
+- Modify: `crates/busytok-subagent/src/manager.rs:167-200` (`delegate` callsite)
+- Modify: `crates/busytok-subagent/src/error.rs` (add `Validation` variant + extend `code()`)
 - Test: `crates/busytok-store/tests/subagent_queries.rs` (or wherever subagent query tests live)
 - Test: `crates/busytok-subagent/src/resolver.rs` tests (if present)
 
 **Interfaces:**
-- Consumes: Task 1's migration (DB schema has bound columns)
+- Consumes: Task 1's migration (DB schema has bound columns) + Task 1's `ProviderKind`
 - Produces:
   - `SubagentLogicalSubagentRow { bound_provider_id: String, bound_model_id: String }` (no `default_model`)
   - `LogicalSubagent { bound_provider_id: String, bound_model_id: String }` (no `default_model`)
-  - `resolve_by_name` and `create_subagent` will be fully updated in Task 5 — here we only update the row/struct/SQL so the workspace compiles. The signatures still take `default_model` for now (will be flipped in Task 5).
-
-NOTE: This task is purely mechanical (column rename + propagation). The signature change to `resolve_by_name` (dropping `default_model`, adding `bound_provider_id` + `bound_model_id`) is deferred to Task 5 to keep the diff reviewable.
+  - `DelegateRequest { bound_provider_id: Option<String>, bound_model_id: Option<String> }`
+  - `resolve_by_name(db, name, cwd, default_profile, bound_provider_id: &str, bound_model_id: &str) -> Result<Resolved>`
+  - Creation-time validation: provider exists + enabled, model exists + enabled
+  - `SubagentError::Validation(String)` + `code() => "subagent.validation_error"`
 
 - [ ] **Step 1: Update `SubagentLogicalSubagentRow` struct**
 
@@ -816,7 +821,23 @@ pub struct LogicalSubagent {
 }
 ```
 
-- [ ] **Step 5: Update `resolver.rs::row_to_model`**
+- [ ] **Step 5: Update `DelegateRequest` struct**
+
+Edit `crates/busytok-subagent/src/models.rs` — find the `DelegateRequest` struct and add the bound fields. This is the internal subagent-crate struct (does NOT depend on Task 4's DTO):
+
+```rust
+pub struct DelegateRequest {
+    // ... existing fields (subagent_name, subagent_id, cwd, profile, intent,
+    //     prompt, prompt_artifact_ref, timeout_seconds, model_override,
+    //     source_harness, source_session_id) ...
+    /// Spec §3.3: when creating a new subagent, both must be provided
+    /// together. Ignored when reusing an existing subagent.
+    pub bound_provider_id: Option<String>,
+    pub bound_model_id: Option<String>,
+}
+```
+
+- [ ] **Step 6: Update `resolver.rs::row_to_model`**
 
 Edit `crates/busytok-subagent/src/resolver.rs:175-197`:
 
@@ -848,9 +869,84 @@ pub fn row_to_model(r: &SubagentLogicalSubagentRow) -> LogicalSubagent {
 }
 ```
 
-- [ ] **Step 6: Update `resolver.rs::create_subagent` (interim — still takes default_model)**
+- [ ] **Step 7: Update `resolve_by_name` signature + body**
 
-Edit `crates/busytok-subagent/src/resolver.rs:140-173`. For this task, the function still receives `default_model: Option<&str>` from `resolve_by_name` (signature flips in Task 5). The interim body maps `default_model` to placeholder bound fields so the workspace compiles:
+Edit `crates/busytok-subagent/src/resolver.rs:18-65`:
+
+```rust
+pub fn resolve_by_name(
+    db: &busytok_store::Database,
+    name: &str,
+    cwd: &str,
+    default_profile: &str,
+    bound_provider_id: &str,
+    bound_model_id: &str,
+) -> Result<Resolved> {
+    if !LogicalSubagent::is_valid_name(name) {
+        return Err(SubagentError::InvalidName(name.to_string()));
+    }
+    let canonical_cwd = std::fs::canonicalize(cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| cwd.to_string());
+    let repo_hash = derive_project_hash(&canonical_cwd);
+    let matches = db
+        .subagent_find_by_name_in_repo(&repo_hash, &repo_hash, name)
+        .map_err(SubagentError::Store)?;
+    let active: Vec<_> = matches
+        .into_iter()
+        .filter(|r| r.status != "deleted")
+        .collect();
+    match active.len() {
+        0 => {
+            // Creation path: validate provider + model before insert.
+            validate_bound_provider_model(db, bound_provider_id, bound_model_id)?;
+            Ok(Resolved {
+                subagent: create_subagent(
+                    db,
+                    name,
+                    &canonical_cwd,
+                    &repo_hash,
+                    default_profile,
+                    bound_provider_id,
+                    bound_model_id,
+                )?,
+                created: true,
+            })
+        }
+        1 => Ok(Resolved {
+            subagent: row_to_model(&active[0]),
+            created: false,
+        }),
+        _ => Err(SubagentError::AmbiguousName(name.to_string())),
+    }
+}
+
+fn validate_bound_provider_model(
+    db: &busytok_store::Database,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<()> {
+    let provider = db
+        .get_provider_with_secret(provider_id)
+        .map_err(SubagentError::Store)?
+        .ok_or_else(|| SubagentError::Validation(format!("provider not found: {}", provider_id)))?;
+    if !provider.enabled {
+        return Err(SubagentError::Validation(format!("provider disabled: {}", provider_id)));
+    }
+    let model = db
+        .get_model_by_provider_and_model_id(provider_id, model_id)
+        .map_err(SubagentError::Store)?
+        .ok_or_else(|| SubagentError::Validation(format!("model not found in provider: {}", model_id)))?;
+    if !model.enabled {
+        return Err(SubagentError::Validation(format!("model disabled: {}", model_id)));
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 8: Update `create_subagent` signature + body**
+
+Edit `crates/busytok-subagent/src/resolver.rs:140-173`:
 
 ```rust
 fn create_subagent(
@@ -859,12 +955,11 @@ fn create_subagent(
     cwd: &str,
     repo_hash: &str,
     default_profile: &str,
-    default_model: Option<&str>,
+    bound_provider_id: &str,
+    bound_model_id: &str,
 ) -> Result<LogicalSubagent> {
     let now = busytok_domain::now_ms();
     let id = uuid::Uuid::new_v4().to_string();
-    // INTERIM: default_model is still the input; bound fields use placeholder
-    // empty strings. Task 5 flips the signature to take bound fields directly.
     let row = SubagentLogicalSubagentRow {
         id: id.clone(),
         name: name.to_string(),
@@ -874,8 +969,8 @@ fn create_subagent(
         branch: None,
         intent: None,
         default_profile: default_profile.to_string(),
-        bound_provider_id: String::new(),
-        bound_model_id: default_model.map(|s| s.to_string()).unwrap_or_default(),
+        bound_provider_id: bound_provider_id.to_string(),
+        bound_model_id: bound_model_id.to_string(),
         status: "cold".to_string(),
         created_at_ms: now,
         updated_at_ms: now,
@@ -887,13 +982,111 @@ fn create_subagent(
 }
 ```
 
-- [ ] **Step 7: Fix downstream construction sites**
+- [ ] **Step 9: Add `SubagentError::Validation` variant + extend `code()` method**
 
-Run: `cargo check --workspace 2>&1 | grep -E "error|no field|missing field" | head -50`
+Edit `crates/busytok-subagent/src/error.rs` — add the `Validation` variant:
 
-Fix each `SubagentLogicalSubagentRow { ... }` literal that's missing `bound_provider_id` / `bound_model_id` or has a stray `default_model` field. Common sites: tests in `crates/busytok-store/tests/subagent_queries.rs`, `crates/busytok-subagent/src/manager.rs` (anywhere `LogicalSubagent { ... }` is constructed in tests). Grep `SubagentLogicalSubagentRow {` and `LogicalSubagent {` across the workspace.
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum SubagentError {
+    // ... existing variants ...
+    #[error("{0}")]
+    Validation(String),
+}
+```
 
-- [ ] **Step 8: Write the failing test for bound fields round-trip**
+**Important:** also extend the `code()` method (error.rs:68-83) to add a `Validation` branch — otherwise the `match` becomes non-exhaustive and won't compile. Add:
+
+```rust
+SubagentError::Validation(_) => "subagent.validation_error",
+```
+
+Grep `crates/busytok-subagent/src/manager.rs` for `e.code()` callsites in `delegate()` (e.g. line 190 `reason = e.code()`) — the new variant flows through automatically once `code()` returns the string.
+
+- [ ] **Step 10: Update `delegate` callsite in manager**
+
+Edit `crates/busytok-subagent/src/manager.rs:167-200`. The `delegate()` method now extracts `bound_provider_id` + `bound_model_id` from the request, applies the "both or neither" rule, and calls `resolve_by_name` with the new signature. When reusing (name path hit OR `subagent_id` path), the bound fields are ignored.
+
+```rust
+pub async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult> {
+    // Spec §3.3: bound fields are conditional required (create path only).
+    let bound_pair = match (&req.bound_provider_id, &req.bound_model_id) {
+        (Some(p), Some(m)) => Some((p.clone(), m.clone())),
+        (None, None) => None,
+        _ => return Err(SubagentError::Validation(
+            "bound_provider_id and bound_model_id must be provided together".into(),
+        ).into()),
+    };
+    // INTERIM: Task 3 will delete `profile_model()` and this line; until then
+    // we keep it so the post-resolution delegate body (which still references
+    // `profile_model` in `model:` fields of `DelegateResult` and `ExecutorInput`)
+    // continues to compile. Task 3 Step 11 rewrites those `model:` fields to
+    // `req.model_override.clone()` (no `profile_model` fallback) and deletes
+    // this line + the `profile_model()` method.
+    let profile_model = self.profile_model(&req.profile);
+    let Resolved { subagent, created } = {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        if let Some(id) = &req.subagent_id {
+            // Reuse path: ignore bound fields, resolve by id.
+            Resolved {
+                subagent: resolve_by_id(&db, id)?,
+                created: false,
+            }
+        } else {
+            // name path: pass bound fields; resolver validates only on create.
+            let (p, m) = bound_pair.unwrap_or((String::new(), String::new()));
+            match resolve_by_name(
+                &db,
+                &req.subagent_name,
+                &req.cwd,
+                &req.profile,
+                &p,
+                &m,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        event_code = "subagent.delegate.rejected",
+                        reason = e.code(),
+                        name = %req.subagent_name,
+                    );
+                    return Err(e);
+                }
+            }
+        }
+    };
+    // ── Everything below is the EXISTING delegate() body, unchanged ──
+    // (preserve verbatim from the pre-refactor delegate() implementation):
+    //   1. The "Unknown profile" early-reject guard (delegate() lines ~133-142)
+    //      — KEEP as-is. (Note: `profile_known` check stays; profile is still
+    //      a real config concept, just no longer carries provider/model.)
+    //   2. The "prompt vs prompt_artifact_ref" mutual-exclusion guard
+    //      (delegate() lines ~143-166) — KEEP as-is.
+    //   3. The pressure-gate + has_running_task queue-vs-run decision +
+    //      `subagent_insert_task` (lines ~199-252) — KEEP as-is.
+    //   4. The early-return `DelegateResult { status: Queued, ... }` when
+    //      `should_queue` is true (lines ~266-288) — KEEP as-is. The `model:`
+    //      field uses `req.model_override.clone().or(profile_model)` for now;
+    //      Task 3 Step 11 will drop the `profile_model` fallback (rewrite to
+    //      `req.model_override.clone()`).
+    //   5. The `SubagentTaskRow` construction (lines ~290-320) — KEEP as-is.
+    //   6. The `execute_task(task_row, subagent)` call (line ~321) — KEEP
+    //      as-is. Task 5 rewrites `execute_task` internals to use
+    //      `subagent.bound_provider_id` + `effective_model_id`.
+    //   7. The post-execute `DelegateResult` construction + return — KEEP
+    //      as-is.
+    //
+    // The ONLY change in this step is replacing the resolution block (old
+    // lines 167-197) with the new `bound_pair` extraction + new-signature
+    // `resolve_by_name` call above. Everything else in delegate() is
+    // preserved verbatim. The `profile_model` line is kept as INTERIM so
+    // the post-resolution body compiles; Task 3 removes it.
+}
+```
+
+NOTE: The engineer should NOT rewrite the post-resolution body — only the resolution block (lines 167-197 in the pre-refactor file) is replaced (plus the new `bound_pair` extraction + interim `profile_model` line). Task 3 will delete `profile_model()` and rewrite the `model:` fields in `DelegateResult`/`ExecutorInput` to use `req.model_override.clone()` (no `profile_model` fallback). Until then, the post-resolution body stays as-is.
+
+- [ ] **Step 11: Write the failing test for bound fields round-trip**
 
 Add to `crates/busytok-store/tests/subagent_queries.rs` (or the existing subagent_queries test file):
 
@@ -925,25 +1118,99 @@ fn subagent_upsert_logical_persists_bound_fields() {
 }
 ```
 
-- [ ] **Step 9: Run tests**
+- [ ] **Step 12: Write the failing tests for creation-time validation**
 
-Run: `cargo test -p busytok-store --test subagent_queries subagent_upsert_logical_persists_bound_fields`
+Add to `crates/busytok-subagent/src/resolver.rs` tests (or `tests/` integration file if no inline tests exist):
+
+```rust
+#[test]
+fn resolve_by_name_creates_subagent_with_valid_bound_provider_and_model() {
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let provider_id = busytok_store::provider_catalog::create_provider(&db.conn(), busytok_store::provider_catalog::CreateProviderReq {
+        name: "P1".into(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        enabled: true,
+        api_key: Some("sk-test".into()),
+    }).unwrap().id;
+    let model = busytok_store::provider_catalog::create_model(&db.conn(), busytok_store::provider_catalog::CreateModelReq {
+        provider_id: provider_id.clone(),
+        model_id: "gpt-4o".into(),
+        enabled: true,
+        tags: vec![],
+        display_name: None,
+        reasoning: None,
+        context_window: Some(128000),
+        max_tokens: Some(16384),
+    }).unwrap();
+    let resolved = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &provider_id, &model.model_id).unwrap();
+    assert!(resolved.created);
+    assert_eq!(resolved.subagent.bound_provider_id, provider_id);
+    assert_eq!(resolved.subagent.bound_model_id, "gpt-4o");
+}
+
+#[test]
+fn resolve_by_name_rejects_disabled_provider() {
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let provider_id = busytok_store::provider_catalog::create_provider(&db.conn(), busytok_store::provider_catalog::CreateProviderReq {
+        name: "P1".into(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        enabled: false,
+        api_key: None,
+    }).unwrap().id;
+    let result = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &provider_id, "gpt-4o");
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("provider disabled"), "got: {}", msg);
+}
+
+#[test]
+fn resolve_by_name_rejects_missing_model_in_provider() {
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let provider_id = busytok_store::provider_catalog::create_provider(&db.conn(), busytok_store::provider_catalog::CreateProviderReq {
+        name: "P1".into(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        base_url: "https://api.test.com".into(),
+        enabled: true,
+        api_key: Some("sk-test".into()),
+    }).unwrap().id;
+    let result = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &provider_id, "gpt-4o");
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("model not found in provider"), "got: {}", msg);
+}
+```
+
+- [ ] **Step 13: Fix downstream construction sites**
+
+Run: `cargo check --workspace 2>&1 | grep -E "error|no field|missing field" | head -50`
+
+Fix each `SubagentLogicalSubagentRow { ... }` literal that's missing `bound_provider_id` / `bound_model_id` or has a stray `default_model` field. Common sites: tests in `crates/busytok-store/tests/subagent_queries.rs`, `crates/busytok-subagent/src/manager.rs` (anywhere `LogicalSubagent { ... }` is constructed in tests). Grep `SubagentLogicalSubagentRow {` and `LogicalSubagent {` across the workspace.
+
+Also grep `resolve_by_name(` callsites across the workspace and update each to pass two more args (`bound_provider_id: &str, bound_model_id: &str`). For tests that exercise the reuse path, pass empty strings (the resolver hits the existing row and ignores the bound fields). For manager.rs test mocks that call `resolve_by_name(`, pass `"test-prov"` / `"test-model"` or empty strings as appropriate.
+
+- [ ] **Step 14: Run tests**
+
+Run: `cargo test -p busytok-store --test subagent_queries subagent_upsert_logical_persists_bound_fields && cargo test -p busytok-subagent --lib resolver && cargo test -p busytok-subagent --lib manager`
 Expected: PASS
 
-- [ ] **Step 10: Workspace check + clippy**
+- [ ] **Step 15: Workspace check + clippy**
 
 Run: `cargo check --workspace && cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -30`
-Expected: clean (compile errors fixed in Step 7). The runtime may still reference `default_model` via `profile_model()` — that's removed in Task 4. For now `LogicalSubagent.default_model` is gone; `manager.rs` calls to `self.profile_model()` return `Option<String>` and don't touch the struct field, so should compile.
+Expected: clean (compile errors fixed in Step 13). The runtime may still reference `default_model` via `profile_model()` — that's removed in Task 3. For now `LogicalSubagent.default_model` is gone; `manager.rs` calls to `self.profile_model()` return `Option<String>` and don't touch the struct field, so should compile.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 16: Commit**
 
 ```bash
 git add crates/busytok-store/src/repository.rs \
         crates/busytok-store/src/subagent_queries.rs \
         crates/busytok-store/tests/subagent_queries.rs \
         crates/busytok-subagent/src/models.rs \
-        crates/busytok-subagent/src/resolver.rs
-git commit -m "refactor(store): SubagentLogicalSubagentRow bound fields (drop default_model)"
+        crates/busytok-subagent/src/resolver.rs \
+        crates/busytok-subagent/src/manager.rs \
+        crates/busytok-subagent/src/error.rs
+git commit -m "refactor(subagent): atomic bound fields migration — row/struct/SQL + resolve_by_name validation + delegate wiring"
 ```
 
 ---
@@ -1122,17 +1389,17 @@ Edit `crates/busytok-subagent/src/manager.rs:1053-1061` — delete the `profile_
 - [ ] **Step 11: Strip `profile_model` usages from `delegate` + `execute_task`**
 
 Edit `crates/busytok-subagent/src/manager.rs`:
-- Line ~167: `let profile_model = self.profile_model(&req.profile);` — delete this line
-- Line ~184: drop `profile_model.as_deref(),` argument to `resolve_by_name` (signature change is in Task 5; for now pass `None` to keep workspace compiling — actually since Task 2 still has `default_model: Option<&str>` in `resolve_by_name`, pass `req.model_override.as_deref()` as the placeholder)
-- Line ~284: `model: req.model_override.clone().or(profile_model)` → `model: req.model_override.clone()` (interim; Task 6 flips this to read `subagent.bound_model_id`)
+- Line ~167: `let profile_model = self.profile_model(&req.profile);` — delete this line (was kept as INTERIM in Task 2 Step 10; now safe to remove)
+- Line ~184: the `resolve_by_name` call already uses the new signature from Task 2 — no change needed here
+- Line ~284: `model: req.model_override.clone().or(profile_model)` → `model: req.model_override.clone()` (interim; Task 5 flips this to read `subagent.bound_model_id`)
 - Line ~294: same pattern — drop `profile_model` from the `model:` field
-- Line ~360: `.or_else(|| self.profile_model(&task.profile))` — delete this fallback (Task 6 replaces with `subagent.bound_model_id`)
+- Line ~360: `.or_else(|| self.profile_model(&task.profile))` — delete this fallback (Task 5 replaces with `subagent.bound_model_id`)
 
-Engineer: grep for `profile_model` across the workspace and remove all references. The interim `delegate()` body should use `req.model_override.clone()` for the `model` field of `DelegateResult` and `ExecutorInput`.
+Engineer: grep for `profile_model` across the workspace and remove all references. The `delegate()` body should use `req.model_override.clone()` for the `model` field of `DelegateResult` and `ExecutorInput` (Task 2 Step 10 kept `profile_model` as INTERIM; this step removes it).
 
 - [ ] **Step 12: Strip `subagent_delegate` profile provider/model validation**
 
-Edit `crates/busytok-runtime/src/supervisor.rs:5409-5470` — delete the entire `if self.worker_pool().is_some() { ... }` block that validates `profile_cfg.provider_id` + `profile_cfg.model`. The new validation chain (Task 7) will use `bound_provider_id` + `effective_model_id`. For now, the handler just forwards to `subagent_manager().delegate()`.
+Edit `crates/busytok-runtime/src/supervisor.rs:5409-5470` — delete the entire `if self.worker_pool().is_some() { ... }` block that validates `profile_cfg.provider_id` + `profile_cfg.model`. The new validation chain (Task 6) will use `bound_provider_id` + `effective_model_id`. For now, the handler just forwards to `subagent_manager().delegate()`.
 
 ```rust
 async fn subagent_delegate(
@@ -1549,322 +1816,7 @@ git commit -m "feat(protocol): DTOs for bound fields + model metadata + profile 
 
 ---
 
-## Task 5: `resolve_by_name` new signature + creation-time validation chain
-
-**Files:**
-- Modify: `crates/busytok-subagent/src/resolver.rs:18-65` (`resolve_by_name` + `create_subagent`)
-- Modify: `crates/busytok-subagent/src/manager.rs:167-200` (`delegate` callsite)
-- Modify: `crates/busytok-subagent/src/error.rs` (add new error variants if needed)
-- Test: `crates/busytok-subagent/src/resolver.rs` tests
-
-**Interfaces:**
-- Consumes: Tasks 1-4
-- Produces:
-  - `resolve_by_name(db, name, cwd, default_profile, bound_provider_id: &str, bound_model_id: &str) -> Result<Resolved>`
-  - Creation-time validation: provider exists + enabled, model exists + enabled
-  - Error messages: `provider not found` / `provider disabled` / `model not found in provider` / `model disabled`
-
-- [ ] **Step 1: Write the failing test for creation-time validation**
-
-Add to `crates/busytok-subagent/src/resolver.rs` tests (or `tests/` integration file if no inline tests exist):
-
-```rust
-#[test]
-fn resolve_by_name_creates_subagent_with_valid_bound_provider_and_model() {
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let provider_id = busytok_store::provider_catalog::create_provider(&db.conn(), busytok_store::provider_catalog::CreateProviderReq {
-        name: "P1".into(),
-        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test.com".into(),
-        enabled: true,
-        api_key: Some("sk-test".into()),
-    }).unwrap().id;
-    let model = busytok_store::provider_catalog::create_model(&db.conn(), busytok_store::provider_catalog::CreateModelReq {
-        provider_id: provider_id.clone(),
-        model_id: "gpt-4o".into(),
-        enabled: true,
-        tags: vec![],
-        display_name: None,
-        reasoning: None,
-        context_window: Some(128000),
-        max_tokens: Some(16384),
-    }).unwrap();
-    let resolved = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &provider_id, &model.model_id).unwrap();
-    assert!(resolved.created);
-    assert_eq!(resolved.subagent.bound_provider_id, provider_id);
-    assert_eq!(resolved.subagent.bound_model_id, "gpt-4o");
-}
-
-#[test]
-fn resolve_by_name_rejects_disabled_provider() {
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let provider_id = busytok_store::provider_catalog::create_provider(&db.conn(), busytok_store::provider_catalog::CreateProviderReq {
-        name: "P1".into(),
-        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test.com".into(),
-        enabled: false,
-        api_key: None,
-    }).unwrap().id;
-    let result = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &provider_id, "gpt-4o");
-    assert!(result.is_err());
-    let msg = format!("{}", result.unwrap_err());
-    assert!(msg.contains("provider disabled"), "got: {}", msg);
-}
-
-#[test]
-fn resolve_by_name_rejects_missing_model_in_provider() {
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let provider_id = busytok_store::provider_catalog::create_provider(&db.conn(), busytok_store::provider_catalog::CreateProviderReq {
-        name: "P1".into(),
-        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test.com".into(),
-        enabled: true,
-        api_key: Some("sk-test".into()),
-    }).unwrap().id;
-    let result = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &provider_id, "gpt-4o");
-    assert!(result.is_err());
-    let msg = format!("{}", result.unwrap_err());
-    assert!(msg.contains("model not found in provider"), "got: {}", msg);
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p busytok-subagent --lib resolver`
-Expected: FAIL (signature mismatch)
-
-- [ ] **Step 3: Update `resolve_by_name` signature + body**
-
-Edit `crates/busytok-subagent/src/resolver.rs:18-65`:
-
-```rust
-pub fn resolve_by_name(
-    db: &busytok_store::Database,
-    name: &str,
-    cwd: &str,
-    default_profile: &str,
-    bound_provider_id: &str,
-    bound_model_id: &str,
-) -> Result<Resolved> {
-    if !LogicalSubagent::is_valid_name(name) {
-        return Err(SubagentError::InvalidName(name.to_string()));
-    }
-    let canonical_cwd = std::fs::canonicalize(cwd)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| cwd.to_string());
-    let repo_hash = derive_project_hash(&canonical_cwd);
-    let matches = db
-        .subagent_find_by_name_in_repo(&repo_hash, &repo_hash, name)
-        .map_err(SubagentError::Store)?;
-    let active: Vec<_> = matches
-        .into_iter()
-        .filter(|r| r.status != "deleted")
-        .collect();
-    match active.len() {
-        0 => {
-            // Creation path: validate provider + model before insert.
-            validate_bound_provider_model(db, bound_provider_id, bound_model_id)?;
-            Ok(Resolved {
-                subagent: create_subagent(
-                    db,
-                    name,
-                    &canonical_cwd,
-                    &repo_hash,
-                    default_profile,
-                    bound_provider_id,
-                    bound_model_id,
-                )?,
-                created: true,
-            })
-        }
-        1 => Ok(Resolved {
-            subagent: row_to_model(&active[0]),
-            created: false,
-        }),
-        _ => Err(SubagentError::AmbiguousName(name.to_string())),
-    }
-}
-
-fn validate_bound_provider_model(
-    db: &busytok_store::Database,
-    provider_id: &str,
-    model_id: &str,
-) -> Result<()> {
-    let provider = db
-        .get_provider_with_secret(provider_id)
-        .map_err(SubagentError::Store)?
-        .ok_or_else(|| SubagentError::Validation(format!("provider not found: {}", provider_id)))?;
-    if !provider.enabled {
-        return Err(SubagentError::Validation(format!("provider disabled: {}", provider_id)));
-    }
-    let model = db
-        .get_model_by_provider_and_model_id(provider_id, model_id)
-        .map_err(SubagentError::Store)?
-        .ok_or_else(|| SubagentError::Validation(format!("model not found in provider: {}", model_id)))?;
-    if !model.enabled {
-        return Err(SubagentError::Validation(format!("model disabled: {}", model_id)));
-    }
-    Ok(())
-}
-```
-
-If `SubagentError::Validation` doesn't exist, add it to `crates/busytok-subagent/src/error.rs`:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum SubagentError {
-    // ... existing variants ...
-    #[error("{0}")]
-    Validation(String),
-}
-```
-
-**Important:** also extend the `code()` method (error.rs:68-83) to add a `Validation` branch — otherwise the `match` becomes non-exhaustive and won't compile. Add:
-
-```rust
-SubagentError::Validation(_) => "subagent.validation_error",
-```
-
-Grep `crates/busytok-subagent/src/manager.rs` for `e.code()` callsites in `delegate()` (e.g. line 190 `reason = e.code()`) — the new variant flows through automatically once `code()` returns the string.
-
-- [ ] **Step 4: Update `create_subagent` signature + body**
-
-Edit `crates/busytok-subagent/src/resolver.rs:140-173`:
-
-```rust
-fn create_subagent(
-    db: &busytok_store::Database,
-    name: &str,
-    cwd: &str,
-    repo_hash: &str,
-    default_profile: &str,
-    bound_provider_id: &str,
-    bound_model_id: &str,
-) -> Result<LogicalSubagent> {
-    let now = busytok_domain::now_ms();
-    let id = uuid::Uuid::new_v4().to_string();
-    let row = SubagentLogicalSubagentRow {
-        id: id.clone(),
-        name: name.to_string(),
-        project_id: repo_hash.to_string(),
-        repo_path: cwd.to_string(),
-        repo_hash: repo_hash.to_string(),
-        branch: None,
-        intent: None,
-        default_profile: default_profile.to_string(),
-        bound_provider_id: bound_provider_id.to_string(),
-        bound_model_id: bound_model_id.to_string(),
-        status: "cold".to_string(),
-        created_at_ms: now,
-        updated_at_ms: now,
-        last_active_at_ms: None,
-    };
-    db.subagent_upsert_logical(&row).map_err(SubagentError::Store)?;
-    db.subagent_upsert_memory(&SubagentMemoryRow::new_empty(&id)).map_err(SubagentError::Store)?;
-    Ok(row_to_model(&row))
-}
-```
-
-- [ ] **Step 5: Update `delegate` callsite in manager**
-
-Edit `crates/busytok-subagent/src/manager.rs:167-200`. The `delegate()` method now extracts `bound_provider_id` + `bound_model_id` from the request, applies the "both or neither" rule, and calls `resolve_by_name` with the new signature. When reusing (name path hit OR `subagent_id` path), the bound fields are ignored.
-
-```rust
-pub async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult> {
-    // Spec §3.3: bound fields are conditional required (create path only).
-    let bound_pair = match (&req.bound_provider_id, &req.bound_model_id) {
-        (Some(p), Some(m)) => Some((p.clone(), m.clone())),
-        (None, None) => None,
-        _ => return Err(SubagentError::Validation(
-            "bound_provider_id and bound_model_id must be provided together".into(),
-        ).into()),
-    };
-    let Resolved { subagent, created } = {
-        let db = self.db.lock().expect("subagent db lock poisoned");
-        if let Some(id) = &req.subagent_id {
-            // Reuse path: ignore bound fields, resolve by id.
-            Resolved {
-                subagent: resolve_by_id(&db, id)?,
-                created: false,
-            }
-        } else {
-            // name path: pass bound fields; resolver validates only on create.
-            let (p, m) = bound_pair.unwrap_or((String::new(), String::new()));
-            match resolve_by_name(
-                &db,
-                &req.subagent_name,
-                &req.cwd,
-                &req.profile,
-                &p,
-                &m,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        event_code = "subagent.delegate.rejected",
-                        reason = e.code(),
-                        name = %req.subagent_name,
-                    );
-                    return Err(e);
-                }
-            }
-        }
-    };
-    // ── Everything below is the EXISTING delegate() body, unchanged ──
-    // (preserve verbatim from the pre-refactor delegate() implementation):
-    //   1. The "Unknown profile" early-reject guard (delegate() lines ~133-142)
-    //      — KEEP as-is. (Note: `profile_known` check stays; profile is still
-    //      a real config concept, just no longer carries provider/model.)
-    //   2. The "prompt vs prompt_artifact_ref" mutual-exclusion guard
-    //      (delegate() lines ~143-166) — KEEP as-is.
-    //   3. The pressure-gate + has_running_task queue-vs-run decision +
-    //      `subagent_insert_task` (lines ~199-252) — KEEP as-is.
-    //   4. The early-return `DelegateResult { status: Queued, ... }` when
-    //      `should_queue` is true (lines ~266-288) — KEEP as-is. The `model:`
-    //      field uses `req.model_override.clone()` (Task 3 Step 11 already
-    //      dropped the `profile_model` fallback).
-    //   5. The `SubagentTaskRow` construction (lines ~290-320) — KEEP as-is.
-    //   6. The `execute_task(task_row, subagent)` call (line ~321) — KEEP
-    //      as-is. Task 6 rewrites `execute_task` internals to use
-    //      `subagent.bound_provider_id` + `effective_model_id`.
-    //   7. The post-execute `DelegateResult` construction + return — KEEP
-    //      as-is.
-    //
-    // The ONLY change in this step is replacing the resolution block (old
-    // lines 167-197) with the new `bound_pair` extraction + new-signature
-    // `resolve_by_name` call above. Everything else in delegate() is
-    // preserved verbatim.
-}
-```
-
-NOTE: The engineer should NOT rewrite the post-resolution body — only the resolution block (lines 167-197 in the pre-refactor file) is replaced. The `profile_model` variable (formerly line 167) is GONE (Task 3 Step 11 already removed it); the new `bound_pair` extraction replaces it. All subsequent references to `profile_model` (in the `model:` field of `DelegateResult` and `ExecutorInput`) were already rewritten to `req.model_override.clone()` by Task 3 Step 11.
-
-- [ ] **Step 6: Update manager.rs test mocks for `resolve_by_name`**
-
-Grep `crates/busytok-subagent/src/manager.rs` tests + any test files for `resolve_by_name(` callsites — update each to pass two more args (`"test-prov"`, `"test-model"` or similar). For tests that exercise the reuse path, pass empty strings (the resolver hits the existing row and ignores the bound fields).
-
-- [ ] **Step 7: Run tests**
-
-Run: `cargo test -p busytok-subagent --lib resolver && cargo test -p busytok-subagent --lib manager`
-Expected: PASS
-
-- [ ] **Step 8: Workspace check + clippy**
-
-Run: `cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -30`
-Expected: clean
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add crates/busytok-subagent/src/resolver.rs \
-        crates/busytok-subagent/src/manager.rs \
-        crates/busytok-subagent/src/error.rs
-git commit -m "feat(subagent): resolve_by_name bound provider/model validation chain"
-```
-
----
-
-## Task 6: `ExecutorInput` + `execute_task` validation chain + sidecar executor turn_auto params + delete `inject_provider_env`
+## Task 5: `ExecutorInput` + `execute_task` validation chain + sidecar executor turn_auto params + delete `inject_provider_env`
 
 **Files:**
 - Modify: `crates/busytok-subagent/src/mock_executor.rs:11-31` (`ExecutorInput`)
@@ -1964,7 +1916,7 @@ async fn execute_task_fails_when_bound_provider_disabled() {
 }
 ```
 
-Adjust the `DelegateRequest` field set if Task 4 / Task 5 added more fields; grep `crates/busytok-subagent/src/models.rs` for the current struct definition. If `SubagentManager::new` signature differs (e.g. takes `with_pressure_gate`), use whichever constructor the existing tests use.
+Adjust the `DelegateRequest` field set if Task 4 / Task 2 added more fields; grep `crates/busytok-subagent/src/models.rs` for the current struct definition. If `SubagentManager::new` signature differs (e.g. takes `with_pressure_gate`), use whichever constructor the existing tests use.
 
 - [ ] **Step 2: Update `ExecutorInput` struct (with model metadata fields)**
 
@@ -2128,7 +2080,7 @@ let params = serde_json::json!({
     "provider_kind": input.provider_kind,
     "provider_base_url": input.provider_base_url,
     // provider_api_key is sent so the sidecar can register it in AuthStorage.
-    // Sidecar must NOT log this field in plaintext (Task 8 enforces).
+    // Sidecar must NOT log this field in plaintext (Task 7 enforces).
     "provider_api_key": input.provider_api_key,
     "model_reasoning": input.model_reasoning,
     "model_context_window": input.model_context_window,
@@ -2146,8 +2098,8 @@ Edit `crates/busytok-subagent/src/sidecar/pool.rs`:
 - Delete the callsite at line ~227 (`inject_provider_env(&mut config.env, &entry);`) AND the `info!` log at line ~232 (`"injected OPENAI_API_KEY + OPENAI_BASE_URL into sidecar env"`)
 - Delete the test at line ~518-528 (the `inject_provider_env` test that asserts `env.get("OPENAI_API_KEY")`)
 - **Clean up the module docstring (lines 1-44)** — multiple lines reference the old env-injection mechanism:
-  - Line 4-5: `injecting provider-specific env (\`OPENAI_API_KEY\` + \`OPENAI_BASE_URL\`) into the cloned \`SidecarConfig\` before construction.` → replace with: `lazily creating them via \`ensure_worker\`. Provider credentials are now threaded per-turn via \`turn_auto\` params (Task 6), not via env injection.`
-  - Line 7-12: the `**Fixed env injection (Task 7):**` paragraph — delete entirely (no longer applies).
+  - Line 4-5: `injecting provider-specific env (\`OPENAI_API_KEY\` + \`OPENAI_BASE_URL\`) into the cloned \`SidecarConfig\` before construction.` → replace with: `lazily creating them via \`ensure_worker\`. Provider credentials are now threaded per-turn via \`turn_auto\` params (Task 5), not via env injection.`
+  - Line 7-12: the `**Fixed env injection (Task 6):**` paragraph — delete entirely (no longer applies).
   - Line 67-68: the `/// Inject provider credentials into env using FIXED names. / /// Sidecar only recognizes \`OPENAI_API_KEY\` and \`OPENAI_BASE_URL\`.` doc comment — delete with the function.
   - Line 87-90: the `/// injects \`OPENAI_API_KEY\` / \`OPENAI_BASE_URL\` per provider before` comment on `base_config` → replace with: `/// Produced by \`resolve_base_sidecar_config\`; the pool clones it per provider (no env override — credentials flow via \`turn_auto\` params).`
 
@@ -2179,7 +2131,7 @@ git commit -m "feat(subagent): ExecutorInput + execute_task validation chain + d
 
 ---
 
-## Task 7: `provider_test_connection` Anthropic branch
+## Task 6: `provider_test_connection` Anthropic branch
 
 **Files:**
 - Modify: `crates/busytok-runtime/src/supervisor.rs:5884-6033` (`provider_test_connection`)
@@ -2189,51 +2141,120 @@ git commit -m "feat(subagent): ExecutorInput + execute_task validation chain + d
 - Consumes: Task 1 (`ProviderKind::AnthropicCompatible`)
 - Produces: `provider_test_connection` dispatches by `provider.provider_kind` — OpenAI path unchanged, Anthropic path uses `POST /v1/messages` with `max_tokens: 1` + `messages: [{role: "user", content: "ping"}]`
 
-- [ ] **Step 1: Write the failing test for Anthropic probe dispatch**
+- [ ] **Step 1: Write the failing test for Anthropic probe request contract**
 
-The runtime crate has no HTTP mock library (no `wiremock` / `mockito` in `Cargo.toml`), and the existing `provider_test_connection_*` tests follow a "test the pure decision helper" pattern (see `provider_test_connection_fallback_triggers_only_for_absent_endpoint_codes` at supervisor.rs:6807). Apply the same pattern: extract a pure dispatch helper `probe_endpoint_for_kind(kind: ProviderKind) -> ProbeEndpoint` (returns `ProbeEndpoint::OpenAi { url_path: "/models", .. }` or `ProbeEndpoint::Anthropic { url_path: "/v1/messages", .. }`) and test it. This avoids spinning up an HTTP server in unit tests.
+The runtime crate has no HTTP mock library (no `wiremock` / `mockito` in `Cargo.toml`). Testing only "which branch is taken" would let an engineer ship a malformed request (wrong path, missing `x-api-key`, wrong body) and still see green. To prevent this, extract a **pure request builder helper** `build_probe_request(kind: ProviderKind, base_url: &str, api_key: &str) -> ProbeRequest` that returns the full request contract (method, path, headers, JSON body) without any network I/O, then test the contract fields directly.
 
-Add to `crates/busytok-runtime/src/supervisor.rs` inline tests (alongside the existing `provider_test_connection_*` decision tests at line 6807+):
+Add `ProbeRequest` + `build_probe_request` to `crates/busytok-runtime/src/supervisor.rs` (outside `#[cfg(test)]` — used by `provider_test_connection` in production):
 
 ```rust
+/// A probe request contract built from a `ProviderKind`, without network I/O.
+/// Extracted so unit tests can assert method / path / headers / body without
+/// spinning up an HTTP server.
 #[derive(Debug, PartialEq, Eq)]
-enum ProbeEndpoint {
-    OpenAi,
-    Anthropic,
+pub struct ProbeRequest {
+    pub method: reqwest::Method,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: serde_json::Value,
 }
 
-/// Pure dispatch helper extracted from `provider_test_connection` so the
-/// routing decision is unit-testable without an HTTP server. Returns the
-/// probe endpoint kind for a given `ProviderKind`.
-fn probe_endpoint_for_kind(kind: busytok_domain::ProviderKind) -> ProbeEndpoint {
+/// Build the probe request for a `ProviderKind`. Used by `provider_test_connection`
+/// to construct the actual HTTP call; tested directly to lock the contract.
+pub fn build_probe_request(
+    kind: busytok_domain::ProviderKind,
+    base_url: &str,
+    api_key: &str,
+) -> ProbeRequest {
+    let base = base_url.trim_end_matches('/');
     match kind {
-        busytok_domain::ProviderKind::OpenAiCompatible => ProbeEndpoint::OpenAi,
-        busytok_domain::ProviderKind::AnthropicCompatible => ProbeEndpoint::Anthropic,
+        busytok_domain::ProviderKind::OpenAiCompatible => ProbeRequest {
+            method: reqwest::Method::GET,
+            url: format!("{}/models", base),
+            headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],
+            body: serde_json::Value::Null,
+        },
+        busytok_domain::ProviderKind::AnthropicCompatible => ProbeRequest {
+            method: reqwest::Method::POST,
+            url: format!("{}/v1/messages", base),
+            headers: vec![
+                ("x-api-key".into(), api_key.to_string()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            body: serde_json::json!({
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }),
+        },
     }
-}
-
-#[test]
-fn probe_endpoint_for_kind_dispatches_openai_for_openai_compatible() {
-    assert_eq!(
-        probe_endpoint_for_kind(busytok_domain::ProviderKind::OpenAiCompatible),
-        ProbeEndpoint::OpenAi,
-    );
-}
-
-#[test]
-fn probe_endpoint_for_kind_dispatches_anthropic_for_anthropic_compatible() {
-    assert_eq!(
-        probe_endpoint_for_kind(busytok_domain::ProviderKind::AnthropicCompatible),
-        ProbeEndpoint::Anthropic,
-    );
 }
 ```
 
-(Place `ProbeEndpoint` + `probe_endpoint_for_kind` outside the `#[cfg(test)]` module — they're used by `provider_test_connection` in production too. The two `#[test]`s go inside the existing tests module.)
+Add the following tests inside the existing `#[cfg(test)]` module (alongside the `provider_test_connection_*` tests at line 6807+):
 
-- [ ] **Step 2: Refactor `provider_test_connection` to dispatch by kind**
+```rust
+#[test]
+fn build_probe_request_openai_uses_get_models_with_bearer_auth() {
+    let req = build_probe_request(
+        busytok_domain::ProviderKind::OpenAiCompatible,
+        "https://api.test.com",
+        "sk-test",
+    );
+    assert_eq!(req.method, reqwest::Method::GET);
+    assert_eq!(req.url, "https://api.test.com/models");
+    assert_eq!(
+        req.headers.iter().find(|(k, _)| k == "Authorization"),
+        Some(&("Authorization".into(), "Bearer sk-test".into())),
+        "OpenAI probe must carry Authorization: Bearer <key>"
+    );
+    assert_eq!(req.body, serde_json::Value::Null);
+}
 
-Edit `crates/busytok-runtime/src/supervisor.rs:5884`. Wrap the existing OpenAI logic in a `match provider.provider_kind` block, add the Anthropic branch:
+#[test]
+fn build_probe_request_anthropic_uses_post_v1_messages_with_x_api_key_header() {
+    let req = build_probe_request(
+        busytok_domain::ProviderKind::AnthropicCompatible,
+        "https://api.anthropic.com",
+        "sk-ant-test",
+    );
+    assert_eq!(req.method, reqwest::Method::POST);
+    assert_eq!(req.url, "https://api.anthropic.com/v1/messages");
+    // Required headers — x-api-key (not Bearer), anthropic-version, content-type
+    assert_eq!(
+        req.headers.iter().find(|(k, _)| k == "x-api-key"),
+        Some(&("x-api-key".into(), "sk-ant-test".into())),
+        "Anthropic probe must use x-api-key header (not Bearer)"
+    );
+    assert_eq!(
+        req.headers.iter().find(|(k, _)| k == "anthropic-version"),
+        Some(&("anthropic-version".into(), "2023-06-01".into())),
+        "Anthropic probe must carry anthropic-version header"
+    );
+    assert_eq!(
+        req.headers.iter().find(|(k, _)| k == "content-type"),
+        Some(&("content-type".into(), "application/json".into())),
+    );
+    // Minimal body shape: max_tokens + messages[0].role + messages[0].content
+    assert_eq!(req.body["max_tokens"], 1);
+    assert_eq!(req.body["messages"][0]["role"], "user");
+    assert_eq!(req.body["messages"][0]["content"], "ping");
+}
+
+#[test]
+fn build_probe_request_trims_trailing_slash_from_base_url() {
+    let req = build_probe_request(
+        busytok_domain::ProviderKind::AnthropicCompatible,
+        "https://api.anthropic.com/",
+        "sk-test",
+    );
+    assert_eq!(req.url, "https://api.anthropic.com/v1/messages");
+}
+```
+
+- [ ] **Step 2: Refactor `provider_test_connection` to dispatch by kind via `build_probe_request`**
+
+Edit `crates/busytok-runtime/src/supervisor.rs:5884`. The Anthropic branch MUST call `build_probe_request` (the same helper tested in Step 1) so the request contract is locked — no inline header/body duplication. The OpenAI branch stays as-is (it has DB access for the probe model fallback). Add the Anthropic branch:
 
 ```rust
 async fn provider_test_connection(
@@ -2259,24 +2280,15 @@ async fn provider_test_connection(
         .build()?;
     match provider.provider_kind {
         busytok_domain::ProviderKind::OpenAiCompatible => {
+            // ... existing OpenAI logic (GET /models → fallback POST /chat/completions) ...
+            // Keep as-is. Engineer: move the existing body into a `test_connection_openai` helper
+            // that takes `&self` (for DB access to list_models_filtered) + client + provider_id + base_url + api_key.
             self.test_connection_openai(&client, &provider_id, &base_url, api_key).await
         }
         busytok_domain::ProviderKind::AnthropicCompatible => {
             self.test_connection_anthropic(&client, &provider_id, &base_url, api_key).await
         }
     }
-}
-
-async fn test_connection_openai(
-    &self,
-    client: &reqwest::Client,
-    provider_id: &str,
-    base_url: &str,
-    api_key: &str,
-) -> Result<ProviderTestConnectionResponseDto> {
-    // ... existing OpenAI logic (GET /models → fallback POST /chat/completions) ...
-    // Move the body of the existing function here, replacing `self` references
-    // to db with direct calls (or pass `self.db` through).
 }
 
 async fn test_connection_anthropic(
@@ -2286,24 +2298,29 @@ async fn test_connection_anthropic(
     base_url: &str,
     api_key: &str,
 ) -> Result<ProviderTestConnectionResponseDto> {
-    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+    // Build the probe request via the tested helper — DO NOT inline headers/body here.
+    // The contract (path, x-api-key, anthropic-version, body shape) is locked by
+    // `build_probe_request_anthropic_uses_post_v1_messages_with_x_api_key_header` test.
+    let probe = build_probe_request(
+        busytok_domain::ProviderKind::AnthropicCompatible,
+        base_url,
+        api_key,
+    );
     tracing::info!(
         event_code = "provider.test_connection",
         provider_id = %provider_id,
-        url = %url,
+        url = %probe.url,
         "testing anthropic provider connection"
     );
-    let body = serde_json::json!({
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "ping"}],
-    });
-    let resp = client
-        .post(&url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await;
+    let mut req_builder = client
+        .request(probe.method, &probe.url);
+    for (k, v) in &probe.headers {
+        req_builder = req_builder.header(k, v);
+    }
+    if probe.body != serde_json::Value::Null {
+        req_builder = req_builder.json(&probe.body);
+    }
+    let resp = req_builder.send().await;
     match resp {
         Ok(r) if r.status().is_success() => {
             tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "anthropic connection test succeeded");
@@ -2321,6 +2338,8 @@ async fn test_connection_anthropic(
     }
 }
 ```
+
+**Critical:** the Anthropic branch must call `build_probe_request()` — the same helper tested in Step 1. This ensures the request contract (path `/v1/messages`, header `x-api-key`, header `anthropic-version: 2023-06-01`, body `{max_tokens: 1, messages: [{role: "user", content: "ping"}]}`) is verified by tests. Do NOT inline a separate `serde_json::json!({...})` body or `.header("x-api-key", ...)` call in `test_connection_anthropic` — that would bypass the test contract and allow drift.
 
 The OpenAI helper needs DB access (for the probe model fallback). Pass `self` through or extract the probe-model lookup into a separate helper. Engineer: keep the existing DB access pattern (lock + list_models_filtered) inside `test_connection_openai`.
 
@@ -2343,7 +2362,7 @@ git commit -m "feat(runtime): provider_test_connection Anthropic /v1/messages pr
 
 ---
 
-## Task 8: Sidecar types + pi_session.ts + turn_auto handler
+## Task 7: Sidecar types + pi_session.ts + turn_auto handler
 
 **Files:**
 - Modify: `apps/pi-sidecar/src/types.ts` (`TurnAutoParams`)
@@ -2353,12 +2372,12 @@ git commit -m "feat(runtime): provider_test_connection Anthropic /v1/messages pr
 - Test: `apps/pi-sidecar/src/handlers/turn_auto.test.ts`
 
 **Interfaces:**
-- Consumes: Task 6 (Rust sends the new params)
+- Consumes: Task 5 (Rust sends the new params)
 - Produces:
   - `TurnAutoParams { provider_kind, provider_base_url, provider_api_key, model_reasoning, model_context_window, model_max_tokens, model_display_name }`
   - `CreateSessionOpts { model: string, provider_id: string, provider_kind, provider_base_url, provider_api_key, model_reasoning, model_context_window, model_max_tokens, model_display_name }`
   - `defaultSessionFactory` uses `AuthStorage.inMemory` + `ModelRegistry.create` + `registerProvider` (no `cachedRegistry`, no env var)
-  - `inject_provider_env` already deleted in Task 6
+  - `inject_provider_env` already deleted in Task 5
 
 - [ ] **Step 1: Write the failing test for `defaultSessionFactory` with new params**
 
@@ -2653,10 +2672,10 @@ Engineer: grep for `SessionPool` / `pool.ensure` and verify the existing impleme
 Run: `pnpm -F pi-sidecar test`
 Expected: PASS
 
-- [ ] **Step 8: Lint + typecheck**
+- [ ] **Step 8: Typecheck**
 
-Run: `pnpm -F pi-sidecar lint && pnpm -F pi-sidecar typecheck`
-Expected: clean
+Run: `pnpm -F pi-sidecar typecheck`
+Expected: clean (no `lint` script exists for pi-sidecar — do NOT run one)
 
 - [ ] **Step 9: Commit**
 
@@ -2671,18 +2690,20 @@ git commit -m "feat(sidecar): defaultSessionFactory via AuthStorage.inMemory + M
 
 ---
 
-## Task 9: GUI updates — provider_kind selector + model metadata form
+## Task 8: GUI updates — provider_kind selector + model metadata form
 
 **Files:**
 - Modify: `apps/gui/src/pages/ProvidersPage.tsx` (provider_kind selector)
 - Modify: `apps/gui/src/components/ModelsSection.tsx` (model metadata form)
-- Test: `apps/gui/src/pages/ProvidersPage.test.tsx` (if present)
+- Test: `apps/gui/src/pages/ProvidersPage.test.tsx` (already exists — extend with `provider_kind` selector assertions)
+- Test: `apps/gui/src/components/ModelsSection.test.tsx` (already exists — extend with metadata form assertions)
 
 **Interfaces:**
 - Consumes: Task 4 (regenerated TS types with `ProviderKind` + model metadata)
 - Produces:
   - Provider create/edit form includes a `provider_kind` selector (`openai_compatible` / `anthropic_compatible`)
   - Model create form includes required `context_window` + `max_tokens` inputs + optional `display_name` + `reasoning` checkbox
+  - Both test files extended to cover the new UI controls (required for `pnpm coverage:gui` ≥90% threshold)
 
 - [ ] **Step 1: Update `ProvidersPage.tsx` provider_kind selector**
 
@@ -2735,22 +2756,113 @@ Grep `apps/gui/src/components/ModelsSection.tsx` for the create form. Add inputs
 
 The form submit handler must validate that `context_window` and `max_tokens` are present before calling the RPC. Show a user-facing error if missing.
 
-- [ ] **Step 3: Run GUI tests + typecheck**
+- [ ] **Step 3: Write failing tests for `provider_kind` selector in `ProvidersPage.test.tsx`**
+
+Both `ProvidersPage.test.tsx` and `ModelsSection.test.tsx` already exist (see the mock setup pattern at `apps/gui/src/pages/ProvidersPage.test.tsx:1-50`). Extend them with assertions for the new UI controls. Add to `ProvidersPage.test.tsx`:
+
+```tsx
+it("renders provider_kind selector with both options", async () => {
+  mockUseProviders.mockReturnValue({
+    data: { providers: [], total: 0 } as ProviderListResponseDto,
+    isLoading: false,
+    error: null,
+  });
+  mockUseProviderMutations.mockReturnValue({
+    create: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+    testConnection: vi.fn(),
+  });
+  mockUseModels.mockReturnValue({ data: { models: [], total: 0 }, isLoading: false, error: null });
+  mockUseModelMutations.mockReturnValue({ create: vi.fn(), update: vi.fn(), delete: vi.fn() });
+  mockUseSettingsSnapshot.mockReturnValue({ data: null, isLoading: false });
+  mockUseProfileMutations.mockReturnValue({ create: vi.fn(), update: vi.fn(), delete: vi.fn() });
+
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ProvidersPage />
+    </QueryClientProvider>
+  );
+
+  // Open the create-provider form (adjust selector to match existing UI)
+  const addButton = await screen.findByText(/add provider|新增/i);
+  fireEvent.click(addButton);
+
+  // Assert the selector exists and offers both kinds
+  const selector = await screen.findByRole("combobox", { name: /kind|类型/i });
+  expect(selector).toBeTruthy();
+  const options = screen.getAllByRole("option");
+  const optionValues = options.map((o) => (o as HTMLOptionElement).value);
+  expect(optionValues).toContain("openai_compatible");
+  expect(optionValues).toContain("anthropic_compatible");
+});
+
+it("blocks create when provider_kind is not selected", async () => {
+  // Setup same as above...
+  // Assert that the submit button is disabled or an error shows when no kind is selected.
+});
+```
+
+- [ ] **Step 4: Write failing tests for metadata form in `ModelsSection.test.tsx`**
+
+Add to `ModelsSection.test.tsx`:
+
+```tsx
+it("renders context_window and max_tokens as required inputs in create form", async () => {
+  mockUseProviders.mockReturnValue({
+    data: { providers: [{ id: "prov-1", name: "P1", provider_kind: "openai_compatible", base_url: "https://api.test.com", enabled: true } as ProviderDto] } as ProviderListResponseDto,
+    isLoading: false,
+    error: null,
+  });
+  mockUseModels.mockReturnValue({ data: { models: [], total: 0 }, isLoading: false, error: null });
+  mockUseModelMutations.mockReturnValue({ create: vi.fn(), update: vi.fn(), delete: vi.fn() });
+
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ModelsSection />
+    </QueryClientProvider>
+  );
+
+  // Open the create-model form
+  const addButton = await screen.findByText(/add model|新增/i);
+  fireEvent.click(addButton);
+
+  // Assert required inputs exist
+  expect(screen.getByPlaceholderText(/context window/i)).toBeTruthy();
+  expect(screen.getByPlaceholderText(/max tokens/i)).toBeTruthy();
+  // Assert optional inputs exist
+  expect(screen.getByPlaceholderText(/display name/i)).toBeTruthy();
+  expect(screen.getByLabelText(/reasoning/i)).toBeTruthy();
+});
+
+it("blocks model create when context_window or max_tokens is missing", async () => {
+  // Fill form with model_id but leave context_window/max_tokens empty.
+  // Assert create mutation is NOT called, or error message shows.
+  const createFn = vi.fn();
+  mockUseModelMutations.mockReturnValue({ create: createFn, update: vi.fn(), delete: vi.fn() });
+  // ... render + open form + fill model_id only + click submit ...
+  expect(createFn).not.toHaveBeenCalled();
+});
+```
+
+- [ ] **Step 5: Run GUI tests + typecheck + coverage**
 
 Run: `pnpm -F gui typecheck && pnpm -F gui test`
 Expected: PASS
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add apps/gui/src/pages/ProvidersPage.tsx \
-        apps/gui/src/components/ModelsSection.tsx
-git commit -m "feat(gui): provider_kind selector + model metadata form"
+        apps/gui/src/pages/ProvidersPage.test.tsx \
+        apps/gui/src/components/ModelsSection.tsx \
+        apps/gui/src/components/ModelsSection.test.tsx
+git commit -m "feat(gui): provider_kind selector + model metadata form + tests"
 ```
 
 ---
 
-## Task 10: Regression + spec coverage verification + final commit
+## Task 9: Regression + spec coverage verification + final commit
 
 **Files:**
 - Verify: spec test cases 1-40 from `docs/superpowers/specs/2026-07-04-subagent-provider-binding-design.md` §9
@@ -2769,20 +2881,20 @@ Expected: PASS
 Run: `cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -30`
 Expected: clean
 
-- [ ] **Step 3: Run coverage gate**
+- [ ] **Step 3: Run Rust coverage gate**
 
 Run: `cargo llvm-cov --workspace --fail-under-lines 90 2>&1 | tail -30`
-Expected: PASS (coverage ≥ 90%)
+Expected: PASS (Rust coverage ≥ 90%)
 
-- [ ] **Step 4: Run sidecar tests**
+- [ ] **Step 4: Run GUI coverage gate**
 
-Run: `pnpm -F pi-sidecar test && pnpm -F pi-sidecar lint && pnpm -F pi-sidecar typecheck`
-Expected: PASS
+Run: `pnpm coverage:gui`
+Expected: PASS (GUI line/function/branch/statement coverage ≥ 90% — enforced by `vitest.config.ts` thresholds). This is a hard gate because Task 8 modified `ProvidersPage.tsx` + `ModelsSection.tsx`.
 
-- [ ] **Step 5: Run GUI tests**
+- [ ] **Step 5: Run sidecar tests + typecheck**
 
-Run: `pnpm -F gui typecheck && pnpm -F gui test`
-Expected: PASS
+Run: `pnpm -F pi-sidecar test && pnpm -F pi-sidecar typecheck`
+Expected: PASS (no `lint` script exists for pi-sidecar — do NOT run one)
 
 - [ ] **Step 6: Verify spec test cases 1-40 are covered**
 
@@ -2799,7 +2911,7 @@ Engineer: write a checklist mapping each spec test case to a test function name.
 
 - [ ] **Step 7: Add integration test for first-session base_url (spec §9.5 item 37, pi#2291)**
 
-Add to `apps/pi-sidecar/tests/model_resolution.test.ts` (same file as Task 8 Step 1's tests — reuses the same `vi.mock` block). The test verifies that the custom `provider_base_url` from `CreateSessionOpts` flows through to the model object passed into `createAgentSession` (i.e. `registerProvider` was called with `baseUrl: <custom base_url>` AND `createAgentSession` received a `model` whose provider config carries that base_url):
+Add to `apps/pi-sidecar/tests/model_resolution.test.ts` (same file as Task 7 Step 1's tests — reuses the same `vi.mock` block). The test verifies that the custom `provider_base_url` from `CreateSessionOpts` flows through to the model object passed into `createAgentSession` (i.e. `registerProvider` was called with `baseUrl: <custom base_url>` AND `createAgentSession` received a `model` whose provider config carries that base_url):
 
 ```typescript
 describe('defaultSessionFactory custom base_url on first session miss (pi#2291)', () => {
@@ -2837,7 +2949,7 @@ describe('defaultSessionFactory custom base_url on first session miss (pi#2291)'
     // 3. The session object's resolvedProvider field must equal the provider_id
     //    (the factory passes it to the PiSdkSession constructor).
     // (The existing `defaultSessionFactory` returns a PiSdkSession whose
-    // `resolvedProvider` is `opts.provider_id` — Task 8 makes this required.)
+    // `resolvedProvider` is `opts.provider_id` — Task 7 makes this required.)
   });
 
   it('does NOT leak provider_api_key into createAgentSession opts (瞬态数据隔离)', async () => {
@@ -2882,23 +2994,23 @@ Expected: all PASS
 - §2.3 subagent_logical_subagents rebuild → Task 1 (migration) + Task 2 (struct) ✓
 - §2.4 LogicalSubagent struct → Task 2 ✓
 - §2.5 Profile downgrade → Task 3 ✓
-- §3.1 resolve_by_name signature → Task 5 ✓
-- §3.2 creation validation chain → Task 5 ✓
-- §3.3 SubagentDelegateRequestDto + DelegateRequest → Task 4 + Task 5 ✓
-- §3.4 DB write → Task 5 ✓
-- §3.5 runtime no profile-derived model/provider → Task 3 (delete profile_model) + Task 6 (execute_task uses bound fields) ✓
-- §4.1 model resolution chain → Task 6 ✓
-- §4.2 provider resolution chain → Task 6 ✓
-- §4.3 validation chain → Task 6 ✓
-- §4.4 ExecutorInput → Task 6 ✓
-- §4.5 provider_test_connection Anthropic → Task 7 ✓
-- §5.1-5.7 sidecar / Pi SDK → Task 8 ✓
-- §6 turn_auto / session creation → Task 8 ✓
+- §3.1 resolve_by_name signature → Task 2 ✓
+- §3.2 creation validation chain → Task 2 ✓
+- §3.3 SubagentDelegateRequestDto + DelegateRequest → Task 4 + Task 2 ✓
+- §3.4 DB write → Task 2 ✓
+- §3.5 runtime no profile-derived model/provider → Task 3 (delete profile_model) + Task 5 (execute_task uses bound fields) ✓
+- §4.1 model resolution chain → Task 5 ✓
+- §4.2 provider resolution chain → Task 5 ✓
+- §4.3 validation chain → Task 5 ✓
+- §4.4 ExecutorInput → Task 5 ✓
+- §4.5 provider_test_connection Anthropic → Task 6 ✓
+- §5.1-5.7 sidecar / Pi SDK → Task 7 ✓
+- §6 turn_auto / session creation → Task 7 ✓
 - §7.1 provider_kind change → kill worker → Task 1 Step 18b (store `UpdateProviderPatch` + `update_provider`) + Task 4 Step 3b (DTO `ProviderUpdateRequestDto` + `provider_kind`) + Task 4 Step 5 (supervisor `provider_update` plumbs `provider_kind` to patch; existing `provider_changed` call kills worker) ✓
-- §7.2-7.5 provider update + delete semantics → Task 3 (delete collect_profile_refs) + Task 6 (worker kill via provider_changed, already exists) ✓
-- §9 testing → Task 10 ✓
+- §7.2-7.5 provider update + delete semantics → Task 3 (delete collect_profile_refs) + Task 5 (worker kill via provider_changed, already exists) ✓
+- §9 testing → Task 9 ✓
 
-**Placeholder scan:** None — every step has concrete code or exact commands. (Earlier draft had placeholder test stubs in Tasks 6/7/8/10 + `/* from profile config */` / `/* from ExecutorInput — add field */` placeholders in Task 6 + "rest of delegate unchanged" pointer in Task 5; all replaced with concrete code or explicit line-by-line preservation instructions in this revision.)
+**Placeholder scan:** None — every step has concrete code or exact commands. (Earlier draft had placeholder test stubs in Tasks 5/6/7/9 + `/* from profile config */` / `/* from ExecutorInput — add field */` placeholders in Task 5 + "rest of delegate unchanged" pointer in Task 2; all replaced with concrete code or explicit line-by-line preservation instructions in this revision.)
 
 **Type consistency:**
 - `bound_provider_id: String` / `bound_model_id: String` consistent across `LogicalSubagent`, `SubagentLogicalSubagentRow`, `SubagentDetailDto`
@@ -2906,6 +3018,6 @@ Expected: all PASS
 - `provider_kind: ProviderKind` consistent across `ExecutorInput`, `TurnAutoParams`, `CreateSessionOpts`, `UpdateProviderPatch` (`Option<ProviderKind>`), `ProviderUpdateRequestDto` (`Option<ProviderKind>`)
 - `provider_api_key: String` consistent (not `Option<String>`) across `ExecutorInput`, `TurnAutoParams`, `CreateSessionOpts`
 - `model_reasoning: bool` / `model_context_window: i64` (Rust) / `number` (TS) / `model_max_tokens: i64` (Rust) / `number` (TS) / `model_display_name: Option<String>` (Rust) / `string?` (TS) consistent across `ExecutorInput`, `TurnAutoParams`, `CreateSessionOpts`
-- `SubagentError::Validation(String)` added in Task 5 Step 3 + `code()` method extended with `subagent.validation_error` branch (Task 5 Step 3 note)
+- `SubagentError::Validation(String)` added in Task 2 Step 9 + `code()` method extended with `subagent.validation_error` branch (Task 2 Step 9 note)
 
 **Known coupling:** Tasks 2-3 may produce transient compile errors in downstream crates if the engineer doesn't fix all construction sites in the same commit. The plan calls this out at each step ("grep for ... and fix each"). Task 1 Step 18b adds a new field to `UpdateProviderPatch` — every `UpdateProviderPatch { ... }` literal (tests + production) must add `provider_kind: None` to compile; Task 1 Step 18c calls this out.
