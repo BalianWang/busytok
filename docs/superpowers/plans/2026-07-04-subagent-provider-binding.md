@@ -151,7 +151,9 @@ CREATE UNIQUE INDEX idx_subagent_unique_active_name
 
 -- 4. Recreate child tables with schema equivalent to migrations 0003+0004+0005
 --    applied (subagent_tasks has timeout_seconds/model_override from 0004 and
---    error_kind from 0005; do NOT use only the 0003 definition).
+--    error_kind from 0005; do NOT use only the 0003 definition). All five
+--    child tables from 0003 are recreated: subagent_memory, subagent_tasks,
+--    subagent_harness_bindings, subagent_usage_records, subagent_resource_events.
 
 CREATE TABLE subagent_memory (
     id TEXT PRIMARY KEY,
@@ -241,6 +243,25 @@ CREATE TABLE subagent_usage_records (
 );
 
 CREATE INDEX idx_subagent_usage_task ON subagent_usage_records(task_id);
+
+-- subagent_resource_events (from 0003) — resource monitor events for
+-- hot/warm sessions. Has no FK to subagent_logical_subagents (target_id
+-- is a free-form string that can reference subagents OR sessions), so
+-- it survives the parent rebuild without orphan concerns. Must be
+-- recreated here to keep the child-table set equivalent to the current
+-- full schema (0003+0004+0005 applied).
+CREATE TABLE subagent_resource_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    target_id TEXT,
+    rss_mb REAL,
+    cpu_percent REAL,
+    detail_json TEXT,
+    created_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX idx_subagent_events_type ON subagent_resource_events(event_type, created_at_ms);
+CREATE INDEX idx_subagent_events_target ON subagent_resource_events(target_id, created_at_ms);
 ```
 
 - [ ] **Step 2: Update `schema.rs` — bump SCHEMA_VERSION + register migration**
