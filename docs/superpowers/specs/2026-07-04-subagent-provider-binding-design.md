@@ -12,7 +12,7 @@
 2. sidecar worker 只支持固定 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 注入，无法表达 Anthropic API 形状
 3. Pi SDK session 的 model 在 `createAgentSession()` 时确定，但当前 sidecar 既不传 `apiKey` 也不传 `baseUrl`，SDK 只能靠自身 fallback 机制
 
-本次重构将路由真相唯一化到 `subagent.bound_provider_id + bound_model_id`，并接入 Pi SDK 的 `AuthStorage.inMemory` + `ModelRegistry.inMemory` + `registerProvider` 机制。
+本次重构将路由真相唯一化到 `subagent.bound_provider_id + bound_model_id`，并接入 Pi SDK 的 `AuthStorage.inMemory` + `ModelRegistry.create` + `registerProvider` 机制。
 
 ## 2. 数据模型
 
@@ -41,16 +41,38 @@ ALTER TABLE models ADD COLUMN max_tokens INTEGER;
 ```
 
 - SQL 允许 `NULL`（migration 安全）
-- 运行时 `create_model` RPC 对非内置模型必须要求 `context_window` / `max_tokens` 有值
+- 运行时 `create_model` RPC 必须要求 `context_window` / `max_tokens` 有值（`display_name` / `reasoning` 可选）
 - `reasoning` 默认 `0`（false）
 - `display_name` 可选
 
+同步更新以下类型/查询以读写新列：
+- `busytok-domain::provider_catalog::Model` domain struct（新增 `display_name: Option<String>` / `reasoning: bool` / `context_window: Option<i64>` / `max_tokens: Option<i64>`）
+- `busytok-store::provider_catalog::CreateModelReq`（新增对应字段）
+- `busytok-store::provider_catalog::UpdateModelPatch`（新增可选 patch 字段）
+- `busytok-store::provider_catalog` 的 `create_model` / `get_model_by_id` / `get_model_by_provider_and_model_id` / `list_models_filtered` / `row_to_model` 查询
+- `busytok-protocol::dto::ModelCreateRequestDto`（新增 `context_window` / `max_tokens` 必填，`display_name` / `reasoning` 可选）
+- `busytok-protocol::dto::ModelUpdateRequestDto`（新增可选 patch 字段）
+- `busytok-protocol::dto::ModelCatalogEntryDto`（新增 `display_name` / `reasoning` / `context_window` / `max_tokens` 字段）
+
+migration 注册时同步将 `busytok-store::schema::SCHEMA_VERSION` 从 `6` bump 到 `7`，并在 `migrations()` 末尾追加 `(7, SUBAGENT_ROUTE_BINDING_AND_MODEL_METADATA_SQL)`。
+
 ### 2.3 `subagent_logical_subagents` 重建
 
-项目未上线，直接重建表，带正确的 `NOT NULL` 约束，删除 `default_model` 列：
+项目未上线，直接重建表，带正确的 `NOT NULL` 约束，删除 `default_model` 列。存量数据可丢弃，无需搬数据。
+
+migration 在 `unchecked_transaction` 内 `execute_batch`，且 `PRAGMA foreign_keys = ON` 在事务内无法关闭。`subagent_logical_subagents` 被 `subagent_memory` / `subagent_tasks` / `subagent_harness_bindings` / `subagent_usage_records` 通过 FK 引用（均无 `ON DELETE CASCADE`），直接 `DROP TABLE` 在有存量数据时会因 FK 约束失败。因此先按 FK 依赖顺序 drop 所有子表，再 drop + recreate 主表，最后按 `0003_subagent.sql` 中的定义 recreate 子表（schema 不变，仅清除存量数据）：
 
 ```sql
-CREATE TABLE subagent_logical_subagents_new (
+-- 1. Drop child tables (FK references to subagent_logical_subagents, no cascade)
+DROP TABLE IF EXISTS subagent_usage_records;
+DROP TABLE IF EXISTS subagent_harness_bindings;
+DROP TABLE IF EXISTS subagent_tasks;
+DROP TABLE IF EXISTS subagent_memory;
+
+-- 2. Drop and recreate parent table (new schema: bound_provider_id + bound_model_id NOT NULL, no default_model)
+DROP TABLE IF EXISTS subagent_logical_subagents;
+
+CREATE TABLE subagent_logical_subagents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     project_id TEXT NOT NULL,
@@ -67,9 +89,22 @@ CREATE TABLE subagent_logical_subagents_new (
     updated_at_ms INTEGER NOT NULL,
     last_active_at_ms INTEGER
 );
+
+CREATE INDEX idx_subagent_logical_project
+    ON subagent_logical_subagents(project_id, repo_hash, status);
+CREATE INDEX idx_subagent_logical_last_active
+    ON subagent_logical_subagents(last_active_at_ms);
+CREATE UNIQUE INDEX idx_subagent_unique_active_name
+    ON subagent_logical_subagents(project_id, repo_hash, name)
+    WHERE status != 'deleted';
+
+-- 3. Recreate child tables (same schema as 0003_subagent.sql; subagent_resource_events 无 FK 引用但一并重建)
+--    完整 CREATE TABLE 语句复用 0003_subagent.sql 中 subagent_memory / subagent_tasks /
+--    subagent_harness_bindings / subagent_usage_records / subagent_resource_events 的定义
+--    及其索引。
 ```
 
-迁移步骤：建新表 → 搬数据（存量数据可丢弃，项目未上线）→ 删旧表 → 重命名。不使用 `DEFAULT ''` 过渡态。
+不使用 `DEFAULT ''` 过渡态，不使用 `ALTER TABLE ADD COLUMN` + `DROP COLUMN`（无法添加 `NOT NULL` 无默认值的列）。
 
 ### 2.4 `LogicalSubagent` domain struct
 
@@ -92,7 +127,11 @@ pub struct LogicalSubagent {
 }
 ```
 
-删除 `default_model` 字段。所有引用 `default_model` 的 DTO、store row、resolver、tests 同步清除。
+删除 `default_model` 字段。所有引用 `default_model` 的 DTO、store row、resolver、tests 同步清除，包括：
+- `busytok-store::repository::SubagentLogicalSubagentRow`（`default_model` 字段删除，新增 `bound_provider_id: String` / `bound_model_id: String`）
+- `busytok-store::subagent_queries` 的 `upsert_logical_subagent` / `get_logical_subagent` / `list_active_by_repo` / `find_by_name_in_repo` / `list_filtered` 的 SQL 列列表
+- `busytok-protocol::dto::SubagentDetailDto`（`default_model` 字段删除，新增 `bound_provider_id: String` / `bound_model_id: String`）
+- `packages/busytok-protocol-types/src/generated.ts`（重新生成）
 
 ### 2.5 Profile 降级为纯行为模板
 
@@ -107,7 +146,14 @@ pub struct SubagentProfileConfig {
 }
 ```
 
-`SubagentModelsConfig`（`default_cheap_model` / `default_review_model` / `default_reasoning_model`）整体删除。`profile_model()` 方法删除。`profile_create` / `profile_update` 的所有 provider/model whitelist 校验删除。
+`SubagentModelsConfig`（`default_cheap_model` / `default_review_model` / `default_reasoning_model` / `default_coder_model`）整体删除。`profile_model()` 方法删除。`profile_create` / `profile_update` 的所有 provider/model whitelist 校验删除。
+
+同步更新以下 DTO 以删除 `provider_id` / `model` 字段：
+- `busytok-protocol::dto::ProfileDto`（删除 `provider_id` / `model`）
+- `busytok-protocol::dto::ProfileCreateRequestDto`（删除 `provider_id` / `model`）
+- `busytok-protocol::dto::ProfileUpdateRequestDto`（删除 `provider_id` / `model` patch 字段）
+- `busytok-config::lib::default_profiles()` 中每个内置 profile 的构造（不再设置 `model` / `provider_id`）
+- `packages/busytok-protocol-types/src/generated.ts`（重新生成）
 
 ## 3. 创建 subagent 的新语义
 
@@ -134,12 +180,14 @@ pub fn resolve_by_name(
 
 ### 3.3 `delegate()` 请求 DTO
 
-`SubagentDelegateRequestDto` 新增：
+`SubagentDelegateRequestDto`（`busytok-protocol::dto`）新增：
 
 ```rust
 pub bound_provider_id: Option<String>,
 pub bound_model_id: Option<String>,
 ```
+
+`busytok-subagent::models::DelegateRequest`（内部 struct，由 DTO 转换而来）同步新增相同字段。
 
 语义（条件必填）：
 
@@ -216,7 +264,7 @@ pub struct ExecutorInput {
 ### 5.1 核心原则
 
 - `AuthStorage.inMemory` 是 secret 唯一来源
-- `ModelRegistry.inMemory` + `registerProvider` 是 provider/model runtime 唯一来源
+- `ModelRegistry.create` + `registerProvider` 是 provider/model runtime 唯一来源
 - `turn_auto` params 是创建新 session 时的权威输入
 - `process.env` 不参与 provider secret 传递
 - `registry.find(providerId, modelId)` 是唯一 model lookup 方式
@@ -256,8 +304,8 @@ const authStorage = AuthStorage.inMemory({
   [providerId]: { type: "api_key", key: providerApiKey },
 });
 
-// 2. ModelRegistry — in-memory，无文件 I/O
-const registry = ModelRegistry.inMemory(authStorage);
+// 2. ModelRegistry — in-memory，无文件 I/O（与现有 `ModelRegistry.create(AuthStorage.inMemory())` API 一致）
+const registry = ModelRegistry.create(authStorage);
 
 // 3. 动态注册 provider
 registry.registerProvider(providerId, {
@@ -414,7 +462,7 @@ provider 是共享连接对象。以下变更影响所有绑定该 provider 的 
 28. 首次 delegate 把正确 model + metadata 传入 `createAgentSession()`
 29. 复用已有 hot session 时，继续沿用原有 model（忽略新路由参数）
 30. `AuthStorage.inMemory` 是 secret 唯一来源，`process.env` 不参与 secret 传递
-31. `ModelRegistry.inMemory` + `registerProvider` 是 provider runtime 唯一来源，无文件 I/O
+31. `ModelRegistry.create` + `registerProvider` 是 provider runtime 唯一来源，无文件 I/O
 
 ### 9.6 回归测试
 
