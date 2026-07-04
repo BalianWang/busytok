@@ -136,6 +136,63 @@ fn make_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
     BusytokSupervisor::new(db, paths)
 }
 
+/// Task 5: seed a test provider + model into SQL so the `execute_task`
+/// validation chain (bound provider exists + enabled + has api_key +
+/// bound model exists + enabled) passes. Returns `(provider_id, model_id)`
+/// for the caller to pass as `bound_provider_id` / `bound_model_id` in
+/// `SubagentDelegateRequestDto`. Mirrors the pattern in
+/// `subagent_e2e_sidecar.rs::seed_test_providers` but uses
+/// `busytok_store::provider_catalog` for schema-correct inserts.
+fn seed_bound_provider_model(db: &Database) -> (String, String) {
+    use busytok_store::provider_catalog::{
+        create_model, create_provider, CreateModelReq, CreateProviderReq,
+    };
+    let provider = create_provider(
+        db.conn(),
+        CreateProviderReq {
+            name: "Test Provider".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .expect("seed test provider");
+    let model_id = "test-model".to_string();
+    create_model(
+        db.conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: model_id.clone(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .expect("seed test model");
+    // Seed extra models used by `model_override` tests (gpt-5, gpt-4o).
+    for mid in ["gpt-5", "gpt-4o"] {
+        create_model(
+            db.conn(),
+            CreateModelReq {
+                provider_id: provider.id.clone(),
+                model_id: mid.into(),
+                enabled: true,
+                tags: vec![],
+                display_name: None,
+                reasoning: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+            },
+        )
+        .expect("seed extra test model");
+    }
+    (provider.id, model_id)
+}
+
 fn make_file_backed_db(tmp: &tempfile::TempDir) -> Database {
     let db_path = tmp.path().join("busytok.sqlite");
     Database::open(&db_path).unwrap()
@@ -3511,6 +3568,10 @@ async fn initial_scan_promotes_active_generation_metadata() {
 async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes (bound provider exists + enabled + has api_key + bound
+    // model exists + enabled).
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let supervisor = make_supervisor(db, &tmp);
 
     // delegate (mock execution)
@@ -3527,8 +3588,8 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -4596,14 +4657,16 @@ async fn provider_changed_removes_worker_then_respawns() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
-/// `provider_update_respawn_picks_up_live_config` (Task 7 rewrite): the
+/// `provider_update_respawn_picks_up_live_config` (Task 5 + Task 7): the
 /// `WorkerPool` holds a `ProviderRuntimeEntry` per provider (populated from
 /// SQL at construction, updated via `update_provider_and_kill_old` on
 /// `provider_changed`). When `provider_update` changes `base_url`,
 /// `provider_changed` re-reads the provider from SQL, updates the entry, and
-/// force-kills the old worker — so the next `ensure_worker` re-spawns with
-/// the new `OPENAI_BASE_URL`. Sidecar only recognizes the FIXED env names
-/// `OPENAI_API_KEY` / `OPENAI_BASE_URL` (no provider-specific aliases).
+/// force-kills the old worker — so the next `ensure_worker` re-spawns. Task
+/// 5: env injection was deleted; credentials now flow via `turn_auto`
+/// params. The supervisor's env map must NOT contain `OPENAI_API_KEY` /
+/// `OPENAI_BASE_URL` — the new credentials are carried by the updated
+/// `ProviderRuntimeEntry` and threaded per-turn by the executor.
 #[tokio::test]
 async fn provider_update_respawn_picks_up_live_config() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4637,19 +4700,19 @@ async fn provider_update_respawn_picks_up_live_config() {
         .expect("provider_create must succeed");
     let pid = created.id.clone();
 
-    // Initial worker: ensure_worker reads the entry from the pool's map and
-    // injects OPENAI_API_KEY + OPENAI_BASE_URL (fixed names).
+    // Initial worker: Task 5 — env injection was deleted, so the supervisor's
+    // env map must NOT contain `OPENAI_API_KEY` / `OPENAI_BASE_URL`. The
+    // credentials are stored in the `ProviderRuntimeEntry` and flow via
+    // `turn_auto` params at execute() time.
     let initial = pool.ensure_worker(&pid).expect("ensure_worker (initial)");
     let initial_cfg = initial.config();
-    assert_eq!(
-        initial_cfg.env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.test-provider.example.com/v1".to_string()),
-        "initial worker env[OPENAI_BASE_URL] should have the original base_url"
+    assert!(
+        !initial_cfg.env.contains_key("OPENAI_BASE_URL"),
+        "initial worker must NOT inject OPENAI_BASE_URL (Task 5: turn_auto params)"
     );
-    assert_eq!(
-        initial_cfg.env.get("OPENAI_API_KEY"),
-        Some(&"test-key".to_string()),
-        "initial worker env[OPENAI_API_KEY] should have the api_key"
+    assert!(
+        !initial_cfg.env.contains_key("OPENAI_API_KEY"),
+        "initial worker must NOT inject OPENAI_API_KEY (Task 5: turn_auto params)"
     );
 
     // Update base_url via provider_update. This mutates the SQL row AND calls
@@ -4673,27 +4736,21 @@ async fn provider_update_respawn_picks_up_live_config() {
     );
 
     // Re-spawn: ensure_worker reads the UPDATED entry from the pool's map
-    // (update_provider_and_kill_old inserted it). The new config must reflect
-    // the updated base_url under the FIXED env name OPENAI_BASE_URL.
+    // (update_provider_and_kill_old inserted it). Task 5: the respawned
+    // supervisor's env must still NOT contain provider env vars — the
+    // updated credentials live in the entry, threaded per-turn via
+    // `turn_auto` params.
     let respawned = pool
         .ensure_worker(&pid)
         .expect("ensure_worker must re-spawn the worker");
     let respawned_cfg = respawned.config();
-    assert_eq!(
-        respawned_cfg.env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.updated.example.com/v1".to_string()),
-        "respawned worker env[OPENAI_BASE_URL] must be the updated base_url"
-    );
-    // OPENAI_API_KEY unchanged (provider_update didn't rotate it).
-    assert_eq!(
-        respawned_cfg.env.get("OPENAI_API_KEY"),
-        Some(&"test-key".to_string()),
-        "respawned worker env[OPENAI_API_KEY] must still be the original key"
-    );
-    // Only fixed env names — no provider-specific aliases (Task 7 contract).
     assert!(
-        !respawned_cfg.env.contains_key("UPDATED_BASE_URL"),
-        "respawned worker must NOT have provider-specific env aliases (fixed names only)"
+        !respawned_cfg.env.contains_key("OPENAI_BASE_URL"),
+        "respawned worker must NOT inject OPENAI_BASE_URL (Task 5: turn_auto params)"
+    );
+    assert!(
+        !respawned_cfg.env.contains_key("OPENAI_API_KEY"),
+        "respawned worker must NOT inject OPENAI_API_KEY (Task 5: turn_auto params)"
     );
 
     sup.shutdown_writer().await.expect("writer shutdown");
@@ -5052,6 +5109,9 @@ async fn write_usage_event_inserts_into_usage_events() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-write-1", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5068,8 +5128,8 @@ async fn write_usage_event_inserts_into_usage_events() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5090,6 +5150,9 @@ async fn write_usage_event_idempotent_on_same_task_id() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-write-2", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5110,8 +5173,8 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5165,6 +5228,9 @@ async fn write_usage_event_uses_active_generation_id() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-active-for-subagent", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5181,8 +5247,8 @@ async fn write_usage_event_uses_active_generation_id() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5205,6 +5271,10 @@ async fn write_usage_event_produces_real_rollup_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-rollup", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes. The `gpt-5` model_override is also seeded by the
+    // helper so the override resolves to a valid model row.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5221,8 +5291,8 @@ async fn write_usage_event_produces_real_rollup_rows() {
             model_override: Some("gpt-5".to_string()),
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5268,6 +5338,9 @@ async fn write_usage_event_visible_in_overview_read_path() {
         .ok();
     let db2 = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db2, "gen-overview", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db2);
     let sup = make_supervisor_with_settings(db2, &tmp, settings);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5284,8 +5357,8 @@ async fn write_usage_event_visible_in_overview_read_path() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5365,6 +5438,7 @@ async fn e2e_usage_events_agent_kind_is_codex() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-codex", 1000);
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5380,8 +5454,8 @@ async fn e2e_usage_events_agent_kind_is_codex() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
-        bound_provider_id: None,
-        bound_model_id: None,
+        bound_provider_id: Some(bound_provider_id),
+        bound_model_id: Some(bound_model_id),
     })
     .await
     .unwrap();

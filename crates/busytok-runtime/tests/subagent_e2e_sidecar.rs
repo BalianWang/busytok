@@ -624,6 +624,17 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
 
+    // Task 5: seed a valid provider+model into SQL so the `execute_task`
+    // validation chain (bound provider exists + enabled + has api_key +
+    // bound model exists + enabled) passes. Without this, delegate would
+    // fail earlier with `subagent.validation_error: bound provider not
+    // found`, masking the sidecar_spawn_failed error this test asserts.
+    // The supervisor constructor uses `FailingTaskExecutor` (not the real
+    // sidecar) because the sidecar config resolve failed, so the seeded
+    // provider is never actually contacted — it just satisfies validation.
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    seed_test_providers(&db, &[TEST_PROVIDER_SEED.clone()]);
+
     // Settings with enabled=true but a runtime_dir that has no bundle —
     // resolve_sidecar_config will fail with "sidecar bundle not found".
     let mut settings = BusytokSettings::default();
@@ -659,6 +670,10 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
     // the semantic code `subagent.sidecar_spawn_failed` (not the generic
     // `subagent.store_error`), proving FailingTaskExecutor's error
     // downcasts to SubagentError::SidecarSpawn through the manager.
+    // Task 5: bound_provider_id / bound_model_id are required on the create
+    // path (sourced from TEST_PROVIDER_SEED) so the validation chain in
+    // `execute_task` passes and the FailingTaskExecutor's SidecarSpawn
+    // error surfaces.
     let result = supervisor
         .subagent_delegate(SubagentDelegateRequestDto {
             subagent_name: "misconfigured-test".to_string(),
@@ -672,8 +687,8 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
-            bound_provider_id: None,
-            bound_model_id: None,
+            bound_provider_id: Some(TEST_PROVIDER_SEED.id.to_string()),
+            bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
         })
         .await;
 

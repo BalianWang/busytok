@@ -1,10 +1,11 @@
-//! Integration tests for `WorkerPool` (Task 2 — Phase 3, updated Task 7).
+//! Integration tests for `WorkerPool` (Task 2 — Phase 3, updated Task 5/7).
 //!
-//! These tests verify the per-provider supervisor map, fixed env injection
-//! (`OPENAI_API_KEY` / `OPENAI_BASE_URL`), two-phase bootstrap via
-//! `set_responder_factory` (P1c fix), and async `remove_worker_and_kill` /
-//! `update_provider_and_kill_old` (P1b fix). They do NOT spawn real sidecar
-//! processes — they verify config/env construction and map lifecycle only.
+//! These tests verify the per-provider supervisor map, base-config cloning
+//! (Task 5: provider credentials now flow via `turn_auto` params — no env
+//! injection), two-phase bootstrap via `set_responder_factory` (P1c fix),
+//! and async `remove_worker_and_kill` / `update_provider_and_kill_old`
+//! (P1b fix). They do NOT spawn real sidecar processes — they verify
+//! config construction and map lifecycle only.
 
 #![allow(clippy::unwrap_used)]
 
@@ -143,48 +144,51 @@ fn ensure_worker_creates_supervisor_lazily() {
     );
 }
 
-/// `ensure_worker_injects_credentials` — verify env map contains
-/// `OPENAI_API_KEY` + `OPENAI_BASE_URL` + the base config's
-/// `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS`. Sidecar only recognizes these fixed
-/// env names (Task 7).
+/// `ensure_worker_clones_base_config_without_provider_env` — Task 5: with
+/// env injection deleted, `ensure_worker` must clone the base config
+/// verbatim. The supervisor's env map must NOT contain `OPENAI_API_KEY` or
+/// `OPENAI_BASE_URL` (credentials now flow via `turn_auto` params), but
+/// must retain the base config's `BUSYTOK_SIDECAR_MAX_HOT_SESSIONS`.
 #[test]
-fn ensure_worker_injects_credentials() {
+fn ensure_worker_clones_base_config_without_provider_env() {
     let (pool, _gate, _exec) = make_test_pool();
     let sup = pool.ensure_worker("deepseek").expect("ensure_worker");
     let env = &sup.config().env;
-    assert_eq!(
-        env.get("OPENAI_API_KEY"),
-        Some(&"test-key".to_string()),
-        "OPENAI_API_KEY must be set to the credential value"
+    assert!(
+        !env.contains_key("OPENAI_API_KEY"),
+        "OPENAI_API_KEY must NOT be set — Task 5 routes credentials via turn_auto params"
     );
-    assert_eq!(
-        env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.deepseek.com/v1".to_string()),
-        "OPENAI_BASE_URL must be set to the provider base_url"
+    assert!(
+        !env.contains_key("OPENAI_BASE_URL"),
+        "OPENAI_BASE_URL must NOT be set — Task 5 routes credentials via turn_auto params"
     );
     assert_eq!(
         env.get("BUSYTOK_SIDECAR_MAX_HOT_SESSIONS"),
         Some(&"3".to_string()),
-        "base config env vars must be preserved"
+        "base config env vars must be preserved verbatim"
     );
 }
 
-/// `ensure_worker_injects_credentials` for the openai provider — same
-/// fixed env names (`OPENAI_API_KEY` + `OPENAI_BASE_URL`).
+/// `ensure_worker_clones_base_config_without_provider_env` for the openai
+/// provider — same Task 5 invariant: no env injection, base config cloned
+/// verbatim.
 #[test]
-fn ensure_worker_injects_credentials_openai() {
+fn ensure_worker_clones_base_config_without_provider_env_openai() {
     let (pool, _gate, _exec) = make_test_pool();
     let sup = pool.ensure_worker("openai").expect("ensure_worker");
     let env = &sup.config().env;
-    assert_eq!(
-        env.get("OPENAI_API_KEY"),
-        Some(&"test-key".to_string()),
-        "OPENAI_API_KEY must be set"
+    assert!(
+        !env.contains_key("OPENAI_API_KEY"),
+        "OPENAI_API_KEY must NOT be set for openai provider (Task 5)"
+    );
+    assert!(
+        !env.contains_key("OPENAI_BASE_URL"),
+        "OPENAI_BASE_URL must NOT be set for openai provider (Task 5)"
     );
     assert_eq!(
-        env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.openai.com/v1".to_string()),
-        "OPENAI_BASE_URL must be set to provider base_url"
+        env.get("BUSYTOK_SIDECAR_MAX_HOT_SESSIONS"),
+        Some(&"3".to_string()),
+        "base config env vars must be preserved for openai provider"
     );
 }
 
@@ -388,12 +392,15 @@ fn set_responder_factory_called_twice_is_ignored() {
     pool2.set_responder_factory(factory1);
     // Second call — OnceLock::set returns Err, warning is logged, call is ignored.
     pool2.set_responder_factory(factory2);
-    // Verify the first factory is still active by ensuring ensure_worker works.
+    // Verify the first factory is still active by ensuring ensure_worker works
+    // (Task 5: no env-var assertion — credentials no longer flow via env).
     let sup = pool2
         .ensure_worker("deepseek")
         .expect("ensure_worker after double set");
-    let env = &sup.config().env;
-    assert_eq!(env.get("OPENAI_API_KEY"), Some(&"test-key".to_string()));
+    assert!(
+        sup.pressure_responder().is_some(),
+        "first factory must still be active — responder must be set"
+    );
 }
 
 /// `remove_worker_and_kill` when no worker exists for the given provider_id
@@ -431,16 +438,17 @@ async fn supervisor_for_session_with_no_db_returns_first() {
 }
 
 /// `update_provider_and_kill_old` (Task 7): updating a provider's entry
-/// kills the old worker and lets `ensure_worker` re-spawn with the new
-/// credentials/base_url.
+/// kills the old worker and lets `ensure_worker` re-spawn. Task 5: env
+/// injection was deleted, so the respawned supervisor's env must NOT
+/// contain `OPENAI_API_KEY` / `OPENAI_BASE_URL` — the new credentials are
+/// carried by the updated `ProviderRuntimeEntry` and flow via `turn_auto`
+/// params at execute() time. We verify (1) the old worker is killed, (2) a
+/// new supervisor is created, (3) the base config is cloned verbatim
+/// (no provider env injection).
 #[tokio::test]
 async fn update_provider_and_kill_old_respawns_with_new_credentials() {
     let (pool, _gate, _exec) = make_test_pool();
     let sup1 = pool.ensure_worker("deepseek").expect("first ensure");
-    assert_eq!(
-        sup1.config().env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.deepseek.com/v1".to_string())
-    );
 
     // Update the provider entry with a new base_url + api_key.
     pool.update_provider_and_kill_old(ProviderRuntimeEntry {
@@ -451,7 +459,7 @@ async fn update_provider_and_kill_old_respawns_with_new_credentials() {
     .await
     .expect("update_provider_and_kill_old");
 
-    // Re-spawn — must reflect the new credentials.
+    // Re-spawn — must be a new supervisor (old one was killed).
     let sup2 = pool
         .ensure_worker("deepseek")
         .expect("re-spawn after update");
@@ -459,14 +467,22 @@ async fn update_provider_and_kill_old_respawns_with_new_credentials() {
         !Arc::ptr_eq(&sup1, &sup2),
         "re-spawned supervisor must be a NEW Arc"
     );
-    assert_eq!(
-        sup2.config().env.get("OPENAI_API_KEY"),
-        Some(&"new-key".to_string()),
-        "re-spawned worker must use the updated api_key"
+    // Task 5: env injection was deleted — credentials do NOT appear in the
+    // supervisor's env map. They flow via `turn_auto` params at execute()
+    // time, sourced from the updated `ProviderRuntimeEntry`.
+    let env = &sup2.config().env;
+    assert!(
+        !env.contains_key("OPENAI_API_KEY"),
+        "re-spawned worker must NOT inject OPENAI_API_KEY (Task 5)"
     );
+    assert!(
+        !env.contains_key("OPENAI_BASE_URL"),
+        "re-spawned worker must NOT inject OPENAI_BASE_URL (Task 5)"
+    );
+    // Base config env var must still be present (cloned verbatim).
     assert_eq!(
-        sup2.config().env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.updated.example.com/v1".to_string()),
-        "re-spawned worker must use the updated base_url"
+        env.get("BUSYTOK_SIDECAR_MAX_HOT_SESSIONS"),
+        Some(&"3".to_string()),
+        "base config env vars must be preserved after respawn"
     );
 }

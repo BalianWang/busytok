@@ -89,6 +89,26 @@ fn seed_test_provider_model(db: &Database) {
         },
     )
     .unwrap();
+    // Task 5: seed additional models used by `model_override` tests. The
+    // validation chain in `execute_task` now verifies the effective model
+    // (override or bound) exists in the bound provider's model list, so any
+    // model_override value referenced by a test must be seeded here.
+    for mid in ["gpt-4o", "claude-fancy-override"] {
+        create_model(
+            db.conn(),
+            CreateModelReq {
+                provider_id: provider.id.clone(),
+                model_id: mid.into(),
+                enabled: true,
+                tags: vec![],
+                display_name: None,
+                reasoning: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+            },
+        )
+        .unwrap();
+    }
     TEST_PROVIDER_ID.with(|c| *c.borrow_mut() = provider.id);
     TEST_MODEL_ID.with(|c| *c.borrow_mut() = TEST_MODEL_NAME.to_string());
 }
@@ -868,6 +888,13 @@ impl TaskExecutor for MemoryUpdateExecutor {
             },
             write_access: input.write_access,
             provider_id: input.provider_id.clone(),
+            provider_kind: input.provider_kind.clone(),
+            provider_base_url: input.provider_base_url.clone(),
+            provider_api_key: input.provider_api_key.clone(),
+            model_reasoning: input.model_reasoning,
+            model_context_window: input.model_context_window,
+            model_max_tokens: input.model_max_tokens,
+            model_display_name: input.model_display_name.clone(),
         };
         *self.captured_input.lock().unwrap() = Some(captured);
         Ok(ExecutorOutput {
@@ -1625,4 +1652,392 @@ async fn last_task_by_subagent_empty_when_no_tasks() {
     let manager = manager_with_db(db);
     let lasts = manager.last_task_by_subagent().await.unwrap();
     assert!(lasts.is_empty());
+}
+
+// --- Task 5: execute_task validation chain (spec §4.3 fail-fast) ---------
+
+/// `execute_task_fails_when_bound_provider_disabled` — Task 5 spec §4.3
+/// fail-fast: if the subagent's bound provider is disabled, `delegate()`
+/// must reject the request with `SubagentError::Validation` carrying
+/// "bound provider disabled" (NOT pass the disabled provider downstream to
+/// the executor/sidecar, which would surface as an opaque auth/network
+/// error). The reuse path is exercised (`subagent_id` set, bound fields
+/// ignored on the request) so the subagent's persisted `bound_provider_id`
+/// is the source of truth.
+#[tokio::test]
+async fn execute_task_fails_when_bound_provider_disabled() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    // Insert a provider that is DISABLED (spec §4.3 fail-fast).
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-disabled".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: false, // disabled — execute_task must reject
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    // Insert a subagent bound to the disabled provider. The reuse path
+    // (delegate with subagent_id set) reads bound fields from this row,
+    // ignoring the request's bound_provider_id / bound_model_id.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-1".into(),
+            name: "test-sub".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-1"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub".into(),
+        subagent_id: Some("sub-1".into()), // reuse path — bound fields ignored
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound provider is disabled"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound provider disabled"),
+        "expected 'bound provider disabled' in error, got: {msg}"
+    );
+    // Verify the error is SubagentError::Validation (not a store error).
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+/// `execute_task_fails_when_bound_provider_missing_api_key` — Task 5 spec
+/// §4.3 fail-fast: a provider with an empty api_key must be rejected at
+/// validation time (not deferred to the sidecar, where it would surface as
+/// an opaque -32010 AUTH_FAILURE on the first turn).
+#[tokio::test]
+async fn execute_task_fails_when_bound_provider_missing_api_key() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    // Enabled provider but with NO api_key — must be rejected.
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-no-key".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: None, // missing — execute_task must reject
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-nokey".into(),
+            name: "test-sub-nokey".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-nokey"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-nokey".into(),
+        subagent_id: Some("sub-nokey".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound provider has no api key"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound provider missing api key"),
+        "expected 'bound provider missing api key' in error, got: {msg}"
+    );
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+/// `execute_task_fails_when_bound_model_not_found` — Task 5 spec §4.3
+/// fail-fast: if the effective model id (from `task.model_override` or
+/// `subagent.bound_model_id`) doesn't exist in the bound provider's model
+/// list, `delegate()` must reject with `SubagentError::Validation` carrying
+/// "bound model not found".
+#[tokio::test]
+async fn execute_task_fails_when_bound_model_not_found() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-model-missing".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    // Note: NO model is created for this provider — the bound_model_id
+    // below refers to a non-existent model.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-nomodel".into(),
+            name: "test-sub-nomodel".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: "ghost-model".into(), // doesn't exist
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-nomodel"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-nomodel".into(),
+        subagent_id: Some("sub-nomodel".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound model is not found"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound model not found"),
+        "expected 'bound model not found' in error, got: {msg}"
+    );
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+/// `execute_task_fails_when_bound_model_disabled` — Task 5 spec §4.3
+/// fail-fast: a disabled model in the bound provider must be rejected at
+/// validation time.
+#[tokio::test]
+async fn execute_task_fails_when_bound_model_disabled() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-model-disabled".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: false, // disabled — execute_task must reject
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-model-disabled".into(),
+            name: "test-sub-model-disabled".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-model-disabled"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-model-disabled".into(),
+        subagent_id: Some("sub-model-disabled".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound model is disabled"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound model disabled"),
+        "expected 'bound model disabled' in error, got: {msg}"
+    );
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
 }

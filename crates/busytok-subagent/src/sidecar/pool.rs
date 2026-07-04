@@ -1,15 +1,10 @@
-//! WorkerPool — multi-provider supervisor management + credential injection.
+//! WorkerPool — multi-provider supervisor management.
 //!
 //! Owns one `PiSidecarSupervisor` per active provider. Lazily creates them
-//! via `ensure_worker`, injecting provider-specific env (`OPENAI_API_KEY` +
-//! `OPENAI_BASE_URL`) into the cloned `SidecarConfig` before construction.
-//!
-//! **Fixed env injection (Task 7):** the sidecar only recognizes
-//! `OPENAI_API_KEY` and `OPENAI_BASE_URL`. The pool no longer reads from
-//! external closures (`ProviderLookup` / `CredentialReader`) — instead it
-//! holds a `HashMap<String, ProviderRuntimeEntry>` populated from SQL at
-//! construction and updated via `update_provider_and_kill_old` when
-//! `provider_changed` fires.
+//! via `ensure_worker`. Provider credentials are now threaded per-turn via
+//! `turn_auto` params (Task 5), not via env injection — `inject_provider_env`
+//! was deleted along with the `OPENAI_API_KEY` / `OPENAI_BASE_URL` env
+//! injection mechanism.
 //!
 //! **Two-phase bootstrap (P1c fix):** the responder-factory is NOT passed
 //! to `new` — it's set via `set_responder_factory` AFTER the
@@ -64,13 +59,6 @@ pub struct ProviderRuntimeEntry {
     pub base_url: String,
 }
 
-/// Inject provider credentials into env using FIXED names.
-/// Sidecar only recognizes `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
-pub fn inject_provider_env(env: &mut HashMap<String, String>, entry: &ProviderRuntimeEntry) {
-    env.insert("OPENAI_API_KEY".to_string(), entry.api_key.clone());
-    env.insert("OPENAI_BASE_URL".to_string(), entry.base_url.clone());
-}
-
 /// Responder factory closure (P1c two-phase init). Takes a
 /// `Weak<PiSidecarSupervisor>` (so the responder holds a weak ref,
 /// breaking the supervisor → responder → executor → supervisor cycle)
@@ -84,10 +72,9 @@ pub type ResponderFactory =
 ///
 /// See the module docs for the P1/P1b/P1c/I1/I2 fixes encoded in this type.
 pub struct WorkerPool {
-    /// Base sidecar config — cloned per provider, with env overridden.
-    /// Produced by `resolve_base_sidecar_config`; the pool clones it and
-    /// injects `OPENAI_API_KEY` / `OPENAI_BASE_URL` per provider before
-    /// constructing each supervisor.
+    /// Base sidecar config — cloned per provider (no env override —
+    /// credentials flow via `turn_auto` params, Task 5).
+    /// Produced by `resolve_base_sidecar_config`.
     base_config: SidecarConfig,
     /// Optional shared DB handle — threaded to each supervisor.
     db: Option<SharedDb>,
@@ -195,10 +182,11 @@ impl WorkerPool {
         provider_id: &str,
     ) -> Result<Arc<PiSidecarSupervisor>, SidecarError> {
         // (1) Look up provider runtime entry (clone — no lock held during
-        // supervisor construction). The entry contains api_key + base_url
-        // (already resolved from SQL at construction or via
-        // update_provider_and_kill_old).
-        let entry = {
+        // supervisor construction). Task 5: the entry's api_key + base_url
+        // are no longer consumed here (credentials flow via `turn_auto`
+        // params), but the lookup is kept so unknown providers fail fast
+        // with "unknown provider" before constructing a supervisor.
+        let _entry = {
             let providers = self.providers.lock().expect("providers map lock poisoned");
             providers
                 .get(provider_id)
@@ -224,14 +212,9 @@ impl WorkerPool {
         // (3) No entry → build config + construct supervisor + responder +
         // insert. Constructed OUTSIDE the workers map lock so the (cheap,
         // sync) allocation doesn't block other callers' fast-path lookups.
-        let mut config = self.base_config.clone();
-        inject_provider_env(&mut config.env, &entry);
-
-        info!(
-            event_code = "subagent.credential_injected",
-            provider_id = %provider_id,
-            "injected OPENAI_API_KEY + OPENAI_BASE_URL into sidecar env"
-        );
+        // Task 5: provider credentials flow via `turn_auto` params (no env
+        // injection); the base config is cloned as-is.
+        let config = self.base_config.clone();
 
         // Construct supervisor with shared pressure gate.
         let policy = self.resource_policy.clone();
@@ -509,21 +492,7 @@ impl WorkerPool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn build_provider_config_uses_fixed_env_names() {
-        let entry = ProviderRuntimeEntry {
-            provider_id: "p1".into(),
-            api_key: "sk-test".into(),
-            base_url: "https://api.test.com".into(),
-        };
-        let mut env = std::collections::HashMap::new();
-        inject_provider_env(&mut env, &entry);
-        assert_eq!(env.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
-        assert_eq!(
-            env.get("OPENAI_BASE_URL"),
-            Some(&"https://api.test.com".to_string())
-        );
-    }
+    // Task 5: `inject_provider_env` was deleted — provider credentials now
+    // flow via `turn_auto` params. The `OPENAI_API_KEY` / `OPENAI_BASE_URL`
+    // env-injection test was removed with it.
 }

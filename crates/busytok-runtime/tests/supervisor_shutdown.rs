@@ -82,8 +82,11 @@ fn mock_sidecar_config() -> SidecarConfig {
 }
 
 /// Build the provider runtime entries map (Task 7: replaces the old
-/// `ProviderLookup` + `CredentialReader` closures). The pool injects
-/// `OPENAI_API_KEY` / `OPENAI_BASE_URL` from this entry at spawn time.
+/// `ProviderLookup` + `CredentialReader` closures). Task 5: the pool no
+/// longer injects env vars from this entry — credentials flow via
+/// `turn_auto` params. The entry is still consulted by `ensure_worker`
+/// to fail-fast on unknown providers and to populate the executor's
+/// per-turn params.
 fn make_providers(provider_id: &str) -> HashMap<String, ProviderRuntimeEntry> {
     let mut map = HashMap::new();
     map.insert(

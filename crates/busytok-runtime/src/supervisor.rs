@@ -331,9 +331,8 @@ impl BusytokSupervisor {
         }
         // Either use the injected config (test path) or resolve the base
         // (unbound) config from settings + paths. `resolve_base_sidecar_config`
-        // produces a config without provider-specific env — the pool injects
-        // `OPENAI_API_KEY` / `OPENAI_BASE_URL` per provider via
-        // `inject_provider_env` before constructing each supervisor.
+        // produces a config without provider-specific credentials (Task 5:
+        // credentials now flow via `turn_auto` params, not env injection).
         let config_result = match sidecar_config_override {
             Some(cfg) => Ok(cfg),
             None => {
@@ -391,8 +390,8 @@ impl BusytokSupervisor {
                 };
 
                 // Build the pool. The base config is cloned per-provider by
-                // `ensure_worker`, with env overridden (OPENAI_API_KEY +
-                // OPENAI_BASE_URL injected via `inject_provider_env`).
+                // `ensure_worker` (Task 5: credentials flow via `turn_auto`
+                // params, not env injection).
                 let resource_policy = settings.lock().unwrap().subagent.resource_policy.clone();
                 let pool = Arc::new(busytok_subagent::sidecar::WorkerPool::new(
                     sidecar_config,

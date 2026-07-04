@@ -366,7 +366,7 @@ fn executor_input() -> ExecutorInput {
         subagent_name: "reviewer".to_string(),
         cwd: "/tmp/repo".to_string(),
         profile: "pi/search-cheap".to_string(),
-        model: None,
+        model: "test-model".to_string(),
         prompt: "do something".to_string(),
         prompt_artifact_ref: None,
         timeout_seconds: Some(5),
@@ -374,7 +374,14 @@ fn executor_input() -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".to_string(),
+        provider_api_key: "sk-test".to_string(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     }
 }
 
@@ -549,7 +556,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 1".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -557,7 +564,14 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let out1 = executor
         .execute(&input1)
@@ -617,7 +631,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 2".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -625,7 +639,14 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let out2 = executor
         .execute(&input2)
@@ -685,7 +706,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 1".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -693,7 +714,14 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let _out1 = executor
         .execute(&input1)
@@ -713,7 +741,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 2".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -721,7 +749,14 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -811,7 +846,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 1".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -819,7 +854,14 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let _out1 = executor
         .execute(&input1)
@@ -837,7 +879,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 2".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -845,7 +887,14 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -985,7 +1034,7 @@ fn evict_input(id: &str) -> ExecutorInput {
         subagent_name: id.into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: format!("do {id}"),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -993,7 +1042,14 @@ fn evict_input(id: &str) -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     }
 }
 

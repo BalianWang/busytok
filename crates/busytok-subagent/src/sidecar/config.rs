@@ -17,10 +17,10 @@ use crate::sidecar::SidecarError;
 /// Resolved sidecar configuration — everything needed to spawn and supervise.
 ///
 /// `Clone` so the WorkerPool can clone the base config produced by
-/// `resolve_base_sidecar_config` and override `env` per provider before
-/// spawning (Phase 3 multi-provider routing). Provider-specific credentials
-/// are injected into `env` via `inject_provider_env` (fixed env names
-/// `OPENAI_API_KEY` / `OPENAI_BASE_URL`). All fields are `Clone`-able.
+/// `resolve_base_sidecar_config` per provider before spawning (Phase 3
+/// multi-provider routing). Task 5: provider credentials flow via
+/// `turn_auto` params (no env injection); `env` is preserved verbatim from
+/// the base config. All fields are `Clone`-able.
 #[derive(Clone)]
 pub struct SidecarConfig {
     pub node_binary: PathBuf,
@@ -49,11 +49,11 @@ pub struct SidecarConfig {
 
 /// Resolve a base `SidecarConfig` from settings + paths.
 ///
-/// Produces a config without provider-specific env (the WorkerPool injects
-/// `OPENAI_API_KEY` / `OPENAI_BASE_URL` into `env` per provider at spawn
-/// time via `inject_provider_env`). Existing callers that don't care about
-/// provider binding (Plan 1/2 tests, single-supervisor paths) can use this
-/// directly or via `resolve_sidecar_config` (which delegates here).
+/// Produces a config without provider-specific credentials (Task 5:
+/// credentials now flow via `turn_auto` params, not env injection).
+/// Existing callers that don't care about provider binding (Plan 1/2
+/// tests, single-supervisor paths) can use this directly or via
+/// `resolve_sidecar_config` (which delegates here).
 ///
 /// Explicit mode selection — NO silent fallback. Spec §10.1/§5.1.
 /// `node_runtime = "bundled"` requires the bundled node binary to exist;
@@ -161,8 +161,9 @@ mod tests {
     }
 
     /// `resolve_base_sidecar_config` produces a base config without
-    /// provider-specific env. This is the contract the WorkerPool relies
-    /// on: clone → inject provider env → spawn.
+    /// provider-specific env. Task 5: provider credentials now flow via
+    /// `turn_auto` params (no env injection); the base config is cloned
+    /// verbatim per provider at spawn time.
     #[test]
     fn resolve_base_sidecar_config_produces_no_provider_env() {
         let tmp = TempDir::new().unwrap();

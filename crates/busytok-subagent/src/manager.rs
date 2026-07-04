@@ -365,10 +365,62 @@ impl SubagentManager {
         task: &SubagentTaskRow,
         subagent: &LogicalSubagent,
     ) -> Result<DelegateResult> {
-        let model = task
+        // Spec §4.3: effective model = task.model_override.unwrap_or(bound_model_id)
+        let effective_model_id = task
             .model_override
             .clone()
-            .or_else(|| Some(subagent.bound_model_id.clone()));
+            .unwrap_or_else(|| subagent.bound_model_id.clone());
+        // Spec §4.3 validation chain — fail fast on bound provider/model
+        // issues. Reads happen under the DB lock; the resolved values are
+        // used below to populate `ExecutorInput`'s provider config + model
+        // metadata fields.
+        let (resolved_provider, resolved_model) = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            let provider = db
+                .get_provider_with_secret(&subagent.bound_provider_id)
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "bound provider not found: {}",
+                        subagent.bound_provider_id
+                    ))
+                })?;
+            if !provider.enabled {
+                return Err(SubagentError::Validation(format!(
+                    "bound provider disabled: {}",
+                    subagent.bound_provider_id
+                )));
+            }
+            let api_key = provider.api_key.clone().unwrap_or_default();
+            if api_key.is_empty() {
+                return Err(SubagentError::Validation(format!(
+                    "bound provider missing api key: {}",
+                    subagent.bound_provider_id
+                )));
+            }
+            let model = db
+                .get_model_by_provider_and_model_id(
+                    &subagent.bound_provider_id,
+                    &effective_model_id,
+                )
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "bound model not found in provider: {effective_model_id}"
+                    ))
+                })?;
+            if !model.enabled {
+                return Err(SubagentError::Validation(format!(
+                    "bound model disabled: {effective_model_id}"
+                )));
+            }
+            (provider, model)
+        };
+        // `model` (the local variable used by the rest of execute_task) is the
+        // resolved model id (a String, not Option<String>). The rest of the
+        // body uses `effective_model_id` in its place; this shim keeps the
+        // existing body compiling without further edits.
+        let model: Option<String> = Some(effective_model_id.clone());
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -434,7 +486,7 @@ impl SubagentManager {
                 // canonicalized to during `resolve_by_name`.)
                 cwd: subagent.repo_path.clone(),
                 profile: task.profile.clone(),
-                model: model.clone(),
+                model: effective_model_id.clone(),
                 prompt,
                 prompt_artifact_ref: task.prompt_artifact_ref.clone(),
                 timeout_seconds: task.timeout_seconds.map(|t| t as u64),
@@ -442,13 +494,21 @@ impl SubagentManager {
                 memory: snapshot,
                 context: compact,
                 write_access,
-                // Task 3 + Task 5: thread `subagent.bound_provider_id` so the
-                // WorkerPool can route to the correct per-provider supervisor.
-                // Profiles are now pure behavior templates (no provider_id) —
-                // provider/model binding is per-subagent (NOT NULL columns).
-                // Task 5 will replace this with a fully-threaded
-                // `ExecutorInput.provider_id` from the task/subagent path.
-                provider_id: Some(subagent.bound_provider_id.clone()),
+                // Task 5: thread the resolved provider config + model
+                // metadata end-to-end so the sidecar can route to the
+                // correct per-provider supervisor and build a complete model
+                // definition (spec §5.2). `provider_id` is now `String`
+                // (NOT NULL — validated above), so the WorkerPool always has
+                // a route target.
+                provider_id: resolved_provider.id.clone(),
+                provider_kind: resolved_provider.provider_kind.clone(),
+                provider_base_url: resolved_provider.base_url.clone(),
+                // 瞬态：不写回 task row，不进日志明文，不进 DTO/response/diagnostic.
+                provider_api_key: resolved_provider.api_key.clone().unwrap_or_default(),
+                model_reasoning: resolved_model.reasoning,
+                model_context_window: resolved_model.context_window.unwrap_or(0),
+                model_max_tokens: resolved_model.max_tokens.unwrap_or(0),
+                model_display_name: resolved_model.display_name.clone(),
             };
             (
                 input,
