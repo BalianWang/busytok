@@ -1858,7 +1858,6 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
                     branch: None,
                     intent: None,
                     default_profile: "pi/search-cheap".into(),
-                    default_model: None,
                     bound_provider_id: "test-provider".into(),
                     bound_model_id: "test-model".into(),
                     status: "cold".into(),
@@ -2150,6 +2149,8 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
     };
     // §8.3 step 2 "queue only": delegate() accepts the task and returns
     // DelegateResult { status: Queued } — NOT an error. The background

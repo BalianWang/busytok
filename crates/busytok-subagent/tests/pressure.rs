@@ -208,7 +208,6 @@ async fn evict_lru_hibernates_oldest_hot_binding() {
                     branch: None,
                     intent: None,
                     default_profile: "pi/search-cheap".into(),
-                    default_model: None,
                     bound_provider_id: "test-provider".into(),
                     bound_model_id: "test-model".into(),
                     status: "warm".into(),

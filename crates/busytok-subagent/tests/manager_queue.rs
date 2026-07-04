@@ -17,6 +17,9 @@ use busytok_subagent::models::{DelegateRequest, TaskStatus};
 use busytok_subagent::pressure::{PressureAction, PressureGate};
 use busytok_subagent::SubagentManager;
 
+const TEST_PROVIDER_ID: &str = "test-prov";
+const TEST_MODEL_NAME: &str = "test-model";
+
 /// Minimal mock executor that returns a fixed `Completed` result. Used by
 /// both the queued-when-paused test (verifies delegate returns early without
 /// invoking the executor) and the dispatcher test (verifies the dispatcher
@@ -38,6 +41,44 @@ impl TaskExecutor for RecordingExecutor {
     }
 }
 
+/// Create an in-memory database seeded with a test provider + model so
+/// `delegate()` can create subagents with valid bound fields.
+fn test_db() -> Arc<Mutex<busytok_store::Database>> {
+    let db = Arc::new(Mutex::new(
+        busytok_store::Database::open_in_memory().unwrap(),
+    ));
+    seed_test_provider_model(&db.lock().unwrap());
+    db
+}
+
+fn seed_test_provider_model(db: &busytok_store::Database) {
+    let now = busytok_domain::now_ms();
+    db.conn().execute(
+        "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            TEST_PROVIDER_ID,
+            "Test Provider",
+            serde_json::to_string(&busytok_domain::ProviderKind::OpenAiCompatible).unwrap(),
+            "https://api.test.com",
+            1i64,
+            "sk-test",
+            now,
+        ],
+    ).unwrap();
+    db.conn().execute(
+        "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, display_name, reasoning, context_window, max_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, 0, 128000, 16384)",
+        rusqlite::params![
+            "test-model-row",
+            TEST_PROVIDER_ID,
+            TEST_MODEL_NAME,
+            1i64,
+            now,
+        ],
+    ).unwrap();
+}
+
 fn req(name: &str, prompt: &str) -> DelegateRequest {
     DelegateRequest {
         subagent_name: name.to_string(),
@@ -51,14 +92,14 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        bound_model_id: Some(TEST_MODEL_NAME.to_string()),
     }
 }
 
 #[tokio::test]
 async fn delegate_returns_queued_when_gate_paused() {
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
     let gate = Arc::new(PressureGate::new());
@@ -94,9 +135,7 @@ async fn delegate_returns_queued_when_gate_paused() {
 
 #[tokio::test]
 async fn dispatcher_executes_queued_task_when_gate_clears() {
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
     let gate = Arc::new(PressureGate::new());
@@ -161,9 +200,7 @@ async fn dispatcher_executes_queued_task_when_gate_clears() {
 /// sequentially (one at a time), never concurrently.
 #[tokio::test]
 async fn dispatcher_serializes_tasks_per_subagent_fifo() {
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
     let gate = Arc::new(PressureGate::new());
@@ -359,9 +396,7 @@ impl TaskExecutor for DelayingExecutor {
 async fn delegate_queues_when_subagent_already_running() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let call_count = Arc::new(AtomicUsize::new(0));
     let executor = Arc::new(DelayingExecutor(
@@ -427,9 +462,7 @@ async fn delegate_queues_when_subagent_already_running() {
 /// Setting both is rejected with `InvalidArgument`.
 #[tokio::test]
 async fn delegate_rejects_both_prompt_and_artifact_ref() {
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
     let manager =
@@ -447,9 +480,7 @@ async fn delegate_rejects_both_prompt_and_artifact_ref() {
 /// Setting neither `prompt` nor `prompt_artifact_ref` is rejected.
 #[tokio::test]
 async fn delegate_rejects_neither_prompt_nor_artifact_ref() {
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
     let manager =
@@ -486,9 +517,7 @@ async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
         }
     }
 
-    let db = Arc::new(Mutex::new(
-        busytok_store::Database::open_in_memory().unwrap(),
-    ));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let captured = Arc::new(StdMutex::new(None));
     let executor = Arc::new(CapturingExecutor(Arc::clone(&captured))) as Arc<dyn TaskExecutor>;

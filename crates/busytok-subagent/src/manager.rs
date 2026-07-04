@@ -166,23 +166,37 @@ impl SubagentManager {
         }
         let profile_model = self.profile_model(&req.profile);
 
+        // Spec §3.3: bound fields are conditionally required (create path
+        // only). Both must be present or both absent — one without the other
+        // is a validation error. Ignored when reusing an existing subagent
+        // (name path hit OR subagent_id shortcut).
+        let bound_pair = match (&req.bound_provider_id, &req.bound_model_id) {
+            (Some(p), Some(m)) => Some((p.clone(), m.clone())),
+            (None, None) => None,
+            _ => {
+                return Err(SubagentError::Validation(
+                    "bound_provider_id and bound_model_id must be provided together".into(),
+                ));
+            }
+        };
+
         // 1. resolve subagent (create if needed). `resolve_by_name` canonicalizes
         //    cwd and validates the name; errors propagate with a reject log.
         let Resolved { subagent, created } = {
             let db = self.db.lock().expect("subagent db lock poisoned");
             if let Some(id) = &req.subagent_id {
+                // Reuse path: ignore bound fields, resolve by id.
                 Resolved {
                     subagent: resolve_by_id(&db, id)?,
                     created: false,
                 }
             } else {
-                match resolve_by_name(
-                    &db,
-                    &req.subagent_name,
-                    &req.cwd,
-                    &req.profile,
-                    profile_model.as_deref(),
-                ) {
+                // Name path: pass bound fields; resolver validates only on
+                // create (existing subagent → bound fields ignored).
+                let (p, m) = bound_pair
+                    .clone()
+                    .unwrap_or_else(|| (String::new(), String::new()));
+                match resolve_by_name(&db, &req.subagent_name, &req.cwd, &req.profile, &p, &m) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(
@@ -356,7 +370,7 @@ impl SubagentManager {
         let model = task
             .model_override
             .clone()
-            .or_else(|| subagent.default_model.clone())
+            .or_else(|| Some(subagent.bound_model_id.clone()))
             .or_else(|| self.profile_model(&task.profile));
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {

@@ -20,11 +20,8 @@ fn subagent() -> SubagentLogicalSubagentRow {
         branch: Some("main".into()),
         intent: Some("Study auth refresh logic".into()),
         default_profile: "pi/review-cheap".into(),
-        default_model: None,
-        // Task 1 placeholder: bound_provider_id + bound_model_id are NOT NULL
-        // in the new schema; Task 2 will replace with proper binding.
-        bound_provider_id: "legacy".into(),
-        bound_model_id: String::new(),
+        bound_provider_id: "test-provider".into(),
+        bound_model_id: "test-model".into(),
         status: "hot".into(),
         created_at_ms: 1000,
         updated_at_ms: 2000,

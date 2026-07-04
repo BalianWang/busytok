@@ -2893,6 +2893,8 @@ fn validate_runtime_dir(runtime_dir: &str, node_runtime: &str) -> Result<()> {
 
 fn delegate_request_from_dto(
     d: busytok_protocol::dto::SubagentDelegateRequestDto,
+    bound_provider_id: Option<String>,
+    bound_model_id: Option<String>,
 ) -> busytok_subagent::models::DelegateRequest {
     busytok_subagent::models::DelegateRequest {
         subagent_name: d.subagent_name,
@@ -2906,6 +2908,11 @@ fn delegate_request_from_dto(
         model_override: d.model_override,
         source_harness: d.source_harness,
         source_session_id: d.source_session_id,
+        // INTERIM (Task 2): thread bound fields from the profile config so
+        // the create path can validate provider + model. Task 4 will replace
+        // this by reading bound fields directly from the DTO.
+        bound_provider_id,
+        bound_model_id,
     }
 }
 
@@ -2929,7 +2936,9 @@ fn subagent_detail(s: busytok_subagent::models::LogicalSubagent) -> SubagentDeta
         branch: s.branch,
         intent: s.intent,
         default_profile: s.default_profile,
-        default_model: s.default_model,
+        // Task 4 replaces this DTO field with bound_provider_id/bound_model_id;
+        // until then we surface None so the conversion compiles.
+        default_model: None,
         status: s.status.as_str().to_string(),
         created_at_ms: s.created_at_ms,
         updated_at_ms: s.updated_at_ms,
@@ -5475,9 +5484,41 @@ impl RuntimeControl for BusytokSupervisor {
         // fail the task (the task result is already persisted; usage is
         // best-effort observability).
         let cwd = req.cwd.clone();
+        // INTERIM (Task 2): resolve bound fields from the profile config so
+        // the create path can validate provider + model. Task 4 replaces
+        // this by reading bound fields directly from the DTO.
+        //
+        // Spec §3.3 "both or neither": when the profile lacks either a
+        // provider_id or a model, pass (None, None) so the manager's
+        // bound-pair check passes and the resolver skips validation
+        // (both-absent branch). Only thread real values through when both
+        // are present.
+        let (bound_provider_id, bound_model_id) = {
+            let settings = self.settings.lock().unwrap();
+            let profile_cfg = settings.subagent.profiles.get(&req.profile);
+            match profile_cfg {
+                Some(p) => {
+                    let provider = p.provider_id.clone();
+                    let model = if p.model.is_empty() {
+                        None
+                    } else {
+                        Some(p.model.clone())
+                    };
+                    match (provider, model) {
+                        (Some(pid), Some(mid)) => (Some(pid), Some(mid)),
+                        _ => (None, None),
+                    }
+                }
+                None => (None, None),
+            }
+        };
         let r = self
             .subagent_manager()
-            .delegate(delegate_request_from_dto(req))
+            .delegate(delegate_request_from_dto(
+                req,
+                bound_provider_id,
+                bound_model_id,
+            ))
             .await
             .map_err(map_subagent_error)?;
         // Only bridge usage for completed/failed tasks — queued tasks have
@@ -7316,7 +7357,8 @@ mod tests {
             source_harness: Some("gui".to_string()),
             source_session_id: Some("sess-1".to_string()),
         };
-        let req = delegate_request_from_dto(dto);
+        let req =
+            delegate_request_from_dto(dto, Some("prov-1".to_string()), Some("gpt-5".to_string()));
         assert_eq!(req.subagent_name, "sa");
         assert_eq!(req.subagent_id.as_deref(), Some("id-1"));
         assert_eq!(req.cwd, "/tmp");
@@ -7328,6 +7370,8 @@ mod tests {
         assert_eq!(req.model_override.as_deref(), Some("gpt-5"));
         assert_eq!(req.source_harness.as_deref(), Some("gui"));
         assert_eq!(req.source_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(req.bound_provider_id.as_deref(), Some("prov-1"));
+        assert_eq!(req.bound_model_id.as_deref(), Some("gpt-5"));
     }
 
     #[test]
@@ -7356,7 +7400,8 @@ mod tests {
             branch: Some("main".to_string()),
             intent: Some("fix".to_string()),
             default_profile: "pi/search-cheap".to_string(),
-            default_model: Some("gpt-5".to_string()),
+            bound_provider_id: "prov-1".to_string(),
+            bound_model_id: "gpt-5".to_string(),
             status: busytok_subagent::models::SubagentStatus::Hot,
             created_at_ms: 100,
             updated_at_ms: 200,

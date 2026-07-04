@@ -4,6 +4,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use busytok_config::{SubagentProfileConfig, SubagentSettings};
+use busytok_store::provider_catalog::{
+    create_model, create_provider, CreateModelReq, CreateProviderReq,
+};
 use busytok_store::{Database, SubagentHarnessBindingRow};
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::memory::{KeyFile, MemoryUpdate, OpenQuestion};
@@ -30,13 +33,72 @@ fn install_tracing() -> tracing::subscriber::DefaultGuard {
 
 async fn manager() -> SubagentManager {
     // std::sync::Mutex — matches the supervisor's db field type.
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     SubagentManager::new(
         db,
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
     )
+}
+
+// Thread-local storage for the seeded test provider/model IDs. Each
+// `#[tokio::test]` runs on its own thread, and `test_db()` seeds fresh
+// values before `req()` is called.
+thread_local! {
+    static TEST_PROVIDER_ID: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    static TEST_MODEL_ID: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+const TEST_MODEL_NAME: &str = "test-model";
+
+/// Create an in-memory database seeded with a test provider + model so
+/// `delegate()` can create subagents with valid bound fields. The seeded
+/// IDs are stored in thread-locals for `req()` / `req_with_cwd()` to read.
+fn test_db() -> std::sync::Arc<std::sync::Mutex<Database>> {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    seed_test_provider_model(&db.lock().unwrap());
+    db
+}
+
+fn seed_test_provider_model(db: &Database) {
+    let provider = create_provider(
+        db.conn(),
+        CreateProviderReq {
+            name: "Test Provider".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    create_model(
+        db.conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: TEST_MODEL_NAME.into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    TEST_PROVIDER_ID.with(|c| *c.borrow_mut() = provider.id);
+    TEST_MODEL_ID.with(|c| *c.borrow_mut() = TEST_MODEL_NAME.to_string());
+}
+
+fn bound_provider_id() -> String {
+    TEST_PROVIDER_ID.with(|c| c.borrow().clone())
+}
+
+fn bound_model_id() -> String {
+    TEST_MODEL_ID.with(|c| c.borrow().clone())
 }
 
 fn req_with_cwd(name: &str, prompt: &str, cwd: &str) -> DelegateRequest {
@@ -52,6 +114,8 @@ fn req_with_cwd(name: &str, prompt: &str, cwd: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     }
 }
 
@@ -68,6 +132,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     }
 }
 
@@ -305,7 +371,7 @@ async fn delegate_review_and_plan_profiles_resolve_default_models() {
 
 #[tokio::test]
 async fn delegate_rejected_when_feature_disabled() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let settings = SubagentSettings {
         enabled: false,
         ..Default::default()
@@ -667,7 +733,7 @@ impl TaskExecutor for WarmMemoryExecutor {
 
 #[tokio::test]
 async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -700,7 +766,7 @@ async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
 
 #[tokio::test]
 async fn task_counts_returns_zero_when_task_table_query_fails() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
@@ -723,7 +789,7 @@ async fn task_counts_returns_zero_when_task_table_query_fails() {
 async fn hibernate_closes_existing_hot_binding() {
     // delegate creates no hot binding (Plan 1), so seed one manually to cover
     // the `if let Some(mut b) = binding` branch in manager::hibernate.
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
@@ -833,7 +899,7 @@ impl TaskExecutor for MemoryUpdateExecutor {
 
 #[tokio::test]
 async fn delegate_builds_context_and_merges_memory_update() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let executor = std::sync::Arc::new(MemoryUpdateExecutor {
         captured_input: Mutex::new(None),
     });
@@ -855,6 +921,8 @@ async fn delegate_builds_context_and_merges_memory_update() {
         model_override: None,
         source_harness: Some("cli".into()),
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     };
     let result = manager.delegate(req).await.unwrap();
     assert_eq!(result.status, TaskStatus::Completed);
@@ -929,7 +997,7 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
     // P1-1 regression: no adapter_session_id + no memory_update => hot_summary
     // is None => status must be Cold (NOT Warm). The old code unconditionally
     // set Warm, violating §3.3: "warm iff hot_summary IS NOT NULL".
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = std::sync::Arc::new(MockTaskExecutor);
     let manager = SubagentManager::new(db.clone(), settings, "mock", executor);
@@ -945,6 +1013,8 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     };
     let result = manager.delegate(req).await.unwrap();
     // Verify status is Cold, not Warm.
@@ -984,7 +1054,7 @@ async fn delegate_populates_attempts_after_first_completed_task() {
     // summary (which becomes result_summary via set_task_status), so after the
     // fix the fresh snapshot's most-recent task carries that summary and an
     // attempt entry is appended.
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = SubagentManager::new(
         db.clone(),
         SubagentSettings::default(),
@@ -1003,6 +1073,8 @@ async fn delegate_populates_attempts_after_first_completed_task() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     };
     let result = manager.delegate(req).await.unwrap();
     assert_eq!(result.status.as_str(), "completed");
@@ -1081,7 +1153,7 @@ impl TaskExecutor for HotSessionExecutor {
 #[tokio::test]
 async fn delegate_executor_subagent_error_downcasts_and_propagates() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -1102,7 +1174,7 @@ async fn delegate_executor_subagent_error_downcasts_and_propagates() {
 #[tokio::test]
 async fn delegate_executor_generic_error_wrapped_as_store() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -1118,7 +1190,8 @@ async fn delegate_executor_generic_error_wrapped_as_store() {
 }
 
 /// When profile model is empty + no model_override + fresh subagent,
-/// execute_task returns model=None → line 277 sets result.model (to None).
+/// execute_task resolves the model from `subagent.bound_model_id` (spec §3.3:
+/// bound_model_id is the authoritative fallback after model_override).
 #[tokio::test]
 async fn delegate_sets_model_when_execute_task_returns_none() {
     let _guard = install_tracing();
@@ -1134,8 +1207,9 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
             provider_id: None,
         },
     );
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor));
+    let expected_model = bound_model_id();
     let r = m
         .delegate(DelegateRequest {
             profile: "custom/empty-model".to_string(),
@@ -1144,9 +1218,10 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         .await
         .unwrap();
     assert_eq!(r.profile, "custom/empty-model");
-    assert!(
-        r.model.is_none(),
-        "model is None when profile model is empty and no override"
+    assert_eq!(
+        r.model.as_deref(),
+        Some(expected_model.as_str()),
+        "model falls back to bound_model_id when profile model is empty and no override"
     );
 }
 
@@ -1156,7 +1231,7 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
 #[tokio::test]
 async fn delegate_hot_binding_commit_failure_returns_store_error() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         g.conn()
@@ -1181,7 +1256,7 @@ async fn delegate_hot_binding_commit_failure_returns_store_error() {
 #[tokio::test]
 async fn dispatcher_shutdown_returns_promptly() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -1205,7 +1280,7 @@ async fn dispatcher_shutdown_returns_promptly() {
 #[tokio::test]
 async fn dispatcher_skips_queued_task_while_gate_paused() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let gate = std::sync::Arc::new(PressureGate::new());
     gate.set_action(PressureAction::PauseNewTasks);
     let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
@@ -1272,7 +1347,7 @@ async fn dispatcher_skips_queued_task_while_gate_paused() {
 #[tokio::test]
 async fn dispatcher_marks_task_failed_when_subagent_missing() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = std::sync::Arc::new(SubagentManager::new(
         db.clone(),
         SubagentSettings::default(),
@@ -1336,7 +1411,7 @@ async fn dispatcher_marks_task_failed_when_subagent_missing() {
 #[tokio::test]
 async fn dispatcher_marks_task_failed_when_execute_task_errors() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let gate = std::sync::Arc::new(PressureGate::new());
     gate.set_action(PressureAction::PauseNewTasks);
     let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
@@ -1444,7 +1519,7 @@ fn manager_with_db(db: std::sync::Arc<std::sync::Mutex<Database>>) -> SubagentMa
 
 #[tokio::test]
 async fn recent_tasks_all_returns_across_all_subagents_in_desc_order() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1469,7 +1544,7 @@ async fn recent_tasks_all_returns_across_all_subagents_in_desc_order() {
 
 #[tokio::test]
 async fn recent_tasks_all_respects_limit() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1485,7 +1560,7 @@ async fn recent_tasks_all_respects_limit() {
 
 #[tokio::test]
 async fn recent_tasks_all_empty_when_no_tasks() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = manager_with_db(db);
     let tasks = manager.recent_tasks_all(20).await.unwrap();
     assert!(tasks.is_empty());
@@ -1493,7 +1568,7 @@ async fn recent_tasks_all_empty_when_no_tasks() {
 
 #[tokio::test]
 async fn task_counts_by_subagent_groups_correctly_across_subagents() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1515,7 +1590,7 @@ async fn task_counts_by_subagent_groups_correctly_across_subagents() {
 
 #[tokio::test]
 async fn task_counts_by_subagent_empty_when_no_tasks() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = manager_with_db(db);
     let counts = manager.task_counts_by_subagent().await.unwrap();
     assert!(counts.is_empty());
@@ -1523,7 +1598,7 @@ async fn task_counts_by_subagent_empty_when_no_tasks() {
 
 #[tokio::test]
 async fn last_task_by_subagent_returns_latest_per_subagent() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1547,7 +1622,7 @@ async fn last_task_by_subagent_returns_latest_per_subagent() {
 
 #[tokio::test]
 async fn last_task_by_subagent_empty_when_no_tasks() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = manager_with_db(db);
     let lasts = manager.last_task_by_subagent().await.unwrap();
     assert!(lasts.is_empty());

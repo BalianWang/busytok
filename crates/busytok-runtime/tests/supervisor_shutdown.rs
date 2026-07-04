@@ -151,6 +151,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
     }
 }
 

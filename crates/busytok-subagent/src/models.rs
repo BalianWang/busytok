@@ -90,7 +90,8 @@ pub struct LogicalSubagent {
     pub branch: Option<String>,
     pub intent: Option<String>,
     pub default_profile: String,
-    pub default_model: Option<String>,
+    pub bound_provider_id: String,
+    pub bound_model_id: String,
     pub status: SubagentStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -139,6 +140,10 @@ pub struct DelegateRequest {
     pub model_override: Option<String>,
     pub source_harness: Option<String>,
     pub source_session_id: Option<String>,
+    /// Spec §3.3: when creating a new subagent, both must be provided
+    /// together. Ignored when reusing an existing subagent.
+    pub bound_provider_id: Option<String>,
+    pub bound_model_id: Option<String>,
 }
 
 /// Resolution params for single-subagent operations (show/tasks/hibernate/delete).

@@ -335,7 +335,6 @@ fn find_hot_binding_by_session_returns_binding_for_known_session() {
         branch: None,
         intent: None,
         default_profile: "pi/search-cheap".into(),
-        default_model: None,
         bound_provider_id: "test-provider".into(),
         bound_model_id: "test-model".into(),
         status: "hot".into(),
@@ -393,7 +392,6 @@ fn find_hot_binding_by_session_excludes_closed_bindings() {
         branch: None,
         intent: None,
         default_profile: "pi/search-cheap".into(),
-        default_model: None,
         bound_provider_id: "test-provider".into(),
         bound_model_id: "test-model".into(),
         status: "warm".into(),
@@ -524,4 +522,49 @@ fn task_counts_by_status_returns_zeros_when_no_tasks() {
     let (queued, running) = db.subagent_task_counts_by_status().unwrap();
     assert_eq!(queued, 0);
     assert_eq!(running, 0);
+}
+
+/// Spec §2.3: `bound_provider_id` + `bound_model_id` round-trip through the
+/// store. Verifies the atomic bound fields migration (Task 2) persists both
+/// columns and that `default_model` is gone (no API to read it — just verify
+/// no panic and the bound fields come back as written).
+#[test]
+fn subagent_upsert_logical_persists_bound_fields() {
+    let db = db();
+    let row = SubagentLogicalSubagentRow {
+        id: "sub-1".into(),
+        name: "test-sub".into(),
+        project_id: "repo-hash".into(),
+        repo_path: "/tmp".into(),
+        repo_hash: "repo-hash".into(),
+        branch: None,
+        intent: None,
+        default_profile: "pi/search-cheap".into(),
+        bound_provider_id: "prov-1".into(),
+        bound_model_id: "gpt-4o".into(),
+        status: "cold".into(),
+        created_at_ms: 1000,
+        updated_at_ms: 1000,
+        last_active_at_ms: None,
+    };
+    db.subagent_upsert_logical(&row).unwrap();
+    let fetched = db.subagent_get_logical("sub-1").unwrap().unwrap();
+    assert_eq!(fetched.bound_provider_id, "prov-1");
+    assert_eq!(fetched.bound_model_id, "gpt-4o");
+    // Round-trip via find_by_name_in_repo too (exercises the SELECT column
+    // list + row construction for that path).
+    let by_name = db
+        .subagent_find_by_name_in_repo("repo-hash", "repo-hash", "test-sub")
+        .unwrap();
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].bound_provider_id, "prov-1");
+    assert_eq!(by_name[0].bound_model_id, "gpt-4o");
+    // list_active_by_repo + list_filtered also exercise the bound column
+    // mapping — verify they return the bound fields correctly.
+    let active = db.subagent_list_active_by_repo("repo-hash").unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].bound_provider_id, "prov-1");
+    let filtered = db.subagent_list_filtered(None, None, false).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].bound_model_id, "gpt-4o");
 }

@@ -178,6 +178,7 @@ fn make_harness() -> TestHarness {
 
 fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     let db: SharedDb = Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    seed_sidecar_test_provider(&db);
     let (pool, executor, supervisor, holder) =
         make_pool_with_config(mock_sidecar_config_with_env(env), Some(Arc::clone(&db)));
     let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
@@ -197,6 +198,37 @@ fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     }
 }
 
+/// Seed the DB with a provider + model matching `TEST_PROVIDER_ID` so
+/// `delegate()` can create subagents with valid bound fields.
+fn seed_sidecar_test_provider(db: &SharedDb) {
+    let db_guard = db.lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db_guard.conn().execute(
+        "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            TEST_PROVIDER_ID,
+            "Test Provider",
+            serde_json::to_string(&busytok_domain::ProviderKind::OpenAiCompatible).unwrap(),
+            "https://test.example.com/v1",
+            1i64,
+            "test-key",
+            now,
+        ],
+    ).unwrap();
+    db_guard.conn().execute(
+        "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, display_name, reasoning, context_window, max_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, 0, 128000, 16384)",
+        rusqlite::params![
+            "test-model-row",
+            TEST_PROVIDER_ID,
+            "test-model",
+            1i64,
+            now,
+        ],
+    ).unwrap();
+}
+
 fn req(name: &str, prompt: &str) -> DelegateRequest {
     DelegateRequest {
         subagent_name: name.to_string(),
@@ -210,6 +242,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        bound_model_id: Some("test-model".to_string()),
     }
 }
 
@@ -551,7 +585,6 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
                 branch: None,
                 intent: None,
                 default_profile: "pi/search-cheap".into(),
-                default_model: None,
                 bound_provider_id: "test-provider".into(),
                 bound_model_id: "test-model".into(),
                 status: "hot".into(),
@@ -738,7 +771,6 @@ async fn executor_eviction_aborts_when_session_close_fails() {
                 branch: None,
                 intent: None,
                 default_profile: "pi/search-cheap".into(),
-                default_model: None,
                 bound_provider_id: "test-provider".into(),
                 bound_model_id: "test-model".into(),
                 status: "hot".into(),
@@ -986,7 +1018,6 @@ fn seed_hot_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &s
             branch: None,
             intent: None,
             default_profile: "pi/search-cheap".into(),
-            default_model: None,
             bound_provider_id: "test-provider".into(),
             bound_model_id: "test-model".into(),
             status: "hot".into(),
