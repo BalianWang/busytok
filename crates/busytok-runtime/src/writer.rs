@@ -675,6 +675,41 @@ async fn flush_single_generation(
     }
 }
 
+/// Prune usage_events older than 24h for the active generation.
+///
+/// Reads the active generation from `status`, then spawns a blocking task
+/// to delete old events. On success, decrements `total_usage_event_count`.
+async fn prune_old_usage_events(
+    db: &Arc<Mutex<Database>>,
+    status: &Arc<tokio::sync::RwLock<ServiceStatusSnapshot>>,
+) {
+    let active_gen = status.read().await.active_generation_id.clone();
+    if let Some(ref gen_id) = active_gen {
+        let db = Arc::clone(db);
+        let gen_id = gen_id.clone();
+        let gen_label = gen_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            let db = db.lock().unwrap();
+            write_queries::prune_usage_events(db.conn(), &gen_id)
+        })
+        .await
+        {
+            Ok(Ok(deleted)) => {
+                if deleted > 0 {
+                    debug!(deleted, gen = %gen_label, "pruned old usage events");
+                    let mut snap = status.write().await;
+                    snap.total_usage_event_count =
+                        snap.total_usage_event_count.saturating_sub(deleted);
+                }
+            }
+            Ok(Err(e)) => warn!(error = %e, gen = %gen_label, "usage event pruning query failed"),
+            Err(join_err) => {
+                warn!(error = ?join_err, gen = %gen_label, "usage event pruning spawn failed")
+            }
+        }
+    }
+}
+
 pub fn spawn_writer(
     db: Arc<Mutex<Database>>,
     status: Arc<tokio::sync::RwLock<ServiceStatusSnapshot>>,
@@ -758,30 +793,7 @@ pub fn try_spawn_writer(
                             let now = now_ms();
                             if now - last_metrics_checkpoint > (METRICS_CHECKPOINT_INTERVAL_SECS as i64 * 1000) {
                                 persist_metrics_checkpoint(&db, &status).await;
-                                // Prune usage_events older than 24h for the active generation.
-                                {
-                                    let active_gen = status.read().await.active_generation_id.clone();
-                                    if let Some(ref gen_id) = active_gen {
-                                        let db = Arc::clone(&db);
-                                        let gen_id = gen_id.clone();
-                                        let gen_label = gen_id.clone();
-                                        match tokio::task::spawn_blocking(move || {
-                                            let db = db.lock().unwrap();
-                                            write_queries::prune_usage_events(db.conn(), &gen_id)
-                                        }).await {
-                                            Ok(Ok(deleted)) => {
-                                                if deleted > 0 {
-                                                    debug!(deleted, gen = %gen_label, "pruned old usage events");
-                                                    let mut snap = status.write().await;
-                                                    snap.total_usage_event_count =
-                                                        snap.total_usage_event_count.saturating_sub(deleted);
-                                                }
-                                            }
-                                            Ok(Err(e)) => warn!(error = %e, gen = %gen_label, "usage event pruning query failed"),
-                                            Err(join_err) => warn!(error = ?join_err, gen = %gen_label, "usage event pruning spawn failed"),
-                                        }
-                                    }
-                                }
+                                prune_old_usage_events(&db, &status).await;
                                 if let Err(e) = db.lock().unwrap().checkpoint_wal() {
                                     warn!("WAL checkpoint failed: {e}");
                                 }
@@ -1970,5 +1982,457 @@ mod tests {
         // Passing all-empty slices should succeed without inserting anything.
         insert_supplementary_events(&tx, &[], &[], &[]).unwrap();
         tx.commit().unwrap();
+    }
+
+    // ── prune_old_usage_events tests (lines 682-711) ─────────────────────
+
+    #[tokio::test]
+    async fn prune_old_usage_events_no_active_generation_is_noop() {
+        // Covers the early-return path when active_generation_id is None.
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        // active_generation_id is None by default.
+        let before = status.read().await.total_usage_event_count;
+        prune_old_usage_events(&db, &status).await;
+        let after = status.read().await.total_usage_event_count;
+        assert_eq!(before, after, "no prune should happen without active gen");
+    }
+
+    #[tokio::test]
+    async fn prune_old_usage_events_with_active_gen_and_no_events_returns_zero() {
+        // Covers the Ok(Ok(0)) branch where deleted == 0 (no decrement).
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        {
+            let mut snap = status.write().await;
+            snap.active_generation_id = Some("gen-no-events".to_string());
+            snap.total_usage_event_count = 5;
+        }
+        prune_old_usage_events(&db, &status).await;
+        let after = status.read().await.total_usage_event_count;
+        assert_eq!(after, 5, "count should not change when 0 events pruned");
+    }
+
+    #[tokio::test]
+    async fn prune_old_usage_events_deletes_old_events_and_decrements_count() {
+        // Covers the Ok(Ok(deleted > 0)) branch with decrement.
+        let db = Database::open_in_memory().unwrap();
+        let now = now_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO audit_generations (generation_id, state, started_at_ms, is_active, \
+                 created_at_ms, updated_at_ms) VALUES ('gen-prune', 'promoted', ?1, 1, ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        let mut evt = NormalizedUsageEvent::minimal_for_test(
+            "evt-old",
+            busytok_domain::AgentKind::ClaudeCode,
+        );
+        evt.timestamp_ms = now - 86_400_000 - 1_000; // 25h ago
+        evt.total_tokens = 100;
+        db.write_usage_event(&evt, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE usage_events SET generation_id = 'gen-prune' WHERE id = 'evt-old'",
+                [],
+            )
+            .unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        {
+            let mut snap = status.write().await;
+            snap.active_generation_id = Some("gen-prune".to_string());
+            snap.total_usage_event_count = 1;
+        }
+        prune_old_usage_events(&db, &status).await;
+        let snap = status.read().await;
+        assert_eq!(
+            snap.total_usage_event_count, 0,
+            "should decrement after prune"
+        );
+        let count: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE id = 'evt-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "old event should be pruned");
+    }
+
+    #[tokio::test]
+    async fn prune_old_usage_events_keeps_recent_events() {
+        // Additional coverage: events within 24h should not be pruned.
+        let db = Database::open_in_memory().unwrap();
+        let now = now_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO audit_generations (generation_id, state, started_at_ms, is_active, \
+                 created_at_ms, updated_at_ms) VALUES ('gen-keep', 'promoted', ?1, 1, ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        let mut evt = NormalizedUsageEvent::minimal_for_test(
+            "evt-recent",
+            busytok_domain::AgentKind::ClaudeCode,
+        );
+        evt.timestamp_ms = now - 1_000; // 1s ago
+        evt.total_tokens = 50;
+        db.write_usage_event(&evt, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE usage_events SET generation_id = 'gen-keep' WHERE id = 'evt-recent'",
+                [],
+            )
+            .unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        {
+            let mut snap = status.write().await;
+            snap.active_generation_id = Some("gen-keep".to_string());
+            snap.total_usage_event_count = 1;
+        }
+        prune_old_usage_events(&db, &status).await;
+        let snap = status.read().await;
+        assert_eq!(
+            snap.total_usage_event_count, 1,
+            "recent event should not be pruned"
+        );
+    }
+
+    // ── flush_pending_batches multi-generation warning (lines 447-453) ────
+
+    #[tokio::test]
+    async fn flush_pending_batches_with_multiple_generations_logs_warning() {
+        // Covers the groups.len() > 1 branch.
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let settings = Arc::new(Mutex::new(BusytokSettings::default()));
+        {
+            let db = db.lock().unwrap();
+            let now = now_ms();
+            db.conn()
+                .execute(
+                    "INSERT INTO audit_generations (generation_id, state, started_at_ms, is_active, \
+                     created_at_ms, updated_at_ms) \
+                     VALUES ('gen-multi-a', 'promoted', ?1, 0, ?1, ?1), \
+                            ('gen-multi-b', 'promoted', ?1, 0, ?1, ?1)",
+                    rusqlite::params![now],
+                )
+                .unwrap();
+        }
+        let mut pending: Vec<WriteCommand> = vec![
+            WriteCommand::TailBatch(TailBatchCommand {
+                source_id: "src-a".into(),
+                source_file_id: None,
+                source_file_agent: "claude_code".into(),
+                source_file_path: "/tmp/a.jsonl".into(),
+                source_file_inode: None,
+                events: vec![make_test_event("evt-a", 10, None)],
+                tool_events: vec![],
+                diagnostic_events: vec![],
+                codex_snapshots: vec![],
+                generation_id: "gen-multi-a".into(),
+                checkpoint_offset: None,
+                write_policy: UsageWritePolicy::InsertOnce,
+            }),
+            WriteCommand::TailBatch(TailBatchCommand {
+                source_id: "src-b".into(),
+                source_file_id: None,
+                source_file_agent: "claude_code".into(),
+                source_file_path: "/tmp/b.jsonl".into(),
+                source_file_inode: None,
+                events: vec![make_test_event("evt-b", 20, None)],
+                tool_events: vec![],
+                diagnostic_events: vec![],
+                codex_snapshots: vec![],
+                generation_id: "gen-multi-b".into(),
+                checkpoint_offset: None,
+                write_policy: UsageWritePolicy::InsertOnce,
+            }),
+        ];
+        flush_pending_batches(&db, &status, &event_bus, &settings, &mut pending).await;
+        assert!(pending.is_empty());
+        let db = db.lock().unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE id IN ('evt-a','evt-b')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── flush_single_generation invalid timezone fallback (lines 565-567) ─
+
+    #[tokio::test]
+    async fn flush_single_generation_invalid_timezone_falls_back_to_utc() {
+        // Covers lines 565-567: settings.timezone parse error → UTC fallback.
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let settings = Arc::new(Mutex::new(BusytokSettings::default()));
+        settings.lock().unwrap().timezone = "Mars/Olympus".to_string();
+        {
+            let db = db.lock().unwrap();
+            let now = now_ms();
+            db.conn()
+                .execute(
+                    "INSERT INTO audit_generations (generation_id, state, started_at_ms, is_active, \
+                     created_at_ms, updated_at_ms) \
+                     VALUES ('gen-tz-bad', 'promoted', ?1, 0, ?1, ?1)",
+                    rusqlite::params![now],
+                )
+                .unwrap();
+        }
+        let group = vec![WriteCommand::TailBatch(TailBatchCommand {
+            source_id: "src-tz".into(),
+            source_file_id: None,
+            source_file_agent: "claude_code".into(),
+            source_file_path: "/tmp/tz.jsonl".into(),
+            source_file_inode: None,
+            events: vec![make_test_event("evt-tz", 100, None)],
+            tool_events: vec![],
+            diagnostic_events: vec![],
+            codex_snapshots: vec![],
+            generation_id: "gen-tz-bad".into(),
+            checkpoint_offset: None,
+            write_policy: UsageWritePolicy::InsertOnce,
+        })];
+        flush_single_generation(&db, &status, &event_bus, &settings, group, "gen-tz-bad").await;
+        let db = db.lock().unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE id = 'evt-tz'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "event should be persisted despite bad timezone");
+    }
+
+    // ── emit_threshold_diagnostics queue paths (lines 1553-1588) ──────────
+
+    #[tokio::test]
+    async fn emit_threshold_diagnostics_queue_warning_fires() {
+        // Covers the Some("warning") branch.
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let mut rx = event_bus.subscribe();
+        let mut prev_queue_state: Option<String> = None;
+        let mut prev_lag_state: Option<String> = None;
+        emit_threshold_diagnostics(
+            &event_bus,
+            &db,
+            &status,
+            70, // above warning (64), below critical (96)
+            &mut prev_queue_state,
+            &mut prev_lag_state,
+        )
+        .await;
+        let evt = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event channel closed");
+        if let AppEvent::WriterQueueThreshold { severity, .. } = evt.event {
+            assert_eq!(severity, "warning");
+        } else {
+            panic!("expected WriterQueueThreshold event");
+        }
+        assert_eq!(prev_queue_state, Some("warning".to_string()));
+    }
+
+    #[tokio::test]
+    async fn emit_threshold_diagnostics_queue_critical_fires() {
+        // Covers the Some("critical") branch.
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let mut rx = event_bus.subscribe();
+        let mut prev_queue_state: Option<String> = None;
+        let mut prev_lag_state: Option<String> = None;
+        emit_threshold_diagnostics(
+            &event_bus,
+            &db,
+            &status,
+            100, // above critical (96)
+            &mut prev_queue_state,
+            &mut prev_lag_state,
+        )
+        .await;
+        let evt = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event channel closed");
+        if let AppEvent::WriterQueueThreshold { severity, .. } = evt.event {
+            assert_eq!(severity, "critical");
+        } else {
+            panic!("expected WriterQueueThreshold event");
+        }
+        assert_eq!(prev_queue_state, Some("critical".to_string()));
+    }
+
+    #[tokio::test]
+    async fn emit_threshold_diagnostics_queue_recovery_fires() {
+        // Covers the None branch (recovery from previous warning).
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let mut rx = event_bus.subscribe();
+        let mut prev_queue_state: Option<String> = Some("warning".to_string());
+        let mut prev_lag_state: Option<String> = None;
+        emit_threshold_diagnostics(
+            &event_bus,
+            &db,
+            &status,
+            0, // below all thresholds
+            &mut prev_queue_state,
+            &mut prev_lag_state,
+        )
+        .await;
+        let evt = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event channel closed");
+        if let AppEvent::WriterQueueThreshold { severity, .. } = evt.event {
+            assert!(
+                severity.starts_with("recovered_from_"),
+                "expected recovery severity, got: {severity}"
+            );
+        } else {
+            panic!("expected WriterQueueThreshold event");
+        }
+        assert_eq!(prev_queue_state, None);
+    }
+
+    #[tokio::test]
+    async fn emit_threshold_diagnostics_lag_recovery_fires_directly() {
+        // Covers the lag None branch (recovery from previous warning).
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let mut rx = event_bus.subscribe();
+        {
+            let mut snap = status.write().await;
+            snap.aggregate_lag_ms = 6_000;
+        }
+        let mut prev_queue_state: Option<String> = None;
+        let mut prev_lag_state: Option<String> = None;
+        // First call: triggers warning.
+        emit_threshold_diagnostics(
+            &event_bus,
+            &db,
+            &status,
+            0,
+            &mut prev_queue_state,
+            &mut prev_lag_state,
+        )
+        .await;
+        // Drain the warning event.
+        let _ = rx.try_recv();
+        // Now set lag to 0 — triggers recovery.
+        {
+            let mut snap = status.write().await;
+            snap.aggregate_lag_ms = 0;
+        }
+        emit_threshold_diagnostics(
+            &event_bus,
+            &db,
+            &status,
+            0,
+            &mut prev_queue_state,
+            &mut prev_lag_state,
+        )
+        .await;
+        let evt = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout waiting for event")
+            .expect("event channel closed");
+        if let AppEvent::WriterLagThreshold { severity, .. } = evt.event {
+            assert!(
+                severity.starts_with("recovered_from_"),
+                "expected recovery severity, got: {severity}"
+            );
+        } else {
+            panic!("expected WriterLagThreshold event");
+        }
+        assert_eq!(prev_lag_state, None);
+    }
+
+    // ── handle_log_source_upsert with active generation (lines 1276-1282) ─
+
+    #[tokio::test]
+    async fn handle_log_source_upsert_with_active_generation_refreshes_summary() {
+        let db = Database::open_in_memory().unwrap();
+        let now = now_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO audit_generations (generation_id, state, started_at_ms, is_active, \
+                 created_at_ms, updated_at_ms) VALUES ('gen-lsu', 'promoted', ?1, 1, ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let cmd = LogSourceUpsertCommand {
+            row: LogSourceRow {
+                id: "src-lsu".to_string(),
+                agent: "claude_code".to_string(),
+                source_type: "jsonl".to_string(),
+                root_path: "/tmp/lsu".to_string(),
+                configured_by_user: 1,
+                default_discovery_enabled: 1,
+                status: "active".to_string(),
+                last_scan_started_at_ms: Some(now),
+                last_scan_completed_at_ms: Some(now),
+                last_error: None,
+                first_seen_at_ms: now,
+                last_seen_at_ms: now,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        };
+        handle_log_source_upsert(&db, cmd).await.expect("upsert");
+        let db = db.lock().unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM source_health_summary \
+                 WHERE generation_id = 'gen-lsu' AND source_id = 'src-lsu'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "source_health_summary should be refreshed");
+    }
+
+    // ── handle_rebuild_rollups NoOp branch (lines 1427-1434) ──────────────
+
+    #[tokio::test]
+    async fn handle_rebuild_rollups_noop_when_no_events_and_no_active_gen() {
+        // Covers the NoOp branch: no active generation and no usage events.
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let status = Arc::new(tokio::sync::RwLock::new(ServiceStatusSnapshot::new()));
+        let event_bus = Arc::new(AppEventBus::new(8));
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let cmd = RebuildRollupsCommand {
+            timezone: "UTC".to_string(),
+            respond_tx,
+        };
+        handle_rebuild_rollups(&db, &event_bus, &status, cmd)
+            .await
+            .expect("should succeed");
+        let result = respond_rx.await.expect("response should be sent");
+        assert!(result.is_ok(), "NoOp should respond with Ok(())");
     }
 }
