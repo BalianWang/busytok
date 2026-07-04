@@ -1721,10 +1721,6 @@ pub struct ProfileDto {
     /// True if this is one of the 3 built-in profiles (pi/search-cheap, etc.).
     /// Derived by the service from `is_builtin_profile()` — not stored in config.
     pub is_builtin: bool,
-    /// Provider this profile runs on. None = unbound (delegate will reject).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    pub model: String,
     pub tools: Vec<String>,
     pub context_budget_tokens: u32,
     pub timeout_seconds: u64,
@@ -1735,9 +1731,6 @@ pub struct ProfileDto {
 #[serde(rename_all = "snake_case")]
 pub struct ProfileCreateRequestDto {
     pub id: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1748,16 +1741,11 @@ pub struct ProfileCreateRequestDto {
     pub write_access: Option<bool>,
 }
 
-/// Patch semantics: None = leave unchanged. For provider_id, Some("") = unbind.
+/// Patch semantics: None = leave unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProfileUpdateRequestDto {
     pub id: String,
-    /// Some("openai") = bind to openai; Some("") = unbind; None = unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2323,8 +2311,6 @@ mod tests {
         let dto = ProfileDto {
             id: "pi/search-cheap".to_string(),
             is_builtin: true,
-            provider_id: Some("deepseek-prod".to_string()),
-            model: "deepseek-chat".to_string(),
             tools: vec!["read".to_string(), "write".to_string()],
             context_budget_tokens: 8000,
             timeout_seconds: 30,
@@ -2334,7 +2320,6 @@ mod tests {
         // snake_case wire names.
         assert_eq!(json["id"], "pi/search-cheap");
         assert_eq!(json["is_builtin"], true);
-        assert_eq!(json["provider_id"], "deepseek-prod");
         assert_eq!(json["context_budget_tokens"], 8000);
         assert_eq!(json["timeout_seconds"], 30);
         assert_eq!(json["write_access"], false);
@@ -2342,38 +2327,34 @@ mod tests {
         let parsed: ProfileDto = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.id, "pi/search-cheap");
         assert!(parsed.is_builtin);
-        assert_eq!(parsed.provider_id.as_deref(), Some("deepseek-prod"));
         assert_eq!(parsed.tools, vec!["read".to_string(), "write".to_string()]);
     }
 
     #[test]
-    fn profile_dto_unbound_provider_omits_field() {
-        // Unbound profile: provider_id = None must be skipped on serialize.
+    fn profile_dto_has_no_provider_or_model_fields() {
+        // Profile downgrade: provider_id and model fields are gone — verifying
+        // that deserialization still succeeds when these fields are absent.
         let dto = ProfileDto {
             id: "draft".to_string(),
             is_builtin: false,
-            provider_id: None,
-            model: "gpt-4o".to_string(),
             tools: vec![],
             context_budget_tokens: 4096,
             timeout_seconds: 60,
             write_access: true,
         };
         let json = serde_json::to_value(&dto).unwrap();
+        // provider_id and model fields no longer exist on the wire.
         assert!(json.get("provider_id").is_none());
-        // Round-trips with provider_id absent in JSON.
+        assert!(json.get("model").is_none());
         let parsed: ProfileDto = serde_json::from_value(json).unwrap();
-        assert!(parsed.provider_id.is_none());
+        assert_eq!(parsed.id, "draft");
     }
 
     #[test]
     fn profile_create_request_dto_defaults_omitted_fields() {
-        // Only `id` and `model` are required; everything else is optional.
-        let minimal: ProfileCreateRequestDto =
-            serde_json::from_str(r#"{"id":"p","model":"m"}"#).unwrap();
+        // Only `id` is required; everything else is optional.
+        let minimal: ProfileCreateRequestDto = serde_json::from_str(r#"{"id":"p"}"#).unwrap();
         assert_eq!(minimal.id, "p");
-        assert_eq!(minimal.model, "m");
-        assert!(minimal.provider_id.is_none());
         assert!(minimal.tools.is_none());
         assert!(minimal.context_budget_tokens.is_none());
         assert!(minimal.timeout_seconds.is_none());
@@ -2381,8 +2362,6 @@ mod tests {
 
         let full = ProfileCreateRequestDto {
             id: "p2".to_string(),
-            model: "gpt-4o".to_string(),
-            provider_id: Some("openai".to_string()),
             tools: Some(vec!["read".to_string()]),
             context_budget_tokens: Some(16000),
             timeout_seconds: Some(120),
@@ -2390,38 +2369,32 @@ mod tests {
         };
         let json = serde_json::to_value(&full).unwrap();
         // Optional fields present when set.
-        assert_eq!(json["provider_id"], "openai");
         assert_eq!(json["context_budget_tokens"], 16000);
         assert_eq!(json["write_access"], true);
     }
 
     #[test]
     fn profile_update_request_dto_patch_semantics() {
-        // None = leave unchanged. Empty string on provider_id = unbind.
+        // None = leave unchanged. All fields optional.
         let patch = ProfileUpdateRequestDto {
             id: "p".to_string(),
-            provider_id: Some(String::new()), // unbind
-            model: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
             write_access: None,
         };
         let json = serde_json::to_value(&patch).unwrap();
-        assert_eq!(json["provider_id"], "");
         // None fields skipped.
-        assert!(json.get("model").is_none());
         assert!(json.get("tools").is_none());
         assert!(json.get("write_access").is_none());
 
         let parsed: ProfileUpdateRequestDto = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.provider_id.as_deref(), Some(""));
-        assert!(parsed.model.is_none());
+        assert!(parsed.tools.is_none());
 
         // Minimal patch with just an id is valid (no-op update).
         let noop: ProfileUpdateRequestDto = serde_json::from_str(r#"{"id":"p"}"#).unwrap();
         assert_eq!(noop.id, "p");
-        assert!(noop.provider_id.is_none());
+        assert!(noop.tools.is_none());
     }
 
     #[test]
@@ -2478,8 +2451,6 @@ mod tests {
             profiles: vec![ProfileDto {
                 id: "pi/search-cheap".to_string(),
                 is_builtin: true,
-                provider_id: Some("deepseek-prod".to_string()),
-                model: "deepseek-chat".to_string(),
                 tools: vec!["read".to_string()],
                 context_budget_tokens: 8000,
                 timeout_seconds: 30,

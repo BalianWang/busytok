@@ -164,7 +164,6 @@ impl SubagentManager {
                 "either prompt or prompt_artifact_ref must be set".to_string(),
             ));
         }
-        let profile_model = self.profile_model(&req.profile);
 
         // Spec §3.3: bound fields are conditionally required (create path
         // only). Both must be present or both absent — one without the other
@@ -295,7 +294,7 @@ impl SubagentManager {
                 session_reused: false,
                 status: TaskStatus::Queued,
                 profile: req.profile.clone(),
-                model: req.model_override.clone().or(profile_model),
+                model: req.model_override.clone(),
                 summary: None,
                 usage: TaskUsage::default(),
             });
@@ -305,7 +304,7 @@ impl SubagentManager {
         //    No lock held during execution. Task 7 Step 3: the post-insert
         //    execute logic is delegated to `execute_task()` so the background
         //    dispatcher can reuse it for queued tasks.
-        let model = req.model_override.clone().or(profile_model);
+        let model = req.model_override.clone();
         // The task row is already inserted as 'running' (Round 4 race-free
         // design). Reconstruct a `SubagentTaskRow` view to pass to
         // `execute_task` — the row is the single source of truth for execution
@@ -337,10 +336,9 @@ impl SubagentManager {
         let mut result = self.execute_task(&task_row, &subagent).await?;
         // `execute_task` returns the model it actually used (which may differ
         // from `model` when the task row's `model_override` is None and the
-        // subagent's `default_model` overrides the profile default). Preserve
-        // the model the caller expected when possible (synchronous path uses
-        // `req.model_override.or(profile_model)`); fall back to the
-        // `execute_task` value otherwise.
+        // subagent's `bound_model_id` is used). Preserve the model the caller
+        // expected when possible (synchronous path uses `req.model_override`);
+        // fall back to the `execute_task` value otherwise.
         if result.model.is_none() {
             result.model = model;
         }
@@ -370,8 +368,7 @@ impl SubagentManager {
         let model = task
             .model_override
             .clone()
-            .or_else(|| Some(subagent.bound_model_id.clone()))
-            .or_else(|| self.profile_model(&task.profile));
+            .or_else(|| Some(subagent.bound_model_id.clone()));
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -445,13 +442,13 @@ impl SubagentManager {
                 memory: snapshot,
                 context: compact,
                 write_access,
-                // Phase 3: thread the profile's `provider_id` so the
-                // WorkerPool (Task 2) can route to the correct per-provider
-                // supervisor. `None` here means the profile is unbound —
-                // Task 2 will reject this at the pool boundary. We read
-                // `profile_cfg.provider_id` (already fetched above) rather
-                // than re-resolving from settings.
-                provider_id: profile_cfg.and_then(|p| p.provider_id.clone()),
+                // Task 3 + Task 5: thread `subagent.bound_provider_id` so the
+                // WorkerPool can route to the correct per-provider supervisor.
+                // Profiles are now pure behavior templates (no provider_id) —
+                // provider/model binding is per-subagent (NOT NULL columns).
+                // Task 5 will replace this with a fully-threaded
+                // `ExecutorInput.provider_id` from the task/subagent path.
+                provider_id: Some(subagent.bound_provider_id.clone()),
             };
             (
                 input,
@@ -706,7 +703,7 @@ impl SubagentManager {
 
                 if let Some(task) = task {
                     // Resolve the subagent from the DB so we have the
-                    // canonical `repo_path`, `default_model`, etc.
+                    // canonical `repo_path`, `bound_provider_id`, etc.
                     let subagent = {
                         let db = manager.db.lock().expect("subagent db lock poisoned");
                         db.subagent_get_logical(&task.subagent_id)
@@ -1062,16 +1059,6 @@ impl SubagentManager {
             SubagentError::InvalidArgument("cwd is required when name is provided".to_string())
         })?;
         crate::resolver::lookup_by_name(db, name, cwd)
-    }
-
-    fn profile_model(&self, profile: &str) -> Option<String> {
-        match profile {
-            "pi/search-cheap" => Some(self.settings.models.default_cheap_model.clone()),
-            "pi/review-cheap" => Some(self.settings.models.default_review_model.clone()),
-            "pi/plan-cheap" => Some(self.settings.models.default_reasoning_model.clone()),
-            other => self.settings.profiles.get(other).map(|p| p.model.clone()),
-        }
-        .filter(|m| !m.is_empty())
     }
 
     /// Whether `profile` is a recognized profile name (built-in or configured).

@@ -258,12 +258,8 @@ impl Database {
     ) -> anyhow::Result<busytok_domain::Provider> {
         crate::provider_catalog::update_provider(&self.conn, id, patch)
     }
-    pub fn delete_provider(
-        &self,
-        id: &str,
-        profile_refs: &[busytok_domain::ProfileModelRef],
-    ) -> anyhow::Result<()> {
-        crate::provider_catalog::delete_provider(&self.conn, id, profile_refs)
+    pub fn delete_provider(&self, id: &str) -> anyhow::Result<()> {
+        crate::provider_catalog::delete_provider(&self.conn, id)
     }
     pub fn get_provider_with_secret(
         &self,
@@ -287,12 +283,8 @@ impl Database {
     ) -> anyhow::Result<busytok_domain::Model> {
         crate::provider_catalog::update_model(&self.conn, id, patch)
     }
-    pub fn delete_model(
-        &self,
-        id: &str,
-        profile_refs: &[busytok_domain::ProfileModelRef],
-    ) -> anyhow::Result<()> {
-        crate::provider_catalog::delete_model(&self.conn, id, profile_refs)
+    pub fn delete_model(&self, id: &str) -> anyhow::Result<()> {
+        crate::provider_catalog::delete_model(&self.conn, id)
     }
     pub fn get_model_by_id(&self, id: &str) -> anyhow::Result<Option<busytok_domain::Model>> {
         crate::provider_catalog::get_model_by_id(&self.conn, id)

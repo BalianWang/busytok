@@ -3,8 +3,7 @@ use anyhow::{anyhow, bail, Result};
 // `pub use` so lib.rs can re-export `ModelCatalogEntry` / `ModelCatalogFilter`
 // (and the rest of the catalog types) from `busytok_store::provider_catalog`.
 pub use busytok_domain::{
-    Model, ModelCatalogEntry, ModelCatalogFilter, ModelTag, ProfileModelRef, Provider,
-    ProviderKind, ProviderSummary,
+    Model, ModelCatalogEntry, ModelCatalogFilter, ModelTag, Provider, ProviderKind, ProviderSummary,
 };
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tracing::{debug, info};
@@ -145,18 +144,7 @@ pub fn update_provider(
         .ok_or_else(|| anyhow!("provider {} not found after update", id))
 }
 
-pub fn delete_provider(
-    conn: &Connection,
-    id: &str,
-    profile_refs: &[ProfileModelRef],
-) -> Result<()> {
-    if provider_has_profile_references(id, profile_refs) {
-        let count = profile_refs.iter().filter(|r| r.provider_id == id).count();
-        bail!(
-            "cannot delete provider: {} profile(s) still reference it",
-            count
-        );
-    }
+pub fn delete_provider(conn: &Connection, id: &str) -> Result<()> {
     let rows = conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
     if rows == 0 {
         bail!("provider not found: {}", id);
@@ -288,11 +276,8 @@ pub fn update_model(conn: &Connection, id: &str, patch: UpdateModelPatch) -> Res
     get_model_by_id(conn, id)?.ok_or_else(|| anyhow!("model {} not found after update", id))
 }
 
-pub fn delete_model(conn: &Connection, id: &str, profile_refs: &[ProfileModelRef]) -> Result<()> {
+pub fn delete_model(conn: &Connection, id: &str) -> Result<()> {
     let model = get_model_by_id(conn, id)?.ok_or_else(|| anyhow!("model not found: {}", id))?;
-    if model_has_profile_references(&model.provider_id, &model.model_id, profile_refs) {
-        bail!("cannot delete model: profile(s) still reference it");
-    }
     let rows = conn.execute("DELETE FROM models WHERE id = ?1", params![id])?;
     if rows == 0 {
         bail!("model not found: {}", id);
@@ -479,21 +464,6 @@ pub fn set_model_tags(conn: &Connection, model_id: &str, tags: &[String]) -> Res
     )?;
     tx.commit()?;
     Ok(())
-}
-
-// ── Profile reference checks (blocking deletes) ────────────────────────
-
-pub fn provider_has_profile_references(provider_id: &str, refs: &[ProfileModelRef]) -> bool {
-    refs.iter().any(|r| r.provider_id == provider_id)
-}
-
-pub fn model_has_profile_references(
-    provider_id: &str,
-    model_id: &str,
-    refs: &[ProfileModelRef],
-) -> bool {
-    refs.iter()
-        .any(|r| r.provider_id == provider_id && r.model_id == model_id)
 }
 
 // ── Row mappers ────────────────────────────────────────────────────────

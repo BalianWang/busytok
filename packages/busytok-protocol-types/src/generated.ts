@@ -411,18 +411,10 @@ export type ProfileDto = { id: string,
  * True if this is one of the 3 built-in profiles (pi/search-cheap, etc.).
  * Derived by the service from `is_builtin_profile()` — not stored in config.
  */
-is_builtin: boolean, 
-/**
- * Provider this profile runs on. None = unbound (delegate will reject).
- */
-provider_id: string | null, model: string, tools: Array<string>, context_budget_tokens: number, timeout_seconds: number, write_access: boolean, };
+is_builtin: boolean, tools: Array<string>, context_budget_tokens: number, timeout_seconds: number, write_access: boolean, };
 
-export type ProfileCreateRequestDto = { id: string, model: string, provider_id: string | null, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
+export type ProfileCreateRequestDto = { id: string, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
 
-export type ProfileUpdateRequestDto = { id: string, 
-/**
- * Some("openai") = bind to openai; Some("") = unbind; None = unchanged.
- */
-provider_id: string | null, model: string | null, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
+export type ProfileUpdateRequestDto = { id: string, tools: Array<string> | null, context_budget_tokens: number | null, timeout_seconds: number | null, write_access: boolean | null, };
 
 export type ProfileDeleteRequestDto = { id: string, };

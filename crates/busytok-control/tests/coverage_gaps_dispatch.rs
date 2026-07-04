@@ -125,8 +125,6 @@ fn stub_profile_dto() -> ProfileDto {
     ProfileDto {
         id: "prof-stub".to_string(),
         is_builtin: false,
-        provider_id: None,
-        model: "stub-model".to_string(),
         tools: vec![],
         context_budget_tokens: 8000,
         timeout_seconds: 60,
@@ -510,7 +508,7 @@ async fn dispatcher_routes_profile_create_returns_ok() {
     // Covers dispatch.rs line 577.
     let runtime = success_runtime().await;
     let dispatcher = ControlDispatcher::new(runtime);
-    let params = serde_json::json!({"id": "prof1", "model": "m"});
+    let params = serde_json::json!({"id": "prof1"});
     let response = dispatcher
         .dispatch(ControlRequest::new("profile.create", params))
         .await
@@ -519,7 +517,6 @@ async fn dispatcher_routes_profile_create_returns_ok() {
     match response {
         ControlResponse::Ok(val) => {
             assert_eq!(val["id"], "prof-stub");
-            assert_eq!(val["model"], "stub-model");
             assert_eq!(val["is_builtin"], false);
             assert_eq!(val["write_access"], false);
         }
@@ -1219,8 +1216,6 @@ async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
     let _ = rt
         .profile_create(ProfileCreateRequestDto {
             id: "prof1".to_string(),
-            model: "m1".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -1230,8 +1225,6 @@ async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
     let _ = rt
         .profile_update(ProfileUpdateRequestDto {
             id: "prof1".to_string(),
-            provider_id: None,
-            model: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,

@@ -1092,14 +1092,11 @@ impl BusytokSupervisor {
         //      865-870). Extract all settings-derived values BEFORE any
         //      `.await` — `self.settings` is a `std::sync::Mutex` and holding
         //      its guard across `.await` (protocol_version probe below) is
-        //      forbidden. `runtime_dir` and `models` are cloned out as owned
-        //      values so the lock is released before the protocol probe.
-        let (runtime_dir, models) = {
+        //      forbidden. `runtime_dir` is cloned out as an owned value so
+        //      the lock is released before the protocol probe.
+        let runtime_dir = {
             let settings = self.settings.lock().unwrap();
-            (
-                settings.subagent.pi_sidecar.runtime_dir.clone(),
-                settings.subagent.models.clone(),
-            )
+            settings.subagent.pi_sidecar.runtime_dir.clone()
         };
         let runtime_dir_ref = runtime_dir.as_deref();
 
@@ -1273,32 +1270,10 @@ impl BusytokSupervisor {
             });
         }
 
-        // 7. Default model config valid (spec §7.1 line 868).
-        {
-            let empty_fields: Vec<&str> = [
-                ("default_cheap_model", &models.default_cheap_model),
-                ("default_review_model", &models.default_review_model),
-                ("default_reasoning_model", &models.default_reasoning_model),
-                ("default_coder_model", &models.default_coder_model),
-            ]
-            .iter()
-            .filter(|(_, v)| v.is_empty())
-            .map(|(k, _)| *k)
-            .collect();
-            let ok = empty_fields.is_empty();
-            let detail = if ok {
-                "all 4 default models configured".to_string()
-            } else {
-                format!("empty model fields: {}", empty_fields.join(", "))
-            };
-            checks.push(DoctorCheckDto {
-                name: "default_model_config".into(),
-                status: if ok { "ok" } else { "error" }.into(),
-                detail: Some(detail),
-            });
-        }
-
-        // 8. Pi runtime installed (spec §7.1 line 869).
+        // 7. Pi runtime installed (spec §7.1 line 869).
+        //    (Task 3 removed the `default_model_config` doctor check —
+        //    `SubagentModelsConfig` was deleted; provider/model binding is
+        //    now per-subagent via SQL catalog, validated at delegate time.)
         {
             let node_path = self.paths.sidecar_bundled_node_path(runtime_dir_ref);
             let bundle_path = self.paths.sidecar_bundle_path(runtime_dir_ref);
@@ -1857,31 +1832,6 @@ impl BusytokSupervisor {
     /// `pi_sidecar_locator_update`, `profile_*`).
     pub fn settings_for_test(&self) -> Arc<Mutex<BusytokSettings>> {
         Arc::clone(&self.settings)
-    }
-
-    /// Collect (provider_id, model_id) references from `settings.subagent.profiles`.
-    /// Used by `provider_delete` / `model_delete` for blocking-delete checks.
-    /// Profiles still live in TOML (they're user-facing config, not catalog
-    /// data), so the store layer can't collect them itself — this helper
-    /// bridges the config layer to the store's reference-check functions.
-    /// Skips profiles with no `provider_id` or an empty `model`.
-    fn collect_profile_refs(&self) -> Vec<busytok_domain::ProfileModelRef> {
-        let settings = self.settings.lock().unwrap();
-        settings
-            .subagent
-            .profiles
-            .values()
-            .filter_map(|p| {
-                let pid = p.provider_id.as_ref()?;
-                if p.model.is_empty() {
-                    return None;
-                }
-                Some(busytok_domain::ProfileModelRef {
-                    provider_id: pid.clone(),
-                    model_id: p.model.clone(),
-                })
-            })
-            .collect()
     }
 
     /// Access the resolved filesystem paths.
@@ -5417,65 +5367,13 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: busytok_protocol::dto::SubagentDelegateRequestDto,
     ) -> Result<SubagentDelegateResponseDto> {
-        // Phase 3 Task 4: provider whitelist validation (spec §3.4, M2 fix).
-        // Only validate when the sidecar pool is wired — when the sidecar is
-        // disabled (mock executor) or config resolution failed
-        // (FailingTaskExecutor), validation is skipped because no real
-        // provider routing happens. This keeps the legacy mock-delegate tests
-        // (which use unbound built-in profiles) working unchanged.
-        //
-        // Spec §3.4: the profile's `provider_id` must refer to an enabled
-        // provider, AND `profile.model` must be in that provider's `models`
-        // whitelist. Failures return a validation error BEFORE the manager
-        // inserts a task row — so no DB write happens for rejected delegates.
-        if self.worker_pool().is_some() {
-            let (profile_provider, profile_model) = {
-                let settings = self.settings.lock().unwrap();
-                let profile_cfg = settings.subagent.profiles.get(&req.profile);
-                match profile_cfg {
-                    Some(p) => (p.provider_id.clone(), p.model.clone()),
-                    None => {
-                        return Err(anyhow::anyhow!("profile not found: {}", req.profile));
-                    }
-                }
-            };
-            if let Some(provider_id) = profile_provider.as_deref() {
-                // SQL-backed provider + model whitelist validation.
-                let (provider_enabled, model_ok) = {
-                    let db = self.db.lock().unwrap();
-                    let provider = db
-                        .get_provider_with_secret(provider_id)?
-                        .ok_or_else(|| anyhow::anyhow!("provider not found: {}", provider_id))?;
-                    let model_ok = if profile_model.is_empty() {
-                        false
-                    } else {
-                        db.get_model_by_provider_and_model_id(provider_id, &profile_model)?
-                            .map(|m| m.enabled)
-                            .unwrap_or(false)
-                    };
-                    (provider.enabled, model_ok)
-                };
-                if !provider_enabled {
-                    anyhow::bail!("provider disabled: {}", provider_id);
-                }
-                // Model whitelist (spec §3.4). Empty `profile.model` is
-                // treated as a whitelist violation — the sidecar would have
-                // no model to send.
-                if !model_ok {
-                    anyhow::bail!(
-                        "model '{}' not in provider '{}' whitelist",
-                        profile_model,
-                        provider_id
-                    );
-                }
-            } else {
-                // Profile has no provider_id bound. When the sidecar is
-                // enabled, the executor's `ensure_worker(provider_id)` would
-                // fail with "no provider_id" — surface the validation error
-                // here for a clearer message.
-                anyhow::bail!("profile not bound to a provider");
-            }
-        }
+        // Task 3: Profile downgrade — profiles no longer carry provider_id /
+        // model, so the whitelist validation block (former Phase 3 Task 4)
+        // is gone. The new validation chain (Task 6) will use
+        // `bound_provider_id` + `effective_model_id` from the DTO + subagent.
+        // For now, the handler forwards to `subagent_manager().delegate()`
+        // with `(None, None)` for bound fields (INTERIM until Task 4 wires
+        // the DTO bound-fields path through `SubagentDelegateRequestDto`).
 
         // Phase 3 Task 5: capture cwd before `req` is consumed by
         // `delegate_request_from_dto`, then bridge the subagent task's usage
@@ -5484,41 +5382,13 @@ impl RuntimeControl for BusytokSupervisor {
         // fail the task (the task result is already persisted; usage is
         // best-effort observability).
         let cwd = req.cwd.clone();
-        // INTERIM (Task 2): resolve bound fields from the profile config so
-        // the create path can validate provider + model. Task 4 replaces
-        // this by reading bound fields directly from the DTO.
-        //
-        // Spec §3.3 "both or neither": when the profile lacks either a
-        // provider_id or a model, pass (None, None) so the manager's
-        // bound-pair check passes and the resolver skips validation
-        // (both-absent branch). Only thread real values through when both
-        // are present.
-        let (bound_provider_id, bound_model_id) = {
-            let settings = self.settings.lock().unwrap();
-            let profile_cfg = settings.subagent.profiles.get(&req.profile);
-            match profile_cfg {
-                Some(p) => {
-                    let provider = p.provider_id.clone();
-                    let model = if p.model.is_empty() {
-                        None
-                    } else {
-                        Some(p.model.clone())
-                    };
-                    match (provider, model) {
-                        (Some(pid), Some(mid)) => (Some(pid), Some(mid)),
-                        _ => (None, None),
-                    }
-                }
-                None => (None, None),
-            }
-        };
+        // INTERIM (Task 3): pass `(None, None)` for bound fields — the real
+        // bound fields will come from `SubagentDelegateRequestDto` once Task 4
+        // adds them to the DTO. The manager's bound-pair check accepts the
+        // both-absent branch, so the create path skips validation.
         let r = self
             .subagent_manager()
-            .delegate(delegate_request_from_dto(
-                req,
-                bound_provider_id,
-                bound_model_id,
-            ))
+            .delegate(delegate_request_from_dto(req, None, None))
             .await
             .map_err(map_subagent_error)?;
         // Only bridge usage for completed/failed tasks — queued tasks have
@@ -5901,15 +5771,14 @@ impl RuntimeControl for BusytokSupervisor {
     }
 
     async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()> {
-        // SQL-backed delete with blocking profile-reference check.
-        // collect_profile_refs walks settings.subagent.profiles and collects
-        // (provider_id, model_id) pairs — the store layer rejects the delete
-        // if any profile references this provider. No auto-unbind: the caller
-        // must unbind profiles before deleting.
-        let profile_refs = self.collect_profile_refs();
+        // SQL-backed delete with "allow delete, dangling binding" semantics.
+        // Per Task 3 spec §7.5: deleting a provider is always allowed even if
+        // subagents still reference it via `bound_provider_id`. The resulting
+        // dangling binding is reported at delegate time (fail-fast) — no
+        // implicit unbind, no auto-rebind.
         {
             let db = self.db.lock().unwrap();
-            db.delete_provider(&req.id, &profile_refs).map_err(|e| {
+            db.delete_provider(&req.id).map_err(|e| {
                 tracing::error!(event_code = "provider.sql_write_failed", provider_id = %req.id, error = %e, "delete_provider failed");
                 e
             })?;
@@ -6192,14 +6061,13 @@ impl RuntimeControl for BusytokSupervisor {
     }
 
     async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()> {
-        // Blocking delete: collect profile refs from settings (profiles still
-        // live in TOML) and pass them to the store. The store rejects the
-        // delete if any profile references this (provider_id, model_id) — no
-        // auto-unbind. The caller must unbind profiles first.
-        let profile_refs = self.collect_profile_refs();
+        // "Allow delete, dangling binding" semantics: deleting a model is
+        // always allowed even if subagents still reference it via
+        // `bound_model_id`. The dangling binding is reported at delegate
+        // time (fail-fast) — no auto-unbind, no implicit rebinding.
         {
             let db = self.db.lock().unwrap();
-            db.delete_model(&req.id, &profile_refs).map_err(|e| {
+            db.delete_model(&req.id).map_err(|e| {
                 tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "delete_model failed");
                 e
             })?;
@@ -6347,10 +6215,6 @@ impl RuntimeControl for BusytokSupervisor {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "invalid_id_format", "profile id must contain only [a-z0-9/_-]+");
             anyhow::bail!("profile id must contain only [a-z0-9/_-]+");
         }
-        if req.model.is_empty() {
-            tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
-            anyhow::bail!("model must not be empty");
-        }
 
         let mut pending = {
             let settings = self.settings.lock().unwrap();
@@ -6361,43 +6225,15 @@ impl RuntimeControl for BusytokSupervisor {
             anyhow::bail!("profile already exists: {}", req.id);
         }
 
-        // If provider_id is specified, validate the provider exists and is
-        // enabled in the SQL catalog, and the model is in the provider's
-        // model whitelist (SQL `models` table).
-        if let Some(ref pid) = req.provider_id {
-            let (provider_enabled, model_ok) = {
-                let db = self.db.lock().unwrap();
-                let provider = db.get_provider_with_secret(pid)
-                    .map_err(|e| {
-                        tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, error = %e, "provider lookup failed");
-                        e
-                    })?
-                    .ok_or_else(|| {
-                        tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
-                        anyhow::anyhow!("provider not found: {}", pid)
-                    })?;
-                let model = db.get_model_by_provider_and_model_id(pid, &req.model)?;
-                (provider.enabled, model.map(|m| m.enabled).unwrap_or(false))
-            };
-            if !provider_enabled {
-                tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
-                anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
-            }
-            if !model_ok {
-                tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, model = %req.model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                anyhow::bail!(
-                    "model '{}' is not in provider '{}'s model whitelist",
-                    req.model,
-                    pid
-                );
-            }
-        }
-
+        // Task 3: Profile downgrade — provider_id / model fields are gone from
+        // `SubagentProfileConfig`. Provider/model binding is now per-subagent
+        // via SQL catalog (`subagent.bound_provider_id` / `bound_model_id`),
+        // so the create path no longer validates a provider whitelist. The
+        // new validation chain (Task 6) will validate bound fields at the
+        // delegate path.
         let profile = busytok_config::SubagentProfileConfig {
             write_access: req.write_access.unwrap_or(false),
             tools: req.tools.unwrap_or_default(),
-            model: req.model,
-            provider_id: req.provider_id,
             context_budget_tokens: req.context_budget_tokens.unwrap_or(3000),
             timeout_seconds: req.timeout_seconds.unwrap_or(120),
         };
@@ -6428,83 +6264,11 @@ impl RuntimeControl for BusytokSupervisor {
                 anyhow::anyhow!("profile not found: {}", req.id)
             })?;
 
-        // Handle provider_id patch: Some("") = unbind, Some("x") = bind, None = unchanged.
-        if let Some(ref pid) = req.provider_id {
-            let new_provider_id = if pid.is_empty() {
-                None
-            } else {
-                // Validate the new provider exists and is enabled (SQL catalog).
-                let provider_enabled = {
-                    let db = self.db.lock().unwrap();
-                    let provider = db.get_provider_with_secret(pid)
-                        .map_err(|e| {
-                            tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, error = %e, "provider lookup failed");
-                            e
-                        })?
-                        .ok_or_else(|| {
-                            tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
-                            anyhow::anyhow!("provider not found: {}", pid)
-                        })?;
-                    provider.enabled
-                };
-                if !provider_enabled {
-                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
-                    anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
-                }
-                Some(pid.clone())
-            };
-            // If binding to a provider (new or same), validate the effective
-            // model against that provider's whitelist (SQL models table).
-            // Skipped when model is also being updated this call — the model
-            // block below will validate.
-            if let Some(ref new_pid) = new_provider_id {
-                if req.model.is_none() {
-                    let effective_model = profile.model.clone();
-                    let model_ok = {
-                        let db = self.db.lock().unwrap();
-                        db.get_model_by_provider_and_model_id(new_pid, &effective_model)?
-                            .map(|m| m.enabled)
-                            .unwrap_or(false)
-                    };
-                    if !model_ok {
-                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                        anyhow::bail!(
-                            "model '{}' is not in provider '{}'s model whitelist",
-                            effective_model,
-                            new_pid
-                        );
-                    }
-                }
-            }
-            profile.provider_id = new_provider_id;
-        }
-
-        // Handle model patch: validate non-empty first (mirrors profile_create),
-        // then whitelist-check against the bound provider if any (SQL models table).
-        if let Some(ref model) = req.model {
-            if model.is_empty() {
-                tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
-                anyhow::bail!("model must not be empty");
-            }
-            if let Some(ref pid) = profile.provider_id {
-                let model_ok = {
-                    let db = self.db.lock().unwrap();
-                    db.get_model_by_provider_and_model_id(pid, model)?
-                        .map(|m| m.enabled)
-                        .unwrap_or(false)
-                };
-                if !model_ok {
-                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                    anyhow::bail!(
-                        "model '{}' is not in provider '{}'s model whitelist",
-                        model,
-                        pid
-                    );
-                }
-            }
-            profile.model = model.clone();
-        }
-
+        // Task 3: Profile downgrade — only behavior-template fields are
+        // patchable. provider_id / model patches are no longer supported
+        // (those fields no longer exist on `SubagentProfileConfig`). Provider
+        // and model binding is per-subagent and mutated via the subagent
+        // binding RPCs (Task 6), not via profile updates.
         if let Some(tools) = req.tools {
             profile.tools = tools;
         }
@@ -6680,20 +6444,6 @@ fn catalog_entry_to_dto_ref(e: &busytok_domain::ModelCatalogEntry) -> ModelCatal
     catalog_entry_to_dto(e.clone())
 }
 
-/// Extracts the provider_id from a profile config (Phase 3 Task 4).
-///
-/// Single source of truth for "which provider does this profile run on?".
-/// Used by:
-/// - `subagent_delegate` (validation before delegating + whitelist check);
-/// - `collect_profile_refs` (builds the reference list for blocking deletes).
-///
-/// Returns `None` for unbound profiles (built-in defaults ship unbound;
-/// Phase 4 adds the UI that lets users set it). Caller decides whether
-/// `None` is an error (delegate path: yes; delete path: just skip).
-fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Option<String> {
-    profile.provider_id.clone()
-}
-
 /// Maps a `SubagentProfileConfig` (settings-layer type) to a `ProfileDto`
 /// (wire type). Mirrors `provider_to_dto` pattern.
 ///
@@ -6701,15 +6451,15 @@ fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Optio
 /// — not stored in config. This is the single mapping point; both
 /// `settings_snapshot` and `profile_create`/`profile_update` use it.
 ///
-/// `provider_id` is extracted via the existing `profile_provider_id()`
-/// helper (supervisor.rs:5719) — the single source of truth for provider
-/// extraction, already used by `provider_delete`'s reference check.
+/// Task 3: Profile downgrade — provider_id / model fields are gone from
+/// both `SubagentProfileConfig` and `ProfileDto`. The DTO now exposes only
+/// behavior-template fields (tools / context_budget_tokens / timeout_seconds
+/// / write_access). Provider/model binding is per-subagent and surfaced via
+/// the subagent detail DTO, not the profile DTO.
 fn profile_to_dto(name: &str, profile: &busytok_config::SubagentProfileConfig) -> ProfileDto {
     ProfileDto {
         id: name.to_string(),
         is_builtin: busytok_config::is_builtin_profile(name),
-        provider_id: profile_provider_id(profile),
-        model: profile.model.clone(),
         tools: profile.tools.clone(),
         context_budget_tokens: profile.context_budget_tokens,
         timeout_seconds: profile.timeout_seconds,
@@ -7170,46 +6920,16 @@ mod tests {
     // ── profile helpers ───────────────────────────────────────────────
 
     #[test]
-    fn profile_provider_id_returns_bound_provider() {
-        let bound = busytok_config::SubagentProfileConfig {
-            write_access: false,
-            tools: vec![],
-            model: "gpt-5".to_string(),
-            context_budget_tokens: 1000,
-            timeout_seconds: 30,
-            provider_id: Some("prov-1".to_string()),
-        };
-        assert_eq!(profile_provider_id(&bound).as_deref(), Some("prov-1"));
-    }
-
-    #[test]
-    fn profile_provider_id_returns_none_for_unbound() {
-        let unbound = busytok_config::SubagentProfileConfig {
-            write_access: false,
-            tools: vec![],
-            model: String::new(),
-            context_budget_tokens: 1000,
-            timeout_seconds: 30,
-            provider_id: None,
-        };
-        assert!(profile_provider_id(&unbound).is_none());
-    }
-
-    #[test]
     fn profile_to_dto_marks_builtin_profiles_and_forwards_fields() {
         let profile = busytok_config::SubagentProfileConfig {
             write_access: true,
             tools: vec!["read".to_string()],
-            model: "gpt-5".to_string(),
             context_budget_tokens: 4000,
             timeout_seconds: 120,
-            provider_id: Some("prov-1".to_string()),
         };
         // Built-in profile name (shipped by default_profiles).
         let dto = profile_to_dto("pi/search-cheap", &profile);
         assert!(dto.is_builtin);
-        assert_eq!(dto.provider_id.as_deref(), Some("prov-1"));
-        assert_eq!(dto.model, "gpt-5");
         assert!(dto.write_access);
         assert_eq!(dto.tools, vec!["read"]);
         assert_eq!(dto.context_budget_tokens, 4000);
@@ -7221,14 +6941,11 @@ mod tests {
         let profile = busytok_config::SubagentProfileConfig {
             write_access: false,
             tools: vec![],
-            model: String::new(),
             context_budget_tokens: 1000,
             timeout_seconds: 30,
-            provider_id: None,
         };
         let dto = profile_to_dto("my-custom-profile", &profile);
         assert!(!dto.is_builtin);
-        assert!(dto.provider_id.is_none());
     }
 
     // ── to_store_exact_windows ────────────────────────────────────────

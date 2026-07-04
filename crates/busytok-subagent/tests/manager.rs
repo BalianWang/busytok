@@ -1189,9 +1189,10 @@ async fn delegate_executor_generic_error_wrapped_as_store() {
     );
 }
 
-/// When profile model is empty + no model_override + fresh subagent,
-/// execute_task resolves the model from `subagent.bound_model_id` (spec §3.3:
-/// bound_model_id is the authoritative fallback after model_override).
+/// When no model_override + fresh subagent, execute_task resolves the model
+/// from `subagent.bound_model_id` (spec §3.3: bound_model_id is the
+/// authoritative source after model_override; profiles no longer carry a
+/// model).
 #[tokio::test]
 async fn delegate_sets_model_when_execute_task_returns_none() {
     let _guard = install_tracing();
@@ -1201,10 +1202,8 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         SubagentProfileConfig {
             write_access: false,
             tools: vec![],
-            model: String::new(), // empty → profile_model returns None
             context_budget_tokens: 3000,
             timeout_seconds: 120,
-            provider_id: None,
         },
     );
     let db = test_db();

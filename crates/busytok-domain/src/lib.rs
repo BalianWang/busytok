@@ -33,8 +33,7 @@ pub use identity::{
     normalize_project_path, IdentityError, MetadataFingerprint,
 };
 pub use provider_catalog::{
-    Model, ModelCatalogEntry, ModelCatalogFilter, ModelTag, ProfileModelRef, Provider,
-    ProviderKind, ProviderSummary,
+    Model, ModelCatalogEntry, ModelCatalogFilter, ModelTag, Provider, ProviderKind, ProviderSummary,
 };
 pub use time::now_ms;
 pub use timezone::{

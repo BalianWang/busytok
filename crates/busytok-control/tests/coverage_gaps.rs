@@ -477,8 +477,6 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
     let _ = runtime
         .profile_create(ProfileCreateRequestDto {
             id: "prof1".to_string(),
-            model: "m".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -488,8 +486,6 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
     let _ = runtime
         .profile_update(ProfileUpdateRequestDto {
             id: "prof1".to_string(),
-            provider_id: None,
-            model: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,

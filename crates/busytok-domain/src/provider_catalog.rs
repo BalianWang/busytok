@@ -104,15 +104,6 @@ pub struct ModelCatalogFilter {
     pub include_disabled: bool,
 }
 
-/// Profile → model reference snapshot. Collected from settings.toml profiles
-/// and passed to store-layer reference-check functions. Keeps store layer
-/// decoupled from config layer.
-#[derive(Debug, Clone)]
-pub struct ProfileModelRef {
-    pub provider_id: String,
-    pub model_id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use busytok_config::{SubagentResourcePolicyConfig, SubagentSettings};
-use busytok_store::Database;
+use busytok_domain::ProviderKind;
+use busytok_store::{CreateModelReq, CreateProviderReq, Database};
 use busytok_subagent::mock_executor::TaskExecutor;
 use busytok_subagent::models::DelegateRequest;
 use busytok_subagent::pressure::{PressureGate, PressureResponder};
@@ -16,9 +17,6 @@ use busytok_subagent::sidecar::{
     PiSidecarSupervisor, ProviderRuntimeEntry, ResponderFactory, WorkerPool,
 };
 use busytok_subagent::SubagentManager;
-
-/// The test provider ID used by the pool-based test.
-const TEST_PROVIDER_ID: &str = "test-prov";
 
 fn mock_sidecar_script() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -86,12 +84,12 @@ fn mock_sidecar_config() -> SidecarConfig {
 /// Build the provider runtime entries map (Task 7: replaces the old
 /// `ProviderLookup` + `CredentialReader` closures). The pool injects
 /// `OPENAI_API_KEY` / `OPENAI_BASE_URL` from this entry at spawn time.
-fn make_providers() -> HashMap<String, ProviderRuntimeEntry> {
+fn make_providers(provider_id: &str) -> HashMap<String, ProviderRuntimeEntry> {
     let mut map = HashMap::new();
     map.insert(
-        TEST_PROVIDER_ID.to_string(),
+        provider_id.to_string(),
         ProviderRuntimeEntry {
-            provider_id: TEST_PROVIDER_ID.to_string(),
+            provider_id: provider_id.to_string(),
             api_key: "test-key".to_string(),
             base_url: "https://test.example.com/v1".to_string(),
         },
@@ -125,20 +123,37 @@ fn make_responder_factory(
     (factory, holder)
 }
 
-/// Build `SubagentSettings` with the `pi/search-cheap` profile bound to
-/// `TEST_PROVIDER_ID` so `SubagentManager::delegate` threads a non-`None`
-/// `provider_id` into `ExecutorInput` (required by the pool-based executor).
-fn settings_with_test_provider() -> SubagentSettings {
-    let mut settings = SubagentSettings::default();
-    settings
-        .profiles
-        .get_mut("pi/search-cheap")
-        .expect("default profiles must include pi/search-cheap")
-        .provider_id = Some(TEST_PROVIDER_ID.to_string());
-    settings
+/// Seed a provider + model into the DB and return `(provider_id, model_id)`.
+/// Profiles are now pure behavior templates (no `provider_id`), so binding
+/// flows per-subagent via `DelegateRequest.bound_provider_id` /
+/// `bound_model_id`. The resolver validates these against the provider/model
+/// catalog on the create path, so the test must seed real rows.
+fn seed_provider_model(db: &Database) -> (String, String) {
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "P1".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .unwrap();
+    (provider.id, model.model_id)
 }
 
-fn req(name: &str, prompt: &str) -> DelegateRequest {
+fn req(name: &str, prompt: &str, provider_id: &str, model_id: &str) -> DelegateRequest {
     DelegateRequest {
         subagent_name: name.to_string(),
         subagent_id: None,
@@ -151,8 +166,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
-        bound_provider_id: None,
-        bound_model_id: None,
+        bound_provider_id: Some(provider_id.to_string()),
+        bound_model_id: Some(model_id.to_string()),
     }
 }
 
@@ -160,13 +175,20 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
 async fn sidecar_shutdown_kills_subprocess_then_restart_works() {
     let db = Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
 
+    // Seed a provider + model so `resolve_by_name` validation succeeds on the
+    // create path (binding is now per-subagent, validated against the catalog).
+    let (provider_id, model_id) = {
+        let db_lock = db.lock().expect("db lock poisoned");
+        seed_provider_model(&db_lock)
+    };
+
     // Build a pool + executor + supervisor via the two-phase bootstrap
     // (mirrors production wiring in `construct_sidecar`).
     let gate = Arc::new(PressureGate::new());
     let pool = Arc::new(WorkerPool::new(
         mock_sidecar_config(),
         Some(Arc::clone(&db)),
-        make_providers(),
+        make_providers(&provider_id),
         Some(Arc::clone(&gate)),
         SubagentResourcePolicyConfig::default(),
     ));
@@ -177,26 +199,28 @@ async fn sidecar_shutdown_kills_subprocess_then_restart_works() {
     let (factory, _holder) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&executor));
     pool.set_responder_factory(factory);
     let supervisor = pool
-        .ensure_worker(TEST_PROVIDER_ID)
-        .expect("ensure_worker test-prov");
+        .ensure_worker(&provider_id)
+        .expect("ensure_worker seeded provider");
 
     let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
-    let manager = SubagentManager::new(
-        Arc::clone(&db),
-        settings_with_test_provider(),
-        "pi",
-        exec_dyn,
-    );
+    let manager =
+        SubagentManager::new(Arc::clone(&db), SubagentSettings::default(), "pi", exec_dyn);
 
     // First delegate spawns the sidecar.
-    let r1 = manager.delegate(req("reviewer", "first")).await.unwrap();
+    let r1 = manager
+        .delegate(req("reviewer", "first", &provider_id, &model_id))
+        .await
+        .unwrap();
     assert!(r1.adapter_session_id.is_some());
 
     // Graceful shutdown — sidecar process exits.
     supervisor.shutdown().await.unwrap();
 
     // Second delegate restarts the sidecar (lazy spawn on ensure_started).
-    let r2 = manager.delegate(req("reviewer", "second")).await.unwrap();
+    let r2 = manager
+        .delegate(req("reviewer", "second", &provider_id, &model_id))
+        .await
+        .unwrap();
     assert!(r2.adapter_session_id.is_some());
 
     supervisor.shutdown().await.unwrap();

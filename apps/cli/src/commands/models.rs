@@ -864,8 +864,6 @@ mod tests {
         let _ = rt
             .profile_create(ProfileCreateRequestDto {
                 id: "pr".into(),
-                model: "m".into(),
-                provider_id: None,
                 tools: None,
                 context_budget_tokens: None,
                 timeout_seconds: None,
@@ -875,8 +873,6 @@ mod tests {
         let _ = rt
             .profile_update(ProfileUpdateRequestDto {
                 id: "pr".into(),
-                provider_id: None,
-                model: None,
                 tools: None,
                 context_budget_tokens: None,
                 timeout_seconds: None,

@@ -147,17 +147,14 @@ fn make_pool_with_config(
     (pool, executor, supervisor, holder)
 }
 
-/// Build `SubagentSettings` with the `pi/search-cheap` profile bound to
-/// `TEST_PROVIDER_ID` so `SubagentManager::delegate` threads a non-`None`
-/// `provider_id` into `ExecutorInput` (required by the pool-based executor).
+/// Build default `SubagentSettings`. Task 3 removed `provider_id` / `model`
+/// from `SubagentProfileConfig` — provider/model binding is now per-subagent
+/// via `bound_provider_id` / `bound_model_id` on the delegate request (see
+/// `make_delegate_request`). Default settings are sufficient because the
+/// `SubagentManager::execute_task` reads `provider_id` from
+/// `subagent.bound_provider_id`, not from the profile config.
 fn settings_with_test_provider() -> SubagentSettings {
-    let mut settings = SubagentSettings::default();
-    settings
-        .profiles
-        .get_mut("pi/search-cheap")
-        .expect("default profiles must include pi/search-cheap")
-        .provider_id = Some(TEST_PROVIDER_ID.to_string());
-    settings
+    SubagentSettings::default()
 }
 
 struct TestHarness {

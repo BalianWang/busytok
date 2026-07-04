@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use busytok_domain::{ModelCatalogFilter, ProfileModelRef, ProviderKind};
+use busytok_domain::{ModelCatalogFilter, ProviderKind};
 use busytok_store::Database;
 use busytok_store::{
     CreateModelReq, CreateProviderReq, ModelCatalogEntry, Provider, ProviderSummary,
@@ -45,7 +45,7 @@ fn provider_crud_round_trip() {
     let with_secret = db.get_provider_with_secret(&created.id).unwrap().unwrap();
     assert_eq!(with_secret.api_key.as_deref(), Some("sk-new-key"));
 
-    db.delete_provider(&created.id, &[]).unwrap();
+    db.delete_provider(&created.id).unwrap();
     assert!(db.list_providers().unwrap().is_empty());
 }
 
@@ -87,7 +87,7 @@ fn model_crud_and_cascade_tags() {
     assert!(tags.contains(&"cheap".to_string()));
 
     // Delete model cascades tags
-    db.delete_model(&model.id, &[]).unwrap();
+    db.delete_model(&model.id).unwrap();
     let entries = db
         .list_models_filtered(ModelCatalogFilter::default())
         .unwrap();
@@ -213,7 +213,13 @@ fn include_disabled_filters_both_provider_and_model() {
 }
 
 #[test]
-fn provider_delete_blocked_by_profile_reference() {
+fn delete_provider_succeeds_even_when_subagent_bound() {
+    // Task 3 spec §7.5: deleting a provider is always allowed even when a
+    // subagent references it via `bound_provider_id`. The resulting dangling
+    // binding is reported at delegate time (fail-fast). The store layer no
+    // longer takes a `profile_refs` parameter — the blocking-check helpers
+    // (`provider_has_profile_references` / `model_has_profile_references`)
+    // and `ProfileModelRef` have been deleted.
     let db = Database::open_in_memory().unwrap();
     let provider = db.create_provider(sample_provider_req()).unwrap();
     let pid = provider.id.clone();
@@ -230,47 +236,36 @@ fn provider_delete_blocked_by_profile_reference() {
         })
         .unwrap();
 
-    let refs = vec![ProfileModelRef {
-        provider_id: pid.clone(),
-        model_id: "gpt-4o".into(),
-    }];
+    // Insert a subagent that binds to this provider (dangling allowed).
+    db.subagent_upsert_logical(&busytok_store::SubagentLogicalSubagentRow {
+        id: "sub-1".into(),
+        name: "bound".into(),
+        project_id: "h".into(),
+        repo_path: "/tmp".into(),
+        repo_hash: "h".into(),
+        branch: None,
+        intent: None,
+        default_profile: "pi/search-cheap".into(),
+        bound_provider_id: pid.clone(),
+        bound_model_id: "gpt-4o".into(),
+        status: "cold".into(),
+        created_at_ms: 1000,
+        updated_at_ms: 1000,
+        last_active_at_ms: None,
+    })
+    .unwrap();
 
-    // Blocked
-    let err = db.delete_provider(&pid, &refs);
-    assert!(err.is_err());
+    // delete_model should succeed (dangling binding allowed per spec §7.5).
+    // Must run before delete_provider: models.provider_id has ON DELETE
+    // CASCADE, so deleting the provider first would remove the model row
+    // and make the subsequent delete_model fail with "model not found".
+    db.delete_model(&model.id).unwrap();
+    // Subagent row remains — its `bound_model_id` is now dangling.
+    assert!(db.subagent_get_logical("sub-1").unwrap().is_some());
 
-    // Not blocked when refs empty
-    db.delete_provider(&pid, &[]).unwrap();
-    let _ = model; // suppress unused
-}
-
-#[test]
-fn model_delete_blocked_by_profile_reference() {
-    let db = Database::open_in_memory().unwrap();
-    let provider = db.create_provider(sample_provider_req()).unwrap();
-    let pid = provider.id.clone();
-    let model = db
-        .create_model(CreateModelReq {
-            provider_id: pid.clone(),
-            model_id: "gpt-4o".into(),
-            enabled: true,
-            tags: vec![],
-            display_name: None,
-            reasoning: None,
-            context_window: None,
-            max_tokens: None,
-        })
-        .unwrap();
-
-    let refs = vec![ProfileModelRef {
-        provider_id: pid.clone(),
-        model_id: "gpt-4o".into(),
-    }];
-
-    let err = db.delete_model(&model.id, &refs);
-    assert!(err.is_err());
-
-    db.delete_model(&model.id, &[]).unwrap();
+    // Same semantics for delete_provider: dangling binding allowed.
+    db.delete_provider(&pid).unwrap();
+    assert!(db.subagent_get_logical("sub-1").unwrap().is_some());
 }
 
 #[test]
@@ -468,7 +463,7 @@ fn model_update_lookup_by_provider_and_tags_setter() {
     assert!(err.is_err());
 
     // delete_provider on missing id errors
-    let err = db.delete_provider("nonexistent", &[]);
+    let err = db.delete_provider("nonexistent");
     assert!(err.is_err());
 
     // get_model_by_id on missing id returns None
