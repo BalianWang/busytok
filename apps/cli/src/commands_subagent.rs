@@ -828,9 +828,10 @@ mod tests {
         show_response: SubagentDetailDto,
         tasks_response: SubagentTasksResponseDto,
         delete_should_fail: AtomicBool,
-        /// When set, `subagent_task_get` bails with "task not found" so
-        /// tests can exercise the `ControlResponse::Err` path through
-        /// `unwrap_ok` (e.g. missing-task error surfacing).
+        /// When set, `subagent_task_get` returns a real
+        /// `MethodDispatchError` (code `subagent.task_not_found`) so tests
+        /// can exercise the `ControlResponse::Err` path through `unwrap_ok`
+        /// (e.g. missing-task error surfacing).
         task_get_should_fail: AtomicBool,
         /// Optional canned response for `model_list` (used by
         /// `resolve_bound_fields` auto-resolution tests). When `None`,
@@ -1092,7 +1093,13 @@ mod tests {
             req: SubagentTaskGetRequestDto,
         ) -> Result<SubagentTaskDetailDto> {
             if self.task_get_should_fail.load(Ordering::SeqCst) {
-                anyhow::bail!("task not found")
+                return Err(anyhow::Error::new(
+                    busytok_control::dispatch::MethodDispatchError::from_read_error(
+                        "subagent.task_not_found",
+                        "task not found: missing-task".to_string(),
+                        serde_json::Value::Null,
+                    ),
+                ));
             }
             self.inner.subagent_task_get(req).await
         }
@@ -2487,6 +2494,21 @@ mod tests {
         // `error`/`error_kind` are null → or_dash renders `-`.
         assert!(s.contains("error:             -"), "got: {s}");
         assert!(s.contains("error_kind:        -"), "got: {s}");
+        // Negative assertions: the text formatter intentionally omits
+        // `prompt`, `prompt_artifact_ref`, and `timeout_seconds` even when
+        // they are present in the payload.
+        assert!(
+            !s.contains("prompt:"),
+            "prompt should not appear in text output"
+        );
+        assert!(
+            !s.contains("prompt_artifact_ref:"),
+            "prompt_artifact_ref should not appear in text output"
+        );
+        assert!(
+            !s.contains("timeout_seconds:"),
+            "timeout_seconds should not appear in text output"
+        );
     }
 
     #[test]
@@ -2601,8 +2623,12 @@ mod tests {
         drop(harness);
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("task not found"),
-            "expected the runtime error to surface, got: {err}"
+            err.contains("subagent.task_not_found"),
+            "expected task-specific code, got: {err}"
+        );
+        assert!(
+            err.contains("task not found: missing-task"),
+            "expected task-specific message, got: {err}"
         );
     }
 }

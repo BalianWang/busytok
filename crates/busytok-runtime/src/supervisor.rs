@@ -5736,7 +5736,7 @@ impl RuntimeControl for BusytokSupervisor {
             let db = self.db.lock().unwrap();
             let task = db.subagent_get_task(&task_id).map_err(|e| {
                 tracing::error!(
-                    event_code = "subagent.task_get.sql_read_failed",
+                    event_code = "subagent.task_get.task_read_failed",
                     error = %e,
                     "subagent_get_task failed"
                 );
@@ -5758,8 +5758,7 @@ impl RuntimeControl for BusytokSupervisor {
                         "subagent.task_not_found",
                         format!("task not found: {task_id}"),
                         serde_json::Value::Null,
-                    ))
-                    .into());
+                    )));
                 }
             };
             // Resolve `subagent_name` from the parent logical subagent row.
@@ -5770,7 +5769,7 @@ impl RuntimeControl for BusytokSupervisor {
                 .subagent_get_logical(&task.subagent_id)
                 .map_err(|e| {
                     tracing::error!(
-                        event_code = "subagent.task_get.sql_read_failed",
+                        event_code = "subagent.task_get.subagent_read_failed",
                         error = %e,
                         "subagent_get_logical failed"
                     );
