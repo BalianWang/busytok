@@ -86,7 +86,7 @@ pub async fn handle_list(
         .await
         .context("subagent.list RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_array(&data, "subagents", "text")
+    print_subagent_list(&data, "text")
 }
 
 pub async fn handle_show(name: Option<String>, id: Option<String>, cwd: String) -> Result<()> {
@@ -316,6 +316,47 @@ fn print_array(value: &serde_json::Value, key: &str, output: &str) -> Result<()>
     })
 }
 
+/// Print the `subagents` array with a BINDING column
+/// (`bound_provider_id`/`bound_model_id`). Per Global Constraints, display
+/// IDs directly (no ID→name resolution). Used only by `handle_list`;
+/// `handle_tasks` keeps the generic `print_array` path.
+fn print_subagent_list(value: &serde_json::Value, output: &str) -> Result<()> {
+    print_json_or(value, output, |v| {
+        let arr = v.get("subagents").and_then(|a| a.as_array());
+        match arr {
+            Some(items) if items.is_empty() => println!("(no subagents)"),
+            Some(items) => {
+                for item in items {
+                    let id = item.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+                    let name = item
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .or_else(|| item.get("subagent_name").and_then(|s| s.as_str()))
+                        .unwrap_or("?");
+                    let bound_provider = item
+                        .get("bound_provider_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let bound_model = item
+                        .get("bound_model_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    // Post-migration-0007 the columns are NOT NULL, so this
+                    // fallback is purely defensive against malformed JSON.
+                    let binding = if bound_provider.is_empty() && bound_model.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("{bound_provider}/{bound_model}")
+                    };
+                    let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                    println!("{id:<36} {name:<20} {binding:<40} {status}");
+                }
+            }
+            None => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
+        }
+    })
+}
+
 /// Print a single subagent detail object.
 fn print_detail(value: &serde_json::Value, output: &str) -> Result<()> {
     print_json_or(value, output, |v| {
@@ -325,10 +366,20 @@ fn print_detail(value: &serde_json::Value, output: &str) -> Result<()> {
             .and_then(|s| s.as_str())
             .or_else(|| v.get("subagent_name").and_then(|s| s.as_str()))
             .unwrap_or("?");
+        let bound_provider = v
+            .get("bound_provider_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
+        let bound_model = v
+            .get("bound_model_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-        println!("id:     {id}");
-        println!("name:   {name}");
-        println!("status: {status}");
+        println!("id:       {id}");
+        println!("name:     {name}");
+        println!("provider: {bound_provider}");
+        println!("model:    {bound_model}");
+        println!("status:   {status}");
     })
 }
 
@@ -461,18 +512,109 @@ mod tests {
         assert!(print_array(&v, "tasks", "text").is_ok());
     }
 
+    // ── print_subagent_list ──────────────────────────────────────────
+    //
+    // Dedicated renderer for `handle_list` — adds a BINDING column
+    // (`bound_provider_id`/`bound_model_id`) that the generic `print_array`
+    // does not show. The `print_array` tests above remain the coverage for
+    // the `handle_tasks` path.
+
+    #[test]
+    fn print_subagent_list_text_empty_prints_no_subagents_message() {
+        // Empty `subagents` array — should print `(no subagents)`.
+        let v = json!({"subagents": []});
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_text_with_bound_fields_shows_binding_column() {
+        // Non-empty list with bound fields — BINDING column renders as
+        // `{bound_provider_id}/{bound_model_id}`.
+        let v = json!({
+            "subagents": [
+                {
+                    "id": "sa-1",
+                    "name": "dev",
+                    "bound_provider_id": "openai",
+                    "bound_model_id": "gpt-5",
+                    "status": "hot"
+                },
+                {
+                    "id": "sa-2",
+                    "subagent_name": "reviewer",
+                    "bound_provider_id": "anthropic",
+                    "bound_model_id": "claude-opus",
+                    "status": "warm"
+                }
+            ]
+        });
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_text_missing_bound_fields_falls_back_to_dash() {
+        // Malformed JSON: items present but bound fields missing — the
+        // BINDING column falls back to `-`. This is purely defensive
+        // (post-migration-0007 the columns are NOT NULL).
+        let v = json!({
+            "subagents": [
+                {"id": "sa-1", "name": "dev", "status": "hot"},
+                {"id": "sa-2", "name": "reviewer", "bound_provider_id": "", "bound_model_id": "", "status": "warm"}
+            ]
+        });
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_text_when_key_absent_falls_back_to_pretty_json() {
+        // The value has no `subagents` array — should print the pretty JSON
+        // of the whole envelope (matches `print_array`'s fallback shape).
+        let v = json!({"unexpected": "shape"});
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_json_output_pretty_prints_payload() {
+        // `json` output mode pretty-prints the full envelope.
+        let v =
+            json!({"subagents": [{"id": "x", "bound_provider_id": "p", "bound_model_id": "m"}]});
+        assert!(print_subagent_list(&v, "json").is_ok());
+    }
+
     // ── print_detail ───────────────────────────────────────────────────
 
     #[test]
     fn print_detail_text_with_name_field() {
-        let v = json!({"id": "id-1", "name": "named", "status": "warm"});
+        // All fields present, including bound IDs — text branch should print
+        // id/name/provider/model/status lines.
+        let v = json!({
+            "id": "id-1",
+            "name": "named",
+            "bound_provider_id": "openai",
+            "bound_model_id": "gpt-5",
+            "status": "warm"
+        });
         assert!(print_detail(&v, "text").is_ok());
     }
 
     #[test]
     fn print_detail_text_falls_back_to_subagent_name() {
         // No `name` field — should fall back to `subagent_name`.
-        let v = json!({"id": "id-2", "subagent_name": "fallback", "status": "cold"});
+        let v = json!({
+            "id": "id-2",
+            "subagent_name": "fallback",
+            "bound_provider_id": "anthropic",
+            "bound_model_id": "claude",
+            "status": "cold"
+        });
+        assert!(print_detail(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_detail_text_missing_bound_fields_falls_back_to_question_mark() {
+        // id/name/status present but bound fields absent — `provider` and
+        // `model` lines should print `?` (defensive fallback).
+        let v = json!({"id": "id-3", "name": "orphan", "status": "cold"});
         assert!(print_detail(&v, "text").is_ok());
     }
 
@@ -484,7 +626,7 @@ mod tests {
 
     #[test]
     fn print_detail_json_output_pretty_prints_payload() {
-        let v = json!({"id": "id-3"});
+        let v = json!({"id": "id-3", "bound_provider_id": "p", "bound_model_id": "m"});
         assert!(print_detail(&v, "json").is_ok());
     }
 
