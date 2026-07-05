@@ -437,41 +437,50 @@ fn print_ack(value: &serde_json::Value, output: &str) -> Result<()> {
 /// required `created_at_ms` field falls back to `0` defensively.
 fn print_task_detail(value: &serde_json::Value, output: &str) -> Result<()> {
     print_json_or(value, output, |v| {
-        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
-        let subagent_id = v.get("subagent_id").and_then(|s| s.as_str()).unwrap_or("?");
-        let subagent_name = or_dash(v.get("subagent_name").and_then(|s| s.as_str()));
-        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-        let profile = v.get("profile").and_then(|s| s.as_str()).unwrap_or("?");
-        let model_override = or_dash(v.get("model_override").and_then(|s| s.as_str()));
-        let source_harness = or_dash(v.get("source_harness").and_then(|s| s.as_str()));
-        let source_session_id = or_dash(v.get("source_session_id").and_then(|s| s.as_str()));
-        let created_at_ms = v.get("created_at_ms").and_then(|n| n.as_i64()).unwrap_or(0);
-        let started_at_ms = v
-            .get("started_at_ms")
-            .and_then(|n| n.as_i64())
-            .map_or("-".to_string(), |n| n.to_string());
-        let completed_at_ms = v
-            .get("completed_at_ms")
-            .and_then(|n| n.as_i64())
-            .map_or("-".to_string(), |n| n.to_string());
-        let result_summary = or_dash(v.get("result_summary").and_then(|s| s.as_str()));
-        let error = or_dash(v.get("error").and_then(|s| s.as_str()));
-        let error_kind = or_dash(v.get("error_kind").and_then(|s| s.as_str()));
-        println!("id:                {id}");
-        println!("subagent_id:       {subagent_id}");
-        println!("subagent_name:     {subagent_name}");
-        println!("status:            {status}");
-        println!("profile:           {profile}");
-        println!("model_override:    {model_override}");
-        println!("source_harness:    {source_harness}");
-        println!("source_session_id: {source_session_id}");
-        println!("created_at_ms:     {created_at_ms}");
-        println!("started_at_ms:     {started_at_ms}");
-        println!("completed_at_ms:   {completed_at_ms}");
-        println!("result_summary:    {result_summary}");
-        println!("error:             {error}");
-        println!("error_kind:        {error_kind}");
+        println!("{}", format_task_detail_text(v));
     })
+}
+
+/// Pure text formatter for a single task detail record
+/// (`SubagentTaskDetailDto`). Returns the rendered string so tests can
+/// assert on the exact output (the caller is responsible for printing).
+fn format_task_detail_text(v: &serde_json::Value) -> String {
+    let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+    let subagent_id = v.get("subagent_id").and_then(|s| s.as_str()).unwrap_or("?");
+    let subagent_name = or_dash(v.get("subagent_name").and_then(|s| s.as_str()));
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+    let profile = v.get("profile").and_then(|s| s.as_str()).unwrap_or("?");
+    let model_override = or_dash(v.get("model_override").and_then(|s| s.as_str()));
+    let source_harness = or_dash(v.get("source_harness").and_then(|s| s.as_str()));
+    let source_session_id = or_dash(v.get("source_session_id").and_then(|s| s.as_str()));
+    let created_at_ms = v.get("created_at_ms").and_then(|n| n.as_i64()).unwrap_or(0);
+    let started_at_ms = v
+        .get("started_at_ms")
+        .and_then(|n| n.as_i64())
+        .map_or("-".to_string(), |n| n.to_string());
+    let completed_at_ms = v
+        .get("completed_at_ms")
+        .and_then(|n| n.as_i64())
+        .map_or("-".to_string(), |n| n.to_string());
+    let result_summary = or_dash(v.get("result_summary").and_then(|s| s.as_str()));
+    let error = or_dash(v.get("error").and_then(|s| s.as_str()));
+    let error_kind = or_dash(v.get("error_kind").and_then(|s| s.as_str()));
+    format!(
+        "id:                {id}\n\
+         subagent_id:       {subagent_id}\n\
+         subagent_name:     {subagent_name}\n\
+         status:            {status}\n\
+         profile:           {profile}\n\
+         model_override:    {model_override}\n\
+         source_harness:    {source_harness}\n\
+         source_session_id: {source_session_id}\n\
+         created_at_ms:     {created_at_ms}\n\
+         started_at_ms:     {started_at_ms}\n\
+         completed_at_ms:   {completed_at_ms}\n\
+         result_summary:    {result_summary}\n\
+         error:             {error}\n\
+         error_kind:        {error_kind}\n"
+    )
 }
 
 /// Render an optional string as `-` when absent. Used by `print_task_detail`
@@ -2462,7 +2471,22 @@ mod tests {
             "error": null,
             "error_kind": null,
         });
-        assert!(print_task_detail(&v, "text").is_ok());
+        let s = format_task_detail_text(&v);
+        assert!(s.contains("id:                task-1"), "got: {s}");
+        assert!(s.contains("subagent_id:       sa-1"), "got: {s}");
+        assert!(s.contains("subagent_name:     dev"), "got: {s}");
+        assert!(s.contains("status:            completed"), "got: {s}");
+        assert!(s.contains("profile:           default"), "got: {s}");
+        assert!(s.contains("model_override:    gpt-5"), "got: {s}");
+        assert!(s.contains("source_harness:    cli"), "got: {s}");
+        assert!(s.contains("source_session_id: sess-1"), "got: {s}");
+        assert!(s.contains("created_at_ms:     1700000000"), "got: {s}");
+        assert!(s.contains("started_at_ms:     1700000001"), "got: {s}");
+        assert!(s.contains("completed_at_ms:   1700000002"), "got: {s}");
+        assert!(s.contains("result_summary:    did the thing"), "got: {s}");
+        // `error`/`error_kind` are null → or_dash renders `-`.
+        assert!(s.contains("error:             -"), "got: {s}");
+        assert!(s.contains("error_kind:        -"), "got: {s}");
     }
 
     #[test]
@@ -2477,14 +2501,52 @@ mod tests {
             "profile": "default",
             "created_at_ms": 1700000000_i64,
         });
-        assert!(print_task_detail(&v, "text").is_ok());
+        let s = format_task_detail_text(&v);
+        // Required string fields render their provided values.
+        assert!(s.contains("id:                task-2"), "got: {s}");
+        assert!(s.contains("subagent_id:       sa-2"), "got: {s}");
+        assert!(s.contains("status:            pending"), "got: {s}");
+        assert!(s.contains("profile:           default"), "got: {s}");
+        assert!(s.contains("created_at_ms:     1700000000"), "got: {s}");
+        // Optional string fields must render `-` (not `?`, not empty).
+        assert!(s.contains("subagent_name:     -"), "got: {s}");
+        assert!(s.contains("model_override:    -"), "got: {s}");
+        assert!(s.contains("source_harness:    -"), "got: {s}");
+        assert!(s.contains("source_session_id: -"), "got: {s}");
+        assert!(s.contains("result_summary:    -"), "got: {s}");
+        assert!(s.contains("error:             -"), "got: {s}");
+        assert!(s.contains("error_kind:        -"), "got: {s}");
+        // Optional i64 timestamps render `-` when absent.
+        assert!(s.contains("started_at_ms:     -"), "got: {s}");
+        assert!(s.contains("completed_at_ms:   -"), "got: {s}");
+        // Sanity: a regression that rendered `?` or empty for optionals
+        // would fail the above — the literal `-` is asserted per-field.
+        assert!(
+            !s.contains("subagent_name:     ?"),
+            "optional field rendered `?` instead of `-`: {s}"
+        );
     }
 
     #[test]
     fn print_task_detail_text_missing_all_fields_uses_defaults() {
         // Empty object — every `unwrap_or` / `or_dash` fallback fires.
         let v = json!({});
-        assert!(print_task_detail(&v, "text").is_ok());
+        let s = format_task_detail_text(&v);
+        // Required string fields fall back to `?`.
+        assert!(s.contains("id:                ?"), "got: {s}");
+        assert!(s.contains("subagent_id:       ?"), "got: {s}");
+        assert!(s.contains("status:            ?"), "got: {s}");
+        assert!(s.contains("profile:           ?"), "got: {s}");
+        // Required i64 field falls back to 0.
+        assert!(s.contains("created_at_ms:     0"), "got: {s}");
+        // Optional fields still render `-`.
+        assert!(s.contains("subagent_name:     -"), "got: {s}");
+        assert!(s.contains("model_override:    -"), "got: {s}");
+        assert!(s.contains("result_summary:    -"), "got: {s}");
+        assert!(s.contains("error:             -"), "got: {s}");
+        assert!(s.contains("error_kind:        -"), "got: {s}");
+        assert!(s.contains("started_at_ms:     -"), "got: {s}");
+        assert!(s.contains("completed_at_ms:   -"), "got: {s}");
     }
 
     #[test]
