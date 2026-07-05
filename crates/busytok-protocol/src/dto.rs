@@ -1337,6 +1337,12 @@ pub struct SubagentTasksRequestDto {
     pub limit: Option<i64>,
 }
 
+/// Spec §3.4: `subagent.task_get` request — address one subagent task by id.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentTaskGetRequestDto {
+    pub task_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct SubagentDeleteRequestDto {
     pub name: Option<String>,
@@ -1408,6 +1414,42 @@ pub struct SubagentTaskSummaryDto {
     pub result_summary: Option<String>,
     pub error: Option<String>,
     pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+/// Spec §3.4: full detail for one subagent task, returned by `subagent.task_get`.
+/// `subagent_name` is optional so the runtime can degrade gracefully if the
+/// parent subagent row is gone (e.g. hard-deleted while a task row remains).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentTaskDetailDto {
+    pub id: String,
+    pub subagent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    pub profile: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_artifact_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i64>,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_ms: Option<i64>,
 }
 
@@ -2656,5 +2698,143 @@ mod tests {
         assert!(back.enabled);
         assert_eq!(back.profiles.len(), 1);
         assert!(back.profiles[0].is_builtin);
+    }
+
+    #[test]
+    fn subagent_task_get_request_dto_serializes() {
+        let dto = SubagentTaskGetRequestDto {
+            task_id: "task-1".to_string(),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json, serde_json::json!({"task_id": "task-1"}));
+
+        let back: SubagentTaskGetRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.task_id, "task-1");
+    }
+
+    #[test]
+    fn subagent_task_detail_dto_round_trips() {
+        let dto = SubagentTaskDetailDto {
+            id: "task-1".to_string(),
+            subagent_id: "sub-1".to_string(),
+            subagent_name: Some("worker-1".to_string()),
+            source_harness: Some("claude_code".to_string()),
+            source_session_id: Some("src-sess-1".to_string()),
+            profile: "pi/search-cheap".to_string(),
+            status: "completed".to_string(),
+            prompt: Some("do the thing".to_string()),
+            prompt_artifact_ref: Some("artifact-1".to_string()),
+            result_summary: Some("ok".to_string()),
+            error: None,
+            error_kind: None,
+            model_override: Some("gpt-4o".to_string()),
+            timeout_seconds: Some(120),
+            created_at_ms: 1_000,
+            started_at_ms: Some(1_100),
+            completed_at_ms: Some(2_000),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["id"], "task-1");
+        assert_eq!(json["subagent_id"], "sub-1");
+        assert_eq!(json["subagent_name"], "worker-1");
+        assert_eq!(json["source_harness"], "claude_code");
+        assert_eq!(json["source_session_id"], "src-sess-1");
+        assert_eq!(json["profile"], "pi/search-cheap");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["prompt"], "do the thing");
+        assert_eq!(json["prompt_artifact_ref"], "artifact-1");
+        assert_eq!(json["result_summary"], "ok");
+        assert!(json.get("error").is_none());
+        assert!(json.get("error_kind").is_none());
+        assert_eq!(json["model_override"], "gpt-4o");
+        assert_eq!(json["timeout_seconds"], 120);
+        assert_eq!(json["created_at_ms"], 1_000);
+        assert_eq!(json["started_at_ms"], 1_100);
+        assert_eq!(json["completed_at_ms"], 2_000);
+
+        let back: SubagentTaskDetailDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id, "task-1");
+        assert_eq!(back.subagent_id, "sub-1");
+        assert_eq!(back.subagent_name.as_deref(), Some("worker-1"));
+        assert_eq!(back.source_harness.as_deref(), Some("claude_code"));
+        assert_eq!(back.source_session_id.as_deref(), Some("src-sess-1"));
+        assert_eq!(back.profile, "pi/search-cheap");
+        assert_eq!(back.status, "completed");
+        assert_eq!(back.prompt.as_deref(), Some("do the thing"));
+        assert_eq!(back.prompt_artifact_ref.as_deref(), Some("artifact-1"));
+        assert_eq!(back.result_summary.as_deref(), Some("ok"));
+        assert!(back.error.is_none());
+        assert!(back.error_kind.is_none());
+        assert_eq!(back.model_override.as_deref(), Some("gpt-4o"));
+        assert_eq!(back.timeout_seconds, Some(120));
+        assert_eq!(back.created_at_ms, 1_000);
+        assert_eq!(back.started_at_ms, Some(1_100));
+        assert_eq!(back.completed_at_ms, Some(2_000));
+    }
+
+    #[test]
+    fn subagent_task_detail_dto_optional_fields_can_be_null_or_omitted() {
+        // All optional fields explicitly null on the wire.
+        let nulls: SubagentTaskDetailDto = serde_json::from_str(
+            r#"{"id":"t","subagent_id":"s","profile":"p","status":"pending","created_at_ms":100}"#,
+        )
+        .unwrap();
+        assert_eq!(nulls.id, "t");
+        assert_eq!(nulls.subagent_id, "s");
+        assert_eq!(nulls.profile, "p");
+        assert_eq!(nulls.status, "pending");
+        assert_eq!(nulls.created_at_ms, 100);
+        assert!(nulls.subagent_name.is_none());
+        assert!(nulls.source_harness.is_none());
+        assert!(nulls.source_session_id.is_none());
+        assert!(nulls.prompt.is_none());
+        assert!(nulls.prompt_artifact_ref.is_none());
+        assert!(nulls.result_summary.is_none());
+        assert!(nulls.error.is_none());
+        assert!(nulls.error_kind.is_none());
+        assert!(nulls.model_override.is_none());
+        assert!(nulls.timeout_seconds.is_none());
+        assert!(nulls.started_at_ms.is_none());
+        assert!(nulls.completed_at_ms.is_none());
+
+        // Optional fields set to null on the wire (rather than omitted).
+        let explicit_nulls: SubagentTaskDetailDto = serde_json::from_str(
+            r#"{"id":"t","subagent_id":"s","subagent_name":null,"source_harness":null,"source_session_id":null,"profile":"p","status":"pending","prompt":null,"prompt_artifact_ref":null,"result_summary":null,"error":null,"error_kind":null,"model_override":null,"timeout_seconds":null,"created_at_ms":100,"started_at_ms":null,"completed_at_ms":null}"#,
+        )
+        .unwrap();
+        assert!(explicit_nulls.subagent_name.is_none());
+        assert!(explicit_nulls.started_at_ms.is_none());
+        assert!(explicit_nulls.completed_at_ms.is_none());
+
+        // A "degraded" detail (parent subagent row gone) — subagent_name is None
+        // but other fields are present.
+        let degraded = SubagentTaskDetailDto {
+            id: "t2".to_string(),
+            subagent_id: "ghost".to_string(),
+            subagent_name: None,
+            source_harness: Some("codex".to_string()),
+            source_session_id: None,
+            profile: "pi/search-cheap".to_string(),
+            status: "failed".to_string(),
+            prompt: None,
+            prompt_artifact_ref: None,
+            result_summary: None,
+            error: Some("boom".to_string()),
+            error_kind: Some("timeout".to_string()),
+            model_override: None,
+            timeout_seconds: None,
+            created_at_ms: 5_000,
+            started_at_ms: Some(5_100),
+            completed_at_ms: Some(6_000),
+        };
+        let json = serde_json::to_value(&degraded).unwrap();
+        // subagent_name is skipped on serialize when None (mirrors
+        // SubagentRuntimeTaskDto / SubagentDelegateResponseDto conventions).
+        assert!(json.get("subagent_name").is_none());
+        assert_eq!(json["error"], "boom");
+        assert_eq!(json["error_kind"], "timeout");
+        let back: SubagentTaskDetailDto = serde_json::from_value(json).unwrap();
+        assert!(back.subagent_name.is_none());
+        assert_eq!(back.error.as_deref(), Some("boom"));
     }
 }

@@ -45,6 +45,7 @@ pub fn method_manifest() -> Vec<String> {
         "subagent.list".to_string(),
         "subagent.show".to_string(),
         "subagent.tasks".to_string(),
+        "subagent.task_get".to_string(),
         "subagent.hibernate".to_string(),
         "subagent.delete".to_string(),
         "subagent.runtime_status".to_string(),
