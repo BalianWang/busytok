@@ -7448,8 +7448,12 @@ mod tests {
 
     #[test]
     fn validate_runtime_dir_rejects_nonexistent_directory() {
-        let err =
-            validate_runtime_dir("/nonexistent/dir/that/does/not/exist", "system").unwrap_err();
+        // Use a platform-agnostic absolute path: temp_dir is absolute on
+        // every platform, and this subdirectory is never created.
+        let tmp = std::env::temp_dir();
+        let nonexistent = tmp.join("busytok-validate-test-nonexistent-xyz-12345");
+        let _ = std::fs::remove_dir_all(&nonexistent);
+        let err = validate_runtime_dir(nonexistent.to_str().unwrap(), "system").unwrap_err();
         assert!(err
             .to_string()
             .contains("does not exist or is not a directory"));
@@ -7558,6 +7562,10 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
+    // The non-executable-binary check only runs on Unix (Windows has no
+    // Unix permission bits). Gate the test accordingly so it doesn't
+    // spuriously fail on Windows where the validation is a no-op.
+    #[cfg(unix)]
     #[test]
     fn validate_runtime_dir_rejects_bundled_node_non_executable_binary() {
         let tmp = std::env::temp_dir().join("busytok-validate-test-bundled-noexec");
@@ -7571,11 +7579,8 @@ mod tests {
         .unwrap();
         let node_path = node_dir.join("node");
         std::fs::write(&node_path, "not executable").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = validate_runtime_dir(tmp.to_str().unwrap(), "bundled").unwrap_err();
         assert!(err.to_string().contains("not executable"));
         std::fs::remove_dir_all(&tmp).unwrap();
