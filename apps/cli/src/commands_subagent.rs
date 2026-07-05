@@ -5,8 +5,9 @@ use std::io::BufRead;
 use anyhow::{bail, Context, Result};
 use busytok_control::ControlClient;
 use busytok_protocol::dto::{
-    SubagentDelegateRequestDto, SubagentDeleteRequestDto, SubagentListRequestDto,
-    SubagentResolveRequestDto, SubagentTasksRequestDto,
+    ModelCatalogEntryDto, ModelListRequestDto, ModelListResponseDto, SubagentDelegateRequestDto,
+    SubagentDeleteRequestDto, SubagentListRequestDto, SubagentResolveRequestDto,
+    SubagentTasksRequestDto,
 };
 use busytok_protocol::{ControlRequest, ControlResponse};
 
@@ -27,9 +28,19 @@ pub async fn handle_delegate(
     timeout: Option<u64>,
     output: String,
     prompt: String,
+    bind_provider: Option<String>,
+    bind_model: Option<String>,
 ) -> Result<()> {
     // Do NOT canonicalize cwd — the service resolver canonicalizes at one chokepoint.
     let mut client = connect().await?;
+
+    // Resolve bound fields before building the DTO.
+    let (bound_provider_id, bound_model_id) =
+        match resolve_bound_fields(&mut client, bind_provider, bind_model).await? {
+            Some((p, m)) => (Some(p), Some(m)),
+            None => (None, None), // valid reuse-path passthrough
+        };
+
     let req = SubagentDelegateRequestDto {
         subagent_name: subagent,
         subagent_id: id,
@@ -42,11 +53,8 @@ pub async fn handle_delegate(
         model_override: model,
         source_harness: Some("cli".to_string()),
         source_session_id: None,
-        // CLI does not yet expose bound-field flags; the reuse path uses the
-        // subagent's stored bound fields, and the create path will reject
-        // (both-absent) until the GUI/CLI add explicit bound-field args.
-        bound_provider_id: None,
-        bound_model_id: None,
+        bound_provider_id,
+        bound_model_id,
     };
     let resp = client
         .call(ControlRequest::new(
@@ -188,6 +196,78 @@ fn unwrap_ok(resp: ControlResponse) -> Result<serde_json::Value> {
     }
 }
 
+/// Resolve (provider_id, model_id) from --bind-provider / --bind-model flags.
+/// Returns:
+/// - Ok(Some((provider, model))) when the bound fields are fully resolved
+/// - Ok(None) for the valid reuse-path passthrough case `(None, None)`
+/// - Err(...) for asymmetric or ambiguous input
+async fn resolve_bound_fields(
+    client: &mut ControlClient,
+    bind_provider: Option<String>,
+    bind_model: Option<String>,
+) -> Result<Option<(String, String)>> {
+    match (bind_provider, bind_model) {
+        (Some(p), Some(m)) => {
+            // Both given — pass through directly.
+            Ok(Some((p, m)))
+        }
+        (None, None) => {
+            // Important: do NOT reject this case in the CLI. It is valid for
+            // BOTH reuse paths:
+            //   - --id <UUID>
+            //   - --subagent <NAME> --cwd <DIR> when an active subagent with
+            //     that name already exists in the repo scope
+            // The service resolver will only reject it if the request falls
+            // through to the create path (0 active matches).
+            Ok(None)
+        }
+        (Some(_), None) => {
+            anyhow::bail!("--bind-model is required when --bind-provider is given")
+        }
+        (None, Some(model)) => {
+            // Auto-resolve provider from the model catalog.
+            // Reuse the typed model.list RPC path (same as `commands/models.rs`).
+            let req = ModelListRequestDto {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: false, // never bind to disabled provider/model
+            };
+            let resp = client
+                .call(ControlRequest::new(
+                    "model.list",
+                    serde_json::to_value(&req)?,
+                ))
+                .await?;
+            let value = unwrap_ok(resp)?;
+            let entries: Vec<ModelCatalogEntryDto> =
+                serde_json::from_value::<ModelListResponseDto>(value)?.models;
+            // include_disabled=false already filters disabled entries; the
+            // extra model_enabled && provider_enabled filter is defense-in-depth.
+            let matches: Vec<_> = entries
+                .iter()
+                .filter(|e| e.model_id == model && e.model_enabled && e.provider_enabled)
+                .collect();
+            match matches.len() {
+                0 => anyhow::bail!("model '{}' not found in catalog", model),
+                1 => {
+                    let pid = &matches[0].provider_id;
+                    eprintln!("  (auto-resolved provider: {})", pid);
+                    Ok(Some((pid.clone(), model)))
+                }
+                _ => {
+                    let providers: Vec<_> = matches.iter().map(|e| &e.provider_id).collect();
+                    anyhow::bail!(
+                        "model '{}' is available from multiple providers: {:?}\n\
+                         Use --bind-provider to disambiguate.",
+                        model,
+                        providers
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// Print the `subagent.delegate` result (task_id / subagent_name / status / summary).
 fn print_delegate(value: &serde_json::Value, output: &str) -> Result<()> {
     print_json_or(value, output, |v| {
@@ -281,6 +361,7 @@ fn print_json_or(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
     use super::*;
+    use busytok_domain::ProviderKind;
     use busytok_protocol::dto::*;
     use busytok_protocol::{ControlError, ControlResponse};
     use serde_json::json;
@@ -508,6 +589,10 @@ mod tests {
         show_response: SubagentDetailDto,
         tasks_response: SubagentTasksResponseDto,
         delete_should_fail: AtomicBool,
+        /// Optional canned response for `model_list` (used by
+        /// `resolve_bound_fields` auto-resolution tests). When `None`,
+        /// `model_list` delegates to the inner runtime.
+        model_list_response: Option<ModelListResponseDto>,
     }
 
     impl SubagentRuntime {
@@ -552,6 +637,7 @@ mod tests {
                     }],
                 },
                 delete_should_fail: AtomicBool::new(false),
+                model_list_response: None,
             }
         }
     }
@@ -771,8 +857,12 @@ mod tests {
         async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
             self.inner.model_create(req).await
         }
-        async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
-            self.inner.model_list(req).await
+        async fn model_list(&self, _req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+            if let Some(resp) = &self.model_list_response {
+                Ok(resp.clone())
+            } else {
+                self.inner.model_list(_req).await
+            }
         }
         async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
             self.inner.model_update(req).await
@@ -824,6 +914,8 @@ mod tests {
             None,
             "text".to_string(),
             "do the thing".to_string(),
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -849,6 +941,8 @@ mod tests {
             Some(60),
             "json".to_string(),
             "do the thing".to_string(),
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -856,6 +950,227 @@ mod tests {
             result.is_ok(),
             "handle_delegate json output: {:?}",
             result.err()
+        );
+    }
+
+    // ── resolve_bound_fields ───────────────────────────────────────────
+    //
+    // Exercise each branch of the bound-field resolver. The `(None, None)`
+    // and `(Some, Some)` and `(Some, None)` cases short-circuit before any
+    // RPC, but still require a live `ControlClient` to satisfy the signature.
+    // The `(None, Some)` auto-resolution cases use a `SubagentRuntime` with
+    // a canned `model_list_response`.
+
+    fn sample_model_entry(provider: &str, model: &str, enabled: bool) -> ModelCatalogEntryDto {
+        ModelCatalogEntryDto {
+            provider_id: provider.to_string(),
+            provider_name: provider.to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            provider_enabled: enabled,
+            model_db_id: format!("{provider}-{model}-db"),
+            model_id: model.to_string(),
+            model_enabled: enabled,
+            tags: vec![],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_none_returns_ok_none() {
+        // (None, None) is the valid reuse-path passthrough — no RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, None).await;
+        drop(harness);
+        assert!(result.is_ok(), "err: {:?}", result.err());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_some_some_returns_ok_some() {
+        // (Some, Some) passes through directly — no RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(
+            &mut client,
+            Some("prov-1".to_string()),
+            Some("model-1".to_string()),
+        )
+        .await;
+        drop(harness);
+        assert!(result.is_ok(), "err: {:?}", result.err());
+        let (p, m) = result.unwrap().unwrap();
+        assert_eq!(p, "prov-1");
+        assert_eq!(m, "model-1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_some_none_errors_asymmetric() {
+        // (Some, None) is asymmetric — bails without RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, Some("prov-1".to_string()), None).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--bind-model is required"),
+            "expected asymmetric error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_auto_resolves_when_unique() {
+        // (None, Some) with a single matching model in the catalog auto-resolves.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![
+                sample_model_entry("openai", "gpt-4", true),
+                sample_model_entry("openai", "gpt-3.5", false),
+                sample_model_entry("deepseek", "deepseek-chat", true),
+            ],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, Some("gpt-4".to_string())).await;
+        drop(harness);
+        assert!(result.is_ok(), "err: {:?}", result.err());
+        let (p, m) = result.unwrap().unwrap();
+        assert_eq!(p, "openai");
+        assert_eq!(m, "gpt-4");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_errors_when_model_not_found() {
+        // (None, Some) with no matching model in the catalog bails.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![sample_model_entry("openai", "gpt-4", true)],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, Some("nope".to_string())).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("model 'nope' not found in catalog"),
+            "expected not-found error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_errors_when_ambiguous() {
+        // (None, Some) with the same model from multiple enabled providers bails.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![
+                sample_model_entry("openai", "shared-model", true),
+                sample_model_entry("azure", "shared-model", true),
+            ],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result =
+            resolve_bound_fields(&mut client, None, Some("shared-model".to_string())).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("multiple providers"),
+            "expected ambiguity error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_skips_disabled_entries() {
+        // (None, Some) where the only catalog match is disabled should bail
+        // (defense-in-depth: include_disabled=false already filters these).
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![sample_model_entry("openai", "gpt-4", false)],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, Some("gpt-4".to_string())).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("model 'gpt-4' not found in catalog"),
+            "expected not-found (disabled filtered), got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_and_bind_model_succeeds() {
+        // (Some, Some) on handle_delegate — the bound fields are passed
+        // straight through to the DTO without any model.list RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("prov-1".to_string()),
+            Some("model-1".to_string()),
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate with bind flags: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_only_errors() {
+        // Asymmetric (--bind-provider without --bind-model) should surface
+        // the CLI-side validation error before any delegate RPC fires.
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("prov-1".to_string()),
+            None,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--bind-model is required"),
+            "expected asymmetric bind error, got: {err}"
         );
     }
 

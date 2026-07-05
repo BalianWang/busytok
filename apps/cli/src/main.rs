@@ -97,6 +97,12 @@ enum Command {
         timeout: Option<u64>,
         #[arg(long, default_value = "text", value_parser = ["json", "text"])]
         output: String,
+        /// Provider ID to bind a new subagent to (required with --bind-model for new subagents)
+        #[arg(long)]
+        bind_provider: Option<String>,
+        /// Model ID to bind a new subagent to (required with --bind-provider for new subagents)
+        #[arg(long)]
+        bind_model: Option<String>,
         /// The task prompt (positional)
         prompt: String,
     },
@@ -596,10 +602,22 @@ async fn run(args: Args) -> anyhow::Result<()> {
             model,
             timeout,
             output,
+            bind_provider,
+            bind_model,
             prompt,
         } => {
             commands_subagent::handle_delegate(
-                subagent, id, cwd, profile, intent, model, timeout, output, prompt,
+                subagent,
+                id,
+                cwd,
+                profile,
+                intent,
+                model,
+                timeout,
+                output,
+                prompt,
+                bind_provider,
+                bind_model,
             )
             .await
         }
@@ -730,6 +748,8 @@ mod tests {
             model: None,
             timeout: None,
             output: "text".to_string(),
+            bind_provider: None,
+            bind_model: None,
             prompt: "do thing".to_string(),
         };
         assert_eq!(command_name(&cmd), "delegate");
