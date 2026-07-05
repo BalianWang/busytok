@@ -31,10 +31,28 @@ pub async fn handle_delegate(
     bind_provider: Option<String>,
     bind_model: Option<String>,
 ) -> Result<()> {
+    // Phase 1: pure shape validation that needs no RPC. Do this BEFORE
+    // `connect()` so obvious CLI misuse (e.g. `--bind-provider` without
+    // `--bind-model`) fails fast with the right error even when the service
+    // is down. `(None, None)` is a valid reuse-path passthrough and must
+    // NOT be rejected here.
+    match (&bind_provider, &bind_model) {
+        (Some(_), None) => {
+            anyhow::bail!("--bind-model is required when --bind-provider is given")
+        }
+        (None, Some(_)) => {
+            // Auto-resolution path — needs the model catalog RPC below.
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            // Direct passthrough or valid reuse path — no RPC needed.
+        }
+    }
+
     // Do NOT canonicalize cwd — the service resolver canonicalizes at one chokepoint.
     let mut client = connect().await?;
 
-    // Resolve bound fields before building the DTO.
+    // Phase 2: auto-resolution. Only the `(None, Some(model))` branch
+    // requires a live `ControlClient` (to call `model.list`).
     let (bound_provider_id, bound_model_id) =
         match resolve_bound_fields(&mut client, bind_provider, bind_model).await? {
             Some((p, m)) => (Some(p), Some(m)),
@@ -694,7 +712,7 @@ mod tests {
     use busytok_control::{dispatch::RuntimeControl, server::ControlServer, TestRuntimeControl};
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Hold a running `ControlServer` for the lifetime of the test.
     struct ServerHarness {
@@ -735,6 +753,11 @@ mod tests {
         /// `resolve_bound_fields` auto-resolution tests). When `None`,
         /// `model_list` delegates to the inner runtime.
         model_list_response: Option<ModelListResponseDto>,
+        /// Captures the most recent `SubagentDelegateRequestDto` received by
+        /// `subagent_delegate`, so tests can assert the outgoing DTO carries
+        /// the expected bound fields. Wrapped in `Mutex` because the trait
+        /// method takes `&self` (not `&mut self`).
+        last_delegate_request: Mutex<Option<SubagentDelegateRequestDto>>,
     }
 
     impl SubagentRuntime {
@@ -780,6 +803,7 @@ mod tests {
                 },
                 delete_should_fail: AtomicBool::new(false),
                 model_list_response: None,
+                last_delegate_request: Mutex::new(None),
             }
         }
     }
@@ -932,8 +956,9 @@ mod tests {
         }
         async fn subagent_delegate(
             &self,
-            _req: SubagentDelegateRequestDto,
+            req: SubagentDelegateRequestDto,
         ) -> Result<SubagentDelegateResponseDto> {
+            *self.last_delegate_request.lock().unwrap() = Some(req);
             Ok(self.delegate_response.clone())
         }
         async fn subagent_list(
@@ -1039,6 +1064,18 @@ mod tests {
         let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
         let runtime: Arc<dyn RuntimeControl> = Arc::new(SubagentRuntime::new(inner));
         spawn_server(runtime).await
+    }
+
+    /// Like `spawn_subagent_server` but also returns the `SubagentRuntime`
+    /// handle so tests can inspect captured state (e.g. the last delegate
+    /// request DTO).
+    async fn spawn_subagent_server_with_runtime() -> (ServerHarness, Arc<SubagentRuntime>, String) {
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let runtime = Arc::new(SubagentRuntime::new(inner));
+        let runtime_handle = Arc::clone(&runtime);
+        let runtime_dyn: Arc<dyn RuntimeControl> = runtime;
+        let (harness, socket) = spawn_server(runtime_dyn).await;
+        (harness, runtime_handle, socket)
     }
 
     #[tokio::test]
@@ -1262,8 +1299,10 @@ mod tests {
     #[serial]
     async fn handle_delegate_with_bind_provider_and_bind_model_succeeds() {
         // (Some, Some) on handle_delegate — the bound fields are passed
-        // straight through to the DTO without any model.list RPC.
-        let (harness, socket) = spawn_subagent_server().await;
+        // straight through to the DTO without any model.list RPC. Verify
+        // the outgoing DTO actually carries them (not just that the call
+        // returns Ok).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
         let result = handle_delegate(
             "dev-subagent".to_string(),
@@ -1279,12 +1318,57 @@ mod tests {
             Some("model-1".to_string()),
         )
         .await;
-        drop(harness);
         assert!(
             result.is_ok(),
             "handle_delegate with bind flags: {:?}",
             result.err()
         );
+        drop(harness);
+        let captured = runtime.last_delegate_request.lock().unwrap().take().expect(
+            "subagent_delegate should have captured the request DTO — \
+             if None, the RPC never reached the runtime",
+        );
+        assert_eq!(captured.bound_provider_id, Some("prov-1".to_string()));
+        assert_eq!(captured.bound_model_id, Some("model-1".to_string()));
+        // model_override is the task-level override (separate from bound fields);
+        // passing None must leave it None.
+        assert_eq!(captured.model_override, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_without_bind_flags_passes_none_to_dto() {
+        // (None, None) reuse-path passthrough: the outgoing DTO must carry
+        // None for both bound fields, so the service resolver can decide
+        // (reject on create path, reuse stored bound fields on reuse path).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_delegate reuse path: {:?}",
+            result.err()
+        );
+        drop(harness);
+        let captured = runtime.last_delegate_request.lock().unwrap().take().expect(
+            "subagent_delegate should have captured the request DTO — \
+             if None, the RPC never reached the runtime",
+        );
+        assert_eq!(captured.bound_provider_id, None);
+        assert_eq!(captured.bound_model_id, None);
     }
 
     #[tokio::test]
@@ -1313,6 +1397,34 @@ mod tests {
         assert!(
             err.contains("--bind-model is required"),
             "expected asymmetric bind error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_bind_provider_only_errors_without_server() {
+        // Phase 1 shape validation must run BEFORE connect(). Point the
+        // socket at a path where no server listens and confirm we still
+        // get the "--bind-model is required" error, not a connect failure.
+        std::env::set_var("BUSYTOK_SOCKET", "/nonexistent/busytok-no-server-test.sock");
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("prov-1".to_string()),
+            None,
+        )
+        .await;
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--bind-model is required"),
+            "expected asymmetric bind error BEFORE connect, got: {err}"
         );
     }
 

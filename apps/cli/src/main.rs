@@ -768,6 +768,73 @@ mod tests {
     }
 
     #[test]
+    fn args_parses_delegate_with_bind_provider_and_bind_model() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--bind-provider",
+            "prov-1",
+            "--bind-model",
+            "model-1",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate {
+                bind_provider,
+                bind_model,
+                model,
+                ..
+            }) => {
+                assert_eq!(bind_provider.as_deref(), Some("prov-1"));
+                assert_eq!(bind_model.as_deref(), Some("model-1"));
+                // --model (task-level override) is separate and defaults to None
+                assert_eq!(model, None);
+            }
+            other => panic!("expected Delegate with bind flags, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_model_override_separate_from_bind_model() {
+        // --model maps to model_override (task-level); --bind-model maps to
+        // the bound model. Both can coexist without conflict.
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--model",
+            "gpt-4",
+            "--bind-provider",
+            "prov-1",
+            "--bind-model",
+            "model-1",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate {
+                model,
+                bind_provider,
+                bind_model,
+                ..
+            }) => {
+                assert_eq!(model.as_deref(), Some("gpt-4"));
+                assert_eq!(bind_provider.as_deref(), Some("prov-1"));
+                assert_eq!(bind_model.as_deref(), Some("model-1"));
+            }
+            other => panic!("expected Delegate with both --model and --bind-*, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn command_name_returns_doctor_for_doctor_variant() {
         assert_eq!(command_name(&Command::Doctor), "doctor");
     }
