@@ -1424,3 +1424,17 @@ fn parse_turn_auto_result_omits_memory_update_when_absent() {
     assert!(out.memory_update.current_state_summary.is_none());
     assert!(out.memory_update.key_files.is_empty());
 }
+
+/// `SidecarTaskExecutor::pool()` returns the underlying `WorkerPool` handle
+/// so wiring code (and tests) can reach the per-provider supervisors. The
+/// getter must return the same `Arc` passed to `with_pool`.
+#[test]
+fn executor_pool_getter_returns_underlying_pool() {
+    let harness = make_harness();
+    let pool_from_executor = harness._executor.pool();
+    // The pool returned by the getter must be the same Arc the harness holds.
+    assert!(
+        Arc::ptr_eq(pool_from_executor, &harness.pool),
+        "pool() must return the same Arc<WorkerPool> passed to with_pool"
+    );
+}

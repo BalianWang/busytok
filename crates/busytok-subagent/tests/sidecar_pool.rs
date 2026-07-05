@@ -486,3 +486,49 @@ async fn update_provider_and_kill_old_respawns_with_new_credentials() {
         "base config env vars must be preserved after respawn"
     );
 }
+
+// --- Task 9: tracing-installed paths for debug!/warn! argument lines --------
+
+/// Install a thread-local tracing subscriber so `debug!`/`warn!` arguments in
+/// `WorkerPool` methods are evaluated (and counted by line coverage). Without
+/// this, the macro short-circuits at the level check and the argument lines
+/// stay uncovered even when the code path runs.
+fn install_tracing() -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .finish();
+    tracing::subscriber::set_default(subscriber)
+}
+
+/// Exercise the `debug!`/`warn!` argument lines in `WorkerPool` that are
+/// uncovered without a tracing subscriber: `set_responder_factory` double-call
+/// warn, `ensure_worker` reuse fast-path debug, `remove_worker_and_kill` no-op
+/// debug, and `shutdown_all` start/done debug. All paths are no-ops or
+/// map-only operations — no real sidecar is spawned.
+#[tokio::test]
+async fn pool_log_argument_lines_evaluated_with_tracing() {
+    let _guard = install_tracing();
+    let (pool, gate, _exec) = make_test_pool();
+
+    // ensure_worker twice for the same provider → second call hits the
+    // "worker_reused" fast-path debug! (line 206).
+    let _sup1 = pool.ensure_worker("deepseek").expect("first ensure");
+    let _sup2 = pool
+        .ensure_worker("deepseek")
+        .expect("second ensure (reuse)");
+
+    // set_responder_factory called again → OnceLock rejects, warn! fires
+    // (line 157). Build a throwaway factory for the second call.
+    let exec2 = Arc::new(SidecarTaskExecutor::with_pool(Arc::clone(&pool), None));
+    let (factory2, _h2) = make_responder_factory(Arc::clone(&gate), Arc::downgrade(&exec2));
+    pool.set_responder_factory(factory2);
+
+    // remove_worker_and_kill on a nonexistent provider → no-op debug! (307).
+    pool.remove_worker_and_kill("nonexistent")
+        .await
+        .expect("noop remove");
+
+    // shutdown_all on a pool with one worker → start/done debug! (408, 423).
+    pool.shutdown_all().await;
+}

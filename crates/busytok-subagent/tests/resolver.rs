@@ -218,4 +218,55 @@ fn resolve_by_name_rejects_disabled_model() {
 // the `subagent_logical_subagents` table enforces:
 //   - UNIQUE(project_id, repo_hash, name)  →AmbiguousName impossible
 //   - CHECK(status IN ('hot','warm','cold','deleted')) → bad-status impossible
-// These are defensive branches; they remain intentionally uncovered.
+// The `AmbiguousName` branch remains intentionally uncovered (it would
+// require violating the DB UNIQUE constraint). The `row_to_model` status
+// fallback IS tested directly below (constructing a row in memory with an
+// invalid status string) — the function is `pub` so the fallback logic can
+// be exercised without going through the DB.
+
+/// Install a thread-local tracing subscriber so the `warn!` arguments in the
+/// `row_to_model` status fallback are evaluated (counted by line coverage).
+fn install_tracing() -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .finish();
+    tracing::subscriber::set_default(subscriber)
+}
+
+/// `row_to_model` falls back to `SubagentStatus::Cold` (with a warn log) when
+/// the row's status string doesn't parse. The DB CHECK constraint makes this
+/// unreachable via the public DB API, but the function is `pub` and directly
+/// testable — this guards the fallback so a future status enum value or a
+/// half-written migration doesn't panic.
+#[test]
+fn row_to_model_falls_back_to_cold_on_unparsable_status() {
+    let _guard = install_tracing();
+    use busytok_store::repository::SubagentLogicalSubagentRow;
+    use busytok_subagent::models::SubagentStatus;
+    use busytok_subagent::resolver::row_to_model;
+
+    let mut row = SubagentLogicalSubagentRow::for_test("sub-bad", "bad-status-sub");
+    row.status = "not-a-real-status".to_string();
+    let model = row_to_model(&row);
+    assert_eq!(
+        model.status,
+        SubagentStatus::Cold,
+        "unparsable status must fall back to Cold"
+    );
+    assert_eq!(model.id, "sub-bad");
+    assert_eq!(model.name, "bad-status-sub");
+}
+
+/// `row_to_model` parses a known status string correctly (no fallback).
+#[test]
+fn row_to_model_parses_known_status_hot() {
+    use busytok_store::repository::SubagentLogicalSubagentRow;
+    use busytok_subagent::models::SubagentStatus;
+    use busytok_subagent::resolver::row_to_model;
+
+    let mut row = SubagentLogicalSubagentRow::for_test("sub-hot", "hot-status-sub");
+    row.status = "hot".to_string();
+    let model = row_to_model(&row);
+    assert_eq!(model.status, SubagentStatus::Hot);
+}

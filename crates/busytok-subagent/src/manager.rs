@@ -1195,3 +1195,121 @@ fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind>
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidecar::protocol::{AUTH_FAILURE, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT};
+    use busytok_store::SubagentTaskRow;
+
+    /// `subagent_error_to_task_error_kind` maps each sidecar failure variant
+    /// to the right `TaskErrorKind` for DB persistence (Task 5). Covers every
+    /// match arm so the classifier cannot silently regress.
+    #[test]
+    fn classifies_sidecar_errors_to_task_error_kind() {
+        // Timeout variants.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::TaskTimeout),
+            Some(TaskErrorKind::Timeout)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarTimeout("10s".into())),
+            Some(TaskErrorKind::Timeout)
+        );
+        // Crash.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarCrashed("sigkill".into())),
+            Some(TaskErrorKind::Crash)
+        );
+        // SidecarRpc with structured codes.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "401".into(),
+                code: Some(AUTH_FAILURE)
+            }),
+            Some(TaskErrorKind::Auth)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "429".into(),
+                code: Some(RATE_LIMIT)
+            }),
+            Some(TaskErrorKind::RateLimit)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "net".into(),
+                code: Some(NETWORK_ERROR)
+            }),
+            Some(TaskErrorKind::Network)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "timed out".into(),
+                code: Some(TASK_TIMEOUT)
+            }),
+            Some(TaskErrorKind::Timeout)
+        );
+        // SidecarRpc with no code → unclassified.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "unknown".into(),
+                code: None
+            }),
+            None
+        );
+        // SidecarRpc with an unrecognized code → unclassified.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "misc".into(),
+                code: Some(-39999)
+            }),
+            None
+        );
+        // Non-sidecar errors → unclassified.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::Validation("x".into())),
+            None
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::NotFound("x".into())),
+            None
+        );
+    }
+
+    /// `task_row_to_summary` falls back to `TaskStatus::Queued` (with a warn
+    /// log) when the DB row's status string is corrupted / unrecognized. This
+    /// guards against a half-written migration or a future status enum value
+    /// that the running binary doesn't yet know.
+    #[test]
+    fn task_row_to_summary_falls_back_to_queued_on_bad_status() {
+        let _guard = install_tracing_for_unit_test();
+        let mut row = SubagentTaskRow::for_test("t-1", "sub-1", "pi/search-cheap", "do something");
+        row.status = "not-a-real-status".to_string();
+        let summary = task_row_to_summary(row);
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.id, "t-1");
+        assert_eq!(summary.subagent_id, "sub-1");
+    }
+
+    /// `task_row_to_summary` parses a known status string without falling back.
+    #[test]
+    fn task_row_to_summary_parses_known_status() {
+        let mut row = SubagentTaskRow::for_test("t-2", "sub-2", "pi/search-cheap", "do something");
+        row.status = "completed".to_string();
+        row.result_summary = Some("done".into());
+        let summary = task_row_to_summary(row);
+        assert_eq!(summary.status, TaskStatus::Completed);
+        assert_eq!(summary.result_summary.as_deref(), Some("done"));
+    }
+
+    /// Install a thread-local tracing subscriber so the `warn!` arguments in
+    /// the fallback path are evaluated (and counted by line coverage).
+    fn install_tracing_for_unit_test() -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+}

@@ -2041,3 +2041,173 @@ async fn execute_task_fails_when_bound_model_disabled() {
         "expected SubagentError::Validation variant, got {err:?}"
     );
 }
+
+// --- Task 9: coverage-gap closures for execute_task validation paths --------
+
+/// Spec §3.3 "both or neither": delegating with only one of
+/// `bound_provider_id` / `bound_model_id` set must fail with a Validation
+/// error BEFORE name resolution or DB writes. Covers the `_ =>` match arm in
+/// `delegate()` (lines 175-179).
+#[tokio::test]
+async fn delegate_rejects_mismatched_bound_fields_provider_only() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let mut r = req("mismatch-p", "do");
+    // provider set, model cleared → mismatch
+    r.bound_model_id = None;
+    let err = m.delegate(r).await.unwrap_err();
+    assert!(matches!(err, SubagentError::Validation(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be provided together"),
+        "expected 'must be provided together' in error, got: {msg}"
+    );
+}
+
+/// Same invariant, opposite direction: model set, provider cleared.
+#[tokio::test]
+async fn delegate_rejects_mismatched_bound_fields_model_only() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let mut r = req("mismatch-m", "do");
+    // model set, provider cleared → mismatch
+    r.bound_provider_id = None;
+    let err = m.delegate(r).await.unwrap_err();
+    assert!(matches!(err, SubagentError::Validation(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be provided together"),
+        "expected 'must be provided together' in error, got: {msg}"
+    );
+}
+
+/// `execute_task` must fail fast with "bound provider not found" when the
+/// provider referenced by an existing subagent's `bound_provider_id` has been
+/// deleted from the catalog. Exercises the reuse path (`subagent_id` set) so
+/// the subagent's stored bound fields are the source of truth, and deletes the
+/// provider between the first and second delegate call. Covers the
+/// `ok_or_else(|| Validation("bound provider not found: ..."))` arm.
+#[tokio::test]
+async fn execute_task_fails_when_bound_provider_deleted() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-deletable".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    // Insert a subagent bound to the (soon-to-be-deleted) provider.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-del".into(),
+            name: "test-sub-del".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-del"))
+            .unwrap();
+    }
+    // Delete the provider from the catalog AFTER the subagent is bound.
+    db.lock()
+        .unwrap()
+        .delete_provider(&provider.id)
+        .expect("delete provider");
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-del".into(),
+        subagent_id: Some("sub-del".into()), // reuse path — bound fields from row
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let err = manager.delegate(req).await.unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound provider not found"),
+        "expected 'bound provider not found' in error, got: {msg}"
+    );
+}
+
+/// `delete(hard=true)` by name WITHOUT `cwd` must return `InvalidArgument`
+/// ("cwd is required when name is provided"). The hard-delete path resolves
+/// the subagent directly (not via `self.resolve()`), so its cwd check is a
+/// separate code path from the soft-delete / show / hibernate paths. Covers
+/// the `ok_or_else(|| InvalidArgument(...))` arm in `delete()`.
+#[tokio::test]
+async fn hard_delete_by_name_without_cwd_returns_invalid_argument() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // delegate first so the subagent exists (not strictly required — the cwd
+    // check happens before the lookup — but keeps the test realistic).
+    let _ = m.delegate(req("harddel", "do")).await.unwrap();
+    let err = m
+        .delete(
+            ResolveParams {
+                id: None,
+                name: Some("harddel".to_string()),
+                cwd: None,
+            },
+            true, // hard=true → uses the dedicated hard-delete resolve path
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cwd is required"),
+        "expected 'cwd is required' in error, got: {msg}"
+    );
+}

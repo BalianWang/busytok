@@ -2249,6 +2249,37 @@ mod tests {
         assert!(err.is_err());
     }
 
+    /// `from_u8` returns `None` for out-of-range values (> 6) and `Some` for
+    /// each valid weekday index 0..=6.
+    #[test]
+    fn weekday_index_dto_from_u8_bounds() {
+        // Valid range 0..=6 — each maps to a Some variant.
+        for v in 0..=6u8 {
+            let parsed = WeekdayIndexDto::from_u8(v);
+            assert!(parsed.is_some(), "expected Some for v={v}");
+            assert_eq!(parsed.unwrap().value(), v);
+        }
+        // Out-of-range values return None.
+        assert!(WeekdayIndexDto::from_u8(7).is_none());
+        assert!(WeekdayIndexDto::from_u8(255).is_none());
+    }
+
+    /// `ControlError::new` builds the canonical error payload with `payload`
+    /// defaulting to `None` (Task 5 control contract).
+    #[test]
+    fn control_error_new_sets_code_and_message_with_no_payload() {
+        let e = ControlError::new("subagent.not_found", "no such subagent");
+        assert_eq!(e.code, "subagent.not_found");
+        assert_eq!(e.message, "no such subagent");
+        assert!(e.payload.is_none(), "payload must default to None");
+        // Round-trip through JSON so the wire contract is stable.
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"code\":\"subagent.not_found\""));
+        assert!(s.contains("\"message\":\"no such subagent\""));
+        // `payload` is skip_serializing_if = None, so it must not appear.
+        assert!(!s.contains("payload"));
+    }
+
     #[test]
     fn activity_list_response_dto_serde() {
         let dto = ActivityListResponseDto {
