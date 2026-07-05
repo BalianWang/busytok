@@ -4459,6 +4459,147 @@ async fn subagent_runtime_status_tasks_recent_shows_display_name_for_deleted_sub
 }
 
 // ---------------------------------------------------------------------------
+// subagent.task_get (Phase 5 Task 3: single-task detail RPC)
+// ---------------------------------------------------------------------------
+//
+// Tests exercise the BusytokSupervisor handler end-to-end via the
+// RuntimeControl trait. Data is seeded directly into the in-memory DB using
+// the existing `seed_subagent_row` / `seed_task_row` helpers (lines 4030 /
+// 4041). The handler resolves the task row via `db.subagent_get_task(...)` and
+// joins `subagent_name` from `db.subagent_get_logical(...)`, degrading
+// gracefully when the parent subagent row is gone.
+
+/// Existing task id returns a populated `SubagentTaskDetailDto` whose fields
+/// match the seeded row, including the resolved `subagent_name`.
+#[tokio::test]
+async fn subagent_task_get_returns_populated_dto_for_existing_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let sub_id = seed_subagent_row(&sup, "researcher", "warm");
+    seed_task_row(&sup, "task-existing", &sub_id, "completed", 1_000);
+
+    let dto = sup
+        .subagent_task_get(SubagentTaskGetRequestDto {
+            task_id: "task-existing".to_string(),
+        })
+        .await
+        .expect("task_get should succeed for existing task");
+
+    assert_eq!(dto.id, "task-existing");
+    assert_eq!(dto.subagent_id, sub_id);
+    assert_eq!(dto.subagent_name.as_deref(), Some("researcher"));
+    assert_eq!(dto.profile, "pi/search-cheap");
+    assert_eq!(dto.status, "completed");
+    assert_eq!(dto.prompt.as_deref(), Some("do work"));
+    assert_eq!(dto.created_at_ms, 1_000);
+    assert_eq!(dto.completed_at_ms, Some(2_000));
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// Missing task id returns a `MethodDispatchError` with the task-specific
+/// code `subagent.task_not_found` and message `task not found: <task_id>`.
+#[tokio::test]
+async fn subagent_task_get_returns_task_not_found_error_for_missing_id() {
+    use busytok_control::dispatch::MethodDispatchError;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let err = sup
+        .subagent_task_get(SubagentTaskGetRequestDto {
+            task_id: "task-missing".to_string(),
+        })
+        .await
+        .expect_err("task_get should fail for missing task id");
+
+    let dispatch_err = err
+        .downcast_ref::<MethodDispatchError>()
+        .expect("error should be a MethodDispatchError");
+    assert_eq!(
+        dispatch_err.code, "subagent.task_not_found",
+        "expected task-specific not-found code; got: {}",
+        dispatch_err.code
+    );
+    assert!(
+        dispatch_err
+            .message
+            .contains("task not found: task-missing"),
+        "expected message to mention the missing task id; got: {}",
+        dispatch_err.message
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+/// Task exists but the parent subagent row was hard-deleted. The handler
+/// must still return the task data with `subagent_name: None` (graceful
+/// degradation) — never fail the whole read.
+#[tokio::test]
+async fn subagent_task_get_returns_none_subagent_name_when_subagent_row_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    // Seed a task whose `subagent_id` references a logical subagent row
+    // that does NOT exist. We disable FK enforcement for the insert
+    // because (a) `subagent_hard_delete` cascade-removes task rows (so we
+    // can't seed-then-delete via the public API), and (b) the schema has
+    // `FOREIGN KEY (subagent_id) REFERENCES subagent_logical_subagents(id)`
+    // with `PRAGMA foreign_keys = ON` in `Database::configure`. SQLite does
+    // NOT retroactively validate existing rows when FK is re-enabled, so
+    // the orphan task survives.
+    let orphan_subagent_id = "ghost-no-row";
+    {
+        let db = sup.db_handle().lock().unwrap();
+        db.conn()
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("disable FK for orphan seed");
+        let mut row = SubagentTaskRow::for_test(
+            "task-orphaned",
+            orphan_subagent_id,
+            "pi/search-cheap",
+            "do work",
+        );
+        row.status = "failed".to_string();
+        row.created_at_ms = 5_000;
+        row.completed_at_ms = Some(6_000);
+        row.error = Some("boom".to_string());
+        db.subagent_insert_task(&row).expect("insert orphan task");
+        db.conn()
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("re-enable FK");
+    }
+
+    let dto = sup
+        .subagent_task_get(SubagentTaskGetRequestDto {
+            task_id: "task-orphaned".to_string(),
+        })
+        .await
+        .expect("task_get should succeed even with orphaned subagent");
+
+    // Task fields are populated from the row...
+    assert_eq!(dto.id, "task-orphaned");
+    assert_eq!(dto.subagent_id, orphan_subagent_id);
+    assert_eq!(dto.profile, "pi/search-cheap");
+    assert_eq!(dto.status, "failed");
+    assert_eq!(dto.error.as_deref(), Some("boom"));
+    assert_eq!(dto.created_at_ms, 5_000);
+    assert_eq!(dto.completed_at_ms, Some(6_000));
+    // ...but `subagent_name` degrades to `None` (no parent row to join).
+    assert!(
+        dto.subagent_name.is_none(),
+        "orphaned task should have subagent_name=None, got {:?}",
+        dto.subagent_name
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3 Task 4: BusytokSupervisor wiring — delegate validation,
 // runtime_status aggregation, provider_changed/deleted worker lifecycle.
 // ---------------------------------------------------------------------------

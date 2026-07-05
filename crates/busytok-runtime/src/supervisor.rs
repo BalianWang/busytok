@@ -2912,6 +2912,38 @@ fn subagent_task_summary(
     }
 }
 
+/// Spec §3.4: map a `SubagentTaskRow` (full DB row) to the detail DTO
+/// returned by `subagent.task_get`. The DTO omits `intent`,
+/// `output_schema_name`, `output_schema_version`, and `result_json` from
+/// the row (consistent with `SubagentTaskSummaryDto`). `subagent_name` is
+/// resolved separately by the caller via `db.subagent_get_logical(...)`
+/// and is `None` when the parent subagent row is gone (graceful
+/// degradation — see `subagent.task_get` handler).
+fn subagent_task_detail(
+    task: busytok_store::repository::SubagentTaskRow,
+    subagent_name: Option<String>,
+) -> SubagentTaskDetailDto {
+    SubagentTaskDetailDto {
+        id: task.id,
+        subagent_id: task.subagent_id,
+        subagent_name,
+        source_harness: task.source_harness,
+        source_session_id: task.source_session_id,
+        profile: task.profile,
+        status: task.status,
+        prompt: task.prompt,
+        prompt_artifact_ref: task.prompt_artifact_ref,
+        result_summary: task.result_summary,
+        error: task.error,
+        error_kind: task.error_kind,
+        model_override: task.model_override,
+        timeout_seconds: task.timeout_seconds,
+        created_at_ms: task.created_at_ms,
+        started_at_ms: task.started_at_ms,
+        completed_at_ms: task.completed_at_ms,
+    }
+}
+
 #[async_trait]
 impl RuntimeControl for BusytokSupervisor {
     // ── Service ──────────────────────────────────────────────────────
@@ -5692,11 +5724,73 @@ impl RuntimeControl for BusytokSupervisor {
 
     async fn subagent_task_get(
         &self,
-        _req: SubagentTaskGetRequestDto,
+        req: SubagentTaskGetRequestDto,
     ) -> Result<SubagentTaskDetailDto> {
-        // Placeholder stub — Task 3 replaces this with the real
-        // `subagent_tasks` row lookup + subagent_name join.
-        Ok(Default::default())
+        // Spec §3.4: single-task detail RPC. Reads the task row directly via
+        // the supervisor's own DB handle (the same pattern as the
+        // provider/model handlers around `provider_create`) — `SubagentManager`
+        // does NOT expose a `get_task(task_id)` method, and adding a one-off
+        // read-only lookup there isn't worth it for a single read path.
+        let task_id = req.task_id.clone();
+        let (task, subagent_name) = {
+            let db = self.db.lock().unwrap();
+            let task = db.subagent_get_task(&task_id).map_err(|e| {
+                tracing::error!(
+                    event_code = "subagent.task_get.sql_read_failed",
+                    error = %e,
+                    "subagent_get_task failed"
+                );
+                anyhow::Error::new(MethodDispatchError::from_read_error(
+                    "subagent.task_get_failed",
+                    format!("task lookup failed: {task_id}"),
+                    serde_json::Value::Null,
+                ))
+            })?;
+            let task = match task {
+                Some(t) => t,
+                None => {
+                    tracing::warn!(
+                        event_code = "subagent.task_get.miss",
+                        task_id = %task_id,
+                        "task not found"
+                    );
+                    return Err(anyhow::Error::new(MethodDispatchError::from_read_error(
+                        "subagent.task_not_found",
+                        format!("task not found: {task_id}"),
+                        serde_json::Value::Null,
+                    ))
+                    .into());
+                }
+            };
+            // Resolve `subagent_name` from the parent logical subagent row.
+            // Degrade gracefully when the parent is gone (e.g. hard-deleted
+            // while a task row remains): `subagent_name: None`, do NOT fail
+            // the whole read.
+            let subagent_name = db
+                .subagent_get_logical(&task.subagent_id)
+                .map_err(|e| {
+                    tracing::error!(
+                        event_code = "subagent.task_get.sql_read_failed",
+                        error = %e,
+                        "subagent_get_logical failed"
+                    );
+                    anyhow::Error::new(MethodDispatchError::from_read_error(
+                        "subagent.task_get_failed",
+                        format!("subagent lookup failed: {task_id}"),
+                        serde_json::Value::Null,
+                    ))
+                })?
+                .map(|s| s.name);
+            (task, subagent_name)
+        };
+
+        tracing::debug!(
+            event_code = "subagent.task_get.hit",
+            task_id = %task.id,
+            subagent_id = %task.subagent_id,
+            "task lookup succeeded"
+        );
+        Ok(subagent_task_detail(task, subagent_name))
     }
 
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
