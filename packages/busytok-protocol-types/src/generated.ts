@@ -326,7 +326,11 @@ export type SubagentListResponseDto = { subagents: Array<SubagentDetailDto>, };
 
 export type SubagentTaskSummaryDto = { id: string, subagent_id: string, profile: string, status: string, prompt: string | null, result_summary: string | null, error: string | null, created_at_ms: number, completed_at_ms: number | null, };
 
+export type SubagentTaskDetailDto = { id: string, subagent_id: string, subagent_name: string | null, source_harness: string | null, source_session_id: string | null, profile: string, status: string, prompt: string | null, prompt_artifact_ref: string | null, result_summary: string | null, error: string | null, error_kind: string | null, model_override: string | null, timeout_seconds: number | null, created_at_ms: number, started_at_ms: number | null, completed_at_ms: number | null, };
+
 export type SubagentTasksRequestDto = { name: string | null, id: string | null, cwd: string | null, limit: number | null, };
+
+export type SubagentTaskGetRequestDto = { task_id: string, };
 
 export type SubagentTasksResponseDto = { tasks: Array<SubagentTaskSummaryDto>, };
 

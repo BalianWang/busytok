@@ -1003,6 +1003,12 @@ mod tests {
         ) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
             self.inner.subagent_runtime_status(req).await
         }
+        async fn subagent_task_get(
+            &self,
+            req: SubagentTaskGetRequestDto,
+        ) -> Result<SubagentTaskDetailDto> {
+            self.inner.subagent_task_get(req).await
+        }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
         }
@@ -1763,6 +1769,12 @@ mod tests {
             req: SubagentRuntimeStatusRequestDto,
         ) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
             self.inner.subagent_runtime_status(req).await
+        }
+        async fn subagent_task_get(
+            &self,
+            req: SubagentTaskGetRequestDto,
+        ) -> Result<SubagentTaskDetailDto> {
+            self.inner.subagent_task_get(req).await
         }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await

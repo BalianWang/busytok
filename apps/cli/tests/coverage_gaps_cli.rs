@@ -423,6 +423,12 @@ impl RuntimeControl for ConfigurableRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
         self.inner.subagent_runtime_status(req).await
     }
+    async fn subagent_task_get(
+        &self,
+        req: SubagentTaskGetRequestDto,
+    ) -> anyhow::Result<SubagentTaskDetailDto> {
+        self.inner.subagent_task_get(req).await
+    }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await
     }

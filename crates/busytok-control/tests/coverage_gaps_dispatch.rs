@@ -351,6 +351,12 @@ impl RuntimeControl for SuccessRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
         self.inner.subagent_runtime_status(req).await
     }
+    async fn subagent_task_get(
+        &self,
+        req: SubagentTaskGetRequestDto,
+    ) -> anyhow::Result<SubagentTaskDetailDto> {
+        self.inner.subagent_task_get(req).await
+    }
 
     // ── Provider overrides (return Ok to cover dispatch success paths) ──
     async fn provider_create(&self, _req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
@@ -859,6 +865,12 @@ impl RuntimeControl for AllErrorRuntime {
     ) -> anyhow::Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
         Err(anyhow::anyhow!("runtime error"))
     }
+    async fn subagent_task_get(
+        &self,
+        _req: SubagentTaskGetRequestDto,
+    ) -> anyhow::Result<SubagentTaskDetailDto> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
 
     async fn provider_create(&self, _req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         Err(anyhow::anyhow!("runtime error"))
@@ -1016,6 +1028,10 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
         ("subagent.hibernate", serde_json::json!({"id": "sa-1"})),
         ("subagent.delete", serde_json::json!({"id": "sa-1"})),
         ("subagent.runtime_status", serde_json::json!({})),
+        (
+            "subagent.task_get",
+            serde_json::json!({"task_id": "task-1"}),
+        ),
         (
             "provider.create",
             serde_json::json!({
@@ -1250,4 +1266,121 @@ async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
             id: "prof1".to_string(),
         })
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// 9. subagent.task_get dispatch route (dispatch.rs subagent.task_get arm)
+// ---------------------------------------------------------------------------
+//
+// `subagent.task_get` was added as a new control RPC in the
+// `subagent-task-get-cli-rpc` plan. These tests exercise the dispatch match
+// arm: valid params must route to `RuntimeControl::subagent_task_get`, and
+// invalid params must surface as a dispatch error before the runtime is
+// touched.
+
+#[tokio::test]
+async fn dispatcher_routes_subagent_task_get_returns_ok() {
+    // Covers the dispatch.rs `"subagent.task_get"` match arm: valid params
+    // deserialize into `SubagentTaskGetRequestDto`, the runtime's
+    // `subagent_task_get` is invoked, and the resulting DTO is wrapped in
+    // `ControlResponse::ok(...)`. `SuccessRuntime` delegates to
+    // `TestRuntimeControl`, whose stub returns `Ok(Default::default())` — a
+    // fully zeroed `SubagentTaskDetailDto`.
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let params = serde_json::json!({"task_id": "task-1"});
+    let response = dispatcher
+        .dispatch(ControlRequest::new("subagent.task_get", params))
+        .await
+        .expect("dispatch should succeed for valid params");
+
+    match response {
+        ControlResponse::Ok(val) => {
+            // Default `SubagentTaskDetailDto` has empty `id`/`subagent_id`/
+            // `profile`/`status` strings; the optional fields serialize to
+            // `null` and the rest are zeros/empties.
+            assert_eq!(val["id"], "");
+            assert_eq!(val["subagent_id"], "");
+            assert_eq!(val["profile"], "");
+            assert_eq!(val["status"], "");
+            assert_eq!(val["created_at_ms"], 0);
+        }
+        other => panic!("expected Ok response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_routes_subagent_task_get_invalid_params_returns_err() {
+    // Covers the dispatch.rs `"subagent.task_get"` arm's `from_value` `?`:
+    // `SubagentTaskGetRequestDto` requires a non-null `task_id` string, so
+    // passing an object without it (or with the wrong type) must surface as
+    // a dispatch error BEFORE the runtime is called.
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+
+    // Missing `task_id` field — deserialization fails.
+    let result = dispatcher
+        .dispatch(ControlRequest::new(
+            "subagent.task_get",
+            serde_json::json!({}),
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "missing task_id should surface as a dispatch error, got {result:?}"
+    );
+
+    // Wrong type for `task_id` — deserialization fails.
+    let result = dispatcher
+        .dispatch(ControlRequest::new(
+            "subagent.task_get",
+            serde_json::json!({"task_id": 42}),
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "non-string task_id should surface as a dispatch error, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_routes_subagent_task_get_propagates_runtime_err() {
+    // Covers the dispatch.rs `"subagent.task_get"` arm's await `?` Err path:
+    // `AllErrorRuntime` returns `Err` for every method, so dispatching
+    // `subagent.task_get` with valid params (so `from_value` succeeds) must
+    // propagate that error out of `dispatch`.
+    let runtime = error_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let result = dispatcher
+        .dispatch(ControlRequest::new(
+            "subagent.task_get",
+            serde_json::json!({"task_id": "task-1"}),
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "subagent.task_get should propagate Err from AllErrorRuntime, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn arc_blanket_impl_delegates_subagent_task_get() {
+    // Covers the `impl RuntimeControl for Arc<T>` forwarding body for
+    // `subagent_task_get` (dispatch.rs L1519-1526 region): calling the method
+    // on `Arc<TestRuntimeControl>` must forward to `(**self).subagent_task_get`.
+    let rt: Arc<TestRuntimeControl> =
+        Arc::new(TestRuntimeControl::with_claude_fixture().await.unwrap());
+
+    let dto = rt
+        .subagent_task_get(SubagentTaskGetRequestDto {
+            task_id: "task-1".to_string(),
+        })
+        .await
+        .expect("subagent_task_get should succeed on TestRuntimeControl stub");
+    // Default `SubagentTaskDetailDto` has empty strings / zeros / nulls.
+    assert_eq!(dto.id, "");
+    assert_eq!(dto.subagent_id, "");
+    assert_eq!(dto.profile, "");
+    assert_eq!(dto.status, "");
+    assert_eq!(dto.created_at_ms, 0);
 }

@@ -5690,6 +5690,15 @@ impl RuntimeControl for BusytokSupervisor {
         )
     }
 
+    async fn subagent_task_get(
+        &self,
+        _req: SubagentTaskGetRequestDto,
+    ) -> Result<SubagentTaskDetailDto> {
+        // Placeholder stub — Task 3 replaces this with the real
+        // `subagent_tasks` row lookup + subagent_name join.
+        Ok(Default::default())
+    }
+
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {

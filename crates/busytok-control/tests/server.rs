@@ -317,6 +317,13 @@ impl RuntimeControl for MethodDispatchErrorRuntime {
         self.inner.subagent_runtime_status(req).await
     }
 
+    async fn subagent_task_get(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskGetRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentTaskDetailDto> {
+        self.inner.subagent_task_get(req).await
+    }
+
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await
     }

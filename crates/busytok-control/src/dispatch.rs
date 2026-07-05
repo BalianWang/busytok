@@ -199,6 +199,10 @@ pub trait RuntimeControl: Send + Sync {
     ) -> Result<
         busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
     >;
+    async fn subagent_task_get(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskGetRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTaskDetailDto>;
 
     // Providers (Phase 1: Credential Foundation)
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto>;
@@ -531,6 +535,12 @@ impl ControlDispatcher {
                     anyhow::anyhow!("invalid params for subagent.runtime_status: {e}")
                 })?;
                 let dto = self.runtime.subagent_runtime_status(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.task_get" => {
+                let req: SubagentTaskGetRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.task_get: {e}"))?;
+                let dto = self.runtime.subagent_task_get(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -1262,6 +1272,12 @@ impl RuntimeControl for TestRuntimeControl {
             },
         ))
     }
+    async fn subagent_task_get(
+        &self,
+        _req: busytok_protocol::dto::SubagentTaskGetRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTaskDetailDto> {
+        Ok(Default::default())
+    }
 
     // ── Providers (Phase 1: Credential Foundation) ───────────────────
 
@@ -1523,6 +1539,12 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         busytok_protocol::dto::ReadEnvelopeDto<busytok_protocol::dto::SubagentRuntimeStatusDto>,
     > {
         (**self).subagent_runtime_status(req).await
+    }
+    async fn subagent_task_get(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskGetRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTaskDetailDto> {
+        (**self).subagent_task_get(req).await
     }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
         (**self).provider_create(req).await
