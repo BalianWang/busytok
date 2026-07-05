@@ -17,6 +17,8 @@ use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
 use busytok_store::Database;
 
+pub mod models;
+
 /// Connect to the control server and return a client.
 pub(crate) async fn connect_client() -> Result<ControlClient> {
     let endpoint = if let Ok(s) = std::env::var("BUSYTOK_SOCKET") {
@@ -1842,6 +1844,21 @@ mod tests {
         ) -> Result<ProviderTestConnectionResponseDto> {
             self.inner.provider_test_connection(req).await
         }
+        async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+            self.inner.model_create(req).await
+        }
+        async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+            self.inner.model_list(req).await
+        }
+        async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
+            self.inner.model_update(req).await
+        }
+        async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()> {
+            self.inner.model_delete(req).await
+        }
+        async fn model_tags_update(&self, req: ModelTagUpdateDto) -> Result<()> {
+            self.inner.model_tags_update(req).await
+        }
         async fn pi_sidecar_locator_update(
             &self,
             req: PiSidecarLocatorUpdateRequestDto,
@@ -1869,5 +1886,300 @@ mod tests {
         let _ = Value::Null;
         let _ = AtomicBool::new(false);
         let _ = Ordering::SeqCst;
+    }
+
+    /// Exercises every delegation method on `TestRuntimeWrapper` so the
+    /// forwarding lines are covered. The inner `TestRuntimeControl`
+    /// stubs return Ok/Err; we only need the delegation line to execute.
+    #[tokio::test]
+    async fn test_runtime_wrapper_delegates_every_method_to_inner() {
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let wrapper = TestRuntimeWrapper::new(inner);
+        let rt: &dyn RuntimeControl = &wrapper;
+
+        // no-arg reads (settings_diagnostics/settings_update/prompts_create
+        // fall through to their delegation line when no error/value is set).
+        let _ = rt.service_health().await;
+        let _ = rt.service_status().await;
+        let _ = rt.shell_status().await;
+        let _ = rt.settings_snapshot().await;
+        let _ = rt.settings_diagnostics().await;
+        let _ = rt.provider_list().await;
+        let _ = rt.event_bus();
+
+        let day = RangePresetDto::Day;
+        let _ = rt
+            .overview_summary(OverviewSummaryRequestDto { range: day })
+            .await;
+        let _ = rt
+            .overview_trend(OverviewTrendRequestDto {
+                range: day,
+                granularity: None,
+            })
+            .await;
+        let _ = rt
+            .overview_heatmap(OverviewHeatmapRequestDto { range: day })
+            .await;
+        let _ = rt
+            .overview_rankings(OverviewRankingsRequestDto { range: day })
+            .await;
+        let _ = rt.receipt_daily(ReceiptDailyRequestDto::default()).await;
+        let _ = rt
+            .activity_recent(ActivityRecentRequestDto {
+                range: day,
+                limit: None,
+            })
+            .await;
+        let _ = rt
+            .activity_list(ActivityListRequestDto {
+                range: day,
+                cursor: None,
+                limit: None,
+                client_id: None,
+                source_id: None,
+                project_hash: None,
+                model_id: None,
+            })
+            .await;
+        let _ = rt
+            .activity_detail(ActivityDetailRequestDto { id: "x".into() })
+            .await;
+        let _ = rt
+            .breakdown_list(BreakdownListRequestDto {
+                kind: BreakdownKindDto::Project,
+                range: day,
+                cursor: None,
+                limit: None,
+            })
+            .await;
+        let _ = rt
+            .breakdown_detail(BreakdownDetailRequestDto {
+                kind: BreakdownKindDto::Project,
+                id: "x".into(),
+                range: day,
+            })
+            .await;
+        let _ = rt
+            .clients_snapshot(ClientsSnapshotRequestDto {
+                cursor: None,
+                limit: None,
+                client_id: None,
+                scan_state: None,
+            })
+            .await;
+        let _ = rt
+            .clients_detail(ClientSourceDetailRequestDto {
+                source_id: "x".into(),
+            })
+            .await;
+        let _ = rt
+            .settings_update(SettingsUpdateRequestDto {
+                timezone: None,
+                week_starts_on: None,
+                discovery: None,
+                privacy: None,
+                prompt_palette_default_action: None,
+            })
+            .await;
+        let _ = rt
+            .settings_recovery_action(SettingsRecoveryActionRequestDto {
+                id: SettingsRecoveryActionIdDto::RescanAll,
+            })
+            .await;
+        let _ = rt
+            .live_window(LiveWindowRequestDto {
+                window_seconds: None,
+            })
+            .await;
+        let _ = rt
+            .prompts_list(PromptListQueryDto {
+                query: None,
+                tag: None,
+                sort: None,
+                limit: None,
+            })
+            .await;
+        let _ = rt.prompts_get(PromptGetRequestDto { id: "x".into() }).await;
+        let _ = rt
+            .prompts_create(PromptCreateRequestDto {
+                content: "c".into(),
+                alias: None,
+                tags: vec![],
+            })
+            .await;
+        let _ = rt
+            .prompts_update(PromptUpdateRequestDto {
+                id: "x".into(),
+                content: "c".into(),
+                alias: None,
+                tags: vec![],
+                is_pinned: false,
+            })
+            .await;
+        let _ = rt
+            .prompts_delete(PromptDeleteRequestDto { id: "x".into() })
+            .await;
+        let _ = rt
+            .prompts_use(PromptUseRequestDto {
+                id: "x".into(),
+                action: PromptActionDto::OnlyCopy,
+                surface: PromptUseSurfaceDto::Overlay,
+                outcome: PromptUseOutcomeDto::Copy,
+                failure_reason: None,
+            })
+            .await;
+        let _ = rt
+            .suggest_tags(PromptSuggestTagsRequestDto {
+                query: None,
+                limit: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_delegate(SubagentDelegateRequestDto {
+                subagent_name: "sa".into(),
+                subagent_id: None,
+                cwd: ".".into(),
+                profile: "default".into(),
+                intent: None,
+                prompt: "p".into(),
+                prompt_artifact_ref: None,
+                timeout_seconds: None,
+                model_override: None,
+                source_harness: None,
+                source_session_id: None,
+                bound_provider_id: None,
+                bound_model_id: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_list(SubagentListRequestDto {
+                status: None,
+                project: None,
+                include_deleted: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_show(SubagentResolveRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_tasks(SubagentTasksRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+                limit: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_hibernate(SubagentResolveRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_delete(SubagentDeleteRequestDto {
+                name: None,
+                id: Some("sa".into()),
+                cwd: None,
+                hard: None,
+            })
+            .await;
+        let _ = rt
+            .subagent_runtime_status(SubagentRuntimeStatusRequestDto::default())
+            .await;
+        let _ = rt
+            .provider_create(ProviderCreateRequestDto {
+                name: "p".into(),
+                provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+                base_url: "https://x.example.com/v1".into(),
+                enabled: None,
+                api_key: None,
+            })
+            .await;
+        let _ = rt
+            .provider_update(ProviderUpdateRequestDto {
+                id: "p".into(),
+                name: None,
+                base_url: None,
+                enabled: None,
+                provider_kind: None,
+                api_key: None,
+            })
+            .await;
+        let _ = rt
+            .provider_delete(ProviderDeleteRequestDto { id: "p".into() })
+            .await;
+        let _ = rt
+            .provider_test_connection(ProviderTestConnectionRequestDto { id: "p".into() })
+            .await;
+        let _ = rt
+            .model_create(ModelCreateRequestDto {
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                enabled: None,
+                tags: vec![],
+                context_window: 8192,
+                max_tokens: 4096,
+                display_name: None,
+                reasoning: None,
+            })
+            .await;
+        let _ = rt
+            .model_list(ModelListRequestDto {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: false,
+            })
+            .await;
+        let _ = rt
+            .model_update(ModelUpdateRequestDto {
+                id: "m".into(),
+                enabled: None,
+                display_name: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
+            })
+            .await;
+        let _ = rt
+            .model_delete(ModelDeleteRequestDto { id: "m".into() })
+            .await;
+        let _ = rt
+            .model_tags_update(ModelTagUpdateDto {
+                model_id: "m".into(),
+                tags: vec![],
+            })
+            .await;
+        let _ = rt
+            .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+                runtime_dir: "/tmp".into(),
+                enabled: true,
+            })
+            .await;
+        let _ = rt
+            .profile_create(ProfileCreateRequestDto {
+                id: "pr".into(),
+                tools: None,
+                context_budget_tokens: None,
+                timeout_seconds: None,
+                write_access: None,
+            })
+            .await;
+        let _ = rt
+            .profile_update(ProfileUpdateRequestDto {
+                id: "pr".into(),
+                tools: None,
+                context_budget_tokens: None,
+                timeout_seconds: None,
+                write_access: None,
+            })
+            .await;
+        let _ = rt
+            .profile_delete(ProfileDeleteRequestDto { id: "pr".into() })
+            .await;
     }
 }

@@ -164,25 +164,43 @@ impl SubagentManager {
                 "either prompt or prompt_artifact_ref must be set".to_string(),
             ));
         }
-        let profile_model = self.profile_model(&req.profile);
+
+        // Spec §3.3: bound fields are conditionally required. One without the
+        // other is a validation error (`(Some, None)` / `(None, Some)`).
+        // `(None, None)` is permitted at this layer for the reuse path (name
+        // hit OR `subagent_id` shortcut) — the caller may not know whether the
+        // subagent exists. The resolver's creation path (0 active matches)
+        // rejects empty bound fields with `SubagentError::Validation`, so a
+        // `(None, None)` request that misses the name lookup fails fast with
+        // "bound_provider_id and bound_model_id are both required to create a
+        // subagent". There is no "create without binding" path (spec §3.3).
+        let bound_pair = match (&req.bound_provider_id, &req.bound_model_id) {
+            (Some(p), Some(m)) => Some((p.clone(), m.clone())),
+            (None, None) => None,
+            _ => {
+                return Err(SubagentError::Validation(
+                    "bound_provider_id and bound_model_id must be provided together".into(),
+                ));
+            }
+        };
 
         // 1. resolve subagent (create if needed). `resolve_by_name` canonicalizes
         //    cwd and validates the name; errors propagate with a reject log.
         let Resolved { subagent, created } = {
             let db = self.db.lock().expect("subagent db lock poisoned");
             if let Some(id) = &req.subagent_id {
+                // Reuse path: ignore bound fields, resolve by id.
                 Resolved {
                     subagent: resolve_by_id(&db, id)?,
                     created: false,
                 }
             } else {
-                match resolve_by_name(
-                    &db,
-                    &req.subagent_name,
-                    &req.cwd,
-                    &req.profile,
-                    profile_model.as_deref(),
-                ) {
+                // Name path: pass bound fields; resolver validates only on
+                // create (existing subagent → bound fields ignored).
+                let (p, m) = bound_pair
+                    .clone()
+                    .unwrap_or_else(|| (String::new(), String::new()));
+                match resolve_by_name(&db, &req.subagent_name, &req.cwd, &req.profile, &p, &m) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(
@@ -281,7 +299,7 @@ impl SubagentManager {
                 session_reused: false,
                 status: TaskStatus::Queued,
                 profile: req.profile.clone(),
-                model: req.model_override.clone().or(profile_model),
+                model: req.model_override.clone(),
                 summary: None,
                 usage: TaskUsage::default(),
             });
@@ -291,7 +309,7 @@ impl SubagentManager {
         //    No lock held during execution. Task 7 Step 3: the post-insert
         //    execute logic is delegated to `execute_task()` so the background
         //    dispatcher can reuse it for queued tasks.
-        let model = req.model_override.clone().or(profile_model);
+        let model = req.model_override.clone();
         // The task row is already inserted as 'running' (Round 4 race-free
         // design). Reconstruct a `SubagentTaskRow` view to pass to
         // `execute_task` — the row is the single source of truth for execution
@@ -323,10 +341,9 @@ impl SubagentManager {
         let mut result = self.execute_task(&task_row, &subagent).await?;
         // `execute_task` returns the model it actually used (which may differ
         // from `model` when the task row's `model_override` is None and the
-        // subagent's `default_model` overrides the profile default). Preserve
-        // the model the caller expected when possible (synchronous path uses
-        // `req.model_override.or(profile_model)`); fall back to the
-        // `execute_task` value otherwise.
+        // subagent's `bound_model_id` is used). Preserve the model the caller
+        // expected when possible (synchronous path uses `req.model_override`);
+        // fall back to the `execute_task` value otherwise.
         if result.model.is_none() {
             result.model = model;
         }
@@ -353,11 +370,62 @@ impl SubagentManager {
         task: &SubagentTaskRow,
         subagent: &LogicalSubagent,
     ) -> Result<DelegateResult> {
-        let model = task
+        // Spec §4.3: effective model = task.model_override.unwrap_or(bound_model_id)
+        let effective_model_id = task
             .model_override
             .clone()
-            .or_else(|| subagent.default_model.clone())
-            .or_else(|| self.profile_model(&task.profile));
+            .unwrap_or_else(|| subagent.bound_model_id.clone());
+        // Spec §4.3 validation chain — fail fast on bound provider/model
+        // issues. Reads happen under the DB lock; the resolved values are
+        // used below to populate `ExecutorInput`'s provider config + model
+        // metadata fields.
+        let (resolved_provider, resolved_model) = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            let provider = db
+                .get_provider_with_secret(&subagent.bound_provider_id)
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "bound provider not found: {}",
+                        subagent.bound_provider_id
+                    ))
+                })?;
+            if !provider.enabled {
+                return Err(SubagentError::Validation(format!(
+                    "bound provider disabled: {}",
+                    subagent.bound_provider_id
+                )));
+            }
+            let api_key = provider.api_key.clone().unwrap_or_default();
+            if api_key.is_empty() {
+                return Err(SubagentError::Validation(format!(
+                    "bound provider missing api key: {}",
+                    subagent.bound_provider_id
+                )));
+            }
+            let model = db
+                .get_model_by_provider_and_model_id(
+                    &subagent.bound_provider_id,
+                    &effective_model_id,
+                )
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "bound model not found in provider: {effective_model_id}"
+                    ))
+                })?;
+            if !model.enabled {
+                return Err(SubagentError::Validation(format!(
+                    "bound model disabled: {effective_model_id}"
+                )));
+            }
+            (provider, model)
+        };
+        // `model` (the local variable used by the rest of execute_task) is the
+        // resolved model id (a String, not Option<String>). The rest of the
+        // body uses `effective_model_id` in its place; this shim keeps the
+        // existing body compiling without further edits.
+        let model: Option<String> = Some(effective_model_id.clone());
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -423,7 +491,7 @@ impl SubagentManager {
                 // canonicalized to during `resolve_by_name`.)
                 cwd: subagent.repo_path.clone(),
                 profile: task.profile.clone(),
-                model: model.clone(),
+                model: effective_model_id.clone(),
                 prompt,
                 prompt_artifact_ref: task.prompt_artifact_ref.clone(),
                 timeout_seconds: task.timeout_seconds.map(|t| t as u64),
@@ -431,13 +499,37 @@ impl SubagentManager {
                 memory: snapshot,
                 context: compact,
                 write_access,
-                // Phase 3: thread the profile's `provider_id` so the
-                // WorkerPool (Task 2) can route to the correct per-provider
-                // supervisor. `None` here means the profile is unbound —
-                // Task 2 will reject this at the pool boundary. We read
-                // `profile_cfg.provider_id` (already fetched above) rather
-                // than re-resolving from settings.
-                provider_id: profile_cfg.and_then(|p| p.provider_id.clone()),
+                // Task 5: thread the resolved provider config + model
+                // metadata end-to-end so the sidecar can route to the
+                // correct per-provider supervisor and build a complete model
+                // definition (spec §5.2). `provider_id` is now `String`
+                // (NOT NULL — validated above), so the WorkerPool always has
+                // a route target.
+                provider_id: resolved_provider.id.clone(),
+                provider_kind: resolved_provider.provider_kind.clone(),
+                provider_base_url: resolved_provider.base_url.clone(),
+                // 瞬态：不写回 task row，不进日志明文，不进 DTO/response/diagnostic.
+                provider_api_key: resolved_provider.api_key.clone().unwrap_or_default(),
+                model_reasoning: resolved_model.reasoning,
+                // I-2 fail-fast: context_window + max_tokens are required at
+                // execute time. Pre-existing/seed models may have NULL for
+                // these columns (migration 0007 adds them as nullable).
+                // `unwrap_or(0)` would propagate 0 into the Pi SDK's
+                // `registerProvider({ contextWindow: 0, maxTokens: 0 })`,
+                // which the SDK may interpret as "no context" / "no output" —
+                // silent breakage. Fail fast with a Validation error instead
+                // so the operator re-creates the model with proper metadata.
+                model_context_window: resolved_model.context_window.ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "model '{effective_model_id}' missing context_window metadata; re-create the model with context_window + max_tokens"
+                    ))
+                })?,
+                model_max_tokens: resolved_model.max_tokens.ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "model '{effective_model_id}' missing max_tokens metadata; re-create the model with context_window + max_tokens"
+                    ))
+                })?,
+                model_display_name: resolved_model.display_name.clone(),
             };
             (
                 input,
@@ -692,7 +784,7 @@ impl SubagentManager {
 
                 if let Some(task) = task {
                     // Resolve the subagent from the DB so we have the
-                    // canonical `repo_path`, `default_model`, etc.
+                    // canonical `repo_path`, `bound_provider_id`, etc.
                     let subagent = {
                         let db = manager.db.lock().expect("subagent db lock poisoned");
                         db.subagent_get_logical(&task.subagent_id)
@@ -1050,16 +1142,6 @@ impl SubagentManager {
         crate::resolver::lookup_by_name(db, name, cwd)
     }
 
-    fn profile_model(&self, profile: &str) -> Option<String> {
-        match profile {
-            "pi/search-cheap" => Some(self.settings.models.default_cheap_model.clone()),
-            "pi/review-cheap" => Some(self.settings.models.default_review_model.clone()),
-            "pi/plan-cheap" => Some(self.settings.models.default_reasoning_model.clone()),
-            other => self.settings.profiles.get(other).map(|p| p.model.clone()),
-        }
-        .filter(|m| !m.is_empty())
-    }
-
     /// Whether `profile` is a recognized profile name (built-in or configured).
     fn profile_known(&self, profile: &str) -> bool {
         matches!(
@@ -1132,5 +1214,123 @@ fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind>
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidecar::protocol::{AUTH_FAILURE, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT};
+    use busytok_store::SubagentTaskRow;
+
+    /// `subagent_error_to_task_error_kind` maps each sidecar failure variant
+    /// to the right `TaskErrorKind` for DB persistence (Task 5). Covers every
+    /// match arm so the classifier cannot silently regress.
+    #[test]
+    fn classifies_sidecar_errors_to_task_error_kind() {
+        // Timeout variants.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::TaskTimeout),
+            Some(TaskErrorKind::Timeout)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarTimeout("10s".into())),
+            Some(TaskErrorKind::Timeout)
+        );
+        // Crash.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarCrashed("sigkill".into())),
+            Some(TaskErrorKind::Crash)
+        );
+        // SidecarRpc with structured codes.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "401".into(),
+                code: Some(AUTH_FAILURE)
+            }),
+            Some(TaskErrorKind::Auth)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "429".into(),
+                code: Some(RATE_LIMIT)
+            }),
+            Some(TaskErrorKind::RateLimit)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "net".into(),
+                code: Some(NETWORK_ERROR)
+            }),
+            Some(TaskErrorKind::Network)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "timed out".into(),
+                code: Some(TASK_TIMEOUT)
+            }),
+            Some(TaskErrorKind::Timeout)
+        );
+        // SidecarRpc with no code → unclassified.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "unknown".into(),
+                code: None
+            }),
+            None
+        );
+        // SidecarRpc with an unrecognized code → unclassified.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
+                message: "misc".into(),
+                code: Some(-39999)
+            }),
+            None
+        );
+        // Non-sidecar errors → unclassified.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::Validation("x".into())),
+            None
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::NotFound("x".into())),
+            None
+        );
+    }
+
+    /// `task_row_to_summary` falls back to `TaskStatus::Queued` (with a warn
+    /// log) when the DB row's status string is corrupted / unrecognized. This
+    /// guards against a half-written migration or a future status enum value
+    /// that the running binary doesn't yet know.
+    #[test]
+    fn task_row_to_summary_falls_back_to_queued_on_bad_status() {
+        let _guard = install_tracing_for_unit_test();
+        let mut row = SubagentTaskRow::for_test("t-1", "sub-1", "pi/search-cheap", "do something");
+        row.status = "not-a-real-status".to_string();
+        let summary = task_row_to_summary(row);
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.id, "t-1");
+        assert_eq!(summary.subagent_id, "sub-1");
+    }
+
+    /// `task_row_to_summary` parses a known status string without falling back.
+    #[test]
+    fn task_row_to_summary_parses_known_status() {
+        let mut row = SubagentTaskRow::for_test("t-2", "sub-2", "pi/search-cheap", "do something");
+        row.status = "completed".to_string();
+        row.result_summary = Some("done".into());
+        let summary = task_row_to_summary(row);
+        assert_eq!(summary.status, TaskStatus::Completed);
+        assert_eq!(summary.result_summary.as_deref(), Some("done"));
+    }
+
+    /// Install a thread-local tracing subscriber so the `warn!` arguments in
+    /// the fallback path are evaluated (and counted by line coverage).
+    fn install_tracing_for_unit_test() -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .finish();
+        tracing::subscriber::set_default(subscriber)
     }
 }

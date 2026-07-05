@@ -248,4 +248,88 @@ describe("createBusytokClient", () => {
     }
   });
 
+  // ── Model catalog RPCs (Task 9 Step 1) ───────────────────────────
+
+  it("requests model list", async () => {
+    const invoke = vi.fn().mockResolvedValue({ models: [] });
+    const client = createBusytokClient({ invoke });
+    await client.modelList({ provider_id: "deepseek", tags: ["chat"], include_disabled: false });
+    expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
+      method: "model.list",
+      params: { provider_id: "deepseek", tags: ["chat"], include_disabled: false },
+    }));
+  });
+
+  it("requests model create", async () => {
+    const invoke = vi.fn().mockResolvedValue({ model_db_id: "m-1" });
+    const client = createBusytokClient({ invoke });
+    await client.modelCreate({
+      provider_id: "deepseek",
+      model_id: "deepseek-chat",
+      enabled: true,
+      tags: ["chat"],
+      context_window: 64000,
+      max_tokens: 8192,
+      display_name: null,
+      reasoning: false,
+    });
+    expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
+      method: "model.create",
+      params: {
+        provider_id: "deepseek",
+        model_id: "deepseek-chat",
+        enabled: true,
+        tags: ["chat"],
+        context_window: 64000,
+        max_tokens: 8192,
+        display_name: null,
+        reasoning: false,
+      },
+    }));
+  });
+
+  it("requests model update", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createBusytokClient({ invoke });
+    await client.modelUpdate({
+      id: "m-1",
+      enabled: false,
+      display_name: null,
+      reasoning: null,
+      context_window: null,
+      max_tokens: null,
+    });
+    expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
+      method: "model.update",
+      params: {
+        id: "m-1",
+        enabled: false,
+        display_name: null,
+        reasoning: null,
+        context_window: null,
+        max_tokens: null,
+      },
+    }));
+  });
+
+  it("requests model delete", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createBusytokClient({ invoke });
+    await client.modelDelete("m-1");
+    expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
+      method: "model.delete",
+      params: { id: "m-1" },
+    }));
+  });
+
+  it("requests model tags update", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createBusytokClient({ invoke });
+    await client.modelTagsUpdate("deepseek-chat", ["chat", "reasoning"]);
+    expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
+      method: "model.tags.update",
+      params: { model_id: "deepseek-chat", tags: ["chat", "reasoning"] },
+    }));
+  });
+
 });

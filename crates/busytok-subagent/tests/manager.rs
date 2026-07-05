@@ -4,6 +4,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use busytok_config::{SubagentProfileConfig, SubagentSettings};
+use busytok_store::provider_catalog::{
+    create_model, create_provider, CreateModelReq, CreateProviderReq,
+};
 use busytok_store::{Database, SubagentHarnessBindingRow};
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::memory::{KeyFile, MemoryUpdate, OpenQuestion};
@@ -30,13 +33,92 @@ fn install_tracing() -> tracing::subscriber::DefaultGuard {
 
 async fn manager() -> SubagentManager {
     // std::sync::Mutex — matches the supervisor's db field type.
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     SubagentManager::new(
         db,
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
     )
+}
+
+// Thread-local storage for the seeded test provider/model IDs. Each
+// `#[tokio::test]` runs on its own thread, and `test_db()` seeds fresh
+// values before `req()` is called.
+thread_local! {
+    static TEST_PROVIDER_ID: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    static TEST_MODEL_ID: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+const TEST_MODEL_NAME: &str = "test-model";
+
+/// Create an in-memory database seeded with a test provider + model so
+/// `delegate()` can create subagents with valid bound fields. The seeded
+/// IDs are stored in thread-locals for `req()` / `req_with_cwd()` to read.
+fn test_db() -> std::sync::Arc<std::sync::Mutex<Database>> {
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    seed_test_provider_model(&db.lock().unwrap());
+    db
+}
+
+fn seed_test_provider_model(db: &Database) {
+    let provider = create_provider(
+        db.conn(),
+        CreateProviderReq {
+            name: "Test Provider".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    create_model(
+        db.conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: TEST_MODEL_NAME.into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    // Task 5: seed additional models used by `model_override` tests. The
+    // validation chain in `execute_task` now verifies the effective model
+    // (override or bound) exists in the bound provider's model list, so any
+    // model_override value referenced by a test must be seeded here.
+    for mid in ["gpt-4o", "claude-fancy-override"] {
+        create_model(
+            db.conn(),
+            CreateModelReq {
+                provider_id: provider.id.clone(),
+                model_id: mid.into(),
+                enabled: true,
+                tags: vec![],
+                display_name: None,
+                reasoning: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+            },
+        )
+        .unwrap();
+    }
+    TEST_PROVIDER_ID.with(|c| *c.borrow_mut() = provider.id);
+    TEST_MODEL_ID.with(|c| *c.borrow_mut() = TEST_MODEL_NAME.to_string());
+}
+
+fn bound_provider_id() -> String {
+    TEST_PROVIDER_ID.with(|c| c.borrow().clone())
+}
+
+fn bound_model_id() -> String {
+    TEST_MODEL_ID.with(|c| c.borrow().clone())
 }
 
 fn req_with_cwd(name: &str, prompt: &str, cwd: &str) -> DelegateRequest {
@@ -52,6 +134,8 @@ fn req_with_cwd(name: &str, prompt: &str, cwd: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     }
 }
 
@@ -68,6 +152,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     }
 }
 
@@ -305,7 +391,7 @@ async fn delegate_review_and_plan_profiles_resolve_default_models() {
 
 #[tokio::test]
 async fn delegate_rejected_when_feature_disabled() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let settings = SubagentSettings {
         enabled: false,
         ..Default::default()
@@ -667,7 +753,7 @@ impl TaskExecutor for WarmMemoryExecutor {
 
 #[tokio::test]
 async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -700,7 +786,7 @@ async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
 
 #[tokio::test]
 async fn task_counts_returns_zero_when_task_table_query_fails() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
@@ -723,7 +809,7 @@ async fn task_counts_returns_zero_when_task_table_query_fails() {
 async fn hibernate_closes_existing_hot_binding() {
     // delegate creates no hot binding (Plan 1), so seed one manually to cover
     // the `if let Some(mut b) = binding` branch in manager::hibernate.
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
@@ -802,6 +888,13 @@ impl TaskExecutor for MemoryUpdateExecutor {
             },
             write_access: input.write_access,
             provider_id: input.provider_id.clone(),
+            provider_kind: input.provider_kind.clone(),
+            provider_base_url: input.provider_base_url.clone(),
+            provider_api_key: input.provider_api_key.clone(),
+            model_reasoning: input.model_reasoning,
+            model_context_window: input.model_context_window,
+            model_max_tokens: input.model_max_tokens,
+            model_display_name: input.model_display_name.clone(),
         };
         *self.captured_input.lock().unwrap() = Some(captured);
         Ok(ExecutorOutput {
@@ -833,7 +926,7 @@ impl TaskExecutor for MemoryUpdateExecutor {
 
 #[tokio::test]
 async fn delegate_builds_context_and_merges_memory_update() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let executor = std::sync::Arc::new(MemoryUpdateExecutor {
         captured_input: Mutex::new(None),
     });
@@ -855,6 +948,8 @@ async fn delegate_builds_context_and_merges_memory_update() {
         model_override: None,
         source_harness: Some("cli".into()),
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     };
     let result = manager.delegate(req).await.unwrap();
     assert_eq!(result.status, TaskStatus::Completed);
@@ -929,7 +1024,7 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
     // P1-1 regression: no adapter_session_id + no memory_update => hot_summary
     // is None => status must be Cold (NOT Warm). The old code unconditionally
     // set Warm, violating §3.3: "warm iff hot_summary IS NOT NULL".
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let settings = SubagentSettings::default();
     let executor = std::sync::Arc::new(MockTaskExecutor);
     let manager = SubagentManager::new(db.clone(), settings, "mock", executor);
@@ -945,6 +1040,8 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     };
     let result = manager.delegate(req).await.unwrap();
     // Verify status is Cold, not Warm.
@@ -984,7 +1081,7 @@ async fn delegate_populates_attempts_after_first_completed_task() {
     // summary (which becomes result_summary via set_task_status), so after the
     // fix the fresh snapshot's most-recent task carries that summary and an
     // attempt entry is appended.
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = SubagentManager::new(
         db.clone(),
         SubagentSettings::default(),
@@ -1003,6 +1100,8 @@ async fn delegate_populates_attempts_after_first_completed_task() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id()),
+        bound_model_id: Some(bound_model_id()),
     };
     let result = manager.delegate(req).await.unwrap();
     assert_eq!(result.status.as_str(), "completed");
@@ -1081,7 +1180,7 @@ impl TaskExecutor for HotSessionExecutor {
 #[tokio::test]
 async fn delegate_executor_subagent_error_downcasts_and_propagates() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -1102,7 +1201,7 @@ async fn delegate_executor_subagent_error_downcasts_and_propagates() {
 #[tokio::test]
 async fn delegate_executor_generic_error_wrapped_as_store() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -1117,8 +1216,10 @@ async fn delegate_executor_generic_error_wrapped_as_store() {
     );
 }
 
-/// When profile model is empty + no model_override + fresh subagent,
-/// execute_task returns model=None → line 277 sets result.model (to None).
+/// When no model_override + fresh subagent, execute_task resolves the model
+/// from `subagent.bound_model_id` (spec §3.3: bound_model_id is the
+/// authoritative source after model_override; profiles no longer carry a
+/// model).
 #[tokio::test]
 async fn delegate_sets_model_when_execute_task_returns_none() {
     let _guard = install_tracing();
@@ -1128,14 +1229,13 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         SubagentProfileConfig {
             write_access: false,
             tools: vec![],
-            model: String::new(), // empty → profile_model returns None
             context_budget_tokens: 3000,
             timeout_seconds: 120,
-            provider_id: None,
         },
     );
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let m = SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor));
+    let expected_model = bound_model_id();
     let r = m
         .delegate(DelegateRequest {
             profile: "custom/empty-model".to_string(),
@@ -1144,9 +1244,10 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         .await
         .unwrap();
     assert_eq!(r.profile, "custom/empty-model");
-    assert!(
-        r.model.is_none(),
-        "model is None when profile model is empty and no override"
+    assert_eq!(
+        r.model.as_deref(),
+        Some(expected_model.as_str()),
+        "model falls back to bound_model_id when profile model is empty and no override"
     );
 }
 
@@ -1156,7 +1257,7 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
 #[tokio::test]
 async fn delegate_hot_binding_commit_failure_returns_store_error() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         g.conn()
@@ -1181,7 +1282,7 @@ async fn delegate_hot_binding_commit_failure_returns_store_error() {
 #[tokio::test]
 async fn dispatcher_shutdown_returns_promptly() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -1205,7 +1306,7 @@ async fn dispatcher_shutdown_returns_promptly() {
 #[tokio::test]
 async fn dispatcher_skips_queued_task_while_gate_paused() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let gate = std::sync::Arc::new(PressureGate::new());
     gate.set_action(PressureAction::PauseNewTasks);
     let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
@@ -1272,7 +1373,7 @@ async fn dispatcher_skips_queued_task_while_gate_paused() {
 #[tokio::test]
 async fn dispatcher_marks_task_failed_when_subagent_missing() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = std::sync::Arc::new(SubagentManager::new(
         db.clone(),
         SubagentSettings::default(),
@@ -1336,7 +1437,7 @@ async fn dispatcher_marks_task_failed_when_subagent_missing() {
 #[tokio::test]
 async fn dispatcher_marks_task_failed_when_execute_task_errors() {
     let _guard = install_tracing();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let gate = std::sync::Arc::new(PressureGate::new());
     gate.set_action(PressureAction::PauseNewTasks);
     let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
@@ -1444,7 +1545,7 @@ fn manager_with_db(db: std::sync::Arc<std::sync::Mutex<Database>>) -> SubagentMa
 
 #[tokio::test]
 async fn recent_tasks_all_returns_across_all_subagents_in_desc_order() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1469,7 +1570,7 @@ async fn recent_tasks_all_returns_across_all_subagents_in_desc_order() {
 
 #[tokio::test]
 async fn recent_tasks_all_respects_limit() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1485,7 +1586,7 @@ async fn recent_tasks_all_respects_limit() {
 
 #[tokio::test]
 async fn recent_tasks_all_empty_when_no_tasks() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = manager_with_db(db);
     let tasks = manager.recent_tasks_all(20).await.unwrap();
     assert!(tasks.is_empty());
@@ -1493,7 +1594,7 @@ async fn recent_tasks_all_empty_when_no_tasks() {
 
 #[tokio::test]
 async fn task_counts_by_subagent_groups_correctly_across_subagents() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1515,7 +1616,7 @@ async fn task_counts_by_subagent_groups_correctly_across_subagents() {
 
 #[tokio::test]
 async fn task_counts_by_subagent_empty_when_no_tasks() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = manager_with_db(db);
     let counts = manager.task_counts_by_subagent().await.unwrap();
     assert!(counts.is_empty());
@@ -1523,7 +1624,7 @@ async fn task_counts_by_subagent_empty_when_no_tasks() {
 
 #[tokio::test]
 async fn last_task_by_subagent_returns_latest_per_subagent() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     {
         let g = db.lock().unwrap();
         seed_logical_subagent(&g, "sub-a");
@@ -1547,8 +1648,754 @@ async fn last_task_by_subagent_returns_latest_per_subagent() {
 
 #[tokio::test]
 async fn last_task_by_subagent_empty_when_no_tasks() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let db = test_db();
     let manager = manager_with_db(db);
     let lasts = manager.last_task_by_subagent().await.unwrap();
     assert!(lasts.is_empty());
+}
+
+// --- Task 5: execute_task validation chain (spec §4.3 fail-fast) ---------
+
+/// `execute_task_fails_when_bound_provider_disabled` — Task 5 spec §4.3
+/// fail-fast: if the subagent's bound provider is disabled, `delegate()`
+/// must reject the request with `SubagentError::Validation` carrying
+/// "bound provider disabled" (NOT pass the disabled provider downstream to
+/// the executor/sidecar, which would surface as an opaque auth/network
+/// error). The reuse path is exercised (`subagent_id` set, bound fields
+/// ignored on the request) so the subagent's persisted `bound_provider_id`
+/// is the source of truth.
+#[tokio::test]
+async fn execute_task_fails_when_bound_provider_disabled() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    // Insert a provider that is DISABLED (spec §4.3 fail-fast).
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-disabled".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: false, // disabled — execute_task must reject
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    // Insert a subagent bound to the disabled provider. The reuse path
+    // (delegate with subagent_id set) reads bound fields from this row,
+    // ignoring the request's bound_provider_id / bound_model_id.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-1".into(),
+            name: "test-sub".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-1"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub".into(),
+        subagent_id: Some("sub-1".into()), // reuse path — bound fields ignored
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound provider is disabled"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound provider disabled"),
+        "expected 'bound provider disabled' in error, got: {msg}"
+    );
+    // Verify the error is SubagentError::Validation (not a store error).
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+/// `execute_task_fails_when_bound_provider_missing_api_key` — Task 5 spec
+/// §4.3 fail-fast: a provider with an empty api_key must be rejected at
+/// validation time (not deferred to the sidecar, where it would surface as
+/// an opaque -32010 AUTH_FAILURE on the first turn).
+#[tokio::test]
+async fn execute_task_fails_when_bound_provider_missing_api_key() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    // Enabled provider but with NO api_key — must be rejected.
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-no-key".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: None, // missing — execute_task must reject
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-nokey".into(),
+            name: "test-sub-nokey".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-nokey"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-nokey".into(),
+        subagent_id: Some("sub-nokey".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound provider has no api key"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound provider missing api key"),
+        "expected 'bound provider missing api key' in error, got: {msg}"
+    );
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+/// `execute_task_fails_when_bound_model_not_found` — Task 5 spec §4.3
+/// fail-fast: if the effective model id (from `task.model_override` or
+/// `subagent.bound_model_id`) doesn't exist in the bound provider's model
+/// list, `delegate()` must reject with `SubagentError::Validation` carrying
+/// "bound model not found".
+#[tokio::test]
+async fn execute_task_fails_when_bound_model_not_found() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-model-missing".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    // Note: NO model is created for this provider — the bound_model_id
+    // below refers to a non-existent model.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-nomodel".into(),
+            name: "test-sub-nomodel".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: "ghost-model".into(), // doesn't exist
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-nomodel"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-nomodel".into(),
+        subagent_id: Some("sub-nomodel".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound model is not found"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound model not found"),
+        "expected 'bound model not found' in error, got: {msg}"
+    );
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+/// `execute_task_fails_when_bound_model_disabled` — Task 5 spec §4.3
+/// fail-fast: a disabled model in the bound provider must be rejected at
+/// validation time.
+#[tokio::test]
+async fn execute_task_fails_when_bound_model_disabled() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-model-disabled".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: false, // disabled — execute_task must reject
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-model-disabled".into(),
+            name: "test-sub-model-disabled".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-model-disabled"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-model-disabled".into(),
+        subagent_id: Some("sub-model-disabled".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let result = manager.delegate(req).await;
+    assert!(
+        result.is_err(),
+        "delegate should fail when bound model is disabled"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound model disabled"),
+        "expected 'bound model disabled' in error, got: {msg}"
+    );
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+}
+
+// --- I-2: fail-fast on missing context_window / max_tokens metadata ---------
+
+/// `execute_task_fails_when_model_missing_context_window` — I-2 spec §4.3
+/// fail-fast: a model with NULL `context_window` must be rejected at
+/// validation time (not deferred to the Pi SDK, which would interpret 0 as
+/// "no context" — silent breakage). The reuse path is exercised
+/// (`subagent_id` set, bound fields from row) so the subagent's persisted
+/// binding is the source of truth.
+#[tokio::test]
+async fn execute_task_fails_when_model_missing_context_window() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-no-ctx".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    // Create a model with NULL context_window (simulates a pre-existing/seed
+    // model before the metadata backfill, or a direct SQL insert).
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None, // missing — execute_task must reject
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-no-ctx".into(),
+            name: "test-sub-no-ctx".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-no-ctx"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-no-ctx".into(),
+        subagent_id: Some("sub-no-ctx".into()), // reuse path — bound fields from row
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let err = manager.delegate(req).await.unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("missing context_window metadata"),
+        "expected 'missing context_window metadata' in error, got: {msg}"
+    );
+}
+
+/// `execute_task_fails_when_model_missing_max_tokens` — I-2 companion: a
+/// model with NULL `max_tokens` must also be rejected at validation time.
+#[tokio::test]
+async fn execute_task_fails_when_model_missing_max_tokens() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-no-max".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: None, // missing — execute_task must reject
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-no-max".into(),
+            name: "test-sub-no-max".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-no-max"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-no-max".into(),
+        subagent_id: Some("sub-no-max".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let err = manager.delegate(req).await.unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("missing max_tokens metadata"),
+        "expected 'missing max_tokens metadata' in error, got: {msg}"
+    );
+}
+
+// --- Task 9: coverage-gap closures for execute_task validation paths --------
+
+/// Spec §3.3 "both or neither": delegating with only one of
+/// `bound_provider_id` / `bound_model_id` set must fail with a Validation
+/// error BEFORE name resolution or DB writes. Covers the `_ =>` match arm in
+/// `delegate()` (lines 175-179).
+#[tokio::test]
+async fn delegate_rejects_mismatched_bound_fields_provider_only() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let mut r = req("mismatch-p", "do");
+    // provider set, model cleared → mismatch
+    r.bound_model_id = None;
+    let err = m.delegate(r).await.unwrap_err();
+    assert!(matches!(err, SubagentError::Validation(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be provided together"),
+        "expected 'must be provided together' in error, got: {msg}"
+    );
+}
+
+/// Same invariant, opposite direction: model set, provider cleared.
+#[tokio::test]
+async fn delegate_rejects_mismatched_bound_fields_model_only() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let mut r = req("mismatch-m", "do");
+    // model set, provider cleared → mismatch
+    r.bound_provider_id = None;
+    let err = m.delegate(r).await.unwrap_err();
+    assert!(matches!(err, SubagentError::Validation(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be provided together"),
+        "expected 'must be provided together' in error, got: {msg}"
+    );
+}
+
+/// `execute_task` must fail fast with "bound provider not found" when the
+/// provider referenced by an existing subagent's `bound_provider_id` has been
+/// deleted from the catalog. Exercises the reuse path (`subagent_id` set) so
+/// the subagent's stored bound fields are the source of truth, and deletes the
+/// provider between the first and second delegate call. Covers the
+/// `ok_or_else(|| Validation("bound provider not found: ..."))` arm.
+#[tokio::test]
+async fn execute_task_fails_when_bound_provider_deleted() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-deletable".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    // Insert a subagent bound to the (soon-to-be-deleted) provider.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-del".into(),
+            name: "test-sub-del".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-del"))
+            .unwrap();
+    }
+    // Delete the provider from the catalog AFTER the subagent is bound.
+    db.lock()
+        .unwrap()
+        .delete_provider(&provider.id)
+        .expect("delete provider");
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-del".into(),
+        subagent_id: Some("sub-del".into()), // reuse path — bound fields from row
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let err = manager.delegate(req).await.unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound provider not found"),
+        "expected 'bound provider not found' in error, got: {msg}"
+    );
+}
+
+/// `delete(hard=true)` by name WITHOUT `cwd` must return `InvalidArgument`
+/// ("cwd is required when name is provided"). The hard-delete path resolves
+/// the subagent directly (not via `self.resolve()`), so its cwd check is a
+/// separate code path from the soft-delete / show / hibernate paths. Covers
+/// the `ok_or_else(|| InvalidArgument(...))` arm in `delete()`.
+#[tokio::test]
+async fn hard_delete_by_name_without_cwd_returns_invalid_argument() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // delegate first so the subagent exists (not strictly required — the cwd
+    // check happens before the lookup — but keeps the test realistic).
+    let _ = m.delegate(req("harddel", "do")).await.unwrap();
+    let err = m
+        .delete(
+            ResolveParams {
+                id: None,
+                name: Some("harddel".to_string()),
+                cwd: None,
+            },
+            true, // hard=true → uses the dedicated hard-delete resolve path
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cwd is required"),
+        "expected 'cwd is required' in error, got: {msg}"
+    );
 }

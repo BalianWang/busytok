@@ -60,14 +60,28 @@ export interface CompactContext {
   source: string;
 }
 
+export type ProviderKind = 'openai_compatible' | 'anthropic_compatible';
+
 export interface TurnAutoParams {
   logical_subagent_id: string;
   logical_subagent_name?: string;
   cwd: string;
   profile: string;
-  model?: string;
-  /** Provider ID (from the Rust-side WorkerPool) for model resolution + usage attribution. */
-  provider_id?: string;
+  /** Model ID — REQUIRED. The Rust side always sends the bound model
+   *  (or model_override) since subagent binding makes routing explicit
+   *  (spec §3.3 + §4.3). Tightened from optional in Phase 3. */
+  model: string;
+  /** Provider ID — now REQUIRED (was optional in Phase 3). The Rust side
+   *  always sends it since subagent binding makes provider routing explicit. */
+  provider_id: string;
+  provider_kind: ProviderKind;
+  provider_base_url: string;
+  /** Transient — sidecar must NOT log this in plaintext. */
+  provider_api_key: string;
+  model_reasoning: boolean;
+  model_context_window: number;
+  model_max_tokens: number;
+  model_display_name?: string;
   tools?: string[];
   prompt: string;
   prompt_artifact_ref?: string | null;

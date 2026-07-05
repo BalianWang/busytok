@@ -13,7 +13,7 @@ pub struct ExecutorInput {
     pub subagent_name: String,
     pub cwd: String,
     pub profile: String,
-    pub model: Option<String>,
+    pub model: String,
     pub prompt: String,
     /// Spec §4.3: when set, the sidecar resolves this artifact path instead of
     /// the inline `prompt`. Mutually exclusive with `prompt`.
@@ -23,11 +23,25 @@ pub struct ExecutorInput {
     pub memory: MemorySnapshot,
     pub context: CompactContext,
     pub write_access: bool,
-    /// Phase 3: provider this task should run on. Threads the profile's
-    /// `provider_id` through the execution path so the WorkerPool (Task 2)
-    /// can route to the correct per-provider supervisor. `None` means
-    /// "no provider bound" — Task 2 treats this as an error (cannot route).
-    pub provider_id: Option<String>,
+    /// Spec §3.3 + Task 5: bound provider id (NOT NULL — subagent is bound
+    /// at create time). Threading it through the execution path lets the
+    /// WorkerPool route to the correct per-provider supervisor.
+    pub provider_id: String,
+    /// Task 5: provider kind (OpenAiCompatible / AnthropicCompatible) so
+    /// the sidecar knows which protocol to speak.
+    pub provider_kind: busytok_domain::ProviderKind,
+    /// Task 5: provider base URL (e.g. `https://api.openai.com/v1`).
+    pub provider_base_url: String,
+    /// 瞬态执行态数据：不写回 task row，不进日志明文，不进 DTO/response/diagnostic。
+    /// Threading the API key end-to-end so the sidecar can register it in
+    /// `AuthStorage` (Task 7) — never logged in plaintext.
+    pub provider_api_key: String,
+    // Model metadata — threaded to the sidecar so `registerProvider` can
+    // build a complete model definition (spec §5.2).
+    pub model_reasoning: bool,
+    pub model_context_window: i64,
+    pub model_max_tokens: i64,
+    pub model_display_name: Option<String>,
 }
 
 /// Output from a task executor — mapped into `DelegateResult` by the manager.
@@ -65,7 +79,7 @@ impl TaskExecutor for MockTaskExecutor {
             status: TaskStatus::Completed,
             summary: summary.clone(),
             usage: TaskUsage {
-                model: input.model.clone(),
+                model: Some(input.model.clone()),
                 provider: Some("mock".to_string()),
                 input_tokens: Some(input.prompt.len() as i64),
                 output_tokens: Some(summary.len() as i64),

@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use busytok_control::dispatch::MethodDispatchError;
 use busytok_control::{ControlDispatcher, RuntimeControl, TestRuntimeControl};
+use busytok_domain::ProviderKind;
 use busytok_events::AppEventBus;
 use busytok_protocol::dto::*;
 use busytok_protocol::{ControlRequest, ControlResponse};
@@ -98,12 +99,29 @@ fn stub_provider_dto() -> ProviderDto {
     ProviderDto {
         id: "p-stub".to_string(),
         name: "Stub Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "http://stub.example".to_string(),
-        api_key_env_name: "STUB_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["stub-model".to_string()],
         enabled: true,
         has_api_key: false,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    }
+}
+
+fn stub_model_catalog_entry_dto() -> ModelCatalogEntryDto {
+    ModelCatalogEntryDto {
+        provider_id: "p-stub".to_string(),
+        provider_name: "Stub Provider".to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
+        provider_enabled: true,
+        model_db_id: "m-stub".to_string(),
+        model_id: "stub-model".to_string(),
+        model_enabled: true,
+        tags: vec![],
+        display_name: None,
+        reasoning: false,
+        context_window: None,
+        max_tokens: None,
     }
 }
 
@@ -111,8 +129,6 @@ fn stub_profile_dto() -> ProfileDto {
     ProfileDto {
         id: "prof-stub".to_string(),
         is_builtin: false,
-        provider_id: None,
-        model: "stub-model".to_string(),
         tools: vec![],
         context_budget_tokens: 8000,
         timeout_seconds: 60,
@@ -359,6 +375,33 @@ impl RuntimeControl for SuccessRuntime {
         self.inner.provider_test_connection(req).await
     }
 
+    // ── Model overrides (return Ok to cover dispatch success paths) ──
+    async fn model_create(
+        &self,
+        _req: ModelCreateRequestDto,
+    ) -> anyhow::Result<ModelCatalogEntryDto> {
+        // Covers dispatch.rs line 573: ControlResponse::ok(serde_json::to_value(dto)?)
+        Ok(stub_model_catalog_entry_dto())
+    }
+    async fn model_list(&self, _req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {
+        // Covers dispatch.rs line 579: ControlResponse::ok(serde_json::to_value(dto)?)
+        Ok(ModelListResponseDto {
+            models: vec![stub_model_catalog_entry_dto()],
+        })
+    }
+    async fn model_update(&self, _req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+        // Covers dispatch.rs line 585: ControlResponse::ok(serde_json::to_value(())?)
+        Ok(())
+    }
+    async fn model_delete(&self, _req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+        // Covers dispatch.rs line 591: ControlResponse::ok(serde_json::to_value(())?)
+        Ok(())
+    }
+    async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> anyhow::Result<()> {
+        // Covers dispatch.rs line 597: ControlResponse::ok(serde_json::to_value(())?)
+        Ok(())
+    }
+
     async fn pi_sidecar_locator_update(
         &self,
         req: PiSidecarLocatorUpdateRequestDto,
@@ -401,11 +444,9 @@ async fn dispatcher_routes_provider_create_returns_ok() {
     let runtime = success_runtime().await;
     let dispatcher = ControlDispatcher::new(runtime);
     let params = serde_json::json!({
-        "id": "p1",
         "name": "P",
-        "base_url": "http://x",
-        "api_key_env_name": "KEY",
-        "models": []
+        "provider_kind": "openai_compatible",
+        "base_url": "http://x"
     });
     let response = dispatcher
         .dispatch(ControlRequest::new("provider.create", params))
@@ -471,7 +512,7 @@ async fn dispatcher_routes_profile_create_returns_ok() {
     // Covers dispatch.rs line 577.
     let runtime = success_runtime().await;
     let dispatcher = ControlDispatcher::new(runtime);
-    let params = serde_json::json!({"id": "prof1", "model": "m"});
+    let params = serde_json::json!({"id": "prof1"});
     let response = dispatcher
         .dispatch(ControlRequest::new("profile.create", params))
         .await
@@ -480,7 +521,6 @@ async fn dispatcher_routes_profile_create_returns_ok() {
     match response {
         ControlResponse::Ok(val) => {
             assert_eq!(val["id"], "prof-stub");
-            assert_eq!(val["model"], "stub-model");
             assert_eq!(val["is_builtin"], false);
             assert_eq!(val["write_access"], false);
         }
@@ -839,6 +879,25 @@ impl RuntimeControl for AllErrorRuntime {
         Err(anyhow::anyhow!("runtime error"))
     }
 
+    async fn model_create(
+        &self,
+        _req: ModelCreateRequestDto,
+    ) -> anyhow::Result<ModelCatalogEntryDto> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_list(&self, _req: ModelListRequestDto) -> anyhow::Result<ModelListResponseDto> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_update(&self, _req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_delete(&self, _req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+    async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("runtime error"))
+    }
+
     async fn pi_sidecar_locator_update(
         &self,
         _req: PiSidecarLocatorUpdateRequestDto,
@@ -960,13 +1019,26 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
         (
             "provider.create",
             serde_json::json!({
-                "id": "p1", "name": "P", "base_url": "http://x",
-                "api_key_env_name": "KEY", "models": []
+                "name": "P", "provider_kind": "openai_compatible", "base_url": "http://x"
             }),
         ),
         ("provider.update", serde_json::json!({"id": "p1"})),
         ("provider.delete", serde_json::json!({"id": "p1"})),
         ("provider.test_connection", serde_json::json!({"id": "p1"})),
+        (
+            "model.create",
+            serde_json::json!({"provider_id": "p1", "model_id": "m1"}),
+        ),
+        ("model.list", serde_json::json!({})),
+        (
+            "model.update",
+            serde_json::json!({"id": "m1", "enabled": false}),
+        ),
+        ("model.delete", serde_json::json!({"id": "m1"})),
+        (
+            "model.tags.update",
+            serde_json::json!({"model_id": "m1", "tags": ["fast"]}),
+        ),
         (
             "pi_sidecar_locator_update",
             serde_json::json!({"runtime_dir": "/tmp/pi", "enabled": true}),
@@ -988,4 +1060,194 @@ async fn dispatch_all_methods_through_error_runtime_returns_err() {
             "{method} should propagate Err from runtime"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Model success-path dispatch tests (covers dispatch.rs L571-598)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dispatcher_routes_model_create_returns_ok() {
+    // Covers dispatch.rs line 573: ControlResponse::ok(serde_json::to_value(dto)?)
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let params = serde_json::json!({
+        "provider_id": "p-stub",
+        "model_id": "stub-model",
+        "context_window": 8192,
+        "max_tokens": 4096
+    });
+    let response = dispatcher
+        .dispatch(ControlRequest::new("model.create", params))
+        .await
+        .unwrap();
+    match response {
+        ControlResponse::Ok(val) => {
+            assert_eq!(val["model_db_id"], "m-stub");
+            assert_eq!(val["model_id"], "stub-model");
+        }
+        other => panic!("expected Ok response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_routes_model_list_returns_ok() {
+    // Covers dispatch.rs line 579: ControlResponse::ok(serde_json::to_value(dto)?)
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let params = serde_json::json!({});
+    let response = dispatcher
+        .dispatch(ControlRequest::new("model.list", params))
+        .await
+        .unwrap();
+    match response {
+        ControlResponse::Ok(val) => {
+            assert!(val["models"].is_array());
+            assert_eq!(val["models"][0]["model_id"], "stub-model");
+        }
+        other => panic!("expected Ok response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_routes_model_update_returns_ok_with_null() {
+    // Covers dispatch.rs line 585: ControlResponse::ok(serde_json::to_value(())?)
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let params = serde_json::json!({"id": "m-stub", "enabled": false});
+    let response = dispatcher
+        .dispatch(ControlRequest::new("model.update", params))
+        .await
+        .unwrap();
+    assert!(matches!(response, ControlResponse::Ok(_)));
+}
+
+#[tokio::test]
+async fn dispatcher_routes_model_delete_returns_ok_with_null() {
+    // Covers dispatch.rs line 591: ControlResponse::ok(serde_json::to_value(())?)
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let params = serde_json::json!({"id": "m-stub"});
+    let response = dispatcher
+        .dispatch(ControlRequest::new("model.delete", params))
+        .await
+        .unwrap();
+    assert!(matches!(response, ControlResponse::Ok(_)));
+}
+
+#[tokio::test]
+async fn dispatcher_routes_model_tags_update_returns_ok_with_null() {
+    // Covers dispatch.rs line 597: ControlResponse::ok(serde_json::to_value(())?)
+    let runtime = success_runtime().await;
+    let dispatcher = ControlDispatcher::new(runtime);
+    let params = serde_json::json!({"model_id": "m-stub", "tags": ["fast"]});
+    let response = dispatcher
+        .dispatch(ControlRequest::new("model.tags.update", params))
+        .await
+        .unwrap();
+    assert!(matches!(response, ControlResponse::Ok(_)));
+}
+
+// ---------------------------------------------------------------------------
+// 5. Arc<T> blanket impl delegation (dispatch.rs lines 1545-1559)
+// ---------------------------------------------------------------------------
+//
+// `impl<T: RuntimeControl> RuntimeControl for Arc<T>` forwards every method
+// via `(**self).method(req).await`. The model_*, pi_sidecar_locator_update,
+// and profile_* forwarding lines (dispatch.rs L1545-1559) are uncovered
+// because no existing test calls these methods directly on an `Arc<T>`.
+// Calling each method through `Arc<TestRuntimeControl>` exercises the
+// blanket-impl forwarding bodies. The inner `TestRuntimeControl` returns
+// `Err` for model_*/profile_* (which is fine — the forwarding line is
+// covered regardless of the inner result) and `Ok` for pi_sidecar.
+
+#[tokio::test]
+async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
+    use std::sync::Arc;
+    // Covers dispatch.rs L1545-1559: `impl RuntimeControl for Arc<T>` forwarding
+    // bodies for model_create/model_list/model_update/model_delete/
+    // model_tags_update/pi_sidecar_locator_update/profile_create/
+    // profile_update/profile_delete.
+    let rt: Arc<TestRuntimeControl> =
+        Arc::new(TestRuntimeControl::with_claude_fixture().await.unwrap());
+
+    // model_* — TestRuntimeControl bails "not yet implemented"; the forwarding
+    // line is covered either way.
+    let _ = rt
+        .model_create(ModelCreateRequestDto {
+            provider_id: "p1".to_string(),
+            model_id: "m1".to_string(),
+            enabled: None,
+            tags: vec![],
+            context_window: 8192,
+            max_tokens: 4096,
+            display_name: None,
+            reasoning: None,
+        })
+        .await;
+    let _ = rt
+        .model_list(ModelListRequestDto {
+            provider_id: None,
+            tags: vec![],
+            include_disabled: false,
+        })
+        .await;
+    let _ = rt
+        .model_update(ModelUpdateRequestDto {
+            id: "m1".to_string(),
+            enabled: None,
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .await;
+    let _ = rt
+        .model_delete(ModelDeleteRequestDto {
+            id: "m1".to_string(),
+        })
+        .await;
+    let _ = rt
+        .model_tags_update(ModelTagUpdateDto {
+            model_id: "m1".to_string(),
+            tags: vec![],
+        })
+        .await;
+
+    // pi_sidecar_locator_update — TestRuntimeControl returns Ok.
+    let sidecar_resp = rt
+        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
+            runtime_dir: "/tmp/sidecar".to_string(),
+            enabled: true,
+        })
+        .await
+        .expect("pi_sidecar_locator_update should succeed on TestRuntimeControl");
+    assert_eq!(sidecar_resp.runtime_dir, "/tmp/sidecar");
+    assert!(sidecar_resp.enabled);
+    assert!(sidecar_resp.in_memory_updated);
+
+    // profile_* — TestRuntimeControl bails "not yet implemented".
+    let _ = rt
+        .profile_create(ProfileCreateRequestDto {
+            id: "prof1".to_string(),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await;
+    let _ = rt
+        .profile_update(ProfileUpdateRequestDto {
+            id: "prof1".to_string(),
+            tools: None,
+            context_budget_tokens: None,
+            timeout_seconds: None,
+            write_access: None,
+        })
+        .await;
+    let _ = rt
+        .profile_delete(ProfileDeleteRequestDto {
+            id: "prof1".to_string(),
+        })
+        .await;
 }

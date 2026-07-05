@@ -8,47 +8,36 @@ use std::time::Duration;
 #[path = "support/mod.rs"]
 mod support;
 
-use busytok_config::{
-    ProviderConfig, ProviderKind, SubagentResourcePolicyConfig, SubagentSettings,
-};
+use busytok_config::{SubagentResourcePolicyConfig, SubagentSettings};
 use busytok_store::repository::{SubagentHarnessBindingRow, SubagentLogicalSubagentRow};
 use busytok_store::Database;
 use busytok_subagent::manager::SubagentManager;
 use busytok_subagent::mock_executor::MockTaskExecutor;
 use busytok_subagent::models::DelegateRequest;
 use busytok_subagent::sidecar::{
-    CredentialReader, PiSidecarSupervisor, PressureLevel, ProviderLookup, ResponderFactory,
-    SidecarConfig, SidecarError, SidecarTaskExecutor, WorkerPool, WorkerState,
+    PiSidecarSupervisor, PressureLevel, ProviderRuntimeEntry, ResponderFactory, SidecarConfig,
+    SidecarError, SidecarTaskExecutor, WorkerPool, WorkerState,
 };
 use busytok_subagent::{PressureAction, PressureGate, PressureResponder};
 
 /// The test provider ID used by pool-based dummy executors.
 const TEST_PROVIDER_ID: &str = "test-prov";
+/// The test model ID used for seeding bound model rows.
+const TEST_MODEL_NAME: &str = "test-model";
 
-fn test_provider() -> ProviderConfig {
-    ProviderConfig {
-        id: TEST_PROVIDER_ID.to_string(),
-        name: "Test".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://test.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    }
-}
-
-fn make_providers() -> ProviderLookup {
-    Arc::new(|pid: &str| -> Option<ProviderConfig> {
-        match pid {
-            TEST_PROVIDER_ID => Some(test_provider()),
-            _ => None,
-        }
-    })
-}
-
-fn canned_credential_reader() -> CredentialReader {
-    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+/// Build the provider runtime entries map (Task 7: replaces the old
+/// `ProviderLookup` + `CredentialReader` closures).
+fn make_providers() -> HashMap<String, ProviderRuntimeEntry> {
+    let mut map = HashMap::new();
+    map.insert(
+        TEST_PROVIDER_ID.to_string(),
+        ProviderRuntimeEntry {
+            provider_id: TEST_PROVIDER_ID.to_string(),
+            api_key: "test-key".to_string(),
+            base_url: "https://test.example.com/v1".to_string(),
+        },
+    );
+    map
 }
 
 /// Build a responder factory that keeps responders alive in a shared holder
@@ -94,16 +83,12 @@ fn make_dummy_executor(db: Arc<Mutex<Database>>) -> Arc<SidecarTaskExecutor> {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     let gate = Arc::new(PressureGate::new());
     let pool = Arc::new(WorkerPool::new(
         config,
         Some(Arc::clone(&db)),
         make_providers(),
-        canned_credential_reader(),
         Some(Arc::clone(&gate)),
         SubagentResourcePolicyConfig::default(),
     ));
@@ -133,9 +118,6 @@ fn mock_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     }
 }
 
@@ -285,6 +267,7 @@ struct Harness {
 
 async fn make_harness() -> Harness {
     let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    seed_test_provider_model(&db.lock().unwrap());
     let manager = SubagentManager::new(
         Arc::clone(&db),
         SubagentSettings::default(),
@@ -292,6 +275,36 @@ async fn make_harness() -> Harness {
         Arc::new(MockTaskExecutor),
     );
     Harness { db, manager }
+}
+
+/// Seed the DB with a provider + model matching `TEST_PROVIDER_ID` so
+/// `delegate()` can create subagents with valid bound fields.
+fn seed_test_provider_model(db: &Database) {
+    let now = busytok_domain::now_ms();
+    db.conn().execute(
+        "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            TEST_PROVIDER_ID,
+            "Test Provider",
+            serde_json::to_string(&busytok_domain::ProviderKind::OpenAiCompatible).unwrap(),
+            "https://test.example.com/v1",
+            1i64,
+            "test-key",
+            now,
+        ],
+    ).unwrap();
+    db.conn().execute(
+        "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, display_name, reasoning, context_window, max_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, 0, 128000, 16384)",
+        rusqlite::params![
+            "test-model-row",
+            TEST_PROVIDER_ID,
+            TEST_MODEL_NAME,
+            1i64,
+            now,
+        ],
+    ).unwrap();
 }
 
 fn req(name: &str, prompt: &str) -> DelegateRequest {
@@ -307,6 +320,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        bound_model_id: Some(TEST_MODEL_NAME.to_string()),
     }
 }
 
@@ -805,9 +820,6 @@ fn write_resource_event_with_sample_populates_rss_and_cpu_columns() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -875,9 +887,6 @@ async fn spawn_rejects_after_3_crashes_within_5_min_window() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,
@@ -924,9 +933,6 @@ async fn spawn_allows_restart_after_5_min_window_expires() {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     };
     let sup = busytok_subagent::sidecar::PiSidecarSupervisor::new(
         config,

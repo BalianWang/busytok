@@ -15,6 +15,7 @@ pub mod agent;
 pub mod cache_metrics;
 pub mod events;
 pub mod identity;
+pub mod provider_catalog;
 pub mod time;
 pub mod timezone;
 
@@ -30,6 +31,9 @@ pub use events::{
 pub use identity::{
     derive_project_hash, derive_session_id, hash_short, metadata_event_hash,
     normalize_project_path, IdentityError, MetadataFingerprint,
+};
+pub use provider_catalog::{
+    Model, ModelCatalogEntry, ModelCatalogFilter, ModelTag, Provider, ProviderKind, ProviderSummary,
 };
 pub use time::now_ms;
 pub use timezone::{

@@ -19,9 +19,7 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use tracing::{debug, error, info, warn};
 
-use busytok_config::{
-    BusytokPaths, BusytokSettings, ProviderConfig, ProviderCredentialStore, ProviderKind,
-};
+use busytok_config::{BusytokPaths, BusytokSettings};
 use busytok_control::dispatch::{MethodDispatchError, RuntimeControl};
 use busytok_domain::{now_ms, ReportingTimezone};
 use busytok_events::AppEventBus;
@@ -251,10 +249,9 @@ impl BusytokSupervisor {
         // Wrap settings in `Arc<Mutex>` ONCE here so the WorkerPool's
         // provider-lookup closure and the supervisor's `settings` field share
         // the SAME live store. Without this, the closure would capture a
-        // snapshot of `settings.providers` taken at construction time, so
-        // `provider_update` (which mutates `self.settings`) would NOT be
-        // visible to `ensure_worker` when it re-spawns a worker — the respawned
-        // supervisor would run with stale `base_url` / `base_url_env_name`.
+        // snapshot taken at construction time, so `provider_update` (which
+        // mutates `self.settings`) would NOT be visible to `ensure_worker`
+        // when it re-spawns a worker.
         let settings = Arc::new(Mutex::new(settings));
         let sidecar = Self::construct_sidecar(&settings, &paths, &db, None);
         Self::assemble_with_sidecar(db, paths, adapters, settings, event_bus, sidecar)
@@ -293,8 +290,10 @@ impl BusytokSupervisor {
     ///
     /// **Phase 3 Task 3:** the executor is rewired from a single
     /// `PiSidecarSupervisor` to `Arc<WorkerPool>`. The pool is constructed
-    /// with a providers lookup (from `settings.providers`) + credential
-    /// reader (from `ProviderCredentialStore`). Two-phase bootstrap:
+    /// with a `HashMap<String, ProviderRuntimeEntry>` populated from SQL
+    /// (the SQL-backed provider catalog — Task 7: the sidecar reads from
+    /// SQL, not from settings TOML).
+    /// Two-phase bootstrap:
     /// pool → executor → responder factory → `set_responder_factory` →
     /// `ensure_worker(first enabled provider)` → supervisor for the
     /// `sidecar_supervisor` field (used by doctor checks, shutdown, and
@@ -332,9 +331,8 @@ impl BusytokSupervisor {
         }
         // Either use the injected config (test path) or resolve the base
         // (unbound) config from settings + paths. `resolve_base_sidecar_config`
-        // produces a config with empty `provider_id` / env names — the pool
-        // clones it and sets per-provider fields before constructing each
-        // supervisor.
+        // produces a config without provider-specific credentials (Task 5:
+        // credentials now flow via `turn_auto` params, not env injection).
         let config_result = match sidecar_config_override {
             Some(cfg) => Ok(cfg),
             None => {
@@ -346,42 +344,59 @@ impl BusytokSupervisor {
             Ok(sidecar_config) => {
                 let gate = Arc::new(busytok_subagent::PressureGate::new());
 
-                // Build the providers lookup closure that reads LIVE settings
-                // (not a startup snapshot). Captures an `Arc::clone` of the
-                // shared settings store; each invocation locks briefly, finds
-                // the provider by id, and clones it out. This ensures that
-                // `provider_update` (which mutates `self.settings` under the
-                // same lock) is visible to `ensure_worker` when it re-spawns a
-                // worker — the respawned supervisor picks up the updated
-                // `base_url` / `base_url_env_name` / `models` / `enabled`.
-                let settings_for_providers = Arc::clone(settings);
-                let providers: busytok_subagent::sidecar::ProviderLookup =
-                    Arc::new(move |pid: &str| {
-                        let s = settings_for_providers.lock().unwrap();
-                        s.providers.iter().find(|p| p.id == pid).cloned()
-                    });
-
-                // Build the credential reader closure from
-                // `ProviderCredentialStore` (OS keychain). E2E tests set
-                // `BUSYTOK_TEST_API_KEY` to bypass the keychain (which may
-                // not be accessible in CI/headless environments).
-                let credential_reader: busytok_subagent::sidecar::CredentialReader =
-                    Arc::new(|pid: &str| {
-                        if let Ok(key) = std::env::var("BUSYTOK_TEST_API_KEY") {
-                            return Ok(Some(key));
-                        }
-                        ProviderCredentialStore::get_key(pid)
-                    });
+                // Build the providers map from SQL (Task 7: sidecar reads
+                // from the SQL-backed provider catalog). Only enabled
+                // providers with a non-None api_key are included;
+                // `provider_changed` updates this map at runtime via
+                // `update_provider_and_kill_old`.
+                let mut first_runnable_provider: Option<String> = None;
+                let providers: std::collections::HashMap<
+                    String,
+                    busytok_subagent::sidecar::ProviderRuntimeEntry,
+                > = {
+                    let db = db.lock().unwrap();
+                    db.list_providers()
+                        .map_err(|e| {
+                            error!(
+                                event_code = "subagent.sidecar.list_providers_failed",
+                                error = %e,
+                                "failed to list providers from SQL during construct_sidecar"
+                            );
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|s| {
+                            let p = db.get_provider_with_secret(&s.id).ok()??;
+                            if !p.enabled {
+                                return None;
+                            }
+                            let api_key = p.api_key?;
+                            // Capture the first runnable provider (in DB
+                            // order) for eager bootstrap below. HashMap
+                            // loses insertion order, so we capture here.
+                            if first_runnable_provider.is_none() {
+                                first_runnable_provider = Some(p.id.clone());
+                            }
+                            Some((
+                                p.id.clone(),
+                                busytok_subagent::sidecar::ProviderRuntimeEntry {
+                                    provider_id: p.id,
+                                    api_key,
+                                    base_url: p.base_url,
+                                },
+                            ))
+                        })
+                        .collect()
+                };
 
                 // Build the pool. The base config is cloned per-provider by
-                // `ensure_worker`, with env overridden (API key + base URL
-                // injected).
+                // `ensure_worker` (Task 5: credentials flow via `turn_auto`
+                // params, not env injection).
                 let resource_policy = settings.lock().unwrap().subagent.resource_policy.clone();
                 let pool = Arc::new(busytok_subagent::sidecar::WorkerPool::new(
                     sidecar_config,
                     Some(Arc::clone(db)),
                     providers,
-                    credential_reader,
                     Some(Arc::clone(&gate)),
                     resource_policy,
                 ));
@@ -423,22 +438,15 @@ impl BusytokSupervisor {
                 );
                 pool.set_responder_factory(factory);
 
-                // Eagerly `ensure_worker` the first enabled provider so the
+                // Eagerly `ensure_worker` the first runnable provider so the
                 // `sidecar_supervisor` field has a supervisor for doctor
                 // checks, shutdown, and runtime status. If no providers are
-                // configured (or the first provider's credential is
-                // missing), `sidecar_supervisor` stays `None` — delegate
-                // calls will fail with "profile not bound to a provider"
-                // or "no API key" (surfaced via the executor's error path).
-                let first_enabled_provider = settings
-                    .lock()
-                    .unwrap()
-                    .providers
-                    .iter()
-                    .find(|p| p.enabled)
-                    .map(|p| p.id.clone());
+                // configured (or all lack credentials), `sidecar_supervisor`
+                // stays `None` — delegate calls will fail with "profile not
+                // bound to a provider" or "unknown provider" (surfaced via
+                // the executor's error path).
                 let sidecar_supervisor =
-                    first_enabled_provider.and_then(|pid| match pool.ensure_worker(&pid) {
+                    first_runnable_provider.and_then(|pid| match pool.ensure_worker(&pid) {
                         Ok(sup) => Some(sup),
                         Err(e) => {
                             error!(
@@ -869,47 +877,89 @@ impl BusytokSupervisor {
         self.sidecar_runtime.read().unwrap().worker_pool.clone()
     }
 
-    /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
-    /// so the next delegate re-spawns it with fresh credentials/config.
+    /// Phase 3 Task 4 (P1b fix) + Task 7 (SQL-backed provider_changed):
+    /// Re-read the provider from SQL and either update the pool's
+    /// `ProviderRuntimeEntry` + kill the old worker (provider enabled with
+    /// api_key) or remove the provider entry + kill the worker (provider
+    /// disabled / missing / no api_key). Both paths use async kill methods
+    /// (`update_provider_and_kill_old` / `remove_worker_and_kill`) so the
+    /// old sidecar child process is explicitly `force_kill`'d (pool.rs:20-24
+    /// invariant — no `Drop` fallback).
+    ///
     /// Called by `provider_update` (covers both metadata changes AND key
     /// rotations) and `provider_create` (defensive — typically a no-op
     /// since no worker exists yet for a brand-new provider).
-    ///
-    /// Self-contained: callers don't need to remember to kill — this
-    /// method delegates to `pool.remove_worker_and_kill(provider_id)`
-    /// which does the remove + `force_kill().await` outside the map lock.
-    /// If no worker exists for `provider_id`, this is a logged no-op.
-    /// If the sidecar is disabled (`worker_pool` is `None`), this is a
-    /// logged no-op.
     pub async fn provider_changed(&self, provider_id: &str) {
-        if let Some(pool) = self.worker_pool() {
-            info!(
-                event_code = "subagent.provider_changed",
-                provider_id = %provider_id,
-                "provider changed — killing worker for lazy re-spawn with fresh credentials"
-            );
-            if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
-                warn!(
-                    event_code = "subagent.provider_changed_kill_failed",
-                    provider_id = %provider_id,
-                    error = %e,
-                    "failed to kill worker after provider change (best-effort)"
-                );
-            }
-        } else {
+        let Some(pool) = self.worker_pool() else {
             debug!(
                 event_code = "subagent.provider_changed_noop",
                 provider_id = %provider_id,
                 "provider_changed called but sidecar is disabled — no-op"
             );
+            return;
+        };
+        // Re-read provider from SQL to decide update vs remove.
+        let entry = {
+            let db = self.db.lock().unwrap();
+            db.get_provider_with_secret(provider_id).ok().flatten()
+        };
+        match entry {
+            Some(p) if p.enabled && p.api_key.is_some() => {
+                info!(
+                    event_code = "subagent.provider_changed",
+                    provider_id = %provider_id,
+                    "provider changed — updating entry + killing old worker for lazy re-spawn"
+                );
+                if let Err(e) = pool
+                    .update_provider_and_kill_old(busytok_subagent::sidecar::ProviderRuntimeEntry {
+                        provider_id: p.id,
+                        api_key: p.api_key.unwrap(),
+                        base_url: p.base_url,
+                    })
+                    .await
+                {
+                    warn!(
+                        event_code = "subagent.provider_changed_kill_failed",
+                        provider_id = %provider_id,
+                        error = %e,
+                        "failed to update+kill worker after provider change (best-effort)"
+                    );
+                }
+            }
+            _ => {
+                // Provider disabled / missing / no api_key — remove the
+                // provider entry (so ensure_worker won't re-spawn with
+                // stale credentials) AND kill + remove the worker. The
+                // entry is removed BEFORE the kill so a concurrent
+                // ensure_worker can't re-spawn between the two steps.
+                // NOTE: this is distinct from the auth-fail kill path in
+                // the executor, which calls remove_worker_and_kill ONLY
+                // (provider entry stays so the next ensure_worker can
+                // re-spawn after a credential refresh).
+                info!(
+                    event_code = "subagent.provider_changed_remove",
+                    provider_id = %provider_id,
+                    "provider changed (disabled/missing/no-key) — removing worker + provider entry"
+                );
+                pool.remove_provider_entry(provider_id);
+                if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
+                    warn!(
+                        event_code = "subagent.provider_changed_kill_failed",
+                        provider_id = %provider_id,
+                        error = %e,
+                        "failed to kill worker after provider change (best-effort)"
+                    );
+                }
+            }
         }
     }
 
     /// Phase 3 Task 4 (P1b fix): kill + remove a single provider's worker
     /// after the provider is deleted. Same mechanism as `provider_changed`
     /// but a distinct log event code so audit trails can distinguish
-    /// "changed" from "deleted". Called by `provider_delete` AFTER the
-    /// settings + keychain deletes succeed.
+    /// "changed" from "deleted". Called by `provider_delete` AFTER the SQL
+    /// delete succeeds. Removes the provider entry from the pool's map
+    /// (so ensure_worker won't re-spawn) AND kills + removes the worker.
     pub async fn provider_deleted(&self, provider_id: &str) {
         if let Some(pool) = self.worker_pool() {
             info!(
@@ -917,6 +967,9 @@ impl BusytokSupervisor {
                 provider_id = %provider_id,
                 "provider deleted — killing worker (if any) to release resources"
             );
+            // Remove the provider entry BEFORE the kill so a concurrent
+            // ensure_worker can't re-spawn between the two steps.
+            pool.remove_provider_entry(provider_id);
             if let Err(e) = pool.remove_worker_and_kill(provider_id).await {
                 warn!(
                     event_code = "subagent.provider_deleted_kill_failed",
@@ -1038,14 +1091,11 @@ impl BusytokSupervisor {
         //      865-870). Extract all settings-derived values BEFORE any
         //      `.await` — `self.settings` is a `std::sync::Mutex` and holding
         //      its guard across `.await` (protocol_version probe below) is
-        //      forbidden. `runtime_dir` and `models` are cloned out as owned
-        //      values so the lock is released before the protocol probe.
-        let (runtime_dir, models) = {
+        //      forbidden. `runtime_dir` is cloned out as an owned value so
+        //      the lock is released before the protocol probe.
+        let runtime_dir = {
             let settings = self.settings.lock().unwrap();
-            (
-                settings.subagent.pi_sidecar.runtime_dir.clone(),
-                settings.subagent.models.clone(),
-            )
+            settings.subagent.pi_sidecar.runtime_dir.clone()
         };
         let runtime_dir_ref = runtime_dir.as_deref();
 
@@ -1219,32 +1269,10 @@ impl BusytokSupervisor {
             });
         }
 
-        // 7. Default model config valid (spec §7.1 line 868).
-        {
-            let empty_fields: Vec<&str> = [
-                ("default_cheap_model", &models.default_cheap_model),
-                ("default_review_model", &models.default_review_model),
-                ("default_reasoning_model", &models.default_reasoning_model),
-                ("default_coder_model", &models.default_coder_model),
-            ]
-            .iter()
-            .filter(|(_, v)| v.is_empty())
-            .map(|(k, _)| *k)
-            .collect();
-            let ok = empty_fields.is_empty();
-            let detail = if ok {
-                "all 4 default models configured".to_string()
-            } else {
-                format!("empty model fields: {}", empty_fields.join(", "))
-            };
-            checks.push(DoctorCheckDto {
-                name: "default_model_config".into(),
-                status: if ok { "ok" } else { "error" }.into(),
-                detail: Some(detail),
-            });
-        }
-
-        // 8. Pi runtime installed (spec §7.1 line 869).
+        // 7. Pi runtime installed (spec §7.1 line 869).
+        //    (Task 3 removed the `default_model_config` doctor check —
+        //    `SubagentModelsConfig` was deleted; provider/model binding is
+        //    now per-subagent via SQL catalog, validated at delegate time.)
         {
             let node_path = self.paths.sidecar_bundled_node_path(runtime_dir_ref);
             let bundle_path = self.paths.sidecar_bundle_path(runtime_dir_ref);
@@ -1795,6 +1823,14 @@ impl BusytokSupervisor {
     /// Access the database handle (for testing and diagnostics).
     pub fn db_handle(&self) -> &Arc<std::sync::Mutex<Database>> {
         &self.db
+    }
+
+    /// Access the settings handle (for testing — e.g. injecting profile
+    /// references to exercise `provider_delete`'s blocking check). Production
+    /// code mutates settings via the RPC handlers (`provider_update`,
+    /// `pi_sidecar_locator_update`, `profile_*`).
+    pub fn settings_for_test(&self) -> Arc<Mutex<BusytokSettings>> {
+        Arc::clone(&self.settings)
     }
 
     /// Access the resolved filesystem paths.
@@ -2819,6 +2855,12 @@ fn delegate_request_from_dto(
         model_override: d.model_override,
         source_harness: d.source_harness,
         source_session_id: d.source_session_id,
+        // Spec §3.3: bound fields come from the DTO. For the reuse path
+        // (existing subagent by name or subagent_id), the manager IGNORES
+        // these and uses the subagent's stored bound fields. For the create
+        // path, the manager enforces "both or neither".
+        bound_provider_id: d.bound_provider_id,
+        bound_model_id: d.bound_model_id,
     }
 }
 
@@ -2842,7 +2884,11 @@ fn subagent_detail(s: busytok_subagent::models::LogicalSubagent) -> SubagentDeta
         branch: s.branch,
         intent: s.intent,
         default_profile: s.default_profile,
-        default_model: s.default_model,
+        // Spec §3.3: per-subagent bound fields (NOT NULL in store) replace
+        // the former `default_model` field. Surfaced on the detail DTO so
+        // the GUI/CLI can show which provider+model the subagent is bound to.
+        bound_provider_id: s.bound_provider_id,
+        bound_model_id: s.bound_model_id,
         status: s.status.as_str().to_string(),
         created_at_ms: s.created_at_ms,
         updated_at_ms: s.updated_at_ms,
@@ -5321,63 +5367,12 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: busytok_protocol::dto::SubagentDelegateRequestDto,
     ) -> Result<SubagentDelegateResponseDto> {
-        // Phase 3 Task 4: provider whitelist validation (spec §3.4, M2 fix).
-        // Only validate when the sidecar pool is wired — when the sidecar is
-        // disabled (mock executor) or config resolution failed
-        // (FailingTaskExecutor), validation is skipped because no real
-        // provider routing happens. This keeps the legacy mock-delegate tests
-        // (which use unbound built-in profiles) working unchanged.
+        // Spec §3.3 + Task 4: bound_provider_id + bound_model_id are read
+        // from the DTO. For the reuse path (existing subagent by name or
+        // subagent_id), the manager IGNORES the DTO bound fields and uses
+        // the subagent's stored bound fields. For the create path, the
+        // manager enforces "both or neither" against the DTO bound fields.
         //
-        // Spec §3.4: the profile's `provider_id` must refer to an enabled
-        // provider, AND `profile.model` must be in that provider's `models`
-        // whitelist. Failures return a validation error BEFORE the manager
-        // inserts a task row — so no DB write happens for rejected delegates.
-        if self.worker_pool().is_some() {
-            let (profile_provider, profile_model) = {
-                let settings = self.settings.lock().unwrap();
-                let profile_cfg = settings.subagent.profiles.get(&req.profile);
-                match profile_cfg {
-                    Some(p) => (p.provider_id.clone(), p.model.clone()),
-                    None => {
-                        return Err(anyhow::anyhow!("profile not found: {}", req.profile));
-                    }
-                }
-            };
-            if let Some(provider_id) = profile_provider.as_deref() {
-                let provider_cfg = {
-                    let settings = self.settings.lock().unwrap();
-                    settings
-                        .providers
-                        .iter()
-                        .find(|p| p.id == provider_id)
-                        .cloned()
-                };
-                let provider_cfg = provider_cfg
-                    .ok_or_else(|| anyhow::anyhow!("provider not found: {}", provider_id))?;
-                if !provider_cfg.enabled {
-                    anyhow::bail!("provider disabled: {}", provider_id);
-                }
-                // Model whitelist (spec §3.4). Empty `profile.model` is
-                // treated as a whitelist violation — the sidecar would have
-                // no model to send.
-                if profile_model.is_empty()
-                    || !provider_cfg.models.iter().any(|m| m == &profile_model)
-                {
-                    anyhow::bail!(
-                        "model '{}' not in provider '{}' whitelist",
-                        profile_model,
-                        provider_id
-                    );
-                }
-            } else {
-                // Profile has no provider_id bound. When the sidecar is
-                // enabled, the executor's `ensure_worker(provider_id)` would
-                // fail with "no provider_id" — surface the validation error
-                // here for a clearer message.
-                anyhow::bail!("profile not bound to a provider");
-            }
-        }
-
         // Phase 3 Task 5: capture cwd before `req` is consumed by
         // `delegate_request_from_dto`, then bridge the subagent task's usage
         // into the unified `usage_events` pipeline after delegate returns.
@@ -5698,177 +5693,98 @@ impl RuntimeControl for BusytokSupervisor {
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
-        // Validate id format (used as keychain account name)
-        if req.id.is_empty() {
-            anyhow::bail!("provider id must not be empty");
-        }
-        if !req
-            .id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            anyhow::bail!("provider id must contain only [a-z0-9-]+");
-        }
-        let mut pending_settings = {
-            let settings = self.settings.lock().unwrap();
-            settings.clone()
+        // id 由 store 层生成（UUID v4），不再校验用户输入。api_key 直接
+        // 存入 SQL providers 表。
+        let provider = {
+            let db = self.db.lock().unwrap();
+            db.create_provider(busytok_store::CreateProviderReq {
+                name: req.name,
+                provider_kind: req.provider_kind,
+                base_url: req.base_url,
+                enabled: req.enabled.unwrap_or(true),
+                api_key: req.api_key,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "provider.sql_write_failed", error = %e, "create_provider failed");
+                e
+            })?
         };
-        if pending_settings.providers.iter().any(|p| p.id == req.id) {
-            anyhow::bail!("provider already exists: {}", req.id);
-        }
-        let provider = ProviderConfig {
-            id: req.id.clone(),
-            name: req.name,
-            provider_kind: ProviderKind::OpenAiCompatible,
-            base_url: req.base_url,
-            api_key_env_name: req.api_key_env_name,
-            base_url_env_name: req.base_url_env_name,
-            models: req.models,
-            enabled: true,
-        };
-        // Write settings first — if keychain fails, the provider exists
-        // but has no key (user can retry set_key later). If keychain
-        // succeeded but settings.save() fails, the key becomes orphaned.
-        pending_settings.providers.push(provider.clone());
-        pending_settings.save(&self.paths)?;
-        {
-            let mut settings = self.settings.lock().unwrap();
-            *settings = pending_settings;
-        }
-        if let Some(key) = &req.api_key {
-            ProviderCredentialStore::set_key(&provider.id, key).context(
-                "failed to store API key in keychain; provider config was written — retry if needed",
-            )?;
-        }
         tracing::info!(event_code = "provider.created", provider_id = %provider.id, "provider created");
-        // Phase 3 Task 4 (I3 fix): defensively kill any pre-existing worker
-        // for this provider id. Typically a no-op (brand-new provider has no
-        // worker yet), but covers the edge case where a provider was deleted
-        // without the worker being cleaned up, then re-created with the same
-        // id — the stale worker would hold the OLD credentials.
+        // Defensive: kill any pre-existing worker for this provider id.
+        // Typically a no-op (brand-new provider has no worker yet), but
+        // covers the edge case where a provider was deleted without the
+        // worker being cleaned up, then re-created — the stale worker would
+        // hold the OLD credentials.
         self.provider_changed(&provider.id).await;
         Ok(provider_to_dto(&provider))
     }
 
     async fn provider_list(&self) -> Result<ProviderListResponseDto> {
-        // Clone the provider vec under the lock, then drop the guard before
-        // mapping to DTOs — `provider_to_dto` calls `ProviderCredentialStore::has_key`
-        // (sync keychain I/O) for each provider, and holding the settings lock
-        // during that window blocks other settings operations.
-        let providers: Vec<ProviderConfig> = {
-            let settings = self.settings.lock().unwrap();
-            settings.providers.clone()
+        // SQL-backed: list_providers returns ProviderSummary (no api_key).
+        // The settings lock is NOT taken — provider CRUD no longer touches
+        // settings.toml.
+        let summaries = {
+            let db = self.db.lock().unwrap();
+            db.list_providers().map_err(|e| {
+                tracing::error!(event_code = "provider.sql_read_failed", error = %e, "list_providers failed");
+                e
+            })?
         };
-        let dtos: Vec<ProviderDto> = providers.iter().map(provider_to_dto).collect();
-        tracing::debug!(count = dtos.len(), "listed providers");
-        Ok(ProviderListResponseDto { providers: dtos })
+        let providers: Vec<ProviderDto> = summaries.iter().map(provider_summary_to_dto).collect();
+        tracing::debug!(count = providers.len(), "listed providers");
+        Ok(ProviderListResponseDto { providers })
     }
 
     async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
-        let mut pending_settings = {
-            let settings = self.settings.lock().unwrap();
-            settings.clone()
+        // SQL-backed: api_key is three-state Option<Option<String>>.
+        //   None              → no change
+        //   Some(None)        → clear
+        //   Some(Some(k))     → update
+        // The store layer handles all three branches atomically under a
+        // transaction.
+        let provider = {
+            let db = self.db.lock().unwrap();
+            db.update_provider(&req.id, busytok_store::UpdateProviderPatch {
+                name: req.name,
+                base_url: req.base_url,
+                enabled: req.enabled,
+                // Spec §7.1: patching provider_kind changes the API shape
+                // (openai_completions vs anthropic_messages). The worker is
+                // killed below via `provider_changed` so the next delegate
+                // re-spawns it with the new API shape.
+                provider_kind: req.provider_kind,
+                api_key: req.api_key,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "provider.sql_write_failed", provider_id = %req.id, error = %e, "update_provider failed");
+                e
+            })?
         };
-        let provider = pending_settings
-            .providers
-            .iter_mut()
-            .find(|p| p.id == req.id)
-            .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
-        if let Some(name) = req.name {
-            provider.name = name;
-        }
-        if let Some(base_url) = req.base_url {
-            provider.base_url = base_url;
-        }
-        // Spec §3.1: api_key_env_name and base_url_env_name are editable provider
-        // fields. They reach the handler via ProviderUpdateRequestDto (patch
-        // semantics: None == leave unchanged).
-        if let Some(api_key_env_name) = req.api_key_env_name {
-            provider.api_key_env_name = api_key_env_name;
-        }
-        if let Some(base_url_env_name) = req.base_url_env_name {
-            provider.base_url_env_name = Some(base_url_env_name);
-        }
-        if let Some(models) = req.models {
-            provider.models = models;
-        }
-        if let Some(enabled) = req.enabled {
-            provider.enabled = enabled;
-        }
-        // Snapshot the provider before `pending_settings` is moved into the
-        // in-memory cache — the reference can't outlive that move.
-        let provider_snapshot = provider.clone();
-        pending_settings.save(&self.paths)?;
-        {
-            let mut settings = self.settings.lock().unwrap();
-            *settings = pending_settings;
-        }
-        // api_key: None = no change; Some("") is ignored (MVP: empty string = no-op).
-        // Future: add clear_api_key: bool if clearing is needed.
-        // Write keychain AFTER settings are persisted — mirrors provider_create's
-        // order so a keychain failure cannot leave the keychain and settings.toml
-        // out of sync (settings is the source of truth; orphaned key is harmless).
-        if let Some(key) = &req.api_key {
-            if !key.is_empty() {
-                ProviderCredentialStore::set_key(&req.id, key)
-                    .context("failed to update API key")?;
-            }
-        }
-        // Compute DTO AFTER the keychain write so has_api_key reflects the
-        // post-update keychain state (mirrors provider_create).
-        let dto = provider_to_dto(&provider_snapshot);
-        tracing::info!(event_code = "provider.updated", provider_id = %req.id, "provider updated");
-        // Phase 3 Task 4 (I3 fix): kill the worker so the next delegate
-        // re-spawns it with the updated config (metadata changes like
-        // base_url / api_key_env_name / models AND key rotations). Covers
-        // both `req.api_key.is_some()` (key rotation) and metadata-only
-        // changes. Safe no-op when no worker exists for this provider.
-        self.provider_changed(&req.id).await;
-        Ok(dto)
+        tracing::info!(event_code = "provider.updated", provider_id = %provider.id, "provider updated");
+        // Kill the worker so the next delegate re-spawns it with the updated
+        // config (metadata changes like base_url AND key rotations). Safe
+        // no-op when no worker exists for this provider.
+        self.provider_changed(&provider.id).await;
+        Ok(provider_to_dto(&provider))
     }
 
     async fn provider_delete(&self, req: ProviderDeleteRequestDto) -> Result<()> {
-        let mut pending_settings = {
-            let settings = self.settings.lock().unwrap();
-            settings.clone()
-        };
-        if !pending_settings.providers.iter().any(|p| p.id == req.id) {
-            anyhow::bail!("provider not found: {}", req.id);
-        }
-        // Check if any profile references this provider (Phase 4 adds provider_id to profiles).
-        // NOTE: BusytokSettings.subagent is SubagentSettings (NOT Option), per lib.rs:106.
-        for (_, profile) in &pending_settings.subagent.profiles {
-            if profile_provider_id(profile).as_deref() == Some(req.id.as_str()) {
-                anyhow::bail!(
-                    "cannot delete provider '{}': profiles still reference it",
-                    req.id
-                );
-            }
-        }
-        pending_settings.providers.retain(|p| p.id != req.id);
-        pending_settings.save(&self.paths)?;
+        // SQL-backed delete with "allow delete, dangling binding" semantics.
+        // Per Task 3 spec §7.5: deleting a provider is always allowed even if
+        // subagents still reference it via `bound_provider_id`. The resulting
+        // dangling binding is reported at delegate time (fail-fast) — no
+        // implicit unbind, no auto-rebind.
         {
-            let mut settings = self.settings.lock().unwrap();
-            *settings = pending_settings;
-        }
-        // Delete key from keychain AFTER settings are persisted.
-        // If keychain delete fails, the orphaned key is harmless (no provider references it);
-        // downgrading to a warning keeps `provider_delete` resilient on platforms where the
-        // OS keychain/secret-service is unavailable (e.g. Ubuntu CI runners without D-Bus).
-        if let Err(e) = ProviderCredentialStore::delete_key(&req.id) {
-            tracing::warn!(
-                event_code = "provider.keychain_delete_failed",
-                provider_id = %req.id,
-                error = %e,
-                "failed to delete API key from keychain (orphaned key is harmless)"
-            );
+            let db = self.db.lock().unwrap();
+            db.delete_provider(&req.id).map_err(|e| {
+                tracing::error!(event_code = "provider.sql_write_failed", provider_id = %req.id, error = %e, "delete_provider failed");
+                e
+            })?;
         }
         tracing::info!(event_code = "provider.deleted", provider_id = %req.id, "provider deleted");
-        // Phase 3 Task 4 (I3 fix): kill + remove the worker for the deleted
-        // provider so its sidecar process doesn't keep running with stale
-        // credentials. Distinct log event code (`subagent.provider_deleted`
-        // vs `subagent.provider_changed`) for audit trail clarity. Safe
-        // no-op when no worker exists for this provider.
+        // Kill + remove the worker for the deleted provider so its sidecar
+        // process doesn't keep running with stale credentials. Safe no-op
+        // when no worker exists for this provider.
         self.provider_deleted(&req.id).await;
         Ok(())
     }
@@ -5877,139 +5793,208 @@ impl RuntimeControl for BusytokSupervisor {
         &self,
         req: ProviderTestConnectionRequestDto,
     ) -> Result<ProviderTestConnectionResponseDto> {
-        // Snapshot the provider fields under the lock, then drop the guard
-        // before awaiting — holding a `MutexGuard` across `.await` makes the
-        // future `!Send` and breaks the `RuntimeControl` trait bound.
-        let (provider_id, base_url, models) = {
-            let settings = self.settings.lock().unwrap();
-            let provider = settings
-                .providers
-                .iter()
-                .find(|p| p.id == req.id)
-                .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?;
-            // Clone `models` too — the /chat/completions fallback needs a model
-            // id for the probe body.
-            (
-                provider.id.clone(),
-                provider.base_url.clone(),
-                provider.models.clone(),
-            )
+        // SQL-backed: load provider (with secret) from the store. Drop the db
+        // guard before awaiting — holding a `MutexGuard` across `.await` makes
+        // the future `!Send` and breaks the `RuntimeControl` trait bound.
+        let provider = {
+            let db = self.db.lock().unwrap();
+            db.get_provider_with_secret(&req.id)
+                .map_err(|e| {
+                    tracing::error!(event_code = "provider.sql_read_failed", provider_id = %req.id, error = %e, "get_provider_with_secret failed");
+                    e
+                })?
+                .ok_or_else(|| anyhow::anyhow!("provider not found: {}", req.id))?
         };
+        let provider_id = provider.id.clone();
+        let base_url = provider.base_url.clone();
         // Defense-in-depth: the frontend doesn't enforce HTTPS, so the backend
         // must reject cleartext URLs before reading the key or sending the key
         // in an Authorization header.
         if !base_url.starts_with("https://") {
             anyhow::bail!("provider base_url must use HTTPS (got: {})", base_url);
         }
-        let key = ProviderCredentialStore::get_key(&provider_id)
-            .context("failed to read keychain")?
-            .ok_or_else(|| anyhow::anyhow!("no API key stored for provider '{}'", provider_id))?;
-        let url = format!("{}/models", base_url.trim_end_matches('/'));
-        tracing::info!(
-            event_code = "provider.test_connection",
-            provider_id = %provider_id,
-            url = %url,
-            "testing provider connection"
-        );
-        // Disable redirects so the Authorization header is never forwarded to
-        // a cross-origin host (a compromised endpoint could otherwise redirect
-        // to an attacker-controlled host and exfiltrate the key).
+        let api_key = provider
+            .api_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("provider has no api key"))?;
+        // Disable redirects so credentials are never forwarded to a cross-origin
+        // host (a compromised endpoint could otherwise redirect to an attacker-
+        // controlled host and exfiltrate the key). Shared by both branches.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let resp = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", key))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "connection test succeeded");
-                Ok(ProviderTestConnectionResponseDto {
-                    ok: true,
-                    error: None,
-                    models_detected: None,
-                })
+        // Dispatch by provider kind. Both the OpenAI and Anthropic branches
+        // build their initial probe via `build_probe_request` (tested helper)
+        // so the request contract — method, path, auth header, body shape —
+        // is locked by tests; no inline header/body duplication.
+        match provider.provider_kind {
+            busytok_domain::ProviderKind::OpenAiCompatible => {
+                self.test_connection_openai(&client, &provider_id, &base_url, api_key)
+                    .await
             }
-            Ok(r) => {
-                let status = r.status();
-                // Spec §4: if GET /v1/models is absent/unsupported (404/405/501),
-                // fall back to POST /v1/chat/completions with a 1-token prompt.
-                if models_probe_should_fallback(status) {
-                    tracing::debug!(
-                        event_code = "provider.test_connection.fallback",
-                        provider_id = %provider_id,
-                        models_status = %status,
-                        "falling back to /chat/completions"
-                    );
-                    let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-                    let body = serde_json::json!({
-                        "model": chat_probe_model(&models),
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": "ping"}],
-                    });
-                    let chat_resp = client
-                        .post(&chat_url)
-                        .header("Authorization", format!("Bearer {}", key))
-                        .json(&body)
-                        .send()
-                        .await;
-                    return match chat_resp {
-                        Ok(cr) => {
-                            let cstatus = cr.status();
-                            let (ok, error) = interpret_chat_probe(cstatus);
-                            if ok {
-                                tracing::info!(
-                                    event_code = "provider.test_connection.ok",
-                                    provider_id = %provider_id,
-                                    "connection test succeeded via /chat/completions fallback"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    event_code = "provider.test_connection.failed",
-                                    provider_id = %provider_id,
-                                    status = %cstatus,
-                                    "connection test failed via /chat/completions fallback"
-                                );
-                            }
-                            Ok(ProviderTestConnectionResponseDto {
-                                ok,
-                                error,
-                                models_detected: None,
-                            })
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                event_code = "provider.test_connection.error",
-                                provider_id = %provider_id,
-                                error = %e,
-                                "connection test error during /chat/completions fallback"
-                            );
-                            Ok(ProviderTestConnectionResponseDto {
-                                ok: false,
-                                error: Some(e.to_string()),
-                                models_detected: None,
-                            })
-                        }
-                    };
-                }
-                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "connection test failed");
-                Ok(ProviderTestConnectionResponseDto {
-                    ok: false,
-                    error: Some(format!("HTTP {}", status)),
-                    models_detected: None,
-                })
-            }
-            Err(e) => {
-                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "connection test error");
-                Ok(ProviderTestConnectionResponseDto {
-                    ok: false,
-                    error: Some(e.to_string()),
-                    models_detected: None,
-                })
+            busytok_domain::ProviderKind::AnthropicCompatible => {
+                self.test_connection_anthropic(&client, &provider_id, &base_url, api_key)
+                    .await
             }
         }
+    }
+
+    // ── Models (Phase: Provider/Model Catalog Refactor) ─────────────
+    //
+    // SQL-backed model CRUD. The store layer (`busytok_store::provider_catalog`)
+    // owns all SQL; the supervisor handlers below are thin adapters that
+    // translate DTO ↔ store requests, drop the db lock before any `.await`
+    // (the `RuntimeControl` trait requires `Send` futures), and emit
+    // structured tracing events.
+    //
+    // `model_id` is immutable after creation — `ModelUpdateRequestDto` only
+    // carries `id` + `enabled`. `model_delete` is blocking: profile refs are
+    // collected from settings and the store rejects the delete if any profile
+    // references this (provider_id, model_id) pair.
+
+    async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
+        // Create the model row + initial tags atomically (store layer
+        // transaction). `model_id` immutability is enforced at the store
+        // layer via UNIQUE(provider_id, model_id). Spec §6.1: context_window
+        // + max_tokens are required at create time (enforced by the DTO);
+        // display_name + reasoning are optional.
+        let model = {
+            let db = self.db.lock().unwrap();
+            db.create_model(busytok_store::CreateModelReq {
+                provider_id: req.provider_id.clone(),
+                model_id: req.model_id.clone(),
+                enabled: req.enabled.unwrap_or(true),
+                tags: req.tags.clone(),
+                display_name: req.display_name.clone(),
+                reasoning: req.reasoning,
+                context_window: Some(req.context_window),
+                max_tokens: Some(req.max_tokens),
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_write_failed", provider_id = %req.provider_id, model_id = %req.model_id, error = %e, "create_model failed");
+                e
+            })?
+        };
+        tracing::info!(
+            event_code = "model.created",
+            model_id = %model.model_id,
+            provider_id = %model.provider_id,
+            model_db_id = %model.id,
+            "model created"
+        );
+        // Re-fetch via the catalog join so the DTO carries provider_name /
+        // provider_kind / provider_enabled / tags in one shot. The store
+        // returns the full joined row.
+        let entries = {
+            let db = self.db.lock().unwrap();
+            db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                provider_id: Some(model.provider_id.clone()),
+                tags: vec![],
+                include_disabled: true,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_read_failed", provider_id = %model.provider_id, model_db_id = %model.id, error = %e, "list_models_filtered re-fetch after create failed");
+                e
+            })?
+        };
+        entries
+            .into_iter()
+            .find(|e| e.model_db_id == model.id)
+            .map(catalog_entry_to_dto)
+            .ok_or_else(|| anyhow::anyhow!("model not found after create"))
+    }
+
+    async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+        // No settings lock — model catalog lives entirely in SQL. Tag filter
+        // uses AND semantics (a model must have ALL selected tags).
+        let entries = {
+            let db = self.db.lock().unwrap();
+            db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                provider_id: req.provider_id,
+                tags: req.tags,
+                include_disabled: req.include_disabled,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_read_failed", error = %e, "list_models_filtered failed");
+                e
+            })?
+        };
+        tracing::info!(
+            event_code = "model.catalog.listed",
+            count = entries.len(),
+            "model catalog listed"
+        );
+        Ok(ModelListResponseDto {
+            models: entries.iter().map(catalog_entry_to_dto_ref).collect(),
+        })
+    }
+
+    async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
+        // `model_id` is immutable — only enabled + metadata are patchable
+        // (spec §6.1). The store layer's `update_model` enforces "model not
+        // found" via row-count check (rows == 0 → bail).
+        let updated = {
+            let db = self.db.lock().unwrap();
+            db.update_model(&req.id, busytok_store::UpdateModelPatch {
+                enabled: req.enabled,
+                display_name: req.display_name,
+                reasoning: req.reasoning,
+                context_window: req.context_window,
+                max_tokens: req.max_tokens,
+            })
+            .map_err(|e| {
+                tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "update_model failed");
+                e
+            })?
+        };
+        tracing::info!(
+            event_code = "model.updated",
+            model_db_id = %updated.id,
+            model_id = %updated.model_id,
+            enabled = updated.enabled,
+            "model updated"
+        );
+        Ok(())
+    }
+
+    async fn model_delete(&self, req: ModelDeleteRequestDto) -> Result<()> {
+        // "Allow delete, dangling binding" semantics: deleting a model is
+        // always allowed even if subagents still reference it via
+        // `bound_model_id`. The dangling binding is reported at delegate
+        // time (fail-fast) — no auto-unbind, no implicit rebinding.
+        {
+            let db = self.db.lock().unwrap();
+            db.delete_model(&req.id).map_err(|e| {
+                tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.id, error = %e, "delete_model failed");
+                e
+            })?;
+        }
+        tracing::info!(
+            event_code = "model.deleted",
+            model_db_id = %req.id,
+            "model deleted"
+        );
+        Ok(())
+    }
+
+    async fn model_tags_update(&self, req: ModelTagUpdateDto) -> Result<()> {
+        // Replace-all semantics: the store diffs against existing tags and
+        // only writes the delta (insert new, remove stale) inside a
+        // transaction. `model_id` here is the models.id (DB PK), not the
+        // immutable model_id string — same param name, different meaning.
+        let db = self.db.lock().unwrap();
+        db.set_model_tags(&req.model_id, &req.tags).map_err(|e| {
+            tracing::error!(event_code = "model.sql_write_failed", model_db_id = %req.model_id, error = %e, "set_model_tags failed");
+            e
+        })?;
+        tracing::info!(
+            event_code = "model.tags_updated",
+            model_db_id = %req.model_id,
+            tag_count = req.tags.len(),
+            "model tags updated"
+        );
+        Ok(())
     }
 
     // ── Phase 5: pi_sidecar locator (service-owned in-memory + on-disk update) ──
@@ -6128,10 +6113,6 @@ impl RuntimeControl for BusytokSupervisor {
             tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "invalid_id_format", "profile id must contain only [a-z0-9/_-]+");
             anyhow::bail!("profile id must contain only [a-z0-9/_-]+");
         }
-        if req.model.is_empty() {
-            tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
-            anyhow::bail!("model must not be empty");
-        }
 
         let mut pending = {
             let settings = self.settings.lock().unwrap();
@@ -6142,34 +6123,15 @@ impl RuntimeControl for BusytokSupervisor {
             anyhow::bail!("profile already exists: {}", req.id);
         }
 
-        // If provider_id is specified, validate the provider exists and is enabled.
-        if let Some(ref pid) = req.provider_id {
-            let provider = pending.providers.iter().find(|p| &p.id == pid.as_str())
-                .ok_or_else(|| {
-                    tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
-                    anyhow::anyhow!("provider not found: {}", pid)
-                })?;
-            if !provider.enabled {
-                tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
-                anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
-            }
-            // Validate model is in provider's whitelist.
-            if !provider.models.contains(&req.model) {
-                tracing::warn!(event_code = "profile.create.rejected", profile_id = %req.id, provider_id = %pid, model = %req.model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                anyhow::bail!(
-                    "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                    req.model,
-                    pid,
-                    provider.models
-                );
-            }
-        }
-
+        // Task 3: Profile downgrade — provider_id / model fields are gone from
+        // `SubagentProfileConfig`. Provider/model binding is now per-subagent
+        // via SQL catalog (`subagent.bound_provider_id` / `bound_model_id`),
+        // so the create path no longer validates a provider whitelist. The
+        // new validation chain (Task 6) will validate bound fields at the
+        // delegate path.
         let profile = busytok_config::SubagentProfileConfig {
             write_access: req.write_access.unwrap_or(false),
             tools: req.tools.unwrap_or_default(),
-            model: req.model,
-            provider_id: req.provider_id,
             context_budget_tokens: req.context_budget_tokens.unwrap_or(3000),
             timeout_seconds: req.timeout_seconds.unwrap_or(120),
         };
@@ -6200,70 +6162,11 @@ impl RuntimeControl for BusytokSupervisor {
                 anyhow::anyhow!("profile not found: {}", req.id)
             })?;
 
-        // Handle provider_id patch: Some("") = unbind, Some("x") = bind, None = unchanged.
-        if let Some(ref pid) = req.provider_id {
-            let new_provider_id = if pid.is_empty() {
-                None
-            } else {
-                // Validate the new provider exists and is enabled.
-                let provider = pending.providers.iter().find(|p| &p.id == pid.as_str())
-                    .ok_or_else(|| {
-                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "provider_not_found", "provider not found");
-                        anyhow::anyhow!("provider not found: {}", pid)
-                    })?;
-                if !provider.enabled {
-                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, reason = "disabled_provider", "cannot bind to disabled provider");
-                    anyhow::bail!("cannot bind profile to disabled provider: {}", pid);
-                }
-                Some(pid.clone())
-            };
-            // If binding to a provider (new or same), validate the effective
-            // model against that provider's whitelist (unless model is also
-            // being updated this call — the model block below will validate).
-            if let Some(ref new_pid) = new_provider_id {
-                let provider = pending
-                    .providers
-                    .iter()
-                    .find(|p| &p.id == new_pid.as_str())
-                    .unwrap();
-                let effective_model = req.model.as_ref().unwrap_or(&profile.model);
-                if !provider.models.contains(effective_model) {
-                    tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %new_pid, model = %effective_model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                    anyhow::bail!(
-                        "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                        effective_model,
-                        new_pid,
-                        provider.models
-                    );
-                }
-            }
-            profile.provider_id = new_provider_id;
-        }
-
-        // Handle model patch: validate non-empty first (mirrors profile_create),
-        // then whitelist-check against the bound provider if any.
-        if let Some(ref model) = req.model {
-            if model.is_empty() {
-                tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, reason = "empty_model", "model must not be empty");
-                anyhow::bail!("model must not be empty");
-            }
-            if let Some(ref pid) = profile.provider_id {
-                let provider = pending.providers.iter().find(|p| &p.id == pid.as_str());
-                if let Some(provider) = provider {
-                    if !provider.models.contains(model) {
-                        tracing::warn!(event_code = "profile.update.rejected", profile_id = %req.id, provider_id = %pid, model = %model, reason = "model_not_in_whitelist", "model not in provider whitelist");
-                        anyhow::bail!(
-                            "model '{}' is not in provider '{}'s model whitelist: {:?}",
-                            model,
-                            pid,
-                            provider.models
-                        );
-                    }
-                }
-            }
-            profile.model = model.clone();
-        }
-
+        // Task 3: Profile downgrade — only behavior-template fields are
+        // patchable. provider_id / model patches are no longer supported
+        // (those fields no longer exist on `SubagentProfileConfig`). Provider
+        // and model binding is per-subagent and mutated via the subagent
+        // binding RPCs (Task 6), not via profile updates.
         if let Some(tools) = req.tools {
             profile.tools = tools;
         }
@@ -6342,6 +6245,220 @@ impl RuntimeControl for BusytokSupervisor {
     }
 }
 
+/// `provider_test_connection` per-kind helpers. Lives in an inherent impl
+/// block (not the `RuntimeControl` trait impl) because these are private
+/// helpers, not trait methods. Both take `&self` for DB access where needed.
+impl BusytokSupervisor {
+    /// OpenAI-compatible probe: `GET /models`, with fallback to
+    /// `POST /chat/completions` (1-token ping) when /models is absent
+    /// (404/405/501). The fallback needs DB access for the probe model id,
+    /// so this helper takes `&self`.
+    ///
+    /// The initial `GET /models` request (URL + Authorization header) is
+    /// built by `build_probe_request(ProviderKind::OpenAiCompatible, ...)`
+    /// — the same helper used by the Anthropic branch and locked by tests.
+    /// Do NOT inline the URL/headers here: that would bypass the test
+    /// contract and allow drift between the helper and the handler.
+    async fn test_connection_openai(
+        &self,
+        client: &reqwest::Client,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        let probe = build_probe_request(
+            busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url,
+            api_key,
+        );
+        tracing::info!(
+            event_code = "provider.test_connection",
+            provider_id = %provider_id,
+            url = %probe.url,
+            "testing provider connection"
+        );
+        let mut req_builder = client.request(probe.method.clone(), &probe.url);
+        for (k, v) in &probe.headers {
+            req_builder = req_builder.header(k, v);
+        }
+        // OpenAI probe body is Null (GET /models) — no body to send.
+        let resp = req_builder.send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "connection test succeeded");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: true,
+                    error: None,
+                    models_detected: None,
+                })
+            }
+            Ok(r) => {
+                let status = r.status();
+                // Spec §4: if GET /v1/models is absent/unsupported (404/405/501),
+                // fall back to POST /v1/chat/completions with a 1-token prompt.
+                if models_probe_should_fallback(status) {
+                    tracing::debug!(
+                        event_code = "provider.test_connection.fallback",
+                        provider_id = %provider_id,
+                        models_status = %status,
+                        "falling back to /chat/completions"
+                    );
+                    // Probe model comes from the SQL models table (enabled only).
+                    let probe_model = {
+                        let db = self.db.lock().unwrap();
+                        db.list_models_filtered(busytok_domain::ModelCatalogFilter {
+                            provider_id: Some(provider_id.to_string()),
+                            tags: vec![],
+                            include_disabled: false,
+                        })
+                        .map_err(|e| {
+                            tracing::error!(event_code = "model.sql_read_failed", provider_id = %provider_id, error = %e, "list_models_filtered for probe failed");
+                            e
+                        })?
+                    };
+                    let probe_model = probe_model.into_iter().next()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "provider has no enabled models configured, cannot probe /chat/completions"
+                        ))?;
+                    // Fallback POST /chat/completions: the URL path diverges
+                    // from the helper (which only builds the GET /models
+                    // probe for OpenAI), so the chat URL is constructed
+                    // inline. The Authorization header is reused from the
+                    // initial probe's headers (single source of truth for the
+                    // Bearer token) to avoid duplicating the `format!("Bearer {}")`
+                    // construction that the helper already encapsulates.
+                    let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                    let body = serde_json::json!({
+                        "model": probe_model.model_id,
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "ping"}],
+                    });
+                    let mut chat_builder = client.post(&chat_url).json(&body);
+                    // Reuse the Authorization header from the probe so the
+                    // Bearer token construction stays in `build_probe_request`.
+                    for (k, v) in &probe.headers {
+                        chat_builder = chat_builder.header(k, v);
+                    }
+                    let chat_resp = chat_builder.send().await;
+                    return match chat_resp {
+                        Ok(cr) => {
+                            let cstatus = cr.status();
+                            let (ok, error) = interpret_chat_probe(cstatus);
+                            if ok {
+                                tracing::info!(
+                                    event_code = "provider.test_connection.ok",
+                                    provider_id = %provider_id,
+                                    "connection test succeeded via /chat/completions fallback"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_code = "provider.test_connection.failed",
+                                    provider_id = %provider_id,
+                                    status = %cstatus,
+                                    "connection test failed via /chat/completions fallback"
+                                );
+                            }
+                            Ok(ProviderTestConnectionResponseDto {
+                                ok,
+                                error,
+                                models_detected: None,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event_code = "provider.test_connection.error",
+                                provider_id = %provider_id,
+                                error = %e,
+                                "connection test error during /chat/completions fallback"
+                            );
+                            Ok(ProviderTestConnectionResponseDto {
+                                ok: false,
+                                error: Some(format!("request failed: {}", e)),
+                                models_detected: None,
+                            })
+                        }
+                    };
+                }
+                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "connection test failed");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("HTTP {}", status)),
+                    models_detected: None,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "connection test error");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("request failed: {}", e)),
+                    models_detected: None,
+                })
+            }
+        }
+    }
+
+    /// Anthropic-compatible probe: `POST /v1/messages` with a 1-token ping.
+    /// The request contract (path, `x-api-key`, `anthropic-version`, body
+    /// shape) is built by `build_probe_request` — the same helper tested by
+    /// `build_probe_request_anthropic_uses_post_v1_messages_with_x_api_key_header`.
+    /// Do NOT inline headers/body here: that would bypass the test contract
+    /// and allow drift between the helper and the handler.
+    async fn test_connection_anthropic(
+        &self,
+        client: &reqwest::Client,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<ProviderTestConnectionResponseDto> {
+        let probe = build_probe_request(
+            busytok_domain::ProviderKind::AnthropicCompatible,
+            base_url,
+            api_key,
+        );
+        tracing::info!(
+            event_code = "provider.test_connection",
+            provider_id = %provider_id,
+            url = %probe.url,
+            "testing anthropic provider connection"
+        );
+        let mut req_builder = client.request(probe.method, &probe.url);
+        for (k, v) in &probe.headers {
+            req_builder = req_builder.header(k, v);
+        }
+        if probe.body != serde_json::Value::Null {
+            req_builder = req_builder.json(&probe.body);
+        }
+        let resp = req_builder.send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(event_code = "provider.test_connection.ok", provider_id = %provider_id, "anthropic connection test succeeded");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: true,
+                    error: None,
+                    models_detected: None,
+                })
+            }
+            Ok(r) => {
+                let status = r.status();
+                tracing::warn!(event_code = "provider.test_connection.failed", provider_id = %provider_id, status = %status, "anthropic connection test failed");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("HTTP {}", status)),
+                    models_detected: None,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(event_code = "provider.test_connection.error", provider_id = %provider_id, error = %e, "anthropic connection test error");
+                Ok(ProviderTestConnectionResponseDto {
+                    ok: false,
+                    error: Some(format!("request failed: {}", e)),
+                    models_detected: None,
+                })
+            }
+        }
+    }
+}
+
 /// Pure decision helpers for `provider_test_connection`. Extracted so the
 /// fallback logic (which status codes trigger a fallback, how the POST probe
 /// status is interpreted) is unit-testable without standing up a TLS mock
@@ -6383,37 +6500,117 @@ fn interpret_chat_probe(status: reqwest::StatusCode) -> (bool, Option<String>) {
     }
 }
 
-/// Maps a `ProviderConfig` (settings-layer type) to a `ProviderDto` (wire type).
-///
-/// Free function rather than a method on `BusytokSupervisor` because it only
-/// needs `ProviderCredentialStore::has_key` (a static method) — taking `&self`
-/// would trip `clippy::unused_self`.
-fn provider_to_dto(provider: &ProviderConfig) -> ProviderDto {
-    ProviderDto {
-        id: provider.id.clone(),
-        name: provider.name.clone(),
-        base_url: provider.base_url.clone(),
-        api_key_env_name: provider.api_key_env_name.clone(),
-        base_url_env_name: provider.base_url_env_name.clone(),
-        models: provider.models.clone(),
-        enabled: provider.enabled,
-        has_api_key: ProviderCredentialStore::has_key(&provider.id),
+/// A probe request contract built from a `ProviderKind`, without network I/O.
+/// Extracted so unit tests can assert method / path / headers / body without
+/// spinning up an HTTP server. Used by `provider_test_connection` to construct
+/// the actual HTTP call so the request contract is locked by tests.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProbeRequest {
+    pub method: reqwest::Method,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: serde_json::Value,
+}
+
+/// Build the probe request for a `ProviderKind`. Pure (no I/O). The OpenAI
+/// and Anthropic branches of `provider_test_connection` MUST call this helper
+/// for their initial probe so the request contract (method, path, auth header,
+/// body shape) is verified by tests — do not inline headers/body in the
+/// handler. For the OpenAI fallback (`POST /chat/completions`), the URL path
+/// diverges from the helper (which only builds the initial `GET /models`
+/// probe), so the chat URL is constructed inline; the Authorization header
+/// is reused from the helper's output to keep the Bearer token construction
+/// in a single place.
+pub fn build_probe_request(
+    kind: busytok_domain::ProviderKind,
+    base_url: &str,
+    api_key: &str,
+) -> ProbeRequest {
+    let base = base_url.trim_end_matches('/');
+    match kind {
+        busytok_domain::ProviderKind::OpenAiCompatible => ProbeRequest {
+            method: reqwest::Method::GET,
+            url: format!("{}/models", base),
+            headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],
+            body: serde_json::Value::Null,
+        },
+        busytok_domain::ProviderKind::AnthropicCompatible => ProbeRequest {
+            method: reqwest::Method::POST,
+            url: format!("{}/v1/messages", base),
+            headers: vec![
+                ("x-api-key".into(), api_key.to_string()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            body: serde_json::json!({
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }),
+        },
     }
 }
 
-/// Extracts the provider_id from a profile config (Phase 3 Task 4).
+/// Maps a `busytok_domain::Provider` (SQL domain type, with secret) to a
+/// `ProviderDto` (wire type). Never exposes `api_key` — only `has_api_key`.
+fn provider_to_dto(p: &busytok_domain::Provider) -> ProviderDto {
+    ProviderDto {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        provider_kind: p.provider_kind.clone(),
+        base_url: p.base_url.clone(),
+        enabled: p.enabled,
+        has_api_key: p.api_key.is_some(),
+        created_at_ms: p.created_at_ms,
+        updated_at_ms: p.updated_at_ms,
+    }
+}
+
+/// Maps a `busytok_domain::ProviderSummary` (SQL domain type, no secret) to a
+/// `ProviderDto` (wire type). Used by `provider_list` which reads summaries.
+fn provider_summary_to_dto(s: &busytok_domain::ProviderSummary) -> ProviderDto {
+    ProviderDto {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        provider_kind: s.provider_kind.clone(),
+        base_url: s.base_url.clone(),
+        enabled: s.enabled,
+        has_api_key: s.has_api_key,
+        created_at_ms: s.created_at_ms,
+        updated_at_ms: s.updated_at_ms,
+    }
+}
+
+/// Maps a `busytok_domain::ModelCatalogEntry` (SQL joined row) to a
+/// `ModelCatalogEntryDto` (wire type). Consumes the entry — used by
+/// `model_create` which already owns the row from a fresh SQL fetch.
 ///
-/// Single source of truth for "which provider does this profile run on?".
-/// Used by:
-/// - `subagent_delegate` (validation before delegating + whitelist check);
-/// - `provider_delete` (reject deletion when a profile still references
-///   the provider).
-///
-/// Returns `None` for unbound profiles (built-in defaults ship unbound;
-/// Phase 4 adds the UI that lets users set it). Caller decides whether
-/// `None` is an error (delegate path: yes; delete path: just skip).
-fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Option<String> {
-    profile.provider_id.clone()
+/// No `api_key` field anywhere in this mapping (only provider metadata +
+/// model + tags) — safe to expose to the GUI/CLI.
+fn catalog_entry_to_dto(e: busytok_domain::ModelCatalogEntry) -> ModelCatalogEntryDto {
+    ModelCatalogEntryDto {
+        provider_id: e.provider_id,
+        provider_name: e.provider_name,
+        provider_kind: e.provider_kind,
+        provider_enabled: e.provider_enabled,
+        model_db_id: e.model_db_id,
+        model_id: e.model_id,
+        model_enabled: e.model_enabled,
+        tags: e.tags,
+        // Spec §6.1: model metadata (display_name + reasoning + context_window
+        // + max_tokens) surfaced on the catalog entry so the GUI/CLI can show
+        // model capabilities without a separate fetch.
+        display_name: e.display_name,
+        reasoning: e.reasoning,
+        context_window: e.context_window,
+        max_tokens: e.max_tokens,
+    }
+}
+
+/// By-reference variant used by `model_list`, which iterates over the
+/// borrowed `Vec<ModelCatalogEntry>` from the store. Clones once (the DTO
+/// owns its strings) — acceptable for catalog-sized lists.
+fn catalog_entry_to_dto_ref(e: &busytok_domain::ModelCatalogEntry) -> ModelCatalogEntryDto {
+    catalog_entry_to_dto(e.clone())
 }
 
 /// Maps a `SubagentProfileConfig` (settings-layer type) to a `ProfileDto`
@@ -6423,15 +6620,15 @@ fn profile_provider_id(profile: &busytok_config::SubagentProfileConfig) -> Optio
 /// — not stored in config. This is the single mapping point; both
 /// `settings_snapshot` and `profile_create`/`profile_update` use it.
 ///
-/// `provider_id` is extracted via the existing `profile_provider_id()`
-/// helper (supervisor.rs:5719) — the single source of truth for provider
-/// extraction, already used by `provider_delete`'s reference check.
+/// Task 3: Profile downgrade — provider_id / model fields are gone from
+/// both `SubagentProfileConfig` and `ProfileDto`. The DTO now exposes only
+/// behavior-template fields (tools / context_budget_tokens / timeout_seconds
+/// / write_access). Provider/model binding is per-subagent and surfaced via
+/// the subagent detail DTO, not the profile DTO.
 fn profile_to_dto(name: &str, profile: &busytok_config::SubagentProfileConfig) -> ProfileDto {
     ProfileDto {
         id: name.to_string(),
         is_builtin: busytok_config::is_builtin_profile(name),
-        provider_id: profile_provider_id(profile),
-        model: profile.model.clone(),
         tools: profile.tools.clone(),
         context_budget_tokens: profile.context_budget_tokens,
         timeout_seconds: profile.timeout_seconds,
@@ -6655,5 +6852,737 @@ mod tests {
             msg.as_deref().unwrap().starts_with("HTTP 429"),
             "expected an HTTP 429 message, got: {msg:?}"
         );
+    }
+
+    // ── build_probe_request: full request contract (method / path / headers / body) ──
+    // The runtime crate has no HTTP mock library (no wiremock / mockito), so
+    // testing "which branch was taken" would let a malformed request ship
+    // green. Instead we assert the full contract fields directly on the pure
+    // helper. Spec §4: OpenAI → GET /models + Bearer; Anthropic → POST
+    // /v1/messages + x-api-key + anthropic-version + minimal ping body.
+
+    #[test]
+    fn build_probe_request_openai_uses_get_models_with_bearer_auth() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::OpenAiCompatible,
+            "https://api.test.com",
+            "sk-test",
+        );
+        assert_eq!(req.method, reqwest::Method::GET);
+        assert_eq!(req.url, "https://api.test.com/models");
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "Authorization"),
+            Some(&("Authorization".into(), "Bearer sk-test".into())),
+            "OpenAI probe must carry Authorization: Bearer <key>"
+        );
+        assert_eq!(req.body, serde_json::Value::Null);
+    }
+
+    /// I-3: `test_connection_openai` consumes `build_probe_request` for its
+    /// initial `GET /models` probe. Since the runtime crate has no HTTP mock
+    /// library, this test verifies the helper's output is structurally
+    /// sufficient for the handler's needs: the handler iterates `probe.headers`
+    /// and applies each to the request builder, so the helper MUST produce
+    /// exactly the headers the handler expects (a single Authorization Bearer
+    /// header for OpenAI). This locks the handler-helper contract so a future
+    /// refactor can't silently drop the helper call and revert to inline
+    /// construction.
+    #[test]
+    fn build_probe_request_openai_output_matches_handler_consumption() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::OpenAiCompatible,
+            "https://api.test.com",
+            "sk-test",
+        );
+        // The handler builds `client.request(probe.method, &probe.url)` and
+        // applies each header from `probe.headers`. Verify the method is GET
+        // (the handler doesn't override it) and the URL ends with /models.
+        assert_eq!(req.method, reqwest::Method::GET);
+        assert!(
+            req.url.ends_with("/models"),
+            "OpenAI probe URL must end with /models, got: {}",
+            req.url
+        );
+        // The handler applies ALL headers from the helper — verify there is
+        // exactly one Authorization header with the Bearer token. If the
+        // helper added extra headers, the handler would send them too.
+        let auth_headers: Vec<_> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .collect();
+        assert_eq!(
+            auth_headers.len(),
+            1,
+            "OpenAI probe must have exactly one Authorization header, got: {:?}",
+            auth_headers
+        );
+        assert_eq!(
+            auth_headers[0].1, "Bearer sk-test",
+            "Authorization header must be 'Bearer <key>'"
+        );
+        // The handler does NOT send a body for the GET probe (body is Null).
+        assert_eq!(req.body, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_probe_request_anthropic_uses_post_v1_messages_with_x_api_key_header() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::AnthropicCompatible,
+            "https://api.anthropic.com",
+            "sk-ant-test",
+        );
+        assert_eq!(req.method, reqwest::Method::POST);
+        assert_eq!(req.url, "https://api.anthropic.com/v1/messages");
+        // Required headers — x-api-key (not Bearer), anthropic-version, content-type
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "x-api-key"),
+            Some(&("x-api-key".into(), "sk-ant-test".into())),
+            "Anthropic probe must use x-api-key header (not Bearer)"
+        );
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "anthropic-version"),
+            Some(&("anthropic-version".into(), "2023-06-01".into())),
+            "Anthropic probe must carry anthropic-version header"
+        );
+        assert_eq!(
+            req.headers.iter().find(|(k, _)| k == "content-type"),
+            Some(&("content-type".into(), "application/json".into())),
+            "Anthropic probe must carry content-type: application/json"
+        );
+        // Minimal body shape: max_tokens + messages[0].role + messages[0].content
+        assert_eq!(req.body["max_tokens"], 1);
+        assert_eq!(req.body["messages"][0]["role"], "user");
+        assert_eq!(req.body["messages"][0]["content"], "ping");
+    }
+
+    #[test]
+    fn build_probe_request_trims_trailing_slash_from_base_url() {
+        let req = build_probe_request(
+            busytok_domain::ProviderKind::AnthropicCompatible,
+            "https://api.anthropic.com/",
+            "sk-test",
+        );
+        assert_eq!(req.url, "https://api.anthropic.com/v1/messages");
+    }
+
+    // ── prompt_*_to_row enum conversion helpers ───────────────────────
+
+    #[test]
+    fn prompt_action_to_row_maps_all_variants() {
+        assert_eq!(
+            prompt_action_to_row(PromptActionDto::OnlyCopy),
+            busytok_store::PromptActionRow::Copy
+        );
+        assert_eq!(
+            prompt_action_to_row(PromptActionDto::OnlyPaste),
+            busytok_store::PromptActionRow::Paste
+        );
+        assert_eq!(
+            prompt_action_to_row(PromptActionDto::CopyAndPaste),
+            busytok_store::PromptActionRow::Paste
+        );
+    }
+
+    #[test]
+    fn prompt_sort_to_row_defaults_to_smart_and_maps_all_variants() {
+        assert_eq!(
+            prompt_sort_to_row(None),
+            busytok_store::PromptSortRow::Smart
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::Smart)),
+            busytok_store::PromptSortRow::Smart
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::RecentlyUsed)),
+            busytok_store::PromptSortRow::RecentlyUsed
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::MostUsed)),
+            busytok_store::PromptSortRow::MostUsed
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::RecentlyUpdated)),
+            busytok_store::PromptSortRow::RecentlyUpdated
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::Alphabetical)),
+            busytok_store::PromptSortRow::Alphabetical
+        );
+        assert_eq!(
+            prompt_sort_to_row(Some(PromptSortDto::PinnedFirst)),
+            busytok_store::PromptSortRow::PinnedFirst
+        );
+    }
+
+    #[test]
+    fn prompt_use_surface_to_row_maps_both_variants() {
+        assert_eq!(
+            prompt_use_surface_to_row(PromptUseSurfaceDto::Overlay),
+            busytok_store::PromptUseSurfaceRow::Overlay
+        );
+        assert_eq!(
+            prompt_use_surface_to_row(PromptUseSurfaceDto::Page),
+            busytok_store::PromptUseSurfaceRow::Page
+        );
+    }
+
+    #[test]
+    fn prompt_use_outcome_to_row_maps_all_variants() {
+        assert_eq!(
+            prompt_use_outcome_to_row(PromptUseOutcomeDto::Copy),
+            busytok_store::PromptUseOutcomeRow::Copy
+        );
+        assert_eq!(
+            prompt_use_outcome_to_row(PromptUseOutcomeDto::PasteAttempted),
+            busytok_store::PromptUseOutcomeRow::PasteAttempted
+        );
+        assert_eq!(
+            prompt_use_outcome_to_row(PromptUseOutcomeDto::PasteFellBackToCopy),
+            busytok_store::PromptUseOutcomeRow::PasteFellBackToCopy
+        );
+    }
+
+    #[test]
+    fn prompt_use_failure_reason_to_row_maps_all_variants() {
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::PermissionMissing),
+            busytok_store::PromptUseFailureReasonRow::PermissionMissing
+        );
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::FocusLost),
+            busytok_store::PromptUseFailureReasonRow::FocusLost
+        );
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::InjectionFailed),
+            busytok_store::PromptUseFailureReasonRow::InjectionFailed
+        );
+        assert_eq!(
+            prompt_use_failure_reason_to_row(PromptUseFailureReasonDto::UnsupportedPlatform),
+            busytok_store::PromptUseFailureReasonRow::UnsupportedPlatform
+        );
+    }
+
+    #[test]
+    fn prompt_list_query_to_row_applies_default_limit_when_none() {
+        let row = prompt_list_query_to_row(PromptListQueryDto {
+            query: Some("hello".to_string()),
+            tag: Some("work".to_string()),
+            sort: Some(PromptSortDto::MostUsed),
+            limit: None,
+        });
+        assert_eq!(row.query.as_deref(), Some("hello"));
+        assert_eq!(row.tag.as_deref(), Some("work"));
+        assert_eq!(row.sort, busytok_store::PromptSortRow::MostUsed);
+        assert_eq!(row.limit, PROMPT_LIST_DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn prompt_list_query_to_row_preserves_explicit_limit() {
+        let row = prompt_list_query_to_row(PromptListQueryDto {
+            query: None,
+            tag: None,
+            sort: None,
+            limit: Some(42),
+        });
+        assert_eq!(row.limit, 42);
+        assert_eq!(row.sort, busytok_store::PromptSortRow::Smart);
+    }
+
+    // ── provider / catalog DTO conversion helpers ─────────────────────
+
+    #[test]
+    fn provider_to_dto_hides_api_key_and_reports_has_key() {
+        let p = busytok_domain::Provider {
+            id: "pid".to_string(),
+            name: "Acme".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.acme.com".to_string(),
+            enabled: true,
+            api_key: Some("sk-secret".to_string()),
+            created_at_ms: 100,
+            updated_at_ms: 200,
+        };
+        let dto = provider_to_dto(&p);
+        assert_eq!(dto.id, "pid");
+        assert_eq!(dto.name, "Acme");
+        assert!(dto.enabled);
+        assert!(dto.has_api_key);
+        assert_eq!(dto.base_url, "https://api.acme.com");
+    }
+
+    #[test]
+    fn provider_to_dto_reports_no_key_when_absent() {
+        let p = busytok_domain::Provider {
+            id: "pid2".to_string(),
+            name: "NoKey".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.nokey.com".to_string(),
+            enabled: false,
+            api_key: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let dto = provider_to_dto(&p);
+        assert!(!dto.has_api_key);
+        assert!(!dto.enabled);
+    }
+
+    #[test]
+    fn provider_summary_to_dto_maps_all_fields() {
+        let s = busytok_domain::ProviderSummary {
+            id: "sid".to_string(),
+            name: "Summary".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://sum.com".to_string(),
+            enabled: true,
+            has_api_key: true,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+        let dto = provider_summary_to_dto(&s);
+        assert_eq!(dto.id, "sid");
+        assert_eq!(dto.name, "Summary");
+        assert!(dto.has_api_key);
+        assert!(dto.enabled);
+        assert_eq!(dto.created_at_ms, 10);
+    }
+
+    #[test]
+    fn catalog_entry_to_dto_maps_all_fields() {
+        let e = busytok_domain::ModelCatalogEntry {
+            provider_id: "pid".to_string(),
+            provider_name: "PName".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "mdb".to_string(),
+            model_id: "gpt-x".to_string(),
+            model_enabled: false,
+            tags: vec!["fast".to_string(), "cheap".to_string()],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
+        };
+        let dto = catalog_entry_to_dto(e.clone());
+        assert_eq!(dto.provider_id, "pid");
+        assert_eq!(dto.provider_name, "PName");
+        assert!(dto.provider_enabled);
+        assert_eq!(dto.model_db_id, "mdb");
+        assert_eq!(dto.model_id, "gpt-x");
+        assert!(!dto.model_enabled);
+        assert_eq!(dto.tags, vec!["fast", "cheap"]);
+    }
+
+    #[test]
+    fn catalog_entry_to_dto_ref_produces_same_output_as_owned() {
+        let e = busytok_domain::ModelCatalogEntry {
+            provider_id: "pid".to_string(),
+            provider_name: "PName".to_string(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "mdb".to_string(),
+            model_id: "gpt-x".to_string(),
+            model_enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
+        };
+        let owned = catalog_entry_to_dto(e.clone());
+        let by_ref = catalog_entry_to_dto_ref(&e);
+        assert_eq!(owned.provider_id, by_ref.provider_id);
+        assert_eq!(owned.model_id, by_ref.model_id);
+        assert_eq!(owned.tags, by_ref.tags);
+    }
+
+    // ── profile helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn profile_to_dto_marks_builtin_profiles_and_forwards_fields() {
+        let profile = busytok_config::SubagentProfileConfig {
+            write_access: true,
+            tools: vec!["read".to_string()],
+            context_budget_tokens: 4000,
+            timeout_seconds: 120,
+        };
+        // Built-in profile name (shipped by default_profiles).
+        let dto = profile_to_dto("pi/search-cheap", &profile);
+        assert!(dto.is_builtin);
+        assert!(dto.write_access);
+        assert_eq!(dto.tools, vec!["read"]);
+        assert_eq!(dto.context_budget_tokens, 4000);
+        assert_eq!(dto.timeout_seconds, 120);
+    }
+
+    #[test]
+    fn profile_to_dto_marks_custom_profiles_as_non_builtin() {
+        let profile = busytok_config::SubagentProfileConfig {
+            write_access: false,
+            tools: vec![],
+            context_budget_tokens: 1000,
+            timeout_seconds: 30,
+        };
+        let dto = profile_to_dto("my-custom-profile", &profile);
+        assert!(!dto.is_builtin);
+    }
+
+    // ── to_store_exact_windows ────────────────────────────────────────
+
+    #[test]
+    fn to_store_exact_windows_maps_empty_and_non_empty() {
+        assert!(to_store_exact_windows(&[]).is_empty());
+        let windows = vec![
+            range::TrendBucketWindow {
+                start_ms: 0,
+                end_ms: 1000,
+                key: "w1".to_string(),
+                is_current: false,
+            },
+            range::TrendBucketWindow {
+                start_ms: 1000,
+                end_ms: 2000,
+                key: "w2".to_string(),
+                is_current: true,
+            },
+        ];
+        let out = to_store_exact_windows(&windows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].key, "w1");
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[0].end_ms, 1000);
+        assert_eq!(out[1].key, "w2");
+    }
+
+    // ── aggregate_trend_bucket ────────────────────────────────────────
+
+    #[test]
+    fn aggregate_trend_bucket_sums_only_rows_in_range() {
+        let bucket = range::TrendBucketWindow {
+            start_ms: 1000,
+            end_ms: 2000,
+            key: "b1".to_string(),
+            is_current: true,
+        };
+        let rows = vec![
+            busytok_store::read_models::OverviewTrendBucketRow {
+                key: "b1".to_string(),
+                start_ms: 1000, // in range
+                end_ms: 2000,
+                tokens: 100,
+                cost_usd: Some(0.5),
+                event_count: 2,
+                has_cost: true,
+                has_no_cost: false,
+            },
+            busytok_store::read_models::OverviewTrendBucketRow {
+                key: "b1".to_string(),
+                start_ms: 1500, // in range
+                end_ms: 2000,
+                tokens: 50,
+                cost_usd: None,
+                event_count: 1,
+                has_cost: false,
+                has_no_cost: true,
+            },
+            busytok_store::read_models::OverviewTrendBucketRow {
+                key: "b1".to_string(),
+                start_ms: 2000, // out of range (end-exclusive)
+                end_ms: 3000,
+                tokens: 999,
+                cost_usd: None,
+                event_count: 99,
+                has_cost: false,
+                has_no_cost: false,
+            },
+        ];
+        let dto = aggregate_trend_bucket(&bucket, &TrendBucketGranularityDto::Hour, &rows);
+        assert_eq!(dto.tokens, 150);
+        assert_eq!(dto.event_count, 3);
+        assert_eq!(dto.cost_usd, Some(0.5));
+        assert!(dto.is_current);
+    }
+
+    #[test]
+    fn aggregate_trend_bucket_returns_zero_tokens_for_no_matching_rows() {
+        let bucket = range::TrendBucketWindow {
+            start_ms: 10_000,
+            end_ms: 20_000,
+            key: "empty".to_string(),
+            is_current: false,
+        };
+        let rows: Vec<busytok_store::read_models::OverviewTrendBucketRow> = vec![];
+        let dto = aggregate_trend_bucket(&bucket, &TrendBucketGranularityDto::Day, &rows);
+        assert_eq!(dto.tokens, 0);
+        assert_eq!(dto.event_count, 0);
+        assert_eq!(dto.cost_usd, None);
+        assert!(!dto.is_current);
+    }
+
+    // ── map_subagent_error ────────────────────────────────────────────
+
+    #[test]
+    fn map_subagent_error_wraps_error_with_stable_code() {
+        let err = map_subagent_error(busytok_subagent::SubagentError::NotFound(
+            "sa-1".to_string(),
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("logical subagent not found: sa-1"));
+    }
+
+    #[test]
+    fn map_subagent_error_preserves_disabled_variant() {
+        let err = map_subagent_error(busytok_subagent::SubagentError::Disabled);
+        assert!(err.to_string().contains("subagent feature is disabled"));
+    }
+
+    // ── delegate_request_from_dto / resolve_params_from_dto ───────────
+
+    #[test]
+    fn delegate_request_from_dto_forwards_all_fields() {
+        let dto = busytok_protocol::dto::SubagentDelegateRequestDto {
+            subagent_name: "sa".to_string(),
+            subagent_id: Some("id-1".to_string()),
+            cwd: "/tmp".to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: Some("find bugs".to_string()),
+            prompt: "do thing".to_string(),
+            prompt_artifact_ref: Some("art/123".to_string()),
+            timeout_seconds: Some(60),
+            model_override: Some("gpt-5".to_string()),
+            source_harness: Some("gui".to_string()),
+            source_session_id: Some("sess-1".to_string()),
+            bound_provider_id: Some("prov-1".to_string()),
+            bound_model_id: Some("gpt-5".to_string()),
+        };
+        let req = delegate_request_from_dto(dto);
+        assert_eq!(req.subagent_name, "sa");
+        assert_eq!(req.subagent_id.as_deref(), Some("id-1"));
+        assert_eq!(req.cwd, "/tmp");
+        assert_eq!(req.profile, "pi/search-cheap");
+        assert_eq!(req.intent.as_deref(), Some("find bugs"));
+        assert_eq!(req.prompt, "do thing");
+        assert_eq!(req.prompt_artifact_ref.as_deref(), Some("art/123"));
+        assert_eq!(req.timeout_seconds, Some(60));
+        assert_eq!(req.model_override.as_deref(), Some("gpt-5"));
+        assert_eq!(req.source_harness.as_deref(), Some("gui"));
+        assert_eq!(req.source_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(req.bound_provider_id.as_deref(), Some("prov-1"));
+        assert_eq!(req.bound_model_id.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn resolve_params_from_dto_forwards_all_fields() {
+        let dto = busytok_protocol::dto::SubagentResolveRequestDto {
+            name: Some("sa".to_string()),
+            id: Some("id-1".to_string()),
+            cwd: Some("/tmp".to_string()),
+        };
+        let p = resolve_params_from_dto(dto);
+        assert_eq!(p.name.as_deref(), Some("sa"));
+        assert_eq!(p.id.as_deref(), Some("id-1"));
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+    }
+
+    // ── subagent_detail / subagent_task_summary ───────────────────────
+
+    #[test]
+    fn subagent_detail_maps_status_to_string_and_forwards_fields() {
+        let s = busytok_subagent::models::LogicalSubagent {
+            id: "id-1".to_string(),
+            name: "sa".to_string(),
+            project_id: "proj".to_string(),
+            repo_path: "/repo".to_string(),
+            repo_hash: "hash".to_string(),
+            branch: Some("main".to_string()),
+            intent: Some("fix".to_string()),
+            default_profile: "pi/search-cheap".to_string(),
+            bound_provider_id: "prov-1".to_string(),
+            bound_model_id: "gpt-5".to_string(),
+            status: busytok_subagent::models::SubagentStatus::Hot,
+            created_at_ms: 100,
+            updated_at_ms: 200,
+            last_active_at_ms: Some(150),
+        };
+        let dto = subagent_detail(s);
+        assert_eq!(dto.id, "id-1");
+        assert_eq!(dto.name, "sa");
+        assert_eq!(dto.status, "hot");
+        assert_eq!(dto.default_profile, "pi/search-cheap");
+        assert_eq!(dto.bound_provider_id, "prov-1");
+        assert_eq!(dto.bound_model_id, "gpt-5");
+        assert_eq!(dto.last_active_at_ms, Some(150));
+    }
+
+    #[test]
+    fn subagent_task_summary_maps_status_to_string_and_forwards_fields() {
+        let t = busytok_subagent::models::SubagentTaskSummary {
+            id: "task-1".to_string(),
+            subagent_id: "sa-1".to_string(),
+            profile: "pi/search-cheap".to_string(),
+            status: busytok_subagent::models::TaskStatus::Completed,
+            prompt: Some("prompt".to_string()),
+            result_summary: Some("ok".to_string()),
+            error: None,
+            created_at_ms: 100,
+            completed_at_ms: Some(200),
+        };
+        let dto = subagent_task_summary(t);
+        assert_eq!(dto.id, "task-1");
+        assert_eq!(dto.subagent_id, "sa-1");
+        assert_eq!(dto.status, "completed");
+        assert_eq!(dto.result_summary.as_deref(), Some("ok"));
+        assert!(dto.error.is_none());
+        assert_eq!(dto.completed_at_ms, Some(200));
+    }
+
+    // ── validate_runtime_dir ──────────────────────────────────────────
+
+    #[test]
+    fn validate_runtime_dir_rejects_relative_path() {
+        let err = validate_runtime_dir("relative/path", "system").unwrap_err();
+        assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_nonexistent_directory() {
+        // Use a platform-agnostic absolute path: temp_dir is absolute on
+        // every platform, and this subdirectory is never created.
+        let tmp = std::env::temp_dir();
+        let nonexistent = tmp.join("busytok-validate-test-nonexistent-xyz-12345");
+        let _ = std::fs::remove_dir_all(&nonexistent);
+        let err = validate_runtime_dir(nonexistent.to_str().unwrap(), "system").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not exist or is not a directory"));
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_dir_missing_bundle_and_manifest() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-empty");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("pi-sidecar.bundle.js"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_dir_with_bundle_but_no_manifest() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bundle-only");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("manifest.json"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_malformed_manifest() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bad-manifest");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(tmp.join("manifest.json"), "{ not valid json }").unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("not a valid SidecarManifest"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_manifest_bundle_drift() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-drift");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        // Manifest references a different bundle filename than what's on disk.
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"other.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "system").unwrap_err();
+        assert!(err.to_string().contains("other.bundle.js"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_accepts_valid_system_runtime() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-valid-system");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let result = validate_runtime_dir(tmp.to_str().unwrap(), "system");
+        assert!(result.is_ok(), "valid system runtime should pass");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_rejects_bundled_node_missing_binary() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-no-node");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "bundled").unwrap_err();
+        assert!(err.to_string().contains("node"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn validate_runtime_dir_accepts_bundled_node_with_executable_binary() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bundled-ok");
+        let node_dir = tmp.join("node").join(std::env::consts::ARCH);
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        // Write a node binary and mark it executable.
+        let node_path = node_dir.join("node");
+        std::fs::write(&node_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let result = validate_runtime_dir(tmp.to_str().unwrap(), "bundled");
+        assert!(
+            result.is_ok(),
+            "bundled runtime with executable node should pass"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    // The non-executable-binary check only runs on Unix (Windows has no
+    // Unix permission bits). Gate the test accordingly so it doesn't
+    // spuriously fail on Windows where the validation is a no-op.
+    #[cfg(unix)]
+    #[test]
+    fn validate_runtime_dir_rejects_bundled_node_non_executable_binary() {
+        let tmp = std::env::temp_dir().join("busytok-validate-test-bundled-noexec");
+        let node_dir = tmp.join("node").join(std::env::consts::ARCH);
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(tmp.join("pi-sidecar.bundle.js"), "code").unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{"version":"1","protocol_version":1,"bundle":"pi-sidecar.bundle.js","node_runtime_version":"22.6.0"}"#,
+        )
+        .unwrap();
+        let node_path = node_dir.join("node");
+        std::fs::write(&node_path, "not executable").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&node_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = validate_runtime_dir(tmp.to_str().unwrap(), "bundled").unwrap_err();
+        assert!(err.to_string().contains("not executable"));
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

@@ -244,6 +244,81 @@ impl Database {
         crate::prompt_entries::suggest_tags(&self.conn, prefix, limit)
     }
 
+    // ── Provider catalog ───────────────────────────────────────────
+    pub fn create_provider(
+        &self,
+        req: crate::provider_catalog::CreateProviderReq,
+    ) -> anyhow::Result<busytok_domain::Provider> {
+        crate::provider_catalog::create_provider(&self.conn, req)
+    }
+    pub fn update_provider(
+        &self,
+        id: &str,
+        patch: crate::provider_catalog::UpdateProviderPatch,
+    ) -> anyhow::Result<busytok_domain::Provider> {
+        crate::provider_catalog::update_provider(&self.conn, id, patch)
+    }
+    pub fn delete_provider(&self, id: &str) -> anyhow::Result<()> {
+        crate::provider_catalog::delete_provider(&self.conn, id)
+    }
+    pub fn get_provider_with_secret(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<busytok_domain::Provider>> {
+        crate::provider_catalog::get_provider_with_secret(&self.conn, id)
+    }
+    pub fn list_providers(&self) -> anyhow::Result<Vec<busytok_domain::ProviderSummary>> {
+        crate::provider_catalog::list_providers(&self.conn)
+    }
+    pub fn create_model(
+        &self,
+        req: crate::provider_catalog::CreateModelReq,
+    ) -> anyhow::Result<busytok_domain::Model> {
+        crate::provider_catalog::create_model(&self.conn, req)
+    }
+    pub fn update_model(
+        &self,
+        id: &str,
+        patch: crate::provider_catalog::UpdateModelPatch,
+    ) -> anyhow::Result<busytok_domain::Model> {
+        crate::provider_catalog::update_model(&self.conn, id, patch)
+    }
+    pub fn delete_model(&self, id: &str) -> anyhow::Result<()> {
+        crate::provider_catalog::delete_model(&self.conn, id)
+    }
+    pub fn get_model_by_id(&self, id: &str) -> anyhow::Result<Option<busytok_domain::Model>> {
+        crate::provider_catalog::get_model_by_id(&self.conn, id)
+    }
+    pub fn get_model_by_provider_and_model_id(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> anyhow::Result<Option<busytok_domain::Model>> {
+        crate::provider_catalog::get_model_by_provider_and_model_id(
+            &self.conn,
+            provider_id,
+            model_id,
+        )
+    }
+    pub fn list_models_filtered(
+        &self,
+        filter: busytok_domain::ModelCatalogFilter,
+    ) -> anyhow::Result<Vec<busytok_domain::ModelCatalogEntry>> {
+        crate::provider_catalog::list_models_filtered(&self.conn, filter)
+    }
+    pub fn list_models_by_provider(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<busytok_domain::ModelCatalogEntry>> {
+        crate::provider_catalog::list_models_by_provider(&self.conn, provider_id)
+    }
+    pub fn list_tags(&self) -> anyhow::Result<Vec<String>> {
+        crate::provider_catalog::list_tags(&self.conn)
+    }
+    pub fn set_model_tags(&self, model_id: &str, tags: &[String]) -> anyhow::Result<()> {
+        crate::provider_catalog::set_model_tags(&self.conn, model_id, tags)
+    }
+
     /// Reopen this database from the same backing file, when one exists.
     ///
     /// File-backed databases return a fresh connection to the same path so

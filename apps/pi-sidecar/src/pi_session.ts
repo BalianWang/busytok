@@ -5,14 +5,14 @@
  * `@earendil-works/pi-coding-agent` and adapts its event-driven API to the
  * synchronous `sendTurn() → result` shape the sidecar handler expects.
  *
- * Model resolution: the profile's `provider_id` + `model` (string) are
- * resolved to a real `Model<any>` object via the SDK's own `ModelRegistry`
- * (exported from `@earendil-works/pi-coding-agent`, same package — no new
- * dependency). The resolved model is passed into `createAgentSession({ model })`
- * so the SDK uses the configured model instead of picking its default.
+ * Model resolution: per-session `AuthStorage.inMemory()` (sole source of
+ * provider credentials — no env vars, no file I/O) + `ModelRegistry.create()`
+ * with dynamic `registerProvider()` (spec §5.2). The resolved model is passed
+ * into `createAgentSession({ model, authStorage, modelRegistry })` so the SDK
+ * uses the configured provider/model instead of its default catalog.
  * Usage attribution (`usage.model`/`provider`) is sourced from the SDK's
- * `session.model` getter (the actual model used) with `profile.model`/
- * `provider_id` as fallback only.
+ * `session.model` getter (the actual model used) with `resolvedProvider`
+ * as fallback only.
  *
  * `SdkSession` is a minimal structural view of the methods we depend on so
  * tests can supply a fake without `vi.mock` and the type surface stays small.
@@ -21,6 +21,7 @@ import {
   ERROR_CODE_AUTH_FAILURE,
   ERROR_CODE_RATE_LIMIT,
   ERROR_CODE_NETWORK,
+  type ProviderKind,
 } from './types.js';
 import { SidecarError } from './errors.js';
 
@@ -75,33 +76,86 @@ export interface SendTurnResult {
 /** Options passed through to the session factory at creation time. */
 export interface CreateSessionOpts {
   cwd: string;
-  model?: string;
-  provider_id?: string;
+  model: string;
+  provider_id: string;
+  provider_kind: ProviderKind;
+  provider_base_url: string;
+  provider_api_key: string;
+  model_reasoning: boolean;
+  model_context_window: number;
+  model_max_tokens: number;
+  model_display_name?: string;
   tools?: string[];
 }
+
+/** Maps sidecar `ProviderKind` → Pi SDK `api` string (spec §5.2). */
+const PROVIDER_KIND_TO_PI_API: Record<ProviderKind, string> = {
+  openai_compatible: 'openai-completions',
+  anthropic_compatible: 'anthropic-messages',
+};
 
 /**
  * Factory that creates a real `PiSdkSession`. Lazily imports the SDK so that
  * tests injecting a fake factory never load the (heavy) SDK module.
  *
- * Model resolution: `opts.provider_id` + `opts.model` (strings) are resolved
- * to a `Model<any>` object via the SDK's `ModelRegistry`. The resolved model
- * is passed into `createAgentSession({ model })` so the SDK uses the
- * configured model instead of its default. If resolution fails (model not in
- * the catalog), the SDK picks its default and a warning is logged.
+ * Per-session provider/model registration (spec §5.2):
+ * 1. `AuthStorage.inMemory()` — sole source of the provider API key (no env
+ *    vars, no file I/O). Populated with `{ [provider_id]: { type: 'api_key', key } }`.
+ * 2. `ModelRegistry.create(authStorage)` — in-memory registry, no file I/O.
+ * 3. `registry.registerProvider(provider_id, { baseUrl, api, apiKey, models })` —
+ *    dynamic provider with the requested model metadata.
+ * 4. `registry.find(provider_id, model)` — precise model lookup; throws if not found.
+ * 5. `createAgentSession({ model, authStorage, modelRegistry, cwd, tools })` —
+ *    session bound to the registered provider/model.
  */
 export const defaultSessionFactory = async (
   logical_subagent_id: string,
   opts: CreateSessionOpts,
 ): Promise<PiSdkSession> => {
-  const { createAgentSession } = await import('@earendil-works/pi-coding-agent');
-  const modelObj = await resolveModelObject(opts.provider_id, opts.model);
-  // `model` is typed `Model<any> | undefined` in the SDK; we cast our resolved
-  // object to satisfy the type without importing the (heavy) SDK type graph.
-  const sessionOpts: { cwd: string; tools?: string[]; model?: unknown } = {
+  const { createAgentSession, ModelRegistry, AuthStorage } = await import('@earendil-works/pi-coding-agent');
+  // 1. AuthStorage — in-memory, secret sole source.
+  const authStorage = AuthStorage.inMemory({
+    [opts.provider_id]: { type: 'api_key', key: opts.provider_api_key },
+  });
+  // 2. ModelRegistry — in-memory, no file I/O.
+  const registry = ModelRegistry.create(authStorage);
+  // 3. Dynamic provider registration.
+  const piApi = PROVIDER_KIND_TO_PI_API[opts.provider_kind];
+  registry.registerProvider(opts.provider_id, {
+    baseUrl: opts.provider_base_url,
+    api: piApi,
+    apiKey: '__busytok_runtime__', // placeholder; real key from authStorage
+    models: [{
+      id: opts.model,
+      name: opts.model_display_name ?? opts.model,
+      reasoning: opts.model_reasoning,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: opts.model_context_window,
+      maxTokens: opts.model_max_tokens,
+    }],
+  });
+  // 4. Precise model lookup.
+  const model = registry.find(opts.provider_id, opts.model);
+  if (!model) {
+    throw new SidecarError(
+      `model not found in registry after registerProvider: ${opts.model}`,
+      -32603,
+    );
+  }
+  // 5. Create session.
+  const sessionOpts: {
+    cwd: string;
+    tools?: string[];
+    model: unknown;
+    authStorage: unknown;
+    modelRegistry: unknown;
+  } = {
     cwd: opts.cwd,
+    model,
+    authStorage,
+    modelRegistry: registry,
     ...(opts.tools ? { tools: opts.tools } : {}),
-    ...(modelObj ? { model: modelObj } : {}),
   };
   const { session } = await createAgentSession(
     sessionOpts as Parameters<typeof createAgentSession>[0],
@@ -110,49 +164,12 @@ export const defaultSessionFactory = async (
     session as unknown as SdkSession,
     logical_subagent_id,
     session.sessionId,
-    (modelObj as { provider?: string } | undefined)?.provider,
+    opts.provider_id,
+    opts.model,
   );
 };
 
 export type SessionFactory = typeof defaultSessionFactory;
-
-/**
- * Resolve a model string to a `Model<any>` object via the SDK's
- * `ModelRegistry`. The registry is created once and cached (the built-in
- * catalog is static). Uses `AuthStorage.inMemory()` — the registry only
- * needs auth for `getAvailable()`, not for `find()`/`getAll()` which we use.
- *
- * Lookup order:
- * 1. If `providerId` is known: exact `registry.find(providerId, modelId)`.
- * 2. Fallback: search all models for a matching `id` (handles aliases).
- * Returns `undefined` if the model is not in the catalog (SDK picks default).
- */
-let cachedRegistry: unknown = null;
-async function resolveModelObject(
-  providerId?: string,
-  modelId?: string,
-): Promise<unknown | undefined> {
-  if (!modelId) return undefined;
-  try {
-    const { ModelRegistry, AuthStorage } = await import('@earendil-works/pi-coding-agent');
-    if (!cachedRegistry) {
-      cachedRegistry = ModelRegistry.create(AuthStorage.inMemory());
-    }
-    const registry = cachedRegistry as {
-      find(p: string, m: string): unknown | undefined;
-      getAll(): unknown[];
-    };
-    if (providerId) {
-      const m = registry.find(providerId, modelId);
-      if (m) return m;
-    }
-    const all = registry.getAll() as Array<{ id?: string }>;
-    return all.find((m) => m.id === modelId);
-  } catch {
-    // ModelRegistry creation or lookup failed — SDK picks its default.
-    return undefined;
-  }
-}
 
 /**
  * Wraps an SDK `AgentSession`, tracking the metadata the hot pool needs and
@@ -165,19 +182,27 @@ export class PiSdkSession {
   readonly created_at_ms: number;
   last_used_at_ms: number;
   private readonly sdk: SdkSession;
-  private readonly resolvedProvider: string | undefined;
+  private readonly resolvedProvider: string;
+  /**
+   * The model this session was created with (from `CreateSessionOpts.model`).
+   * The hot pool compares this against `opts.model` on a hit to detect a
+   * task-level `model_override` change and force a cold miss (P1-1).
+   */
+  readonly resolvedModel: string;
   private closed = false;
 
   constructor(
     sdk: SdkSession,
     logical_subagent_id: string,
     adapter_session_id: string,
-    resolvedProvider?: string,
+    resolvedProvider: string,
+    resolvedModel: string,
   ) {
     this.sdk = sdk;
     this.logical_subagent_id = logical_subagent_id;
     this.adapter_session_id = adapter_session_id;
     this.resolvedProvider = resolvedProvider;
+    this.resolvedModel = resolvedModel;
     const now = Date.now();
     this.created_at_ms = now;
     this.last_used_at_ms = now;

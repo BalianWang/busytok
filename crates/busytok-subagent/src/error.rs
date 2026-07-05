@@ -61,6 +61,9 @@ pub enum SubagentError {
 
     #[error("hot session limit reached, candidate: {candidate}")]
     HotSessionLimit { candidate: String },
+
+    #[error("{0}")]
+    Validation(String),
 }
 
 impl SubagentError {
@@ -81,6 +84,7 @@ impl SubagentError {
             SubagentError::SidecarTimeout(_) => "subagent.sidecar_timeout",
             SubagentError::SidecarCrashed(_) => "subagent.sidecar_crashed",
             SubagentError::HotSessionLimit { .. } => "subagent.hot_session_limit",
+            SubagentError::Validation(_) => "subagent.validation_error",
         }
     }
 }

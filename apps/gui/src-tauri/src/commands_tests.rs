@@ -294,6 +294,14 @@ async fn tauri_invoke_serializes_concurrent_bootstrap_attempts() {
                                 let server_for_task: Arc<ControlServer> = Arc::clone(&server);
                                 tokio::spawn(async move { server_for_task.run().await })
                             };
+                            // Yield to let the server's accept loop start before
+                            // the bootstrap callback returns and the caller tries
+                            // to connect. Without this, under coverage
+                            // instrumentation (which adds overhead) the connect
+                            // can race the accept loop and fail with "reading
+                            // response".
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                             *launched.lock().await = Some((server, server_task));
                         }
                         Ok(())

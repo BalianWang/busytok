@@ -8,9 +8,7 @@ use std::time::Duration;
 #[path = "support/mod.rs"]
 mod support;
 
-use busytok_config::{
-    ProviderConfig, ProviderKind, SubagentResourcePolicyConfig, SubagentSettings,
-};
+use busytok_config::{SubagentResourcePolicyConfig, SubagentSettings};
 use busytok_store::repository::{
     SubagentHarnessBindingRow, SubagentLogicalSubagentRow, SubagentMemoryRow,
 };
@@ -22,7 +20,7 @@ use busytok_subagent::pressure::{PressureGate, PressureResponder};
 use busytok_subagent::sidecar::config::SidecarConfig;
 use busytok_subagent::sidecar::executor::SidecarTaskExecutor;
 use busytok_subagent::sidecar::{
-    CredentialReader, PiSidecarSupervisor, ProviderLookup, ResponderFactory, WorkerPool,
+    PiSidecarSupervisor, ProviderRuntimeEntry, ResponderFactory, WorkerPool,
 };
 use busytok_subagent::SubagentManager;
 
@@ -63,9 +61,6 @@ fn mock_sidecar_config_with_env(env: HashMap<String, String>) -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     }
 }
 
@@ -80,30 +75,19 @@ fn mock_config() -> SidecarConfig {
 // "test-prov" provider, wire the two-phase bootstrap (pool → executor →
 // factory → pool), and return the supervisor via `ensure_worker`.
 
-fn test_provider() -> ProviderConfig {
-    ProviderConfig {
-        id: TEST_PROVIDER_ID.to_string(),
-        name: "Test".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://test.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    }
-}
-
-fn make_providers() -> ProviderLookup {
-    Arc::new(|pid: &str| -> Option<ProviderConfig> {
-        match pid {
-            TEST_PROVIDER_ID => Some(test_provider()),
-            _ => None,
-        }
-    })
-}
-
-fn canned_credential_reader() -> CredentialReader {
-    Arc::new(|_pid: &str| Ok(Some("test-key".to_string())))
+/// Build the provider runtime entries map (Task 7: replaces the old
+/// `ProviderLookup` + `CredentialReader` closures).
+fn make_providers() -> HashMap<String, ProviderRuntimeEntry> {
+    let mut map = HashMap::new();
+    map.insert(
+        TEST_PROVIDER_ID.to_string(),
+        ProviderRuntimeEntry {
+            provider_id: TEST_PROVIDER_ID.to_string(),
+            api_key: "test-key".to_string(),
+            base_url: "https://test.example.com/v1".to_string(),
+        },
+    );
+    map
 }
 
 fn make_responder_factory(
@@ -151,7 +135,6 @@ fn make_pool_with_config(
         config,
         db.clone(),
         make_providers(),
-        canned_credential_reader(),
         Some(Arc::clone(&gate)),
         SubagentResourcePolicyConfig::default(),
     ));
@@ -164,17 +147,14 @@ fn make_pool_with_config(
     (pool, executor, supervisor, holder)
 }
 
-/// Build `SubagentSettings` with the `pi/search-cheap` profile bound to
-/// `TEST_PROVIDER_ID` so `SubagentManager::delegate` threads a non-`None`
-/// `provider_id` into `ExecutorInput` (required by the pool-based executor).
+/// Build default `SubagentSettings`. Task 3 removed `provider_id` / `model`
+/// from `SubagentProfileConfig` — provider/model binding is now per-subagent
+/// via `bound_provider_id` / `bound_model_id` on the delegate request (see
+/// `make_delegate_request`). Default settings are sufficient because the
+/// `SubagentManager::execute_task` reads `provider_id` from
+/// `subagent.bound_provider_id`, not from the profile config.
 fn settings_with_test_provider() -> SubagentSettings {
-    let mut settings = SubagentSettings::default();
-    settings
-        .profiles
-        .get_mut("pi/search-cheap")
-        .expect("default profiles must include pi/search-cheap")
-        .provider_id = Some(TEST_PROVIDER_ID.to_string());
-    settings
+    SubagentSettings::default()
 }
 
 struct TestHarness {
@@ -195,6 +175,7 @@ fn make_harness() -> TestHarness {
 
 fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     let db: SharedDb = Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    seed_sidecar_test_provider(&db);
     let (pool, executor, supervisor, holder) =
         make_pool_with_config(mock_sidecar_config_with_env(env), Some(Arc::clone(&db)));
     let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
@@ -214,6 +195,37 @@ fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     }
 }
 
+/// Seed the DB with a provider + model matching `TEST_PROVIDER_ID` so
+/// `delegate()` can create subagents with valid bound fields.
+fn seed_sidecar_test_provider(db: &SharedDb) {
+    let db_guard = db.lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db_guard.conn().execute(
+        "INSERT INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            TEST_PROVIDER_ID,
+            "Test Provider",
+            serde_json::to_string(&busytok_domain::ProviderKind::OpenAiCompatible).unwrap(),
+            "https://test.example.com/v1",
+            1i64,
+            "test-key",
+            now,
+        ],
+    ).unwrap();
+    db_guard.conn().execute(
+        "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, display_name, reasoning, context_window, max_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, 0, 128000, 16384)",
+        rusqlite::params![
+            "test-model-row",
+            TEST_PROVIDER_ID,
+            "test-model",
+            1i64,
+            now,
+        ],
+    ).unwrap();
+}
+
 fn req(name: &str, prompt: &str) -> DelegateRequest {
     DelegateRequest {
         subagent_name: name.to_string(),
@@ -227,6 +239,8 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        bound_model_id: Some("test-model".to_string()),
     }
 }
 
@@ -352,7 +366,7 @@ fn executor_input() -> ExecutorInput {
         subagent_name: "reviewer".to_string(),
         cwd: "/tmp/repo".to_string(),
         profile: "pi/search-cheap".to_string(),
-        model: None,
+        model: "test-model".to_string(),
         prompt: "do something".to_string(),
         prompt_artifact_ref: None,
         timeout_seconds: Some(5),
@@ -360,7 +374,14 @@ fn executor_input() -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".to_string(),
+        provider_api_key: "sk-test".to_string(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     }
 }
 
@@ -498,7 +519,7 @@ async fn executor_auth_failure_kills_worker_from_pool() {
     // The kill: remove_worker_and_kill must have dropped the worker from the
     // pool map. worker_snapshots() reflects the live map, so it must now be
     // empty — the bad-credential worker is gone and the next execute() would
-    // re-spawn (re-reading credentials via the keychain).
+    // re-spawn (re-reading credentials from the provider catalog).
     let after = pool.worker_snapshots().await;
     assert!(
         after.is_empty(),
@@ -535,7 +556,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 1".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -543,7 +564,14 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let out1 = executor
         .execute(&input1)
@@ -568,7 +596,8 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
                 branch: None,
                 intent: None,
                 default_profile: "pi/search-cheap".into(),
-                default_model: None,
+                bound_provider_id: "test-provider".into(),
+                bound_model_id: "test-model".into(),
                 status: "hot".into(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -602,7 +631,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 2".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -610,7 +639,14 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let out2 = executor
         .execute(&input2)
@@ -670,7 +706,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 1".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -678,7 +714,14 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let _out1 = executor
         .execute(&input1)
@@ -698,7 +741,7 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 2".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -706,7 +749,14 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -753,7 +803,8 @@ async fn executor_eviction_aborts_when_session_close_fails() {
                 branch: None,
                 intent: None,
                 default_profile: "pi/search-cheap".into(),
-                default_model: None,
+                bound_provider_id: "test-provider".into(),
+                bound_model_id: "test-model".into(),
                 status: "hot".into(),
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -795,7 +846,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 1".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -803,7 +854,14 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let _out1 = executor
         .execute(&input1)
@@ -821,7 +879,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: "do 2".into(),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -829,7 +887,14 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     };
     let result = executor.execute(&input2).await;
     assert!(
@@ -969,7 +1034,7 @@ fn evict_input(id: &str) -> ExecutorInput {
         subagent_name: id.into(),
         cwd: "/tmp".into(),
         profile: "pi/search-cheap".into(),
-        model: None,
+        model: "test-model".into(),
         prompt: format!("do {id}"),
         prompt_artifact_ref: None,
         timeout_seconds: None,
@@ -977,7 +1042,14 @@ fn evict_input(id: &str) -> ExecutorInput {
         memory: empty_memory_snapshot(),
         context: empty_compact_context(),
         write_access: false,
-        provider_id: Some(TEST_PROVIDER_ID.to_string()),
+        provider_id: TEST_PROVIDER_ID.to_string(),
+        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+        provider_base_url: "https://test".into(),
+        provider_api_key: "sk-test".into(),
+        model_reasoning: false,
+        model_context_window: 8000,
+        model_max_tokens: 1000,
+        model_display_name: None,
     }
 }
 
@@ -999,7 +1071,8 @@ fn seed_hot_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &s
             branch: None,
             intent: None,
             default_profile: "pi/search-cheap".into(),
-            default_model: None,
+            bound_provider_id: "test-provider".into(),
+            bound_model_id: "test-model".into(),
             status: "hot".into(),
             created_at_ms: now,
             updated_at_ms: now,
@@ -1350,4 +1423,18 @@ fn parse_turn_auto_result_omits_memory_update_when_absent() {
     let out = busytok_subagent::sidecar::executor::parse_turn_auto_result_for_test(&resp);
     assert!(out.memory_update.current_state_summary.is_none());
     assert!(out.memory_update.key_files.is_empty());
+}
+
+/// `SidecarTaskExecutor::pool()` returns the underlying `WorkerPool` handle
+/// so wiring code (and tests) can reach the per-provider supervisors. The
+/// getter must return the same `Arc` passed to `with_pool`.
+#[test]
+fn executor_pool_getter_returns_underlying_pool() {
+    let harness = make_harness();
+    let pool_from_executor = harness._executor.pool();
+    // The pool returned by the getter must be the same Arc the harness holds.
+    assert!(
+        Arc::ptr_eq(pool_from_executor, &harness.pool),
+        "pool() must return the same Arc<WorkerPool> passed to with_pool"
+    );
 }

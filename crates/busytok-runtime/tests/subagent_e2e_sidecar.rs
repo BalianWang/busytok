@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use busytok_config::{BusytokPaths, BusytokSettings, ProviderConfig, ProviderKind};
+use busytok_config::{BusytokPaths, BusytokSettings, ProviderKind};
 use busytok_control::dispatch::RuntimeControl;
 use busytok_protocol::dto::*;
 use busytok_runtime::BusytokSupervisor;
@@ -69,13 +69,104 @@ fn mock_sidecar_bundle_path() -> PathBuf {
     }
 }
 
+/// In-memory description of a provider to seed into SQL for sidecar-wired
+/// tests. Replaces the old `settings.providers.push(ProviderConfig{...})`
+/// pattern after Task 10 removed `BusytokSettings.providers`.
+#[derive(Clone)]
+struct TestProviderSeed {
+    id: &'static str,
+    name: &'static str,
+    base_url: &'static str,
+    api_key_env_name: &'static str,
+    models: &'static [&'static str],
+    enabled: bool,
+}
+
+const TEST_PROVIDER_SEED: TestProviderSeed = TestProviderSeed {
+    id: "test-provider",
+    name: "Test Provider",
+    base_url: "https://api.test-provider.example.com/v1",
+    api_key_env_name: "TEST_API_KEY",
+    models: &["test-model"],
+    enabled: true,
+};
+
+/// Seed a list of `TestProviderSeed` into SQL. Mirrors the old
+/// `seed_providers_from_settings` flow but reads from a `[TestProviderSeed]`
+/// instead of `settings.providers` (which no longer exists). Each provider's
+/// models are also seeded so the delegate's whitelist validation passes.
+/// Uses `INSERT OR REPLACE` for providers so re-seeding overwrites cleanly.
+/// Models use `INSERT OR REPLACE` on the (provider_id, model_id) unique
+/// constraint.
+fn seed_test_providers(db: &busytok_store::Database, seeds: &[TestProviderSeed]) {
+    use rusqlite::params;
+    let now = busytok_domain::now_ms();
+    for p in seeds {
+        let api_key = std::env::var(format!("BUSYTOK_{}", p.api_key_env_name))
+            .or_else(|_| std::env::var(p.api_key_env_name))
+            .ok();
+        db.conn()
+            .execute(
+                "INSERT OR REPLACE INTO providers \
+                 (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    p.id,
+                    p.name,
+                    serde_json::to_string(&ProviderKind::OpenAiCompatible).unwrap(),
+                    p.base_url,
+                    p.enabled as i64,
+                    api_key,
+                    now,
+                ],
+            )
+            .expect("seed provider to SQL");
+        for model_id in p.models {
+            let model_pk = format!("seed-{}-{}", p.id, model_id);
+            // I-2: `execute_task` fails fast on NULL context_window / max_tokens.
+            // The migration 0007 backfill only runs at migration time, so test
+            // seeds must supply both values explicitly. Defaults match the
+            // manager.rs test seeds (128000 context, 16384 max_tokens).
+            db.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO models \
+                     (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, \
+                      display_name, reasoning, context_window, max_tokens) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        model_pk,
+                        p.id,
+                        model_id,
+                        1_i64,
+                        now,
+                        model_id,    // display_name falls back to model_id
+                        0_i64,       // reasoning = false
+                        128_000_i64, // context_window
+                        16_384_i64,  // max_tokens
+                    ],
+                )
+                .expect("seed model to SQL");
+        }
+    }
+}
+
 /// Settings with pi_sidecar enabled, using system bash as the "node"
 /// binary (mock-sidecar.sh is a bash script, not a Node bundle).
-/// Configures a test provider + binds the "pi/search-cheap" profile to it
-/// so the WorkerPool can route delegate calls. The API key is injected via
-/// `BUSYTOK_TEST_API_KEY` env var (checked by `construct_sidecar`'s
-/// credential reader before falling back to the OS keychain).
-fn make_sidecar_settings() -> BusytokSettings {
+/// Configures a test provider so the WorkerPool can route delegate calls.
+/// The API key is injected via `BUSYTOK_TEST_API_KEY` env var (checked by
+/// `construct_sidecar`'s credential reader).
+///
+/// Returns the settings plus the list of `TestProviderSeed`s that must be
+/// seeded into SQL before constructing the supervisor.
+///
+/// NOTE (Task 4): profiles no longer carry `provider_id` / `model` fields.
+/// Provider/model binding is now per-subagent via SQL catalog
+/// (`subagent.bound_provider_id` / `bound_model_id`). The DTO
+/// `SubagentDelegateRequestDto` now carries `bound_provider_id` /
+/// `bound_model_id`, so e2e tests that create new subagents pass both
+/// fields (sourced from `TEST_PROVIDER_SEED`) and exercise the real
+/// sidecar spawn path.
+fn make_sidecar_settings() -> (BusytokSettings, Vec<TestProviderSeed>) {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
     settings.subagent.pi_sidecar.node_runtime = "system".to_string();
@@ -84,32 +175,11 @@ fn make_sidecar_settings() -> BusytokSettings {
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
     settings.subagent.pi_sidecar.task_timeout_seconds = 30;
 
-    // Add a test provider + bind profiles to it.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider".to_string(),
-        name: "Test Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    // Bind all built-in profiles to the test provider. Also set the
-    // profile model to "test-model" (matches the provider's whitelist) so
-    // Phase 3 Task 4's whitelist validation (spec §3.4) doesn't reject
-    // delegate calls. The default profile model ("deepseek-chat") is NOT
-    // in the test-provider's whitelist.
-    for profile in settings.subagent.profiles.values_mut() {
-        profile.provider_id = Some("test-provider".to_string());
-        profile.model = "test-model".to_string();
-    }
-
     // Inject a fake API key via env var so `construct_sidecar`'s credential
-    // reader returns it without touching the OS keychain.
+    // reader returns it.
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
 
-    settings
+    (settings, vec![TEST_PROVIDER_SEED.clone()])
 }
 
 /// Build a `SidecarConfig` that points at mock-sidecar.sh. Mirrors the
@@ -129,9 +199,6 @@ fn make_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
     }
 }
 
@@ -139,11 +206,16 @@ fn make_sidecar_config() -> SidecarConfig {
 /// config file in `tmp` and injects the mock sidecar bundle via
 /// `new_with_sidecar_config`. The settings file must still have
 /// `pi_sidecar.enabled = true` so the sidecar wiring path is taken.
+/// Providers from `seeds` are seeded into SQL before construction so
+/// `construct_sidecar` can build the `WorkerPool`'s provider map
+/// (Task 7: pool reads from SQL, not TOML).
 fn make_sidecar_supervisor(
     db: busytok_store::Database,
     tmp: &tempfile::TempDir,
     settings: BusytokSettings,
+    seeds: Vec<TestProviderSeed>,
 ) -> BusytokSupervisor {
+    seed_test_providers(&db, &seeds);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -156,8 +228,8 @@ fn make_sidecar_supervisor(
 async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let supervisor = make_sidecar_supervisor(db, &tmp, settings, seeds);
 
     // 1. delegate — must go through the sidecar subprocess.
     //    adapter_session_id being set proves the sidecar was used
@@ -175,6 +247,8 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -329,8 +403,8 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
     // early-return (vacuous assertion).
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let supervisor = make_sidecar_supervisor(db, &tmp, settings, seeds);
 
     // 1. delegate — must go through the sidecar subprocess.
     let delegate_resp = supervisor
@@ -346,6 +420,8 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -452,9 +528,10 @@ fn make_sidecar_config_with_memory_update() -> SidecarConfig {
 async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
+    let (settings, seeds) = make_sidecar_settings();
     let sidecar_cfg = make_sidecar_config_with_memory_update();
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -474,6 +551,8 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
             model_override: None,
             source_harness: Some("cli".to_string()),
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -517,6 +596,8 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
             model_override: None,
             source_harness: Some("cli".to_string()),
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -558,6 +639,17 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
 
+    // Task 5: seed a valid provider+model into SQL so the `execute_task`
+    // validation chain (bound provider exists + enabled + has api_key +
+    // bound model exists + enabled) passes. Without this, delegate would
+    // fail earlier with `subagent.validation_error: bound provider not
+    // found`, masking the sidecar_spawn_failed error this test asserts.
+    // The supervisor constructor uses `FailingTaskExecutor` (not the real
+    // sidecar) because the sidecar config resolve failed, so the seeded
+    // provider is never actually contacted — it just satisfies validation.
+    std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    seed_test_providers(&db, &[TEST_PROVIDER_SEED.clone()]);
+
     // Settings with enabled=true but a runtime_dir that has no bundle —
     // resolve_sidecar_config will fail with "sidecar bundle not found".
     let mut settings = BusytokSettings::default();
@@ -593,6 +685,10 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
     // the semantic code `subagent.sidecar_spawn_failed` (not the generic
     // `subagent.store_error`), proving FailingTaskExecutor's error
     // downcasts to SubagentError::SidecarSpawn through the manager.
+    // Task 5: bound_provider_id / bound_model_id are required on the create
+    // path (sourced from TEST_PROVIDER_SEED) so the validation chain in
+    // `execute_task` passes and the FailingTaskExecutor's SidecarSpawn
+    // error surfaces.
     let result = supervisor
         .subagent_delegate(SubagentDelegateRequestDto {
             subagent_name: "misconfigured-test".to_string(),
@@ -606,6 +702,8 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(TEST_PROVIDER_SEED.id.to_string()),
+            bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
         })
         .await;
 
@@ -646,8 +744,9 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.max_hot_sessions = 1;
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -672,6 +771,8 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -692,6 +793,8 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -727,15 +830,15 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
 // --- doctor via settings.diagnostics (Plan 5 Task 3, spec §7.1 + §7.3) ---
 //
 // Verifies that the EXISTING settings.diagnostics RPC path now includes
-// an optional `subagent` section with 11 §7.1 checks. No new RPC method —
+// an optional `subagent` section with 10 §7.1 checks. No new RPC method —
 // the doctor reuses the existing diagnostics infrastructure.
 
 #[tokio::test]
-async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
+async fn settings_diagnostics_includes_subagent_doctor_with_10_checks() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     // Disable sidecar so doctor's `sidecar_launchable` check is "ok"
     // (no bundle to launch in unit tests).
     settings.subagent.pi_sidecar.enabled = false;
@@ -760,8 +863,8 @@ async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
         .as_ref()
         .expect("settings.diagnostics must include subagent section");
 
-    // 11 checks total per spec §7.1.
-    assert_eq!(sub.checks.len(), 11, "must have all 11 §7.1 checks");
+    // 10 checks total per spec §7.1 (Task 3 removed `default_model_config`).
+    assert_eq!(sub.checks.len(), 10, "must have all 10 §7.1 checks");
 
     // 3 bundle-inspection checks return "error" in the default test setup
     // (pi_sidecar.enabled=false, no runtime_dir → dev fallback path
@@ -781,15 +884,6 @@ async fn settings_diagnostics_includes_subagent_doctor_with_11_checks() {
             "check {name} should be 'error' (bundle missing in default test setup)"
         );
     }
-
-    // default_model_config is "ok" — default SubagentModelsConfig has all 4
-    // models non-empty (deepseek-chat, qwen-coder, deepseek-reasoner, qwen-coder).
-    let model_check = sub
-        .checks
-        .iter()
-        .find(|c| c.name == "default_model_config")
-        .expect("missing default_model_config check");
-    assert_eq!(model_check.status, "ok", "default models non-empty => ok");
 
     // artifact_store_writable is "ok" — doctor check self-heals the dir.
     let artifact_check = sub
@@ -851,7 +945,7 @@ async fn doctor_bundled_node_arch_check_validates_arch_directory() {
 
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -883,7 +977,7 @@ async fn doctor_bundled_node_arch_check_errors_on_missing_node() {
     // Don't create the node binary — should error.
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -924,7 +1018,7 @@ async fn doctor_bundle_manifest_readable_check_validates_manifest() {
 
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -955,7 +1049,7 @@ async fn doctor_bundle_manifest_readable_check_fails_on_malformed_manifest() {
 
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings.subagent.pi_sidecar.runtime_dir = Some(runtime_dir.to_string_lossy().to_string());
     settings
@@ -977,46 +1071,11 @@ async fn doctor_bundle_manifest_readable_check_fails_on_malformed_manifest() {
 
 #[tokio::test]
 #[serial]
-async fn doctor_default_model_config_check_validates_models() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
-    settings.subagent.pi_sidecar.enabled = false;
-    settings.subagent.models.default_cheap_model = "".to_string(); // empty → error
-    settings
-        .save_to_file(&paths.config_dir().join("settings.toml"))
-        .unwrap();
-
-    let supervisor = BusytokSupervisor::with_adapters_and_settings(db, paths, vec![], settings);
-    let envelope = supervisor.settings_diagnostics().await.unwrap();
-    let sub = envelope.data.subagent.unwrap();
-    let check = sub
-        .checks
-        .iter()
-        .find(|c| c.name == "default_model_config")
-        .unwrap();
-    assert_eq!(check.status, "error", "empty model field → error");
-    assert!(
-        check
-            .detail
-            .as_deref()
-            .unwrap_or("")
-            .contains("default_cheap_model"),
-        "detail should name the empty field: {:?}",
-        check.detail
-    );
-
-    supervisor.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-#[serial]
 async fn doctor_artifact_store_writable_check_writes_probe_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1050,7 +1109,7 @@ async fn doctor_protocol_version_check_is_warning_when_pi_sidecar_disabled() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1091,7 +1150,7 @@ async fn doctor_protocol_version_check_errors_when_enabled_but_bundle_missing() 
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = true;
     // No bundle installed → resolve_sidecar_config fails → init_error set.
     settings.subagent.pi_sidecar.runtime_dir =
@@ -1135,9 +1194,10 @@ async fn doctor_protocol_version_check_probes_sidecar_when_not_running() {
     // `resolve_sidecar_config` fails before the supervisor is constructed.
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = true;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -1172,7 +1232,7 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1194,9 +1254,11 @@ async fn settings_diagnostics_subagent_flags_stale_subagents_over_30_days() {
             .execute(
                 "INSERT INTO subagent_logical_subagents \
                  (id, name, project_id, repo_path, repo_hash, intent, default_profile, \
+                  bound_provider_id, bound_model_id, \
                   status, created_at_ms, updated_at_ms, last_active_at_ms) \
                  VALUES ('stale_sub', 'stale-test', 'proj', '/repo', 'hash', 'test', \
-                         'pi/search-cheap', 'warm', ?1, ?1, ?1)",
+                         'pi/search-cheap', 'legacy', 'legacy-model', \
+                         'warm', ?1, ?1, ?1)",
                 rusqlite::params![stale_ms],
             )
             .unwrap();
@@ -1251,7 +1313,7 @@ async fn doctor_sqlite_check_errors_on_schema_version_mismatch() {
         .execute_batch("DELETE FROM _schema_version; INSERT INTO _schema_version (version, applied_at_ms) VALUES (999, 0);")
         .unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1296,7 +1358,7 @@ async fn doctor_sqlite_check_errors_on_readonly_database() {
     let db = busytok_store::Database::open_readonly(&db_path).unwrap();
 
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1347,7 +1409,7 @@ async fn doctor_sqlite_check_failure_leaves_connection_usable() {
     let db = busytok_store::Database::open_readonly(&db_path).unwrap();
 
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false;
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
@@ -1437,9 +1499,10 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     // Short idle so the sidecar doesn't linger between test phases.
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1467,6 +1530,8 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .expect("first delegate must complete (response sent before crash)");
@@ -1512,6 +1577,8 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .expect("second delegate must succeed after auto-restart");
@@ -1582,8 +1649,9 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.idle_exit_seconds = 300;
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1607,6 +1675,8 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .expect("first delegate must complete");
@@ -1651,6 +1721,8 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .expect("second delegate must complete after restart");
@@ -1695,6 +1767,8 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .expect("third delegate must complete after second restart");
@@ -1742,7 +1816,8 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let settings = make_sidecar_settings();
+    let (settings, seeds) = make_sidecar_settings();
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1781,7 +1856,8 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
                     branch: None,
                     intent: None,
                     default_profile: "pi/search-cheap".into(),
-                    default_model: None,
+                    bound_provider_id: "test-provider".into(),
+                    bound_model_id: "test-model".into(),
                     status: "cold".into(),
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
@@ -1843,6 +1919,8 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
         })
         .await
         .unwrap();
@@ -1920,7 +1998,8 @@ async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let settings = make_sidecar_settings();
+    let (settings, seeds) = make_sidecar_settings();
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
@@ -1961,6 +2040,8 @@ async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await
         .unwrap();
@@ -2017,7 +2098,7 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     let paths = BusytokPaths::for_test(tmp.path());
-    let mut settings = make_sidecar_settings();
+    let (mut settings, _seeds) = make_sidecar_settings();
     settings.subagent.pi_sidecar.enabled = false; // mock executor
     settings.subagent.enabled = true;
     settings
@@ -2044,6 +2125,11 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     let db2 = Arc::new(std::sync::Mutex::new(
         busytok_store::Database::open_in_memory().unwrap(),
     ));
+    // I-1: the creation path now requires valid bound_provider_id +
+    // bound_model_id (spec §3.3 strict). Seed the test provider + model
+    // into db2 so the resolver's validate_bound_provider_model passes.
+    // The model seed includes context_window + max_tokens (I-2 fail-fast).
+    seed_test_providers(&db2.lock().unwrap(), &[TEST_PROVIDER_SEED.clone()]);
     let settings2 = busytok_config::SubagentSettings {
         enabled: true,
         ..Default::default()
@@ -2070,6 +2156,8 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(TEST_PROVIDER_SEED.id.to_string()),
+        bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
     };
     // §8.3 step 2 "queue only": delegate() accepts the task and returns
     // DelegateResult { status: Queued } — NOT an error. The background
@@ -2142,9 +2230,10 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
 async fn pressure_response_force_kills_on_rss_limit_exceeded() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     settings.subagent.resource_policy.monitor_interval_seconds = 1;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -2170,6 +2259,8 @@ async fn pressure_response_force_kills_on_rss_limit_exceeded() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await;
 
@@ -2222,12 +2313,13 @@ async fn pressure_response_force_kills_on_rss_limit_exceeded() {
 async fn pressure_response_pauses_on_memory_pressure() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     settings.subagent.resource_policy.monitor_interval_seconds = 1;
     // Always pressured: 999999MB free threshold exceeds any real machine's
     // available memory, so `is_under_pressure` returns true on every sample.
     settings.subagent.resource_policy.memory_pressure_free_mb = 999_999;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -2255,6 +2347,8 @@ async fn pressure_response_pauses_on_memory_pressure() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await;
 
@@ -2293,12 +2387,13 @@ async fn pressure_response_pauses_on_memory_pressure() {
 async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
+    let (mut settings, seeds) = make_sidecar_settings();
     settings.subagent.resource_policy.monitor_interval_seconds = 1;
     // Ensure is_under_pressure is false: system_available_mb is always >= 0,
     // so a 0 threshold means pressure is never triggered by available memory.
     settings.subagent.resource_policy.memory_pressure_free_mb = 0;
     let paths = BusytokPaths::for_test(tmp.path());
+    seed_test_providers(&db, &seeds);
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .unwrap();
@@ -2325,6 +2420,8 @@ async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
         })
         .await;
 
@@ -2462,216 +2559,6 @@ async fn pi_sidecar_locator_update_mutates_in_memory_and_disk() {
         Some(fake_dir.to_str().unwrap())
     );
     assert!(reloaded.subagent.pi_sidecar.enabled);
-
-    supervisor.shutdown_writer().await.unwrap();
-}
-
-/// Multi-provider P1 regression: when 2+ provider workers are lazily
-/// spawned via delegate, `rebuild_sidecar_runtime` (triggered by
-/// `pi_sidecar_locator_update` flipping `enabled=true → false`) must drain
-/// ALL workers via `pool.shutdown_all()`, not just the single
-/// "first enabled provider" supervisor. Without this fix, the second
-/// provider's Node subprocess would be orphaned with stale credentials
-/// after a config flip.
-///
-/// This test spawns 2 workers (via 2 delegate calls with different
-/// profiles bound to different providers), captures the OLD pool Arc,
-/// triggers a rebuild (disable), and asserts the old pool is drained to
-/// 0 (proving `shutdown_all` was called, not just single-supervisor
-/// shutdown which would leave the second worker alive in the old pool).
-#[tokio::test]
-#[serial]
-async fn multi_provider_workers_die_after_rebuild() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
-    // Add a SECOND provider + bind a different built-in profile to it.
-    // make_sidecar_settings already binds ALL profiles to "test-provider";
-    // rebind "pi/review-cheap" to the second provider so delegates with
-    // that profile route to a different worker.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-b".to_string(),
-        name: "Test Provider B".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-b.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    // Rebind "pi/review-cheap" to provider B (was bound to test-provider
-    // by make_sidecar_settings's blanket loop).
-    settings
-        .subagent
-        .profiles
-        .get_mut("pi/review-cheap")
-        .expect("pi/review-cheap must exist in built-in profiles")
-        .provider_id = Some("test-provider-b".to_string());
-
-    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
-
-    // Issue 2 delegate calls with different profiles → 2 workers spawn
-    // (one per provider). Both use mock-sidecar.sh so both succeed.
-    for (name, profile) in [
-        ("worker-a", "pi/search-cheap"),
-        ("worker-b", "pi/review-cheap"),
-    ] {
-        supervisor
-            .subagent_delegate(SubagentDelegateRequestDto {
-                subagent_name: name.to_string(),
-                subagent_id: None,
-                cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-                profile: profile.to_string(),
-                intent: None,
-                prompt: "probe".to_string(),
-                prompt_artifact_ref: None,
-                timeout_seconds: None,
-                model_override: None,
-                source_harness: None,
-                source_session_id: None,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("delegate {name} ({profile}) failed: {e}"));
-    }
-
-    // Capture the OLD pool Arc BEFORE rebuild so we can inspect it after
-    // the rebuild swaps in a new (disabled) runtime. The Arc keeps the
-    // old pool alive even after the runtime swap drops its reference.
-    let old_pool = supervisor
-        .worker_pool()
-        .expect("worker_pool must be Some when sidecar is enabled");
-    let snaps = old_pool.worker_snapshots().await;
-    assert_eq!(
-        snaps.len(),
-        2,
-        "2 provider workers must be running before rebuild (got {}): {:?}",
-        snaps.len(),
-        snaps.iter().map(|(p, _)| p).collect::<Vec<_>>()
-    );
-
-    // Trigger rebuild by disabling (enabled=true → false). The rebuild
-    // swaps in a disabled runtime (no pool) + shuts down the OLD pool
-    // via `shutdown_all()`.
-    supervisor
-        .pi_sidecar_locator_update(PiSidecarLocatorUpdateRequestDto {
-            // Path doesn't matter when disabling (validation skipped).
-            runtime_dir: tmp.path().join("disabled").to_string_lossy().to_string(),
-            enabled: false,
-        })
-        .await
-        .unwrap();
-
-    // The NEW runtime is disabled → no pool.
-    assert!(
-        supervisor.worker_pool().is_none(),
-        "worker_pool must be None after disable rebuild"
-    );
-
-    // The OLD pool must be drained to 0 — `shutdown_all()` called
-    // `drain()` on the workers map. If only the single-supervisor
-    // shutdown path ran (the bug), the old pool would still have 2
-    // entries (the second provider's worker would be orphaned).
-    let old_snaps = old_pool.worker_snapshots().await;
-    assert_eq!(
-        old_snaps.len(),
-        0,
-        "old pool must be drained to 0 after rebuild (shutdown_all was called) — \
-         {} worker(s) survived: {:?}",
-        old_snaps.len(),
-        old_snaps.iter().map(|(p, _)| p).collect::<Vec<_>>()
-    );
-
-    supervisor.shutdown_sidecar().await;
-    supervisor.shutdown_writer().await.unwrap();
-}
-
-/// Multi-provider P1 regression: when 2+ provider workers are lazily
-/// spawned, `shutdown_sidecar` (the normal service-exit path) must drain
-/// ALL workers via `pool.shutdown_all()`, not just the single
-/// "first enabled provider" supervisor. Without this fix, service exit
-/// would orphan Node subprocesses for any provider that was delegated to
-/// but wasn't the "first enabled" one.
-///
-/// Same setup as `multi_provider_workers_die_after_rebuild` but triggers
-/// `shutdown_sidecar()` directly (the service-exit path) instead of a
-/// rebuild. Asserts the pool is drained to 0 after shutdown.
-#[tokio::test]
-#[serial]
-async fn multi_provider_workers_die_after_shutdown_sidecar() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
-    // Same 2-provider setup as the rebuild test.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-b".to_string(),
-        name: "Test Provider B".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-b.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    settings
-        .subagent
-        .profiles
-        .get_mut("pi/review-cheap")
-        .expect("pi/review-cheap must exist in built-in profiles")
-        .provider_id = Some("test-provider-b".to_string());
-
-    let supervisor = make_sidecar_supervisor(db, &tmp, settings);
-
-    // Spawn 2 workers via 2 delegate calls (one per provider).
-    for (name, profile) in [
-        ("worker-a", "pi/search-cheap"),
-        ("worker-b", "pi/review-cheap"),
-    ] {
-        supervisor
-            .subagent_delegate(SubagentDelegateRequestDto {
-                subagent_name: name.to_string(),
-                subagent_id: None,
-                cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-                profile: profile.to_string(),
-                intent: None,
-                prompt: "probe".to_string(),
-                prompt_artifact_ref: None,
-                timeout_seconds: None,
-                model_override: None,
-                source_harness: None,
-                source_session_id: None,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("delegate {name} ({profile}) failed: {e}"));
-    }
-
-    let pool = supervisor
-        .worker_pool()
-        .expect("worker_pool must be Some when sidecar is enabled");
-    assert_eq!(
-        pool.worker_snapshots().await.len(),
-        2,
-        "2 provider workers must be running before shutdown"
-    );
-
-    // Call the service-exit shutdown path. This must call
-    // `pool.shutdown_all()` (not single-supervisor shutdown), draining
-    // ALL workers.
-    supervisor.shutdown_sidecar().await;
-
-    // The pool is still Some (shutdown_sidecar doesn't swap the runtime),
-    // but its workers map must be drained to 0.
-    let pool_after = supervisor
-        .worker_pool()
-        .expect("worker_pool still Some after shutdown_sidecar (runtime not swapped)");
-    let snaps = pool_after.worker_snapshots().await;
-    assert_eq!(
-        snaps.len(),
-        0,
-        "pool must be drained to 0 after shutdown_sidecar — \
-         {} worker(s) survived (shutdown_all was NOT called): {:?}",
-        snaps.len(),
-        snaps.iter().map(|(p, _)| p).collect::<Vec<_>>()
-    );
 
     supervisor.shutdown_writer().await.unwrap();
 }

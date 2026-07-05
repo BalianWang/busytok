@@ -12,7 +12,7 @@ pub mod service_marker;
 pub use logging::{init_logging, prune_old_logs, LogSource, LoggingGuards};
 pub use manifest::SidecarManifest;
 pub use paths::BusytokPaths;
-pub use providers::{ProviderConfig, ProviderCredentialStore, ProviderKind};
+pub use providers::ProviderKind;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -108,9 +108,6 @@ pub struct BusytokSettings {
     pub prompt_palette_default_action: PromptDefaultAction,
     #[serde(default)]
     pub subagent: SubagentSettings,
-    /// User-configured model providers. Serialized as [[providers]] in TOML.
-    #[serde(default)]
-    pub providers: Vec<ProviderConfig>,
 }
 
 fn default_week_starts_on() -> u8 {
@@ -126,7 +123,6 @@ impl Default for BusytokSettings {
             discovery: DiscoverySettings::default(),
             prompt_palette_default_action: PromptDefaultAction::default(),
             subagent: SubagentSettings::default(),
-            providers: Vec::new(),
         }
     }
 }
@@ -181,8 +177,6 @@ pub struct SubagentSettings {
     pub context: SubagentContextConfig,
     #[serde(default)]
     pub resource_policy: SubagentResourcePolicyConfig,
-    #[serde(default)]
-    pub models: SubagentModelsConfig,
     #[serde(default = "default_profiles")]
     pub profiles: std::collections::HashMap<String, SubagentProfileConfig>,
 }
@@ -193,7 +187,6 @@ impl Default for SubagentSettings {
             pi_sidecar: SubagentPiSidecarConfig::default(),
             context: SubagentContextConfig::default(),
             resource_policy: SubagentResourcePolicyConfig::default(),
-            models: SubagentModelsConfig::default(),
             profiles: default_profiles(),
         }
     }
@@ -344,58 +337,15 @@ fn default_monitor_interval_seconds() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubagentModelsConfig {
-    #[serde(default = "default_cheap_model")]
-    pub default_cheap_model: String,
-    #[serde(default = "default_review_model")]
-    pub default_review_model: String,
-    #[serde(default = "default_reasoning_model")]
-    pub default_reasoning_model: String,
-    #[serde(default = "default_coder_model")]
-    pub default_coder_model: String,
-}
-impl Default for SubagentModelsConfig {
-    fn default() -> Self {
-        Self {
-            default_cheap_model: default_cheap_model(),
-            default_review_model: default_review_model(),
-            default_reasoning_model: default_reasoning_model(),
-            default_coder_model: default_coder_model(),
-        }
-    }
-}
-fn default_cheap_model() -> String {
-    "deepseek-chat".to_string()
-}
-fn default_review_model() -> String {
-    "qwen-coder".to_string()
-}
-fn default_reasoning_model() -> String {
-    "deepseek-reasoner".to_string()
-}
-fn default_coder_model() -> String {
-    "qwen-coder".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentProfileConfig {
     #[serde(default = "default_false")]
     pub write_access: bool,
     #[serde(default)]
     pub tools: Vec<String>,
-    #[serde(default)]
-    pub model: String,
     #[serde(default = "default_budget_tokens")]
     pub context_budget_tokens: u32,
     #[serde(default = "default_task_timeout_seconds")]
     pub timeout_seconds: u64,
-    /// Phase 3: provider this profile runs on. `None` means "no provider
-    /// bound" — Task 2's WorkerPool treats this as a routing error.
-    /// Defaults to `None` for backward-compat with v0.0.8 configs (which
-    /// predate provider binding). Built-in profiles ship unbound; Phase 4
-    /// adds the UI that lets users set it.
-    #[serde(default)]
-    pub provider_id: Option<String>,
 }
 
 /// The built-in read-only profiles for MVP. `pi/patch-small` is deferred.
@@ -406,10 +356,8 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
         SubagentProfileConfig {
             write_access: false,
             tools: vec!["read".to_string(), "grep".to_string()],
-            model: default_cheap_model(),
             context_budget_tokens: 3000,
             timeout_seconds: 120,
-            provider_id: None,
         },
     );
     m.insert(
@@ -421,10 +369,8 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
                 "grep".to_string(),
                 "git_diff".to_string(),
             ],
-            model: default_review_model(),
             context_budget_tokens: 5000,
             timeout_seconds: 180,
-            provider_id: None,
         },
     );
     m.insert(
@@ -436,10 +382,8 @@ fn default_profiles() -> std::collections::HashMap<String, SubagentProfileConfig
                 "grep".to_string(),
                 "git_diff".to_string(),
             ],
-            model: default_reasoning_model(),
             context_budget_tokens: 6000,
             timeout_seconds: 300,
-            provider_id: None,
         },
     );
     m
@@ -651,7 +595,6 @@ mod tests {
             },
             prompt_palette_default_action: PromptDefaultAction::OnlyCopy,
             subagent: SubagentSettings::default(),
-            providers: Vec::new(),
         };
 
         settings.save_to_file(&path).unwrap();
@@ -754,91 +697,31 @@ codex_default_paths = false
     }
 
     /// Backward-compat with v0.0.8 configs: a profile TOML without
-    /// `provider_id` deserializes to `None`. Phase 3 makes `provider_id`
-    /// explicit but does not break existing on-disk configs.
+    /// `provider_id` deserializes to defaults. Task 3 removed `provider_id`
+    /// and `model` from `SubagentProfileConfig` — profiles are now pure
+    /// behavior templates.
     #[test]
-    fn profile_without_provider_id_deserializes_to_none() {
+    fn profile_config_has_no_provider_or_model_fields() {
         let toml = r#"
 timezone = "UTC"
 
 [subagent.profiles."pi/search-cheap"]
 write_access = false
 tools = ["read", "grep"]
-model = "deepseek-chat"
 context_budget_tokens = 3000
 timeout_seconds = 120
 "#;
         let settings = BusytokSettings::load_from_str(toml).unwrap();
-        let profile = settings
+        let p = settings
             .subagent
             .profiles
             .get("pi/search-cheap")
             .expect("pi/search-cheap profile should be present");
-        assert_eq!(profile.provider_id, None);
-    }
-
-    /// A profile with an explicit `provider_id` deserializes to `Some(...)`.
-    #[test]
-    fn profile_with_provider_id_deserializes_to_some() {
-        let toml = r#"
-timezone = "UTC"
-
-[subagent.profiles."pi/search-cheap"]
-write_access = false
-tools = ["read", "grep"]
-model = "deepseek-chat"
-context_budget_tokens = 3000
-timeout_seconds = 120
-provider_id = "openai"
-"#;
-        let settings = BusytokSettings::load_from_str(toml).unwrap();
-        let profile = settings
-            .subagent
-            .profiles
-            .get("pi/search-cheap")
-            .expect("pi/search-cheap profile should be present");
-        assert_eq!(profile.provider_id.as_deref(), Some("openai"));
-    }
-
-    /// Built-in profiles start with `provider_id: None` — Phase 3 makes the
-    /// binding explicit, so the defaults ship unbound. Phase 4 adds the UI
-    /// that lets users set it; Task 2's WorkerPool treats `None` as
-    /// "no provider bound, cannot route".
-    #[test]
-    fn default_profiles_start_with_provider_id_none() {
-        let profiles = default_profiles();
-        for key in ["pi/search-cheap", "pi/review-cheap", "pi/plan-cheap"] {
-            let profile = profiles
-                .get(key)
-                .unwrap_or_else(|| panic!("built-in profile {key} should exist"));
-            assert_eq!(
-                profile.provider_id, None,
-                "built-in profile {key} must start unbound (provider_id = None)"
-            );
-        }
-    }
-
-    /// Round-trip: a profile with `provider_id` set survives save→load.
-    #[test]
-    fn profile_provider_id_roundtrips_through_toml() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("settings.toml");
-        let mut settings = BusytokSettings::default();
-        let profile = settings
-            .subagent
-            .profiles
-            .get_mut("pi/search-cheap")
-            .expect("built-in profile");
-        profile.provider_id = Some("openai".to_string());
-        settings.save_to_file(&path).unwrap();
-
-        let loaded = BusytokSettings::load_from_file(&path).unwrap();
-        let p = loaded
-            .subagent
-            .profiles
-            .get("pi/search-cheap")
-            .expect("profile");
-        assert_eq!(p.provider_id.as_deref(), Some("openai"));
+        // Compile-time check: the fields that Task 3 removed no longer exist.
+        let _write = p.write_access;
+        let _tools = &p.tools;
+        let _budget = p.context_budget_tokens;
+        let _timeout = p.timeout_seconds;
     }
 
     /// `load` canonicalizes "local" timezone to the system IANA name and persists
@@ -953,10 +836,8 @@ provider_id = "openai"
         let custom = SubagentProfileConfig {
             write_access: true,
             tools: vec!["read".to_string()],
-            model: "custom-model".to_string(),
             context_budget_tokens: 9999,
             timeout_seconds: 1,
-            provider_id: Some("custom".to_string()),
         };
         settings
             .subagent
@@ -970,8 +851,9 @@ provider_id = "openai"
 
         // The custom pi/search-cheap should be preserved.
         let preserved = settings.subagent.profiles.get("pi/search-cheap").unwrap();
-        assert_eq!(preserved.model, "custom-model");
-        assert_eq!(preserved.provider_id, Some("custom".to_string()));
+        assert_eq!(preserved.context_budget_tokens, 9999);
+        assert_eq!(preserved.timeout_seconds, 1);
+        assert!(preserved.write_access);
         // The other two should be filled with defaults.
         assert!(settings.subagent.profiles.contains_key("pi/review-cheap"));
         assert!(settings.subagent.profiles.contains_key("pi/plan-cheap"));

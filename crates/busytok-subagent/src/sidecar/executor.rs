@@ -67,15 +67,14 @@ impl SidecarTaskExecutor {
 #[async_trait]
 impl TaskExecutor for SidecarTaskExecutor {
     async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
-        // Step 1: extract provider_id. None → error (cannot route).
-        let provider_id = input.provider_id.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("profile not bound to a provider — cannot route execute()")
-        })?;
+        // Task 5: provider_id is now String (always present, validated upstream
+        // by `SubagentManager::execute_task`). No "profile not bound" branch.
+        let provider_id = input.provider_id.clone();
 
         // Step 2: ensure_worker (synchronous — I2 fix).
         let supervisor = self
             .pool
-            .ensure_worker(provider_id)
+            .ensure_worker(&provider_id)
             .map_err(sidecar_to_anyhow)?;
 
         // Step 3: ensure_started (async — lazy spawn if needed).
@@ -146,6 +145,16 @@ impl TaskExecutor for SidecarTaskExecutor {
             },
             "adapter_options": {},
             "provider_id": provider_id,
+            "provider_kind": input.provider_kind,
+            "provider_base_url": input.provider_base_url,
+            // provider_api_key is sent so the sidecar can register it in
+            // AuthStorage. Sidecar must NOT log this field in plaintext
+            // (Task 7 enforces).
+            "provider_api_key": input.provider_api_key,
+            "model_reasoning": input.model_reasoning,
+            "model_context_window": input.model_context_window,
+            "model_max_tokens": input.model_max_tokens,
+            "model_display_name": input.model_display_name,
         });
         info!(
             event_code = "subagent.sidecar.turn_auto.start",
@@ -181,10 +190,10 @@ impl TaskExecutor for SidecarTaskExecutor {
                         );
                         // Auth-fail kill: hard-remove + kill the worker so the
                         // next execute() re-reads credentials (the bad key
-                        // might have been refreshed in the keychain).
+                        // might have been refreshed in the provider catalog).
                         if kind == TaskErrorKind::Auth {
                             if let Err(kill_err) =
-                                self.pool.remove_worker_and_kill(provider_id).await
+                                self.pool.remove_worker_and_kill(&provider_id).await
                             {
                                 error!(
                                     event_code = "subagent.pool.auth_kill_failed",
@@ -215,7 +224,7 @@ impl TaskExecutor for SidecarTaskExecutor {
                         provider_id = %provider_id,
                         "auth failure detected — hard-killing + removing worker"
                     );
-                    if let Err(kill_err) = self.pool.remove_worker_and_kill(provider_id).await {
+                    if let Err(kill_err) = self.pool.remove_worker_and_kill(&provider_id).await {
                         error!(
                             event_code = "subagent.pool.auth_kill_failed",
                             provider_id = %provider_id,

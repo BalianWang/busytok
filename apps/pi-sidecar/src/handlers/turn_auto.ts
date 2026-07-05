@@ -2,7 +2,7 @@ import { type TurnAutoParams, type TurnAutoResult } from '../types.js';
 import type { RequestHandler } from '../rpc.js';
 import { SidecarError } from '../errors.js';
 import type { SessionPool } from '../session_pool.js';
-import { PiSdkSession, type SdkSession, type SessionFactory } from '../pi_session.js';
+import { PiSdkSession, type SdkSession, type SessionFactory, type CreateSessionOpts } from '../pi_session.js';
 
 // Mock session id generator (used only when BUSYTOK_USE_MOCK_SIDECAR=1).
 let sessionCounter = 0;
@@ -16,9 +16,12 @@ function nextMockSessionId(): string {
  * invoked (mockTurnAuto returns hardcoded usage). Exists purely so the pool's
  * reuse/limit logic can run in mock mode without touching the real SDK.
  */
-const mockSessionFactory: SessionFactory = async (logical_subagent_id) => {
+const mockSessionFactory: SessionFactory = async (logical_subagent_id, opts) => {
   const sid = nextMockSessionId();
-  return new PiSdkSession(noopSdkSession(sid), logical_subagent_id, sid);
+  // `opts.model` is threaded as `resolvedModel` so the pool's model-mismatch
+  // cold-miss (P1-1) works in mock mode too — a changed `model_override`
+  // evicts the old mock session and creates a fresh one.
+  return new PiSdkSession(noopSdkSession(sid), logical_subagent_id, sid, 'mock', opts.model);
 };
 
 function noopSdkSession(id: string): SdkSession {
@@ -56,13 +59,38 @@ export function turnAutoHandlerWithPool(pool: SessionPool): RequestHandler {
 }
 
 /**
+ * Build `CreateSessionOpts` from `TurnAutoParams`. Used by both the mock and
+ * real paths so the pool always receives a complete opts object (the hit
+ * branch ignores it per spec §5.5; the miss branch threads it to the factory).
+ *
+ * `model` is required on `TurnAutoParams` (M-5: tightened from optional) — no
+ * fallback needed. The mock path supplies a real model value via the params.
+ */
+function buildSessionOpts(p: TurnAutoParams): CreateSessionOpts {
+  const opts: CreateSessionOpts = {
+    cwd: p.cwd,
+    model: p.model,
+    provider_id: p.provider_id,
+    provider_kind: p.provider_kind,
+    provider_base_url: p.provider_base_url,
+    provider_api_key: p.provider_api_key,
+    model_reasoning: p.model_reasoning,
+    model_context_window: p.model_context_window,
+    model_max_tokens: p.model_max_tokens,
+    ...(p.model_display_name ? { model_display_name: p.model_display_name } : {}),
+    ...(p.tools ? { tools: p.tools } : {}),
+  };
+  return opts;
+}
+
+/**
  * Mock path — preserves the Phase 1 mock behavior (hardcoded usage, mock
  * adapter_session_ids) so Rust-side e2e tests run without credentials.
  */
 async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
   const { session, reused } = await pool.ensure(
     p.logical_subagent_id,
-    { cwd: p.cwd, model: p.model, tools: p.tools },
+    buildSessionOpts(p),
     mockSessionFactory,
   );
   const now = Date.now();
@@ -85,7 +113,7 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
       ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
     },
     usage: {
-      model: p.model ?? 'deepseek-chat',
+      model: p.model,
       provider: 'deepseek',
       input_tokens: p.prompt.length,
       output_tokens: 50,
@@ -102,12 +130,13 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
  * error codes by `PiSdkSession.sendTurn` (auth/rate-limit/network/timeout).
  */
 async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
-  const { session, reused } = await pool.ensure(p.logical_subagent_id, {
-    cwd: p.cwd,
-    model: p.model,
-    provider_id: p.provider_id,
-    tools: p.tools,
-  });
+  // M-5: `model` is now required on `TurnAutoParams` (tightened from optional).
+  // The dead `if (!p.model) throw` guard is removed — TypeScript enforces the
+  // contract at compile time, and the Rust side always sends the bound model.
+  const { session, reused } = await pool.ensure(
+    p.logical_subagent_id,
+    buildSessionOpts(p),
+  );
   const result = await session.sendTurn(p.prompt, {
     model: p.model,
     provider_id: p.provider_id,

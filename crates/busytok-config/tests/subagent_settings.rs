@@ -22,16 +22,10 @@ enabled = true
 [subagent.pi_sidecar]
 max_hot_sessions = 7
 idle_exit_seconds = 99
-[subagent.models]
-default_cheap_model = "deepseek-chat"
 "#;
     let settings = BusytokSettings::load_from_str(toml).unwrap();
     assert_eq!(settings.subagent.pi_sidecar.max_hot_sessions, 7);
     assert_eq!(settings.subagent.pi_sidecar.idle_exit_seconds, 99);
-    assert_eq!(
-        settings.subagent.models.default_cheap_model,
-        "deepseek-chat"
-    );
     // Built-in profiles must survive partial config (no [subagent.profiles] in TOML).
     assert_eq!(
         settings.subagent.profiles.len(),
@@ -60,8 +54,6 @@ fn canonicalize_fills_missing_builtins_without_overwriting_user_edits() {
     let toml_str = r#"
 timezone = "UTC"
 [subagent.profiles."pi/search-cheap"]
-model = "user-customized-model"
-provider_id = "my-provider"
 tools = ["read"]
 context_budget_tokens = 9999
 timeout_seconds = 42
@@ -81,14 +73,10 @@ write_access = false
 
     // pi/search-cheap was NOT overwritten — user edits preserved.
     let search = &settings.subagent.profiles["pi/search-cheap"];
-    assert_eq!(search.model, "user-customized-model");
-    assert_eq!(search.provider_id.as_deref(), Some("my-provider"));
     assert_eq!(search.context_budget_tokens, 9999);
 
     // pi/review-cheap was filled with defaults.
     let review = &settings.subagent.profiles["pi/review-cheap"];
-    assert_eq!(review.model, "qwen-coder");
-    assert_eq!(review.provider_id, None);
     assert_eq!(review.context_budget_tokens, 5000);
 }
 
@@ -107,7 +95,7 @@ fn load_canonicalizes_missing_builtin_profiles() {
         r#"
 timezone = "UTC"
 [subagent.profiles."pi/search-cheap"]
-model = "deepseek-chat"
+context_budget_tokens = 3000
 "#,
     )
     .unwrap();

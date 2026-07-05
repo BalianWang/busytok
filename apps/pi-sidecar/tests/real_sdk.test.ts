@@ -67,9 +67,9 @@ function makeFakeSdk(id: string, config: FakeConfig): SdkSession {
 /** Factory that yields PiSdkSessions wrapping fake SDK sessions per `config`. */
 function fakeFactory(config: FakeConfig = {}): SessionFactory {
   let n = 0;
-  return async (subagent: string) => {
+  return async (subagent: string, opts) => {
     const id = `fake_${++n}`;
-    return new PiSdkSession(makeFakeSdk(id, config), subagent, id);
+    return new PiSdkSession(makeFakeSdk(id, config), subagent, id, 'test-provider', opts.model);
   };
 }
 
@@ -230,7 +230,7 @@ describe('PiSdkSession unit', () => {
       stats: { tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 }, cost: 0.5 },
       sdkModel: { id: 'm', provider: 'test-provider' },
     });
-    const session = new PiSdkSession(sdk, 'sub', 's1');
+    const session = new PiSdkSession(sdk, 'sub', 's1', 'test-provider', 'deepseek-chat');
     const result = await session.sendTurn('hi', { model: 'fallback-model' });
     expect(result.status).toBe('completed');
     expect(result.task_summary).toBe('done');
@@ -247,7 +247,7 @@ describe('PiSdkSession unit', () => {
     });
     // Override the default model by removing it
     (sdk as { model?: unknown }).model = undefined;
-    const session = new PiSdkSession(sdk, 'sub', 's1', 'resolved-provider');
+    const session = new PiSdkSession(sdk, 'sub', 's1', 'resolved-provider', 'deepseek-chat');
     const result = await session.sendTurn('hi', { model: 'fallback-model', provider_id: 'pid' });
     expect(result.usage.model).toBe('fallback-model');
     expect(result.usage.provider).toBe('resolved-provider');
@@ -255,7 +255,7 @@ describe('PiSdkSession unit', () => {
 
   it('close() is idempotent and marks the session closed', async () => {
     const sdk = makeFakeSdk('s2', {});
-    const session = new PiSdkSession(sdk, 'sub', 's2');
+    const session = new PiSdkSession(sdk, 'sub', 's2', 'test-provider', 'deepseek-chat');
     await session.close();
     await session.close();
     expect(session.isClosed()).toBe(true);

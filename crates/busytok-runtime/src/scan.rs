@@ -2730,4 +2730,883 @@ mod tests {
             "existing event model must NOT be overwritten"
         );
     }
+
+    // ── normalized_codex_event_model (L55-59) ──────────────────────────
+
+    #[test]
+    fn normalized_codex_event_model_trims_and_filters_empty() {
+        assert_eq!(normalized_codex_event_model(None), None);
+        assert_eq!(normalized_codex_event_model(Some("".to_string())), None);
+        assert_eq!(
+            normalized_codex_event_model(Some("   ".to_string())),
+            None,
+            "whitespace-only should filter to None"
+        );
+        assert_eq!(
+            normalized_codex_event_model(Some("  gpt-5.4  ".to_string())),
+            Some("gpt-5.4".to_string()),
+            "should trim surrounding whitespace"
+        );
+    }
+
+    // ── explicit_zero_component_codex_delta (L61-71) ───────────────────
+
+    #[test]
+    fn explicit_zero_component_codex_delta_true_when_all_zero() {
+        let snap = CodexTokenSnapshot {
+            source_file_id: "f".to_string(),
+            source_path: "p".to_string(),
+            source_line: 0,
+            source_offset_start: 0,
+            source_offset_end: 0,
+            session_id: "s".to_string(),
+            turn_id: None,
+            token_event_ordinal: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 0,
+            delta_input_tokens: Some(0),
+            delta_cached_input_tokens: Some(0),
+            delta_output_tokens: Some(0),
+            delta_reasoning_tokens: Some(0),
+            delta_total_tokens: None,
+            model: None,
+            model_provider: None,
+            cost_usd: None,
+            raw_usage_json: "{}".to_string(),
+            timestamp_ms: 0,
+        };
+        assert!(explicit_zero_component_codex_delta(&snap));
+    }
+
+    #[test]
+    fn explicit_zero_component_codex_delta_false_when_any_nonzero() {
+        let snap = CodexTokenSnapshot {
+            source_file_id: "f".to_string(),
+            source_path: "p".to_string(),
+            source_line: 0,
+            source_offset_start: 0,
+            source_offset_end: 0,
+            session_id: "s".to_string(),
+            turn_id: None,
+            token_event_ordinal: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 0,
+            delta_input_tokens: Some(1),
+            delta_cached_input_tokens: Some(0),
+            delta_output_tokens: Some(0),
+            delta_reasoning_tokens: Some(0),
+            delta_total_tokens: None,
+            model: None,
+            model_provider: None,
+            cost_usd: None,
+            raw_usage_json: "{}".to_string(),
+            timestamp_ms: 0,
+        };
+        assert!(!explicit_zero_component_codex_delta(&snap));
+    }
+
+    // ── resolve_codex_event_model (L386-396) ───────────────────────────
+
+    #[test]
+    fn resolve_codex_event_model_prefers_snapshot_model() {
+        let snap = CodexTokenSnapshot {
+            model: Some("  gpt-5.4  ".to_string()),
+            ..minimal_codex_snapshot()
+        };
+        let prev = CodexTokenSnapshotRow {
+            model: Some("o4-mini".to_string()),
+            ..minimal_codex_snapshot_row()
+        };
+        assert_eq!(
+            resolve_codex_event_model(&snap, Some(&prev)),
+            Some("gpt-5.4".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_codex_event_model_falls_back_to_previous() {
+        let snap = CodexTokenSnapshot {
+            model: None,
+            ..minimal_codex_snapshot()
+        };
+        let prev = CodexTokenSnapshotRow {
+            model: Some("  o4-mini  ".to_string()),
+            ..minimal_codex_snapshot_row()
+        };
+        assert_eq!(
+            resolve_codex_event_model(&snap, Some(&prev)),
+            Some("o4-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_codex_event_model_returns_none_when_both_absent() {
+        let snap = CodexTokenSnapshot {
+            model: None,
+            ..minimal_codex_snapshot()
+        };
+        assert_eq!(resolve_codex_event_model(&snap, None), None);
+    }
+
+    fn minimal_codex_snapshot() -> CodexTokenSnapshot {
+        CodexTokenSnapshot {
+            source_file_id: "f".to_string(),
+            source_path: "p".to_string(),
+            source_line: 0,
+            source_offset_start: 0,
+            source_offset_end: 0,
+            session_id: "s".to_string(),
+            turn_id: None,
+            token_event_ordinal: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 0,
+            delta_input_tokens: None,
+            delta_cached_input_tokens: None,
+            delta_output_tokens: None,
+            delta_reasoning_tokens: None,
+            delta_total_tokens: None,
+            model: None,
+            model_provider: None,
+            cost_usd: None,
+            raw_usage_json: "{}".to_string(),
+            timestamp_ms: 0,
+        }
+    }
+
+    fn minimal_codex_snapshot_row() -> CodexTokenSnapshotRow {
+        CodexTokenSnapshotRow {
+            id: "id".to_string(),
+            source_file_id: "f".to_string(),
+            source_line: 0,
+            source_offset_start: 0,
+            source_offset_end: 0,
+            session_id: "s".to_string(),
+            turn_id: None,
+            token_event_ordinal: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 0,
+            model: None,
+            raw_usage_json: "{}".to_string(),
+            emitted_event_id: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    // ── source_type_str / build_log_source_row (L705-737) ──────────────
+
+    #[test]
+    fn build_log_source_row_covers_sqlite_and_directory_types() {
+        let now = 1_700_000_000_000i64;
+        for (st, expected) in [
+            (busytok_domain::LogSourceType::Jsonl, "jsonl"),
+            (busytok_domain::LogSourceType::SQLite, "sqlite"),
+            (busytok_domain::LogSourceType::Directory, "directory"),
+        ] {
+            let source = busytok_discovery::DiscoveredLogSource {
+                agent: AgentKind::ClaudeCode,
+                source_id: format!("src-{expected}"),
+                root_path: PathBuf::from("/tmp/root"),
+                files: vec![],
+                source_type: st,
+                configured_by_user: false,
+            };
+            let row = build_log_source_row(&source, now, Some(now), None, now, now);
+            assert_eq!(row.source_type, expected, "source_type_str mismatch");
+            assert_eq!(row.id, format!("src-{expected}"));
+            assert_eq!(row.agent, "claude_code");
+            assert_eq!(row.status, "active");
+            assert_eq!(row.default_discovery_enabled, 1);
+            assert!(row.last_error.is_none());
+        }
+    }
+
+    // ── sorted_files_by_earliest_timestamp (L739-751, None branch L745) ─
+
+    #[test]
+    fn sorted_files_by_earliest_timestamp_handles_missing_timestamps() {
+        // Use a temp directory so the files don't have parseable timestamps.
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("a.jsonl");
+        let f2 = dir.path().join("b.jsonl");
+        std::fs::write(&f1, "{}\n").unwrap();
+        std::fs::write(&f2, "{}\n").unwrap();
+
+        // Both files have no JSONL timestamp line → get_earliest_timestamp_ms
+        // returns None, exercising the (None, None) => Equal branch.
+        let sorted = sorted_files_by_earliest_timestamp(&[f1.clone(), f2.clone()]);
+        assert_eq!(sorted.len(), 2);
+        // With both None, order is stable (Equal).
+        assert!(sorted.contains(&f1));
+        assert!(sorted.contains(&f2));
+    }
+
+    // ── partition_parsed_events (L762-808) ─────────────────────────────
+    // Covers Tool branch (L790-792) and diagnostic empty-source_id branch
+    // (L785-787) and CodexTokenSnapshot branch (L794-795).
+
+    #[test]
+    fn partition_parsed_events_routes_tool_and_diagnostic_and_snapshot() {
+        let tool = NormalizedEvent::Tool(ToolEvent {
+            id: "t1".to_string(),
+            agent: AgentKind::ClaudeCode,
+            source_file_id: String::new(),
+            source_path: String::new(),
+            source_line: 0,
+            source_offset_start: 0,
+            source_offset_end: 0,
+            session_id: String::new(),
+            message_id: None,
+            tool_name: "bash".to_string(),
+            status: None,
+            timestamp_ms: None,
+            project_hash: None,
+            created_at_ms: 0,
+        });
+
+        // Diagnostic with empty source_id → triggers the source_id backfill
+        // branch (L785-787).
+        let diag = NormalizedEvent::OperationalDiagnostic(OperationalDiagnosticEvent {
+            id: "d1".to_string(),
+            agent: None,
+            source_id: Some(String::new()),
+            source_file_id: None,
+            source_path: None,
+            source_line: None,
+            category: "parse_error".to_string(),
+            severity: "warning".to_string(),
+            message: "bad line".to_string(),
+            detail_json: None,
+            happened_at_ms: 0,
+            created_at_ms: 0,
+        });
+
+        // Diagnostic with non-empty source_id → skips the backfill branch.
+        let diag2 = NormalizedEvent::OperationalDiagnostic(OperationalDiagnosticEvent {
+            id: "d2".to_string(),
+            agent: None,
+            source_id: Some("src-already-set".to_string()),
+            source_file_id: None,
+            source_path: None,
+            source_line: None,
+            category: "info".to_string(),
+            severity: "info".to_string(),
+            message: "ok".to_string(),
+            detail_json: None,
+            happened_at_ms: 0,
+            created_at_ms: 0,
+        });
+
+        let snap = ParsedLogEvent::CodexTokenSnapshot(minimal_codex_snapshot());
+
+        let parsed = vec![
+            ParsedLogEvent::Normalized(tool),
+            ParsedLogEvent::Normalized(diag),
+            ParsedLogEvent::Normalized(diag2),
+            snap,
+        ];
+
+        let result = partition_parsed_events(parsed, "src-test");
+        assert_eq!(result.tool_events.len(), 1);
+        assert_eq!(result.tool_events[0].tool_name, "bash");
+        assert_eq!(result.diagnostic_events.len(), 2);
+        // The empty-source_id diagnostic should be backfilled to "src-test".
+        assert_eq!(
+            result.diagnostic_events[0].source_id.as_deref(),
+            Some("src-test")
+        );
+        // The already-set source_id should be unchanged.
+        assert_eq!(
+            result.diagnostic_events[1].source_id.as_deref(),
+            Some("src-already-set")
+        );
+        assert_eq!(result.parse_error_count, 1, "one parse_error category diag");
+        assert_eq!(result.parse_errors.len(), 1);
+        assert_eq!(result.codex_snapshots.len(), 1);
+        assert!(result.usage_events.is_empty());
+    }
+
+    // ── collect_codex_model_resolutions (L164-184) ─────────────────────
+
+    #[test]
+    fn collect_codex_model_resolutions_dedupes_by_file_and_session() {
+        let mut e1 = NormalizedUsageEvent::minimal_for_test("e1", AgentKind::Codex);
+        e1.source_file_id = "f1".to_string();
+        e1.session_id = "s1".to_string();
+        e1.model = Some("gpt-5.4".to_string());
+
+        let mut e2 = NormalizedUsageEvent::minimal_for_test("e2", AgentKind::Codex);
+        e2.source_file_id = "f1".to_string();
+        e2.session_id = "s1".to_string();
+        e2.model = Some("gpt-5.4".to_string());
+
+        // Different session → should appear as a separate resolution.
+        let mut e3 = NormalizedUsageEvent::minimal_for_test("e3", AgentKind::Codex);
+        e3.source_file_id = "f1".to_string();
+        e3.session_id = "s2".to_string();
+        e3.model = Some("o4-mini".to_string());
+
+        // Non-Codex agent → skipped.
+        let mut e4 = NormalizedUsageEvent::minimal_for_test("e4", AgentKind::ClaudeCode);
+        e4.source_file_id = "f1".to_string();
+        e4.session_id = "s1".to_string();
+        e4.model = Some("claude-sonnet".to_string());
+
+        // No model → skipped.
+        let mut e5 = NormalizedUsageEvent::minimal_for_test("e5", AgentKind::Codex);
+        e5.source_file_id = "f1".to_string();
+        e5.session_id = "s3".to_string();
+        e5.model = None;
+
+        let res = collect_codex_model_resolutions(&[e1, e2, e3, e4, e5]);
+        assert_eq!(
+            res.len(),
+            2,
+            "should dedupe by (file, session) and skip non-codex/null-model"
+        );
+    }
+
+    // ── backfill_cross_batch_codex_models: multi-model skip (L126-134) ──
+
+    #[test]
+    fn backfill_cross_batch_codex_models_skips_multi_model_session() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed TWO events with DIFFERENT models in the same session.
+        let mut event_a = NormalizedUsageEvent::minimal_for_test("evt-multi-a", AgentKind::Codex);
+        event_a.source_file_id = "f-multi".to_string();
+        event_a.source_path = "/fake/multi.jsonl".to_string();
+        event_a.session_id = "sess-multi".to_string();
+        event_a.agent = AgentKind::Codex;
+        event_a.total_tokens = 10;
+        event_a.model = Some("gpt-5.4".to_string());
+
+        let mut event_b = NormalizedUsageEvent::minimal_for_test("evt-multi-b", AgentKind::Codex);
+        event_b.source_file_id = "f-multi".to_string();
+        event_b.source_path = "/fake/multi.jsonl".to_string();
+        event_b.session_id = "sess-multi".to_string();
+        event_b.agent = AgentKind::Codex;
+        event_b.total_tokens = 20;
+        event_b.model = Some("o4-mini".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(
+            db.conn(),
+            &[event_a, event_b],
+            "gen-test",
+        )
+        .expect("seed events");
+
+        let resolutions = vec![(
+            "f-multi".to_string(),
+            "sess-multi".to_string(),
+            "gpt-5.4".to_string(),
+        )];
+
+        let changed = backfill_cross_batch_codex_models(&db, &resolutions);
+        assert!(
+            !changed,
+            "backfill must skip when session has multiple distinct models"
+        );
+    }
+
+    // ── backfill_cross_batch_codex_models: zero-update Ok(_) path (L145) ─
+
+    #[test]
+    fn backfill_cross_batch_codex_models_no_update_when_single_model_matches() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed ONE event with model already set to "gpt-5.4".
+        let mut event = NormalizedUsageEvent::minimal_for_test("evt-match", AgentKind::Codex);
+        event.source_file_id = "f-match".to_string();
+        event.source_path = "/fake/match.jsonl".to_string();
+        event.session_id = "sess-match".to_string();
+        event.agent = AgentKind::Codex;
+        event.total_tokens = 10;
+        event.model = Some("gpt-5.4".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-test")
+            .expect("seed event");
+
+        // Resolution claims same model — backfill_codex_model_for_session
+        // updates 0 rows (all already have the model) → Ok(0) → Ok(_) => {}
+        let resolutions = vec![(
+            "f-match".to_string(),
+            "sess-match".to_string(),
+            "gpt-5.4".to_string(),
+        )];
+
+        let changed = backfill_cross_batch_codex_models(&db, &resolutions);
+        assert!(
+            !changed,
+            "no rows updated should return false (Ok(0) => {{}} arm)"
+        );
+    }
+
+    // ── cross_batch_backfill_from_turn_context: multi-model batch skip ──
+    // Covers L208-218 (tc_models.len() != 1 with len > 1).
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_skips_when_batch_has_two_models() {
+        let db = Database::open_in_memory().unwrap();
+        // Batch with TWO different turn_context models → skip.
+        let tc1 = codex_turn_context_line("2026-05-20T07:16:24.000Z", "gpt-5.4");
+        let tc2 = codex_turn_context_line("2026-05-20T07:16:25.000Z", "o4-mini");
+        let lines = vec![
+            make_codex_tailed_line(&tc1, 0),
+            make_codex_tailed_line(&tc2, 1),
+        ];
+        let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-tc-multi");
+        assert!(
+            !changed,
+            "must skip when batch has multiple distinct turn_context models"
+        );
+    }
+
+    // ── cross_batch_backfill_from_turn_context: empty batch (len 0) ─────
+    // Covers L208 (tc_models.len() != 1 with len 0 → return false without warn).
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_returns_false_for_empty_batch() {
+        let db = Database::open_in_memory().unwrap();
+        let lines: Vec<TailedLine> = vec![];
+        let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-empty");
+        assert!(!changed, "empty batch should return false");
+    }
+
+    // ── cross_batch_backfill_from_turn_context: conflicting DB model ────
+    // Covers L271-280 (existing model differs from turn_context model).
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_skips_conflicting_db_model() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Seed: a Codex event with a DIFFERENT model than the turn_context.
+        let mut event = NormalizedUsageEvent::minimal_for_test("evt-conflict", AgentKind::Codex);
+        event.source_file_id = "f-conflict".to_string();
+        event.source_path = "/fake/conflict.jsonl".to_string();
+        event.session_id = "sess-conflict".to_string();
+        event.agent = AgentKind::Codex;
+        event.total_tokens = 10;
+        event.model = Some("o4-mini".to_string());
+
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-test")
+            .expect("seed event");
+
+        // turn_context says "gpt-5.4" but DB already has "o4-mini" → conflict.
+        let tc = codex_turn_context_line("2026-05-20T07:16:24.000Z", "gpt-5.4");
+        let lines = vec![make_codex_tailed_line_with_path(
+            &tc,
+            0,
+            "/fake/conflict.jsonl",
+        )];
+
+        let changed = cross_batch_backfill_from_turn_context(&db, &lines, "f-conflict");
+        assert!(
+            !changed,
+            "must skip when DB model conflicts with turn_context"
+        );
+    }
+
+    // ── rebuild_model_aggregates: success path (L322-384) ───────────────
+
+    #[test]
+    fn rebuild_model_aggregates_succeeds_with_events() {
+        let db = Database::open_in_memory().unwrap();
+
+        let mut event = NormalizedUsageEvent::minimal_for_test("evt-rebuild", AgentKind::Codex);
+        event.source_file_id = "f-rebuild".to_string();
+        event.source_path = "/fake/rebuild.jsonl".to_string();
+        event.session_id = "sess-rebuild".to_string();
+        event.agent = AgentKind::Codex;
+        event.total_tokens = 100;
+        event.input_tokens = 60;
+        event.output_tokens = 40;
+        event.model = Some("gpt-5.4".to_string());
+        event.timestamp_ms = 1_700_000_000_000;
+
+        busytok_store::write_queries::insert_usage_events_batch(db.conn(), &[event], "gen-rebuild")
+            .expect("seed event");
+
+        // Should rebuild model_summary, sessions, daily_usage without error.
+        rebuild_model_aggregates(&db, "Asia/Shanghai");
+
+        // Verify model_summary was rebuilt.
+        let models = db.model_summary_rows().expect("query model summaries");
+        assert!(
+            models.iter().any(|m| m.model == "gpt-5.4"),
+            "model_summary should contain gpt-5.4 after rebuild"
+        );
+    }
+
+    // ── rebuild_model_aggregates: empty DB (no events) success path ─────
+
+    #[test]
+    fn rebuild_model_aggregates_succeeds_with_no_events() {
+        let db = Database::open_in_memory().unwrap();
+        // No events — all_usage_events returns Ok(vec![]), rebuild proceeds
+        // with empty inputs and completes the success info! log (L379-382).
+        rebuild_model_aggregates(&db, "UTC");
+        let models = db.model_summary_rows().expect("query");
+        assert!(models.is_empty());
+    }
+
+    // ── backfill_cross_batch_codex_models branch coverage ──────────────
+
+    use busytok_domain::UsageWritePolicy;
+    use busytok_store::CodexTokenSnapshotRow;
+
+    fn make_codex_event(
+        id: &str,
+        file_id: &str,
+        session: &str,
+        model: Option<&str>,
+    ) -> NormalizedUsageEvent {
+        let mut event = NormalizedUsageEvent::minimal_for_test(id, AgentKind::Codex);
+        event.source_file_id = file_id.to_string();
+        event.session_id = session.to_string();
+        event.model = model.map(|s| s.to_string());
+        event.total_tokens = 100;
+        event.input_tokens = 50;
+        event.output_tokens = 50;
+        event.timestamp_ms = 1_000;
+        event
+    }
+
+    fn make_codex_snapshot_row(
+        id: &str,
+        file_id: &str,
+        session: &str,
+        model: Option<&str>,
+        total: i64,
+    ) -> CodexTokenSnapshotRow {
+        let now = busytok_domain::now_ms();
+        CodexTokenSnapshotRow {
+            id: id.to_string(),
+            source_file_id: file_id.to_string(),
+            source_line: 1,
+            source_offset_start: 0,
+            source_offset_end: 100,
+            session_id: session.to_string(),
+            turn_id: None,
+            token_event_ordinal: 1,
+            input_tokens: total / 2,
+            cached_input_tokens: 0,
+            output_tokens: total - (total / 2),
+            reasoning_tokens: 0,
+            total_tokens: total,
+            model: model.map(|s| s.to_string()),
+            raw_usage_json: "{}".to_string(),
+            emitted_event_id: Some(format!("evt-{id}")),
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    #[test]
+    fn backfill_cross_batch_succeeds_when_single_matching_model_and_null_events_exist() {
+        let db = Database::open_in_memory().unwrap();
+        // Event with NULL model for (file-bf, sess-1)
+        let null_event = make_codex_event("evt-null", "file-bf", "sess-1", None);
+        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        // Snapshot with model "gpt-5" for same (file, session)
+        let snap = make_codex_snapshot_row("snap-bf", "file-bf", "sess-1", Some("gpt-5"), 200);
+        db.upsert_codex_snapshot(&snap).unwrap();
+
+        let updated = backfill_cross_batch_codex_models(
+            &db,
+            &[(
+                "file-bf".to_string(),
+                "sess-1".to_string(),
+                "gpt-5".to_string(),
+            )],
+        );
+        assert!(
+            updated,
+            "should report updates when NULL model was backfilled"
+        );
+        let after = db.get_usage_event("evt-null").unwrap().unwrap();
+        assert_eq!(after.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn backfill_cross_batch_noop_when_no_null_models() {
+        let db = Database::open_in_memory().unwrap();
+        // Event already has model "gpt-5" — no NULL to backfill.
+        let event = make_codex_event("evt-set", "file-bf2", "sess-1", Some("gpt-5"));
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        let snap = make_codex_snapshot_row("snap-bf2", "file-bf2", "sess-1", Some("gpt-5"), 200);
+        db.upsert_codex_snapshot(&snap).unwrap();
+
+        let updated = backfill_cross_batch_codex_models(
+            &db,
+            &[(
+                "file-bf2".to_string(),
+                "sess-1".to_string(),
+                "gpt-5".to_string(),
+            )],
+        );
+        assert!(!updated, "should report no updates when no NULL models");
+    }
+
+    #[test]
+    fn backfill_cross_batch_skipped_when_multiple_models_in_session() {
+        let db = Database::open_in_memory().unwrap();
+        let event = make_codex_event("evt-a", "file-bf3", "sess-1", Some("gpt-5a"));
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        let snap = make_codex_snapshot_row("snap-a", "file-bf3", "sess-1", Some("gpt-5b"), 200);
+        db.upsert_codex_snapshot(&snap).unwrap();
+
+        let updated = backfill_cross_batch_codex_models(
+            &db,
+            &[(
+                "file-bf3".to_string(),
+                "sess-1".to_string(),
+                "gpt-5a".to_string(),
+            )],
+        );
+        assert!(!updated, "should skip when multiple distinct models exist");
+    }
+
+    #[test]
+    fn backfill_cross_batch_skipped_when_db_model_differs_from_batch() {
+        let db = Database::open_in_memory().unwrap();
+        let event = make_codex_event("evt-m", "file-bf4", "sess-1", Some("gpt-5"));
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+
+        let updated = backfill_cross_batch_codex_models(
+            &db,
+            &[(
+                "file-bf4".to_string(),
+                "sess-1".to_string(),
+                "different-model".to_string(),
+            )],
+        );
+        assert!(
+            !updated,
+            "should skip when DB model differs from batch model"
+        );
+    }
+
+    #[test]
+    fn backfill_cross_batch_noop_when_no_models_in_db() {
+        let db = Database::open_in_memory().unwrap();
+        // No events or snapshots for (file-bf5, sess-1)
+        let updated = backfill_cross_batch_codex_models(
+            &db,
+            &[(
+                "file-bf5".to_string(),
+                "sess-1".to_string(),
+                "gpt-5".to_string(),
+            )],
+        );
+        assert!(!updated, "should report no updates when no data in DB");
+    }
+
+    // ── cross_batch_backfill_from_turn_context branch coverage ─────────
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_returns_false_for_empty_lines() {
+        let db = Database::open_in_memory().unwrap();
+        let result = cross_batch_backfill_from_turn_context(&db, &[], "file-tc");
+        assert!(!result);
+    }
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_skips_when_multiple_models_in_batch() {
+        let db = Database::open_in_memory().unwrap();
+        let lines = vec![
+            make_tailed_line(r#"{"type":"turn_context","payload":{"model":"gpt-5a"}}"#, 1),
+            make_tailed_line(r#"{"type":"turn_context","payload":{"model":"gpt-5b"}}"#, 2),
+        ];
+        let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
+        assert!(!result, "should skip when batch has multiple models");
+    }
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_returns_false_when_no_null_model_sessions() {
+        let db = Database::open_in_memory().unwrap();
+        let lines = vec![make_tailed_line(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            1,
+        )];
+        // No Codex events with NULL model in DB.
+        let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
+        assert!(!result, "should return false when no null-model sessions");
+    }
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_succeeds_when_null_model_exists() {
+        let db = Database::open_in_memory().unwrap();
+        // Seed a Codex event with NULL model for (file-tc, sess-tc).
+        let null_event = make_codex_event("evt-tc-null", "file-tc", "sess-tc", None);
+        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+
+        let lines = vec![make_tailed_line(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            1,
+        )];
+        let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
+        assert!(
+            result,
+            "should backfill when null-model event exists and model matches"
+        );
+        let after = db.get_usage_event("evt-tc-null").unwrap().unwrap();
+        assert_eq!(after.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn cross_batch_backfill_from_turn_context_skips_when_conflicting_model_in_db() {
+        let db = Database::open_in_memory().unwrap();
+        // Event with NULL model
+        let null_event = make_codex_event("evt-tc-conf", "file-tc", "sess-tc", None);
+        db.write_usage_event(&null_event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        // Snapshot with a DIFFERENT model
+        let snap =
+            make_codex_snapshot_row("snap-conf", "file-tc", "sess-tc", Some("other-model"), 200);
+        db.upsert_codex_snapshot(&snap).unwrap();
+
+        let lines = vec![make_tailed_line(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            1,
+        )];
+        let result = cross_batch_backfill_from_turn_context(&db, &lines, "file-tc");
+        assert!(!result, "should skip when DB has conflicting model");
+    }
+
+    // ── Pure function coverage ─────────────────────────────────────────
+
+    #[test]
+    fn is_jsonl_file_detects_extension() {
+        assert!(is_jsonl_file(std::path::Path::new("/tmp/log.jsonl")));
+        assert!(!is_jsonl_file(std::path::Path::new("/tmp/log.txt")));
+        assert!(!is_jsonl_file(std::path::Path::new("/tmp/log.JSONL")));
+        assert!(!is_jsonl_file(std::path::Path::new("/tmp/noext")));
+        assert!(!is_jsonl_file(std::path::Path::new("/tmp/")));
+    }
+
+    #[test]
+    fn extract_codex_turn_context_model_parses_valid_line() {
+        let model = extract_codex_turn_context_model(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn extract_codex_turn_context_model_returns_none_for_non_turn_context() {
+        let model =
+            extract_codex_turn_context_model(r#"{"type":"usage","payload":{"model":"gpt-5"}}"#);
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_codex_turn_context_model_returns_none_for_empty_model() {
+        let model =
+            extract_codex_turn_context_model(r#"{"type":"turn_context","payload":{"model":""}}"#);
+        assert!(model.is_none(), "empty model string should be filtered out");
+    }
+
+    #[test]
+    fn extract_codex_turn_context_model_returns_none_for_invalid_json() {
+        assert!(extract_codex_turn_context_model("not json").is_none());
+    }
+
+    #[test]
+    fn extract_codex_turn_context_model_trims_whitespace() {
+        let model = extract_codex_turn_context_model(
+            r#"{"type":"turn_context","payload":{"model":"  gpt-5  "}}"#,
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn effective_codex_model_passes_through_value() {
+        assert_eq!(
+            effective_codex_model(&Some("gpt-5".to_string())),
+            Some("gpt-5".to_string())
+        );
+        assert_eq!(effective_codex_model(&None), None);
+    }
+
+    #[test]
+    fn collect_codex_model_resolutions_emits_expected_tuples() {
+        let mut e1 = NormalizedUsageEvent::minimal_for_test("e1", AgentKind::Codex);
+        e1.source_file_id = "file-1".to_string();
+        e1.session_id = "sess-1".to_string();
+        e1.model = Some("gpt-5".to_string());
+
+        let mut e2 = NormalizedUsageEvent::minimal_for_test("e2", AgentKind::Codex);
+        e2.source_file_id = "file-1".to_string();
+        e2.session_id = "sess-1".to_string();
+        e2.model = Some("gpt-5".to_string());
+
+        let mut e3 = NormalizedUsageEvent::minimal_for_test("e3", AgentKind::Codex);
+        e3.source_file_id = "file-1".to_string();
+        e3.session_id = "sess-2".to_string();
+        e3.model = Some("gpt-5".to_string());
+
+        let mut e4 = NormalizedUsageEvent::minimal_for_test("e4", AgentKind::ClaudeCode);
+        e4.model = Some("claude-sonnet-4".to_string());
+
+        let mut e5 = NormalizedUsageEvent::minimal_for_test("e5", AgentKind::Codex);
+        e5.source_file_id = "file-1".to_string();
+        e5.session_id = "sess-3".to_string();
+        e5.model = None;
+
+        let result = collect_codex_model_resolutions(&[e1, e2, e3, e4, e5]);
+        assert_eq!(
+            result.len(),
+            2,
+            "should dedupe by (file, session) and skip non-Codex/None"
+        );
+        assert!(result
+            .iter()
+            .any(|(f, s, m)| f == "file-1" && s == "sess-1" && m == "gpt-5"));
+        assert!(result
+            .iter()
+            .any(|(f, s, m)| f == "file-1" && s == "sess-2" && m == "gpt-5"));
+    }
+
+    #[test]
+    fn load_persisted_codex_model_returns_none_for_unknown_file() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(load_persisted_codex_model(&db, "file-unknown").is_none());
+    }
+
+    #[test]
+    fn load_persisted_codex_model_finds_snapshot_model() {
+        let db = Database::open_in_memory().unwrap();
+        let snap = make_codex_snapshot_row("snap-lp", "file-lp", "sess-lp", Some("gpt-5"), 100);
+        db.upsert_codex_snapshot(&snap).unwrap();
+        let model = load_persisted_codex_model(&db, "file-lp");
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn load_persisted_codex_model_falls_back_to_event_model() {
+        let db = Database::open_in_memory().unwrap();
+        let event = make_codex_event("evt-lp", "file-lp2", "sess-lp", Some("gpt-5-from-event"));
+        db.write_usage_event(&event, UsageWritePolicy::InsertOnce)
+            .unwrap();
+        let model = load_persisted_codex_model(&db, "file-lp2");
+        assert_eq!(model.as_deref(), Some("gpt-5-from-event"));
+    }
 }

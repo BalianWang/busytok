@@ -125,6 +125,56 @@ bundle_sidecar_resources_into_app() {
     cp "$bundle_src" "$sidecar_dir/pi-sidecar.bundle.js" || { echo "  ERROR: cp bundle failed"; return 1; }
     echo "  bundled pi-sidecar.bundle.js"
 
+    # 2b. Install Pi SDK runtime dependency via npm into a temp directory,
+    # then copy into the bundle.  This is the ONLY reliable way to get all
+    # transitive dependencies — pnpm's virtual store makes manual copying
+    # of transitive deps fragile (each dep's own deps live in a separate
+    # .pnpm/<dep>@<hash>/node_modules/ directory).  npm's install nests
+    # all transitive deps inside @earendil-works/pi-coding-agent/node_modules/,
+    # so copying the package dir brings everything in one pass.
+    local pi_sdk_pkg="@earendil-works/pi-coding-agent"
+    # Single source of truth: read the SDK version from package.json instead
+    # of hardcoding it here (avoids drift between bundle script and declared
+    # dep when the SDK is upgraded).
+    local pi_sdk_version
+    pi_sdk_version=$(sed -n 's|.*"@earendil-works/pi-coding-agent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' \
+        "$PROJECT_ROOT/apps/pi-sidecar/package.json" | head -1)
+    if [ -z "$pi_sdk_version" ]; then
+        echo "  ERROR: could not extract $pi_sdk_pkg version from package.json"
+        return 1
+    fi
+    local pi_sdk_dst="$sidecar_dir/node_modules/@earendil-works/pi-coding-agent"
+    local npm_staging
+    npm_staging="$(mktemp -d "${TMPDIR:-/tmp}/busytok-pi-sdk-npm.XXXXXX")" \
+        || { echo "  ERROR: mktemp npm staging failed"; return 1; }
+
+    echo "  installing $pi_sdk_pkg@$pi_sdk_version via npm..."
+    # --no-package-lock: the staging dir is ephemeral. A repo-owned
+    # lockfile would add maintenance burden for marginal determinism
+    # gain in 0.x. Revisit with a committed lockfile at 1.0.
+    ( cd "$npm_staging" \
+        && npm init -y --silent 2>/dev/null \
+        && npm install "${pi_sdk_pkg}@${pi_sdk_version}" --omit=dev --no-package-lock --silent 2>&1
+    ) || { rm -rf "$npm_staging"; echo "  ERROR: npm install ${pi_sdk_pkg} failed"; return 1; }
+
+    local npm_mod="$npm_staging/node_modules/@earendil-works/pi-coding-agent"
+    if [ ! -d "$npm_mod" ]; then
+        rm -rf "$npm_staging"
+        echo "  ERROR: $pi_sdk_pkg not found after npm install"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$pi_sdk_dst")"
+    # rm -rf first: cp -R src dst/ would nest src inside dst if dst already
+    # exists (e.g. when re-running the bundler on an existing .app during
+    # local debugging). Release builds always start fresh, but this makes
+    # re-runs safe.
+    rm -rf "$pi_sdk_dst"
+    cp -R "$npm_mod" "$pi_sdk_dst" \
+        || { rm -rf "$npm_staging"; echo "  ERROR: cp pi-sdk from npm staging failed"; return 1; }
+    rm -rf "$npm_staging"
+    echo "  bundled pi-coding-agent SDK + all transitive deps ($(du -sh "$pi_sdk_dst" 2>/dev/null | cut -f1))"
+
     # 3. Generate manifest.json (Task 1 schema).
     generate_sidecar_manifest "$sidecar_dir" || return 1
 

@@ -1,8 +1,36 @@
 #![allow(clippy::unwrap_used)]
 
-use busytok_store::Database;
+use busytok_domain::ProviderKind;
+use busytok_store::{CreateModelReq, CreateProviderReq, Database};
 use busytok_subagent::resolver::{lookup_by_name, resolve_by_id, resolve_by_name};
 use busytok_subagent::SubagentError;
+
+/// Seed a provider + model and return `(provider_id, model_id)`. Used by
+/// creation-path tests so `validate_bound_provider_model` succeeds.
+fn seed_provider_model(db: &Database) -> (String, String) {
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "P1".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .unwrap();
+    (provider.id, model.model_id)
+}
 
 #[test]
 fn resolve_by_id_returns_not_found_for_missing_uuid() {
@@ -14,7 +42,9 @@ fn resolve_by_id_returns_not_found_for_missing_uuid() {
 #[test]
 fn resolve_by_id_finds_existing_row() {
     let db = Database::open_in_memory().unwrap();
-    let created = resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", None).unwrap();
+    let (pid, mid) = seed_provider_model(&db);
+    let created =
+        resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", &pid, &mid).unwrap();
     let found = resolve_by_id(&db, &created.subagent.id).unwrap();
     assert_eq!(found.id, created.subagent.id);
     assert_eq!(found.name, "reviewer");
@@ -23,7 +53,8 @@ fn resolve_by_id_finds_existing_row() {
 #[test]
 fn resolve_by_name_creates_when_none_exist() {
     let db = Database::open_in_memory().unwrap();
-    let r = resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", None).unwrap();
+    let (pid, mid) = seed_provider_model(&db);
+    let r = resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", &pid, &mid).unwrap();
     assert!(r.created, "should create when no match exists");
     assert_eq!(r.subagent.name, "reviewer");
 }
@@ -31,8 +62,11 @@ fn resolve_by_name_creates_when_none_exist() {
 #[test]
 fn resolve_by_name_reuses_when_one_exists() {
     let db = Database::open_in_memory().unwrap();
-    let first = resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", None).unwrap();
-    let second = resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", None).unwrap();
+    let (pid, mid) = seed_provider_model(&db);
+    let first =
+        resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", &pid, &mid).unwrap();
+    // Second call hits the reuse path — bound fields are ignored.
+    let second = resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", "", "").unwrap();
     assert!(!second.created, "should reuse existing row");
     assert_eq!(first.subagent.id, second.subagent.id);
 }
@@ -40,24 +74,12 @@ fn resolve_by_name_reuses_when_one_exists() {
 #[test]
 fn resolve_by_name_rejects_invalid_name() {
     let db = Database::open_in_memory().unwrap();
-    let err = resolve_by_name(&db, "bad name!", "/tmp/repo", "pi/search-cheap", None)
+    // Invalid name → returns InvalidName BEFORE bound-field validation,
+    // so empty bound fields are fine here.
+    let err = resolve_by_name(&db, "bad name!", "/tmp/repo", "pi/search-cheap", "", "")
         .err()
         .unwrap();
     assert!(matches!(err, SubagentError::InvalidName(_)));
-}
-
-#[test]
-fn resolve_by_name_with_default_model_seeds_row() {
-    let db = Database::open_in_memory().unwrap();
-    let r = resolve_by_name(
-        &db,
-        "reviewer",
-        "/tmp/repo",
-        "pi/search-cheap",
-        Some("claude-default"),
-    )
-    .unwrap();
-    assert_eq!(r.subagent.default_model.as_deref(), Some("claude-default"));
 }
 
 #[test]
@@ -77,9 +99,160 @@ fn lookup_by_name_rejects_invalid_name() {
 #[test]
 fn lookup_by_name_finds_existing_row() {
     let db = Database::open_in_memory().unwrap();
-    resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", None).unwrap();
+    let (pid, mid) = seed_provider_model(&db);
+    resolve_by_name(&db, "reviewer", "/tmp/repo", "pi/search-cheap", &pid, &mid).unwrap();
     let found = lookup_by_name(&db, "reviewer", "/tmp/repo").unwrap();
     assert_eq!(found.name, "reviewer");
+}
+
+// --- Task 2: creation-time validation (validate_bound_provider_model) --------
+
+#[test]
+fn resolve_by_name_creates_subagent_with_valid_bound_provider_and_model() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, mid) = seed_provider_model(&db);
+    let resolved = resolve_by_name(&db, "test-sub", "/tmp", "pi/search-cheap", &pid, &mid).unwrap();
+    assert!(resolved.created);
+    assert_eq!(resolved.subagent.bound_provider_id, pid);
+    assert_eq!(resolved.subagent.bound_model_id, "gpt-4o");
+}
+
+#[test]
+fn resolve_by_name_rejects_disabled_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "P1".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: false,
+            api_key: None,
+        })
+        .unwrap();
+    let result = resolve_by_name(
+        &db,
+        "test-sub",
+        "/tmp",
+        "pi/search-cheap",
+        &provider.id,
+        "gpt-4o",
+    );
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("provider disabled"), "got: {msg}");
+}
+
+#[test]
+fn resolve_by_name_rejects_missing_model_in_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _mid) = seed_provider_model(&db);
+    let result = resolve_by_name(
+        &db,
+        "test-sub",
+        "/tmp",
+        "pi/search-cheap",
+        &pid,
+        "no-such-model",
+    );
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("model not found in provider"), "got: {msg}");
+}
+
+#[test]
+fn resolve_by_name_rejects_unknown_provider() {
+    let db = Database::open_in_memory().unwrap();
+    let result = resolve_by_name(
+        &db,
+        "test-sub",
+        "/tmp",
+        "pi/search-cheap",
+        "nonexistent-provider",
+        "gpt-4o",
+    );
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("provider not found"), "got: {msg}");
+}
+
+#[test]
+fn resolve_by_name_rejects_disabled_model() {
+    let db = Database::open_in_memory().unwrap();
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "P1".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+    let model = db
+        .create_model(CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: false,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None,
+            max_tokens: None,
+        })
+        .unwrap();
+    let result = resolve_by_name(
+        &db,
+        "test-sub",
+        "/tmp",
+        "pi/search-cheap",
+        &provider.id,
+        &model.model_id,
+    );
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("model disabled"), "got: {msg}");
+}
+
+// --- I-1 fix: creation path rejects empty bound fields (spec §3.3 strict) ---
+
+/// Spec §3.3: there is no "create without binding" path. The creation path
+/// (0 active matches) must reject empty `bound_provider_id` / `bound_model_id`
+/// with `SubagentError::Validation`. The INTERIM scaffold that skipped
+/// validation for empty strings has been removed.
+#[test]
+fn resolve_by_name_rejects_empty_bound_fields_on_creation_path() {
+    let db = Database::open_in_memory().unwrap();
+    // No prior subagent → creation path. Empty bound fields must be rejected.
+    let err = resolve_by_name(&db, "fresh-sub", "/tmp/repo", "pi/search-cheap", "", "")
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound_provider_id and bound_model_id are both required"),
+        "expected 'both required' message, got: {msg}"
+    );
+}
+
+/// Same invariant, but only `bound_provider_id` is empty (model is set).
+/// Still a creation-path rejection.
+#[test]
+fn resolve_by_name_rejects_partial_empty_bound_fields_on_creation_path() {
+    let db = Database::open_in_memory().unwrap();
+    let (_pid, mid) = seed_provider_model(&db);
+    let err = resolve_by_name(
+        &db,
+        "fresh-sub-partial",
+        "/tmp/repo",
+        "pi/search-cheap",
+        "",
+        &mid,
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, SubagentError::Validation(_)));
 }
 
 // NOTE: `resolve_by_name` / `lookup_by_name` have an `AmbiguousName` branch
@@ -88,4 +261,55 @@ fn lookup_by_name_finds_existing_row() {
 // the `subagent_logical_subagents` table enforces:
 //   - UNIQUE(project_id, repo_hash, name)  →AmbiguousName impossible
 //   - CHECK(status IN ('hot','warm','cold','deleted')) → bad-status impossible
-// These are defensive branches; they remain intentionally uncovered.
+// The `AmbiguousName` branch remains intentionally uncovered (it would
+// require violating the DB UNIQUE constraint). The `row_to_model` status
+// fallback IS tested directly below (constructing a row in memory with an
+// invalid status string) — the function is `pub` so the fallback logic can
+// be exercised without going through the DB.
+
+/// Install a thread-local tracing subscriber so the `warn!` arguments in the
+/// `row_to_model` status fallback are evaluated (counted by line coverage).
+fn install_tracing() -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .finish();
+    tracing::subscriber::set_default(subscriber)
+}
+
+/// `row_to_model` falls back to `SubagentStatus::Cold` (with a warn log) when
+/// the row's status string doesn't parse. The DB CHECK constraint makes this
+/// unreachable via the public DB API, but the function is `pub` and directly
+/// testable — this guards the fallback so a future status enum value or a
+/// half-written migration doesn't panic.
+#[test]
+fn row_to_model_falls_back_to_cold_on_unparsable_status() {
+    let _guard = install_tracing();
+    use busytok_store::repository::SubagentLogicalSubagentRow;
+    use busytok_subagent::models::SubagentStatus;
+    use busytok_subagent::resolver::row_to_model;
+
+    let mut row = SubagentLogicalSubagentRow::for_test("sub-bad", "bad-status-sub");
+    row.status = "not-a-real-status".to_string();
+    let model = row_to_model(&row);
+    assert_eq!(
+        model.status,
+        SubagentStatus::Cold,
+        "unparsable status must fall back to Cold"
+    );
+    assert_eq!(model.id, "sub-bad");
+    assert_eq!(model.name, "bad-status-sub");
+}
+
+/// `row_to_model` parses a known status string correctly (no fallback).
+#[test]
+fn row_to_model_parses_known_status_hot() {
+    use busytok_store::repository::SubagentLogicalSubagentRow;
+    use busytok_subagent::models::SubagentStatus;
+    use busytok_subagent::resolver::row_to_model;
+
+    let mut row = SubagentLogicalSubagentRow::for_test("sub-hot", "hot-status-sub");
+    row.status = "hot".to_string();
+    let model = row_to_model(&row);
+    assert_eq!(model.status, SubagentStatus::Hot);
+}

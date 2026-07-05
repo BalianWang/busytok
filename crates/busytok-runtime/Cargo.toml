@@ -37,3 +37,4 @@ futures = "0.3"
 sysinfo.workspace = true
 serial_test.workspace = true
 tracing-subscriber = { workspace = true }
+walkdir.workspace = true

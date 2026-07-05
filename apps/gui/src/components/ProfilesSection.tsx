@@ -1,12 +1,11 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useState } from "react";
 import type {
   ProfileDto,
-  ProviderDto,
+  ProfileCreateRequestDto,
   ProfileUpdateRequestDto,
 } from "@busytok/protocol-types";
 import {
   useSettingsSnapshot,
-  useProviders,
   useProfileMutations,
 } from "../api/useBusytokData";
 import { PageState } from "./PageState";
@@ -17,78 +16,172 @@ import { reportFrontendEventSafely } from "../logging/safeReporter";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/** Returns enabled providers for the binding dropdown (spec: "only enabled"). */
-function enabledProviders(providers: ProviderDto[]): ProviderDto[] {
-  return providers.filter((p) => p.enabled);
-}
-
-/** Returns true if the profile's model is NOT in the bound provider's whitelist. */
-function isStaleModel(profile: ProfileDto, providers: ProviderDto[]): boolean {
-  if (!profile.provider_id) return false;
-  const provider = providers.find((p) => p.id === profile.provider_id);
-  if (!provider) return true; // provider deleted → stale
-  return !provider.models.includes(profile.model);
-}
-
-/** Returns true if the profile is bound to a disabled provider. */
-function isBoundToDisabledProvider(
-  profile: ProfileDto,
-  providers: ProviderDto[],
-): boolean {
-  if (!profile.provider_id) return false;
-  const provider = providers.find((p) => p.id === profile.provider_id);
-  return provider != null && !provider.enabled;
+function parseTools(input: string): string[] {
+  return input
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 // ── ProfileRow ───────────────────────────────────────────────────────
+//
+// Per-profile row. The post-Task-4 `ProfileDto` no longer carries
+// `provider_id` / `model` (the bound-fields migration moved binding down
+// to the behavior-template layer), so this row edits ONLY the behavior
+// template fields: tools, context_budget_tokens, timeout_seconds,
+// write_access. Provider/model selection is gone per spec §6.
+//
+// Built-in profiles are read-only (no Edit, no Delete). User profiles
+// show an inline edit form (toggled by the Edit button) + a Delete button.
 
 interface ProfileRowProps {
   profile: ProfileDto;
-  providers: ProviderDto[];
-  providersDegraded: boolean;
-  isEditing: boolean;
-  editProviderId: string;
-  editModel: string;
-  onEdit: (profile: ProfileDto) => void;
-  onEditChange: (patch: { providerId?: string; model?: string }) => void;
-  onEditSubmit: () => void;
-  onEditCancel: () => void;
-  isEditPending: boolean;
-  onDelete: (id: string) => void;
   isDeletePending: boolean;
+  isUpdatePending: boolean;
+  onDelete: (id: string) => void;
+  onSave: (
+    id: string,
+    patch: ProfileUpdateRequestDto,
+    onDone: () => void,
+  ) => void;
 }
 
 function ProfileRow({
   profile,
-  providers,
-  providersDegraded,
-  isEditing,
-  editProviderId,
-  editModel,
-  onEdit,
-  onEditChange,
-  onEditSubmit,
-  onEditCancel,
-  isEditPending,
-  onDelete,
   isDeletePending,
+  isUpdatePending,
+  onDelete,
+  onSave,
 }: ProfileRowProps) {
-  // When the providers query failed, we cannot reliably compute
-  // stale/disabled state — skip both to avoid false positives.
-  const disabled = providersDegraded ? false : isBoundToDisabledProvider(profile, providers);
-  const stale = providersDegraded ? false : isStaleModel(profile, providers);
-  const enabledProvs = enabledProviders(providers);
+  // Inline edit state — local to the row so multiple rows can be edited
+  // independently. Initialised lazily from the profile's current values.
+  const [editing, setEditing] = useState(false);
+  const [toolsDraft, setToolsDraft] = useState(profile.tools.join(", "));
+  const [budgetDraft, setBudgetDraft] = useState<number | undefined>(
+    profile.context_budget_tokens,
+  );
+  const [timeoutDraft, setTimeoutDraft] = useState<number | undefined>(
+    profile.timeout_seconds,
+  );
+  const [writeAccessDraft, setWriteAccessDraft] = useState(
+    profile.write_access,
+  );
 
-  // Cascade-filtered models: only show models from the selected provider.
-  const availableModels = useMemo(() => {
-    const selected = providers.filter((p) => p.enabled).find((p) => p.id === editProviderId);
-    return selected ? selected.models : [];
-  }, [providers, editProviderId]);
+  const beginEdit = () => {
+    setToolsDraft(profile.tools.join(", "));
+    setBudgetDraft(profile.context_budget_tokens);
+    setTimeoutDraft(profile.timeout_seconds);
+    setWriteAccessDraft(profile.write_access);
+    setEditing(true);
+  };
 
-  // Disable Save when a provider is selected but the model is not in its
-  // whitelist (stale or unselected) — spec: "requires re-selection before save".
-  const isEditModelStale =
-    editProviderId !== "" && !availableModels.includes(editModel);
+  const cancelEdit = () => setEditing(false);
+
+  const submitEdit = () => {
+    const patch: ProfileUpdateRequestDto = {
+      id: profile.id,
+      tools: parseTools(toolsDraft),
+      context_budget_tokens: budgetDraft ?? null,
+      timeout_seconds: timeoutDraft ?? null,
+      write_access: writeAccessDraft,
+    };
+    onSave(profile.id, patch, () => setEditing(false));
+  };
+
+  if (editing) {
+    return (
+      <div className="settings-panel">
+        <SettingsRow
+          label={profile.id}
+          description="Editing behavior template"
+          control={
+            <SettingsValue value="Custom" tone="muted" />
+          }
+        />
+        <SettingsRow
+          layout="vertical"
+          label="Tools"
+          description="Comma-separated tool list."
+          control={
+            <input
+              type="text"
+              className="input"
+              aria-label={`Tools for ${profile.id}`}
+              placeholder="read, grep, glob"
+              value={toolsDraft}
+              onChange={(e) => setToolsDraft(e.currentTarget.value)}
+            />
+          }
+        />
+        <SettingsRow
+          layout="vertical"
+          label="Context budget (tokens)"
+          control={
+            <input
+              type="number"
+              className="input"
+              aria-label={`Context budget for ${profile.id}`}
+              value={budgetDraft ?? ""}
+              onChange={(e) => {
+                const v = e.currentTarget.value;
+                setBudgetDraft(v ? Number(v) : undefined);
+              }}
+            />
+          }
+        />
+        <SettingsRow
+          layout="vertical"
+          label="Timeout (seconds)"
+          control={
+            <input
+              type="number"
+              className="input"
+              aria-label={`Timeout for ${profile.id}`}
+              value={timeoutDraft ?? ""}
+              onChange={(e) => {
+                const v = e.currentTarget.value;
+                setTimeoutDraft(v ? Number(v) : undefined);
+              }}
+            />
+          }
+        />
+        <SettingsRow
+          label="Write access"
+          control={
+            <input
+              type="checkbox"
+              checked={writeAccessDraft}
+              onChange={(e) => setWriteAccessDraft(e.currentTarget.checked)}
+              aria-label={`Write access for ${profile.id}`}
+            />
+          }
+        />
+        <SettingsRow
+          label="Actions"
+          control={
+            <SettingsActionGroup direction="row">
+              <button
+                type="button"
+                className="btn btn--primary btn--sm"
+                onClick={submitEdit}
+                disabled={isUpdatePending}
+              >
+                {isUpdatePending ? "Saving..." : "Save"}
+              </button>
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={cancelEdit}
+                disabled={isUpdatePending}
+              >
+                Cancel
+              </button>
+            </SettingsActionGroup>
+          }
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="settings-panel">
@@ -102,160 +195,53 @@ function ProfileRow({
           />
         }
       />
-      {disabled && (
-        <SettingsRow
-          label="⚠ Warning"
-          control={
+      <SettingsRow
+        label="Advanced (read-only)"
+        control={
+          <SettingsActionGroup direction="col">
             <SettingsValue
-              value="Bound to a disabled provider — delegate will fail until rebound"
-              tone="danger"
+              value={`Tools: ${profile.tools.join(", ")}`}
+              tone="muted"
             />
+            <SettingsValue
+              value={`Budget: ${profile.context_budget_tokens} tokens`}
+              tone="muted"
+            />
+            <SettingsValue
+              value={`Timeout: ${profile.timeout_seconds}s`}
+              tone="muted"
+            />
+            <SettingsValue
+              value={`Write access: ${profile.write_access ? "yes" : "no"}`}
+              tone="muted"
+            />
+          </SettingsActionGroup>
+        }
+      />
+      {!profile.is_builtin && (
+        <SettingsRow
+          label="Actions"
+          control={
+            <SettingsActionGroup direction="row">
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                onClick={beginEdit}
+                disabled={isUpdatePending || isDeletePending}
+              >
+                Edit
+              </button>
+              <button
+                type="button"
+                className="btn btn--danger btn--sm"
+                onClick={() => onDelete(profile.id)}
+                disabled={isDeletePending || isUpdatePending}
+              >
+                {isDeletePending ? "Deleting..." : "Delete"}
+              </button>
+            </SettingsActionGroup>
           }
         />
-      )}
-      {stale && !isEditing && (
-        <SettingsRow
-          label="⚠ Stale Model"
-          control={
-            <SettingsValue
-              value="Not in the provider's whitelist — re-select before save"
-              tone="danger"
-            />
-          }
-        />
-      )}
-      {isEditing ? (
-        <>
-          <SettingsRow
-            layout="vertical"
-            label="Provider"
-            description="Only enabled providers can be selected."
-            control={
-              <select
-                className="input"
-                aria-label="Provider"
-                value={editProviderId}
-                onChange={(e) => onEditChange({ providerId: e.currentTarget.value })}
-              >
-                <option value="">— None (unbound) —</option>
-                {enabledProvs.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.id})
-                  </option>
-                ))}
-              </select>
-            }
-          />
-          <SettingsRow
-            layout="vertical"
-            label="Model"
-            description="Models available from the selected provider."
-            control={
-              <select
-                className="input"
-                aria-label="Model"
-                value={editModel}
-                onChange={(e) => onEditChange({ model: e.currentTarget.value })}
-                disabled={availableModels.length === 0}
-              >
-                <option value="">— Select model —</option>
-                {availableModels.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            }
-          />
-          <SettingsRow
-            label="Advanced (read-only)"
-            control={
-              <SettingsActionGroup direction="col">
-                <SettingsValue value={`Tools: ${profile.tools.join(", ")}`} tone="muted" />
-                <SettingsValue value={`Budget: ${profile.context_budget_tokens} tokens`} tone="muted" />
-                <SettingsValue value={`Timeout: ${profile.timeout_seconds}s`} tone="muted" />
-              </SettingsActionGroup>
-            }
-          />
-          <SettingsRow
-            label="Actions"
-            control={
-              <SettingsActionGroup direction="row">
-                <button
-                  type="button"
-                  className="btn btn--primary btn--sm"
-                  onClick={onEditSubmit}
-                  disabled={isEditPending || isEditModelStale}
-                >
-                  {isEditPending ? "Saving..." : "Save"}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--sm"
-                  onClick={onEditCancel}
-                  disabled={isEditPending}
-                >
-                  Cancel
-                </button>
-              </SettingsActionGroup>
-            }
-          />
-        </>
-      ) : (
-        <>
-          <SettingsRow
-            label="Provider"
-            control={
-              <SettingsValue
-                value={profile.provider_id ?? "— unbound —"}
-                tone={profile.provider_id ? "default" : "muted"}
-              />
-            }
-          />
-          <SettingsRow
-            label="Model"
-            control={
-              <SettingsValue
-                value={stale ? "—" : profile.model}
-                tone={stale ? "danger" : "default"}
-              />
-            }
-          />
-          <SettingsRow
-            label="Advanced (read-only)"
-            control={
-              <SettingsActionGroup direction="col">
-                <SettingsValue value={`Tools: ${profile.tools.join(", ")}`} tone="muted" />
-                <SettingsValue value={`Budget: ${profile.context_budget_tokens} tokens`} tone="muted" />
-                <SettingsValue value={`Timeout: ${profile.timeout_seconds}s`} tone="muted" />
-              </SettingsActionGroup>
-            }
-          />
-          <SettingsRow
-            label="Actions"
-            control={
-              <SettingsActionGroup direction="row">
-                <button
-                  type="button"
-                  className="btn btn--primary btn--sm"
-                  onClick={() => onEdit(profile)}
-                >
-                  Edit
-                </button>
-                {!profile.is_builtin && (
-                  <button
-                    type="button"
-                    className="btn btn--danger btn--sm"
-                    onClick={() => onDelete(profile.id)}
-                    disabled={isDeletePending}
-                  >
-                    Delete
-                  </button>
-                )}
-              </SettingsActionGroup>
-            }
-          />
-        </>
       )}
     </div>
   );
@@ -263,85 +249,37 @@ function ProfileRow({
 
 // ── ProfilesSection ──────────────────────────────────────────────────
 
+/**
+ * Profile CRUD for behavior-template fields (tools, context_budget_tokens,
+ * timeout_seconds, write_access). Provider/model selection is NOT exposed
+ * here — those are gone per spec §6 (binding moved to the subagent layer).
+ *
+ * Reads via settings.snapshot (subagent.profiles[]); writes via the
+ * `profile.create` / `profile.update` / `profile.delete` RPCs.
+ */
 export function ProfilesSection() {
   const snapshotQuery = useSettingsSnapshot();
-  const providersQuery = useProviders();
-  const { updateProfile, deleteProfile } = useProfileMutations();
+  const { createProfile, updateProfile, deleteProfile } = useProfileMutations();
 
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editProviderId, setEditProviderId] = useState("");
-  const [editModel, setEditModel] = useState("");
   const [mutationError, setMutationError] = useState<string | null>(null);
 
+  // Create-form state. `id` is required; the rest are optional behavior
+  // template fields (sent as-is when provided).
+  const [createForm, setCreateForm] = useState<{
+    id: string;
+    tools: string;
+    context_budget_tokens: number | undefined;
+    timeout_seconds: number | undefined;
+    write_access: boolean;
+  }>({
+    id: "",
+    tools: "",
+    context_budget_tokens: undefined,
+    timeout_seconds: undefined,
+    write_access: false,
+  });
+
   const profiles = snapshotQuery.data?.data?.subagent?.profiles ?? [];
-  const providers = providersQuery.data?.providers ?? [];
-  const providersDegraded = providersQuery.isError;
-
-  const handleEdit = useCallback((profile: ProfileDto) => {
-    setEditingId(profile.id);
-    setEditProviderId(profile.provider_id ?? "");
-    setEditModel(profile.model);
-    setMutationError(null);
-  }, []);
-
-  const handleEditChange = useCallback(
-    (patch: { providerId?: string; model?: string }) => {
-      if (patch.providerId !== undefined) {
-        setEditProviderId(patch.providerId);
-        // Cascade: when the provider changes, reset the model to the first
-        // available model from the new provider (or empty if none).
-        const newProvider = providers.find((p) => p.id === patch.providerId);
-        setEditModel(newProvider?.models[0] ?? "");
-      }
-      if (patch.model !== undefined) {
-        setEditModel(patch.model);
-      }
-    },
-    [providers],
-  );
-
-  const handleEditSubmit = useCallback(() => {
-    if (!editingId) return;
-    setMutationError(null);
-    const req: ProfileUpdateRequestDto = {
-      id: editingId,
-      provider_id: editProviderId, // empty string = unbind
-      model: editModel,
-      tools: null,
-      context_budget_tokens: null,
-      timeout_seconds: null,
-      write_access: null,
-    };
-    updateProfile.mutate(req, {
-      onSuccess: () => {
-        setEditingId(null);
-        reportFrontendEventSafely({
-          level: "INFO",
-          event_code: "profile.updated",
-          message: "Profile updated",
-          details: { id: editingId },
-        });
-      },
-      onError: (err) => {
-        const msg = (err as Error)?.message ?? String(err);
-        // Exit edit mode so the user can see the error and retry from the
-        // view layout; `handleEdit` clears `mutationError` on re-entry.
-        setEditingId(null);
-        setMutationError(msg);
-        reportFrontendEventSafely({
-          level: "ERROR",
-          event_code: "profile.update.failed",
-          message: "Profile update failed",
-          details: { id: editingId, error: msg },
-        });
-      },
-    });
-  }, [editingId, editProviderId, editModel, updateProfile]);
-
-  const handleEditCancel = useCallback(() => {
-    setEditingId(null);
-    setMutationError(null);
-  }, []);
 
   const handleDelete = useCallback(
     (id: string) => {
@@ -362,6 +300,81 @@ export function ProfilesSection() {
     [deleteProfile],
   );
 
+  const handleSave = useCallback(
+    (
+      id: string,
+      patch: ProfileUpdateRequestDto,
+      onDone: () => void,
+    ) => {
+      setMutationError(null);
+      updateProfile.mutate(patch, {
+        onSuccess: () => {
+          reportFrontendEventSafely({
+            level: "INFO",
+            event_code: "profile.updated",
+            message: "Profile updated",
+            details: { id },
+          });
+          onDone();
+        },
+        onError: (err) => {
+          const msg = (err as Error)?.message ?? String(err);
+          setMutationError(msg);
+          reportFrontendEventSafely({
+            level: "ERROR",
+            event_code: "profile.update.failed",
+            message: "Profile update failed",
+            details: { id, error: msg },
+          });
+        },
+      });
+    },
+    [updateProfile],
+  );
+
+  const handleCreateSubmit = useCallback(() => {
+    const id = createForm.id.trim();
+    if (id === "") {
+      setMutationError("Profile ID cannot be empty.");
+      return;
+    }
+    setMutationError(null);
+    const payload: ProfileCreateRequestDto = {
+      id,
+      tools: parseTools(createForm.tools),
+      context_budget_tokens: createForm.context_budget_tokens ?? null,
+      timeout_seconds: createForm.timeout_seconds ?? null,
+      write_access: createForm.write_access,
+    };
+    createProfile.mutate(payload, {
+      onSuccess: () => {
+        reportFrontendEventSafely({
+          level: "INFO",
+          event_code: "profile.created",
+          message: "Profile created",
+          details: { id },
+        });
+        setCreateForm({
+          id: "",
+          tools: "",
+          context_budget_tokens: undefined,
+          timeout_seconds: undefined,
+          write_access: false,
+        });
+      },
+      onError: (err) => {
+        const msg = (err as Error)?.message ?? String(err);
+        setMutationError(msg);
+        reportFrontendEventSafely({
+          level: "ERROR",
+          event_code: "profile.create.failed",
+          message: "Profile create failed",
+          details: { id, error: msg },
+        });
+      },
+    });
+  }, [createForm, createProfile]);
+
   if (snapshotQuery.isLoading) {
     return <PageState kind="loading" title="Profiles" message="Loading profiles..." />;
   }
@@ -372,19 +385,6 @@ export function ProfilesSection() {
   return (
     <section className="settings-section">
       <h2>Profiles</h2>
-      {providersDegraded && (
-        <div className="settings-panel">
-          <SettingsRow
-            label="⚠ Warning"
-            control={
-              <SettingsValue
-                value="Provider list unavailable — binding checks disabled. Retry by reloading."
-                tone="warning"
-              />
-            }
-          />
-        </div>
-      )}
       {mutationError && (
         <div className="settings-panel">
           <SettingsRow
@@ -393,6 +393,90 @@ export function ProfilesSection() {
           />
         </div>
       )}
+
+      <div className="settings-panel">
+        <SettingsRow
+          layout="vertical"
+          label="Create Profile"
+          description="Add a new behavior-template profile. Provider/model binding is configured at the subagent level (spec §6)."
+          control={
+            <SettingsActionGroup direction="col">
+              <input
+                type="text"
+                className="input"
+                aria-label="Profile ID"
+                placeholder="my-profile"
+                value={createForm.id}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({ ...prev, id: v }));
+                }}
+              />
+              <input
+                type="text"
+                className="input"
+                aria-label="Tools for new profile"
+                placeholder="read, grep, glob"
+                value={createForm.tools}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({ ...prev, tools: v }));
+                }}
+              />
+              <input
+                type="number"
+                className="input"
+                aria-label="Context budget (tokens)"
+                placeholder="Context budget (tokens)"
+                value={createForm.context_budget_tokens ?? ""}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({
+                    ...prev,
+                    context_budget_tokens: v ? Number(v) : undefined,
+                  }));
+                }}
+              />
+              <input
+                type="number"
+                className="input"
+                aria-label="Timeout (seconds)"
+                placeholder="Timeout (seconds)"
+                value={createForm.timeout_seconds ?? ""}
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  setCreateForm((prev) => ({
+                    ...prev,
+                    timeout_seconds: v ? Number(v) : undefined,
+                  }));
+                }}
+              />
+              <label>
+                <input
+                  type="checkbox"
+                  checked={createForm.write_access}
+                  onChange={(e) => {
+                    const v = e.currentTarget.checked;
+                    setCreateForm((prev) => ({ ...prev, write_access: v }));
+                  }}
+                />
+                Write access
+              </label>
+              <SettingsActionGroup direction="row">
+                <button
+                  type="button"
+                  className="btn btn--primary btn--sm"
+                  onClick={handleCreateSubmit}
+                  disabled={createProfile.isPending}
+                >
+                  {createProfile.isPending ? "Creating..." : "Create Profile"}
+                </button>
+              </SettingsActionGroup>
+            </SettingsActionGroup>
+          }
+        />
+      </div>
+
       {profiles.length === 0 ? (
         <div className="settings-panel">
           <p>No profiles configured.</p>
@@ -402,18 +486,10 @@ export function ProfilesSection() {
           <ProfileRow
             key={profile.id}
             profile={profile}
-            providers={providers}
-            providersDegraded={providersDegraded}
-            isEditing={editingId === profile.id}
-            editProviderId={editProviderId}
-            editModel={editModel}
-            onEdit={handleEdit}
-            onEditChange={handleEditChange}
-            onEditSubmit={handleEditSubmit}
-            onEditCancel={handleEditCancel}
-            isEditPending={updateProfile.isPending}
-            onDelete={handleDelete}
             isDeletePending={deleteProfile.isPending}
+            isUpdatePending={updateProfile.isPending}
+            onDelete={handleDelete}
+            onSave={handleSave}
           />
         ))
       )}

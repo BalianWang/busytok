@@ -1,5 +1,22 @@
+use busytok_domain::ProviderKind;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+
+/// Deserialize helper for three-state `Option<Option<T>>` fields.
+///
+/// With plain `#[serde(default)]`, JSON `null` collapses to `None` (indistinguishable
+/// from an absent field), which breaks three-state patch semantics. Wrapping the
+/// inner deserialize in `Some(...)` preserves the distinction:
+///   - field absent  → `None`            (default; means "unchanged")
+///   - `null`        → `Some(None)`      (means "clear")
+///   - `"value"`     → `Some(Some(v))`   (means "update to v")
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 // ---------------------------------------------------------------------------
 // Request / Response envelope
@@ -1285,6 +1302,14 @@ pub struct SubagentDelegateRequestDto {
     pub model_override: Option<String>,
     pub source_harness: Option<String>,
     pub source_session_id: Option<String>,
+    /// Spec §3.3: when creating a new subagent, both must be provided
+    /// together ("both or neither" rule). Ignored when reusing an existing
+    /// subagent (by `subagent_id` or matched `subagent_name` + `cwd`) — the
+    /// subagent's stored bound fields are used instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1358,7 +1383,10 @@ pub struct SubagentDetailDto {
     pub branch: Option<String>,
     pub intent: Option<String>,
     pub default_profile: String,
-    pub default_model: Option<String>,
+    /// Spec §3.3: per-subagent provider/model binding (NOT NULL in store).
+    /// Replaces the former `default_model` field (Task 4).
+    pub bound_provider_id: String,
+    pub bound_model_id: String,
     pub status: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -1528,38 +1556,30 @@ pub struct ReceiptBrandDto {
 
 // ─── Provider DTOs (Phase 1: Credential Foundation) ───────────────────────
 
-/// Provider as seen by the GUI. `has_api_key` indicates keychain state
-/// without exposing the key itself.
+/// Provider as seen by the GUI. `has_api_key` indicates whether a key is
+/// stored in the provider catalog, without exposing the key itself.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderDto {
     pub id: String,
     pub name: String,
+    pub provider_kind: ProviderKind,
     pub base_url: String,
-    pub api_key_env_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url_env_name: Option<String>,
-    pub models: Vec<String>,
     pub enabled: bool,
-    /// True if an API key is stored in the keychain for this provider.
     pub has_api_key: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
-// NOTE: provider_kind is NOT exposed in the wire DTOs for MVP. The service
-// always uses ProviderKind::OpenAiCompatible internally. When more provider
-// kinds are added (Phase 3+), the DTO can expose an enum field.
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProviderCreateRequestDto {
-    pub id: String,
     pub name: String,
+    pub provider_kind: ProviderKind,
     pub base_url: String,
-    pub api_key_env_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url_env_name: Option<String>,
-    pub models: Vec<String>,
-    /// The actual API key. Stored in keychain, never persisted to settings.toml.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
     pub api_key: Option<String>,
 }
 
@@ -1571,19 +1591,105 @@ pub struct ProviderUpdateRequestDto {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// Env var name the sidecar reads for the API key. Editable provider field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_env_name: Option<String>,
-    /// Optional env var name for base URL override. Editable provider field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url_env_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// If provided, replaces the stored key. If None, key is unchanged.
+    /// Spec §7.1: patch the provider's `provider_kind` (which determines the
+    /// API shape — `openai_completions` vs `anthropic_messages`). Changing
+    /// `provider_kind` kills the worker so the next delegate re-spawns it
+    /// with the new API shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub provider_kind: Option<ProviderKind>,
+    // None=不改, Some(None)=清除, Some(Some(k))=更新
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_some"
+    )]
+    #[ts(type = "string | null | undefined")]
+    pub api_key: Option<Option<String>>,
+}
+
+// ─── Model Catalog DTOs (Phase 3: Provider/Model Catalog Refactor) ───────
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelCatalogEntryDto {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_kind: ProviderKind,
+    pub provider_enabled: bool,
+    pub model_db_id: String,
+    pub model_id: String,
+    pub model_enabled: bool,
+    pub tags: Vec<String>,
+    pub display_name: Option<String>,
+    pub reasoning: bool,
+    pub context_window: Option<i64>,
+    pub max_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelCreateRequestDto {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Required metadata (spec §6.1): caller must supply both at create time.
+    pub context_window: i64,
+    pub max_tokens: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelUpdateRequestDto {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelDeleteRequestDto {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelListRequestDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub include_disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelListResponseDto {
+    pub models: Vec<ModelCatalogEntryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelTagUpdateDto {
+    pub model_id: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1651,10 +1757,6 @@ pub struct ProfileDto {
     /// True if this is one of the 3 built-in profiles (pi/search-cheap, etc.).
     /// Derived by the service from `is_builtin_profile()` — not stored in config.
     pub is_builtin: bool,
-    /// Provider this profile runs on. None = unbound (delegate will reject).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    pub model: String,
     pub tools: Vec<String>,
     pub context_budget_tokens: u32,
     pub timeout_seconds: u64,
@@ -1665,9 +1767,6 @@ pub struct ProfileDto {
 #[serde(rename_all = "snake_case")]
 pub struct ProfileCreateRequestDto {
     pub id: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1678,16 +1777,11 @@ pub struct ProfileCreateRequestDto {
     pub write_access: Option<bool>,
 }
 
-/// Patch semantics: None = leave unchanged. For provider_id, Some("") = unbind.
+/// Patch semantics: None = leave unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub struct ProfileUpdateRequestDto {
     pub id: String,
-    /// Some("openai") = bind to openai; Some("") = unbind; None = unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1718,58 +1812,388 @@ mod tests {
         let dto = ProviderDto {
             id: "deepseek-prod".to_string(),
             name: "DeepSeek".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.deepseek.com/v1".to_string(),
-            api_key_env_name: "DEEPSEEK_API_KEY".to_string(),
-            base_url_env_name: None,
-            models: vec!["deepseek-chat".to_string()],
             enabled: true,
             has_api_key: true,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
         };
-        let json = serde_json::to_string(&dto).unwrap();
-        let parsed: ProviderDto = serde_json::from_str(&json).unwrap();
+        let json_str = serde_json::to_string(&dto).unwrap();
+        let parsed: ProviderDto = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.id, "deepseek-prod");
         assert!(parsed.has_api_key);
+        assert_eq!(parsed.provider_kind, ProviderKind::OpenAiCompatible);
+        // No bare `api_key` field on the wire — only `has_api_key`.
+        assert!(!json_str.contains("\"api_key\""));
+        let json: serde_json::Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["provider_kind"], "openai_compatible");
     }
 
     #[test]
-    fn provider_update_request_dto_round_trips_with_env_name_fields() {
-        // Spec §3.1: name, base_url, api_key_env_name and base_url_env_name are
-        // editable provider fields. The update DTO must carry the env-name fields
-        // so the edit-provider UI can patch them.
-        let dto = ProviderUpdateRequestDto {
-            id: "deepseek-prod".to_string(),
-            name: Some("DeepSeek".to_string()),
-            base_url: Some("https://api.deepseek.com/v1".to_string()),
-            api_key_env_name: Some("DEEPSEEK_API_KEY".to_string()),
-            base_url_env_name: Some("DEEPSEEK_BASE_URL".to_string()),
-            models: Some(vec!["deepseek-chat".to_string()]),
-            enabled: None,
-            api_key: None,
+    fn provider_dto_does_not_expose_api_key_field() {
+        // 严禁输出 api_key: ProviderDto has no api_key field at all.
+        let dto = ProviderDto {
+            id: "p".to_string(),
+            name: "P".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://example.com".to_string(),
+            enabled: true,
+            has_api_key: false,
+            created_at_ms: 0,
+            updated_at_ms: 0,
         };
         let json = serde_json::to_value(&dto).unwrap();
-        // snake_case wire names.
-        assert_eq!(json["id"], "deepseek-prod");
-        assert_eq!(json["api_key_env_name"], "DEEPSEEK_API_KEY");
-        assert_eq!(json["base_url_env_name"], "DEEPSEEK_BASE_URL");
-        // `None` fields are skipped on serialize (skip_serializing_if).
-        assert!(json.get("enabled").is_none());
+        // The only api_key-ish field is `has_api_key` (a bool flag).
         assert!(json.get("api_key").is_none());
+        assert_eq!(json["has_api_key"], false);
+    }
 
-        let parsed: ProviderUpdateRequestDto = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.id, "deepseek-prod");
-        assert_eq!(parsed.api_key_env_name.as_deref(), Some("DEEPSEEK_API_KEY"));
-        assert_eq!(
-            parsed.base_url_env_name.as_deref(),
-            Some("DEEPSEEK_BASE_URL")
-        );
+    #[test]
+    fn provider_create_request_dto_omits_id_and_defaults_api_key() {
+        // No `id` field: system generates UUID. api_key defaults to None.
+        let minimal: ProviderCreateRequestDto = serde_json::from_str(
+            r#"{"name":"DeepSeek","provider_kind":"openai_compatible","base_url":"https://api.deepseek.com/v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.name, "DeepSeek");
+        assert_eq!(minimal.provider_kind, ProviderKind::OpenAiCompatible);
+        assert!(minimal.api_key.is_none());
 
-        // An update payload that omits the env-name fields must still deserialize
-        // (they default to None — patch semantics: absent == unchanged).
-        let minimal: ProviderUpdateRequestDto =
-            serde_json::from_str(r#"{"id":"p","name":"P"}"#).unwrap();
-        assert_eq!(minimal.id, "p");
-        assert!(minimal.api_key_env_name.is_none());
-        assert!(minimal.base_url_env_name.is_none());
+        // `id` is not a known field — JSON with `id` must still deserialize
+        // (serde ignores unknown fields by default for these DTOs, but more
+        // importantly the struct itself has no `id` field).
+        let with_id: ProviderCreateRequestDto = serde_json::from_str(
+            r#"{"id":"should-be-ignored","name":"X","provider_kind":"openai_compatible","base_url":"u","api_key":"k"}"#,
+        )
+        .unwrap();
+        assert_eq!(with_id.name, "X");
+        assert_eq!(with_id.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn provider_update_request_dto_api_key_three_state() {
+        // None = unchanged: field omitted on wire.
+        let unchanged = ProviderUpdateRequestDto {
+            id: "p".to_string(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            provider_kind: None,
+            api_key: None,
+        };
+        let json = serde_json::to_value(&unchanged).unwrap();
+        assert!(json.get("api_key").is_none());
+        assert!(json.get("name").is_none());
+
+        // Some(None) = clear: serializes as JSON null.
+        let clear = ProviderUpdateRequestDto {
+            id: "p".to_string(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            provider_kind: None,
+            api_key: Some(None),
+        };
+        let json = serde_json::to_value(&clear).unwrap();
+        assert_eq!(json["api_key"], serde_json::Value::Null);
+
+        // Some(Some(k)) = update: serializes as the new key string.
+        let update = ProviderUpdateRequestDto {
+            id: "p".to_string(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            provider_kind: None,
+            api_key: Some(Some("new-key".to_string())),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["api_key"], "new-key");
+
+        // Round-trip each state.
+        let parsed_clear: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p","api_key":null}"#).unwrap();
+        assert_eq!(parsed_clear.api_key, Some(None));
+
+        let parsed_update: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p","api_key":"k"}"#).unwrap();
+        assert_eq!(parsed_update.api_key, Some(Some("k".to_string())));
+
+        // Absent on the wire deserializes to None (unchanged).
+        let parsed_absent: ProviderUpdateRequestDto =
+            serde_json::from_str(r#"{"id":"p"}"#).unwrap();
+        assert_eq!(parsed_absent.api_key, None);
+    }
+
+    #[test]
+    fn provider_update_request_dto_deserializes_provider_kind_patch() {
+        // Spec §7.1: `provider_kind` is a patch field — absent means
+        // unchanged, present updates the provider's API shape.
+        let json = serde_json::json!({
+            "id": "p1",
+            "provider_kind": "anthropic_compatible",
+        });
+        let dto: ProviderUpdateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(dto.provider_kind, Some(ProviderKind::AnthropicCompatible));
+
+        // Absent → None (unchanged).
+        let absent: ProviderUpdateRequestDto = serde_json::from_str(r#"{"id":"p1"}"#).unwrap();
+        assert_eq!(absent.provider_kind, None);
+    }
+
+    #[test]
+    fn delegate_request_dto_deserializes_bound_fields() {
+        // Spec §3.3: bound_provider_id + bound_model_id are optional on the
+        // wire (None = unchanged / reuse path). When creating a new subagent,
+        // the manager enforces "both or neither".
+        let json = serde_json::json!({
+            "subagent_name": "test",
+            "subagent_id": null,
+            "cwd": "/tmp",
+            "profile": "pi/search-cheap",
+            "intent": null,
+            "prompt": "hi",
+            "prompt_artifact_ref": null,
+            "timeout_seconds": null,
+            "model_override": null,
+            "source_harness": null,
+            "source_session_id": null,
+            "bound_provider_id": "prov-1",
+            "bound_model_id": "gpt-4o",
+        });
+        let dto: SubagentDelegateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(dto.bound_provider_id.as_deref(), Some("prov-1"));
+        assert_eq!(dto.bound_model_id.as_deref(), Some("gpt-4o"));
+
+        // Absent on the wire → None (reuse path or "both absent" create path).
+        let absent: SubagentDelegateRequestDto = serde_json::from_str(
+            r#"{"subagent_name":"t","subagent_id":null,"cwd":"/tmp","profile":"p","intent":null,"prompt":"hi","prompt_artifact_ref":null,"timeout_seconds":null,"model_override":null,"source_harness":null,"source_session_id":null}"#,
+        )
+        .unwrap();
+        assert!(absent.bound_provider_id.is_none());
+        assert!(absent.bound_model_id.is_none());
+
+        // `skip_serializing_if = Option::is_none` — None must NOT appear on
+        // the wire (keeps the JSON shape stable for old clients).
+        let none_dto = SubagentDelegateRequestDto {
+            subagent_name: "t".to_string(),
+            subagent_id: None,
+            cwd: "/tmp".to_string(),
+            profile: "p".to_string(),
+            intent: None,
+            prompt: "hi".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: None,
+            bound_model_id: None,
+        };
+        let json = serde_json::to_value(&none_dto).unwrap();
+        assert!(json.get("bound_provider_id").is_none());
+        assert!(json.get("bound_model_id").is_none());
+    }
+
+    #[test]
+    fn provider_kind_serializes_as_openai_compatible() {
+        let json = serde_json::to_value(ProviderKind::OpenAiCompatible).unwrap();
+        assert_eq!(json, "openai_compatible");
+        let parsed: ProviderKind = serde_json::from_str("\"openai_compatible\"").unwrap();
+        assert_eq!(parsed, ProviderKind::OpenAiCompatible);
+    }
+
+    #[test]
+    fn model_catalog_entry_dto_round_trips() {
+        let dto = ModelCatalogEntryDto {
+            provider_id: "prov-1".to_string(),
+            provider_name: "OpenAI".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "model-db-1".to_string(),
+            model_id: "gpt-4o".to_string(),
+            model_enabled: true,
+            tags: vec!["fast".to_string(), "cheap".to_string()],
+            display_name: Some("GPT-4o".to_string()),
+            reasoning: true,
+            context_window: Some(128_000),
+            max_tokens: Some(16_384),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["provider_id"], "prov-1");
+        assert_eq!(json["provider_kind"], "openai_compatible");
+        assert_eq!(json["model_db_id"], "model-db-1");
+        assert_eq!(json["model_id"], "gpt-4o");
+        assert_eq!(json["tags"][0], "fast");
+        assert_eq!(json["display_name"], "GPT-4o");
+        assert_eq!(json["reasoning"], true);
+        assert_eq!(json["context_window"], 128_000);
+        assert_eq!(json["max_tokens"], 16_384);
+        let parsed: ModelCatalogEntryDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.model_id, "gpt-4o");
+        assert_eq!(parsed.tags.len(), 2);
+        assert_eq!(parsed.reasoning, true);
+        assert_eq!(parsed.context_window, Some(128_000));
+    }
+
+    #[test]
+    fn model_create_request_dto_defaults() {
+        // context_window + max_tokens are required (no default). enabled +
+        // tags default when omitted; display_name + reasoning default to None.
+        let minimal: ModelCreateRequestDto = serde_json::from_str(
+            r#"{"provider_id":"p","model_id":"m","context_window":128000,"max_tokens":4096}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.provider_id, "p");
+        assert_eq!(minimal.model_id, "m");
+        assert!(minimal.enabled.is_none());
+        assert!(minimal.tags.is_empty());
+        assert_eq!(minimal.context_window, 128_000);
+        assert_eq!(minimal.max_tokens, 4_096);
+        assert!(minimal.display_name.is_none());
+        assert!(minimal.reasoning.is_none());
+
+        let full: ModelCreateRequestDto = serde_json::from_str(
+            r#"{"provider_id":"p","model_id":"m","enabled":true,"tags":["t1"],"context_window":128000,"max_tokens":4096,"display_name":"GPT-4o","reasoning":true}"#,
+        )
+        .unwrap();
+        assert_eq!(full.enabled, Some(true));
+        assert_eq!(full.tags, vec!["t1".to_string()]);
+        assert_eq!(full.display_name.as_deref(), Some("GPT-4o"));
+        assert_eq!(full.reasoning, Some(true));
+    }
+
+    #[test]
+    fn model_create_request_dto_requires_metadata() {
+        // Missing context_window + max_tokens → should fail to deserialize.
+        let json = serde_json::json!({
+            "provider_id": "p1",
+            "model_id": "gpt-4o",
+        });
+        let result: Result<ModelCreateRequestDto, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn model_update_request_dto_patch_semantics() {
+        let noop: ModelUpdateRequestDto = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
+        assert_eq!(noop.id, "m");
+        assert!(noop.enabled.is_none());
+        assert!(noop.display_name.is_none());
+        assert!(noop.reasoning.is_none());
+        assert!(noop.context_window.is_none());
+        assert!(noop.max_tokens.is_none());
+
+        let patch = ModelUpdateRequestDto {
+            id: "m".to_string(),
+            enabled: Some(false),
+            display_name: Some("GPT-4o".to_string()),
+            reasoning: Some(true),
+            context_window: Some(128_000),
+            max_tokens: Some(4_096),
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["display_name"], "GPT-4o");
+        assert_eq!(json["reasoning"], true);
+        assert_eq!(json["context_window"], 128_000);
+        assert_eq!(json["max_tokens"], 4_096);
+        let parsed: ModelUpdateRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.enabled, Some(false));
+        assert_eq!(parsed.display_name.as_deref(), Some("GPT-4o"));
+        assert_eq!(parsed.reasoning, Some(true));
+        assert_eq!(parsed.context_window, Some(128_000));
+        assert_eq!(parsed.max_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn model_delete_request_dto_round_trips() {
+        let dto = ModelDeleteRequestDto {
+            id: "m".to_string(),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json, serde_json::json!({"id": "m"}));
+        let back: ModelDeleteRequestDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id, "m");
+    }
+
+    #[test]
+    fn model_list_request_dto_defaults() {
+        let minimal: ModelListRequestDto = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(minimal.provider_id.is_none());
+        assert!(minimal.tags.is_empty());
+        assert!(!minimal.include_disabled);
+
+        let full: ModelListRequestDto =
+            serde_json::from_str(r#"{"provider_id":"p","tags":["fast"],"include_disabled":true}"#)
+                .unwrap();
+        assert_eq!(full.provider_id.as_deref(), Some("p"));
+        assert_eq!(full.tags, vec!["fast".to_string()]);
+        assert!(full.include_disabled);
+
+        // provider_id=None is skipped on serialize.
+        let json = serde_json::to_value(&minimal).unwrap();
+        assert!(json.get("provider_id").is_none());
+    }
+
+    #[test]
+    fn model_list_response_dto_round_trips() {
+        let dto = ModelListResponseDto {
+            models: vec![ModelCatalogEntryDto {
+                provider_id: "p".to_string(),
+                provider_name: "P".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                provider_enabled: true,
+                model_db_id: "mdb".to_string(),
+                model_id: "m".to_string(),
+                model_enabled: true,
+                tags: vec![],
+                display_name: None,
+                reasoning: false,
+                context_window: None,
+                max_tokens: None,
+            }],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["models"][0]["model_id"], "m");
+        let parsed: ModelListResponseDto = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.models.len(), 1);
+    }
+
+    #[test]
+    fn model_tag_update_dto_round_trips() {
+        let dto = ModelTagUpdateDto {
+            model_id: "m".to_string(),
+            tags: vec!["a".to_string(), "b".to_string()],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["model_id"], "m");
+        assert_eq!(json["tags"][0], "a");
+        let back: ModelTagUpdateDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn provider_list_response_dto_round_trips() {
+        let dto = ProviderListResponseDto {
+            providers: vec![ProviderDto {
+                id: "p1".to_string(),
+                name: "OpenAI".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_string(),
+                enabled: true,
+                has_api_key: true,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            }],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["providers"][0]["id"], "p1");
+        assert_eq!(json["providers"][0]["has_api_key"], true);
+        let back: ProviderListResponseDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.providers.len(), 1);
+        assert_eq!(back.providers[0].name, "OpenAI");
+        assert!(back.providers[0].has_api_key);
     }
 
     #[test]
@@ -1823,6 +2247,37 @@ mod tests {
 
         let err: Result<WeekdayIndexDto, _> = serde_json::from_str("7");
         assert!(err.is_err());
+    }
+
+    /// `from_u8` returns `None` for out-of-range values (> 6) and `Some` for
+    /// each valid weekday index 0..=6.
+    #[test]
+    fn weekday_index_dto_from_u8_bounds() {
+        // Valid range 0..=6 — each maps to a Some variant.
+        for v in 0..=6u8 {
+            let parsed = WeekdayIndexDto::from_u8(v);
+            assert!(parsed.is_some(), "expected Some for v={v}");
+            assert_eq!(parsed.unwrap().value(), v);
+        }
+        // Out-of-range values return None.
+        assert!(WeekdayIndexDto::from_u8(7).is_none());
+        assert!(WeekdayIndexDto::from_u8(255).is_none());
+    }
+
+    /// `ControlError::new` builds the canonical error payload with `payload`
+    /// defaulting to `None` (Task 5 control contract).
+    #[test]
+    fn control_error_new_sets_code_and_message_with_no_payload() {
+        let e = ControlError::new("subagent.not_found", "no such subagent");
+        assert_eq!(e.code, "subagent.not_found");
+        assert_eq!(e.message, "no such subagent");
+        assert!(e.payload.is_none(), "payload must default to None");
+        // Round-trip through JSON so the wire contract is stable.
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"code\":\"subagent.not_found\""));
+        assert!(s.contains("\"message\":\"no such subagent\""));
+        // `payload` is skip_serializing_if = None, so it must not appear.
+        assert!(!s.contains("payload"));
     }
 
     #[test]
@@ -2046,8 +2501,6 @@ mod tests {
         let dto = ProfileDto {
             id: "pi/search-cheap".to_string(),
             is_builtin: true,
-            provider_id: Some("deepseek-prod".to_string()),
-            model: "deepseek-chat".to_string(),
             tools: vec!["read".to_string(), "write".to_string()],
             context_budget_tokens: 8000,
             timeout_seconds: 30,
@@ -2057,7 +2510,6 @@ mod tests {
         // snake_case wire names.
         assert_eq!(json["id"], "pi/search-cheap");
         assert_eq!(json["is_builtin"], true);
-        assert_eq!(json["provider_id"], "deepseek-prod");
         assert_eq!(json["context_budget_tokens"], 8000);
         assert_eq!(json["timeout_seconds"], 30);
         assert_eq!(json["write_access"], false);
@@ -2065,38 +2517,34 @@ mod tests {
         let parsed: ProfileDto = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.id, "pi/search-cheap");
         assert!(parsed.is_builtin);
-        assert_eq!(parsed.provider_id.as_deref(), Some("deepseek-prod"));
         assert_eq!(parsed.tools, vec!["read".to_string(), "write".to_string()]);
     }
 
     #[test]
-    fn profile_dto_unbound_provider_omits_field() {
-        // Unbound profile: provider_id = None must be skipped on serialize.
+    fn profile_dto_has_no_provider_or_model_fields() {
+        // Profile downgrade: provider_id and model fields are gone — verifying
+        // that deserialization still succeeds when these fields are absent.
         let dto = ProfileDto {
             id: "draft".to_string(),
             is_builtin: false,
-            provider_id: None,
-            model: "gpt-4o".to_string(),
             tools: vec![],
             context_budget_tokens: 4096,
             timeout_seconds: 60,
             write_access: true,
         };
         let json = serde_json::to_value(&dto).unwrap();
+        // provider_id and model fields no longer exist on the wire.
         assert!(json.get("provider_id").is_none());
-        // Round-trips with provider_id absent in JSON.
+        assert!(json.get("model").is_none());
         let parsed: ProfileDto = serde_json::from_value(json).unwrap();
-        assert!(parsed.provider_id.is_none());
+        assert_eq!(parsed.id, "draft");
     }
 
     #[test]
     fn profile_create_request_dto_defaults_omitted_fields() {
-        // Only `id` and `model` are required; everything else is optional.
-        let minimal: ProfileCreateRequestDto =
-            serde_json::from_str(r#"{"id":"p","model":"m"}"#).unwrap();
+        // Only `id` is required; everything else is optional.
+        let minimal: ProfileCreateRequestDto = serde_json::from_str(r#"{"id":"p"}"#).unwrap();
         assert_eq!(minimal.id, "p");
-        assert_eq!(minimal.model, "m");
-        assert!(minimal.provider_id.is_none());
         assert!(minimal.tools.is_none());
         assert!(minimal.context_budget_tokens.is_none());
         assert!(minimal.timeout_seconds.is_none());
@@ -2104,8 +2552,6 @@ mod tests {
 
         let full = ProfileCreateRequestDto {
             id: "p2".to_string(),
-            model: "gpt-4o".to_string(),
-            provider_id: Some("openai".to_string()),
             tools: Some(vec!["read".to_string()]),
             context_budget_tokens: Some(16000),
             timeout_seconds: Some(120),
@@ -2113,38 +2559,32 @@ mod tests {
         };
         let json = serde_json::to_value(&full).unwrap();
         // Optional fields present when set.
-        assert_eq!(json["provider_id"], "openai");
         assert_eq!(json["context_budget_tokens"], 16000);
         assert_eq!(json["write_access"], true);
     }
 
     #[test]
     fn profile_update_request_dto_patch_semantics() {
-        // None = leave unchanged. Empty string on provider_id = unbind.
+        // None = leave unchanged. All fields optional.
         let patch = ProfileUpdateRequestDto {
             id: "p".to_string(),
-            provider_id: Some(String::new()), // unbind
-            model: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
             write_access: None,
         };
         let json = serde_json::to_value(&patch).unwrap();
-        assert_eq!(json["provider_id"], "");
         // None fields skipped.
-        assert!(json.get("model").is_none());
         assert!(json.get("tools").is_none());
         assert!(json.get("write_access").is_none());
 
         let parsed: ProfileUpdateRequestDto = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.provider_id.as_deref(), Some(""));
-        assert!(parsed.model.is_none());
+        assert!(parsed.tools.is_none());
 
         // Minimal patch with just an id is valid (no-op update).
         let noop: ProfileUpdateRequestDto = serde_json::from_str(r#"{"id":"p"}"#).unwrap();
         assert_eq!(noop.id, "p");
-        assert!(noop.provider_id.is_none());
+        assert!(noop.tools.is_none());
     }
 
     #[test]
@@ -2201,8 +2641,6 @@ mod tests {
             profiles: vec![ProfileDto {
                 id: "pi/search-cheap".to_string(),
                 is_builtin: true,
-                provider_id: Some("deepseek-prod".to_string()),
-                model: "deepseek-chat".to_string(),
                 tools: vec!["read".to_string()],
                 context_budget_tokens: 8000,
                 timeout_seconds: 30,

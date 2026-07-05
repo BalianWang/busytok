@@ -90,7 +90,8 @@ pub struct LogicalSubagent {
     pub branch: Option<String>,
     pub intent: Option<String>,
     pub default_profile: String,
-    pub default_model: Option<String>,
+    pub bound_provider_id: String,
+    pub bound_model_id: String,
     pub status: SubagentStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -139,6 +140,10 @@ pub struct DelegateRequest {
     pub model_override: Option<String>,
     pub source_harness: Option<String>,
     pub source_session_id: Option<String>,
+    /// Spec §3.3: when creating a new subagent, both must be provided
+    /// together. Ignored when reusing an existing subagent.
+    pub bound_provider_id: Option<String>,
+    pub bound_model_id: Option<String>,
 }
 
 /// Resolution params for single-subagent operations (show/tasks/hibernate/delete).
@@ -262,6 +267,30 @@ mod tests {
                     assert_ne!(a, b, "variants {a:?} and {b:?} must be distinct");
                 }
             }
+        }
+    }
+
+    /// `as_str()` returns the stable snake_case string used for DB persistence
+    /// (Task 5). It must match the `#[serde(rename_all = "snake_case")]`
+    /// serialization so the value stored in `subagent_tasks.error_kind` is the
+    /// same string serde_json would emit.
+    #[test]
+    fn task_error_kind_as_str_matches_serde() {
+        let cases = [
+            (TaskErrorKind::Auth, "auth"),
+            (TaskErrorKind::RateLimit, "rate_limit"),
+            (TaskErrorKind::Timeout, "timeout"),
+            (TaskErrorKind::Crash, "crash"),
+            (TaskErrorKind::Network, "network"),
+            (TaskErrorKind::Unknown, "unknown"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected, "as_str mismatch for {kind:?}");
+            // Cross-check: as_str() must equal the serde serialization
+            // (without the surrounding quotes).
+            let serde = serde_json::to_string(&kind).unwrap();
+            let stripped = serde.trim_matches('"');
+            assert_eq!(kind.as_str(), stripped, "as_str != serde for {kind:?}");
         }
     }
 }

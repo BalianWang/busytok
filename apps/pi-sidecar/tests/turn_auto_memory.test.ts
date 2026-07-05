@@ -30,6 +30,7 @@ describe('turn_auto memory_update + structured params', () => {
       prompt: 'check auth',
       cwd: '/repo',
       profile: 'pi/review-cheap',
+      model: 'test-model',
     } as any) as any;
     expect(result.result.memory_update).toBeDefined();
     expect(result.result.memory_update.current_state_summary).toContain('memory update');
@@ -47,6 +48,7 @@ describe('turn_auto memory_update + structured params', () => {
       prompt: 'check auth',
       cwd: '/repo',
       profile: 'pi/review-cheap',
+      model: 'test-model',
     } as any) as any;
     expect(result.result.memory_update).toBeUndefined();
   });
@@ -60,6 +62,7 @@ describe('turn_auto memory_update + structured params', () => {
       prompt: 'check auth',
       cwd: '/repo',
       profile: 'pi/review-cheap',
+      model: 'test-model',
       memory: {
         hot_summary: 'prev state',
         key_files: [{ path: 'src/a.ts', reason: 'r', last_seen_at_ms: 1, score: 1 }],

@@ -13,6 +13,7 @@ await esbuild.build({
   outfile: 'dist/pi-sidecar.bundle.js',
   sourcemap: false,
   minify: false,
+  external: ['@earendil-works/pi-coding-agent'],
   banner: {
     js: '// @busytok/pi-sidecar — auto-generated CJS bundle. Do not edit.',
   },

@@ -2,9 +2,12 @@ import { useCallback, useMemo, useState } from "react";
 import type {
   ProviderCreateRequestDto,
   ProviderDto,
+  ProviderKind,
   ProviderTestConnectionResponseDto,
+  ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
 import { useProviderMutations, useProviders } from "../api/useBusytokData";
+import { ModelsSection } from "../components/ModelsSection";
 import { PageState } from "../components/PageState";
 import { ProfilesSection } from "../components/ProfilesSection";
 import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
@@ -13,46 +16,46 @@ import { SettingsValue } from "../components/desktop/SettingsValue";
 import { ToggleSwitch } from "../components/desktop/ToggleSwitch";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
-function parseModels(input: string): string[] {
-  return input
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-}
-
-function modelsLabel(models: string[]): string {
-  if (models.length === 0) return "None";
-  return models.join(", ");
-}
-
-// ── Provider form (inline add) ──────────────────────────────────────
+// ── Provider form (inline add + inline edit) ────────────────────────
+//
+// Create fields (Spec §3.2): name, base_url, api_key (password),
+// provider_kind (selector — openai_compatible / anthropic_compatible).
+// `id` is system-generated (UUID v4) by the backend; the form never
+// collects it.
+//
+// Edit fields: name, base_url, provider_kind. `enabled` has its own
+// toggle on the row; `api_key` has its own Update Key flow; `id` is
+// immutable. Per Spec §7.1, patching `provider_kind` is allowed and
+// kills the worker so the next delegate re-spawns with the new API
+// shape — so the edit form exposes it as a selector.
 
 interface ProviderFormState {
-  id: string;
   name: string;
   base_url: string;
-  api_key_env_name: string;
-  models: string;
   api_key: string;
+  enabled: boolean;
+  /**
+   * Empty string until the user picks a kind from the selector. The
+   * submit handler blocks create when this is "".
+   */
+  provider_kind: ProviderKind | "";
 }
 
 const EMPTY_FORM: ProviderFormState = {
-  id: "",
   name: "",
   base_url: "",
-  api_key_env_name: "",
-  models: "",
   api_key: "",
+  enabled: true,
+  provider_kind: "",
 };
 
 interface ProviderFormProps {
   form: ProviderFormState;
   /**
-   * `create` shows the full field set (id + api_key). `edit` hides the immutable
-   * `id` (Spec §3.1: "editable only on create") and the `api_key` field, which
-   * has its own dedicated Update Key flow on the provider row.
+   * `create` shows the api_key field (initial key set). `edit` hides it —
+   * the api_key has its own Update Key flow on the provider row, and per
+   * the three-state `Option<Option<String>>` contract omitting it from
+   * the patch payload means "no change".
    */
   mode: "create" | "edit";
   onChange: (patch: Partial<ProviderFormState>) => void;
@@ -71,23 +74,6 @@ function ProviderForm({
 }: ProviderFormProps) {
   return (
     <div className="settings-panel">
-      {mode === "create" && (
-        <SettingsRow
-          layout="vertical"
-          label="Provider ID"
-          description="Unique identifier for this provider (e.g. deepseek-prod). Cannot be changed after creation."
-          control={
-            <input
-              type="text"
-              className="input"
-              aria-label="Provider ID"
-              placeholder="deepseek-prod"
-              value={form.id}
-              onChange={(e) => onChange({ id: e.currentTarget.value })}
-            />
-          }
-        />
-      )}
       <SettingsRow
         layout="vertical"
         label="Name"
@@ -118,43 +104,11 @@ function ProviderForm({
           />
         }
       />
-      <SettingsRow
-        layout="vertical"
-        label="API Key Env Name"
-        description="Environment variable name that holds the API key at runtime."
-        control={
-          <input
-            type="text"
-            className="input"
-            aria-label="API Key Env Name"
-            placeholder="DEEPSEEK_API_KEY"
-            value={form.api_key_env_name}
-            onChange={(e) =>
-              onChange({ api_key_env_name: e.currentTarget.value })
-            }
-          />
-        }
-      />
-      <SettingsRow
-        layout="vertical"
-        label="Models"
-        description="Comma-separated list of model IDs available through this provider."
-        control={
-          <input
-            type="text"
-            className="input"
-            aria-label="Models"
-            placeholder="deepseek-chat, deepseek-reasoner"
-            value={form.models}
-            onChange={(e) => onChange({ models: e.currentTarget.value })}
-          />
-        }
-      />
       {mode === "create" && (
         <SettingsRow
           layout="vertical"
           label="API Key"
-          description="The actual API key. Stored in the system keychain, never written to settings.toml."
+          description="The actual API key. Stored in the provider catalog database, never written to settings.toml."
           control={
             <input
               type="password"
@@ -163,6 +117,40 @@ function ProviderForm({
               placeholder="Enter API key"
               value={form.api_key}
               onChange={(e) => onChange({ api_key: e.currentTarget.value })}
+            />
+          }
+        />
+      )}
+      <SettingsRow
+        layout="vertical"
+        label="Kind"
+        description="API shape: OpenAI-compatible (chat/completions) or Anthropic-compatible (messages)."
+        control={
+          <select
+            className="input"
+            aria-label="Kind"
+            value={form.provider_kind}
+            onChange={(e) =>
+              onChange({
+                provider_kind: e.currentTarget.value as ProviderKind | "",
+              })
+            }
+          >
+            <option value="">— Select kind —</option>
+            <option value="openai_compatible">OpenAI Compatible</option>
+            <option value="anthropic_compatible">Anthropic Compatible</option>
+          </select>
+        }
+      />
+      {mode === "create" && (
+        <SettingsRow
+          label="Enabled"
+          description="Disabled providers are excluded from the model catalog and sidecar routing."
+          control={
+            <ToggleSwitch
+              checked={form.enabled}
+              onChange={(checked) => onChange({ enabled: checked })}
+              aria-label="Enabled"
             />
           }
         />
@@ -204,7 +192,7 @@ interface ProviderRowProps {
   onToggleEnabled: (provider: ProviderDto) => void;
   onDelete: (provider: ProviderDto) => void;
   onUpdateApiKey: (id: string, apiKey: string) => void;
-  // Inline edit mode (Plan Task 6: editable on update, id immutable).
+  // Inline edit mode. `id` is immutable and shown read-only in edit mode.
   isEditing: boolean;
   editForm: ProviderFormState;
   isEditPending: boolean;
@@ -243,9 +231,6 @@ function ProviderRow({
     setApiKeyInput("");
   };
 
-  // Edit mode replaces the read-only field view with the inline edit form.
-  // The toggle / api-key-update / test / delete actions remain available in
-  // view mode; the Edit button is the entry point into edit mode.
   if (isEditing) {
     return (
       <div className="settings-panel">
@@ -255,6 +240,11 @@ function ProviderRow({
             <p>Update provider metadata. Provider ID is immutable. API key has its own Update Key flow when not editing.</p>
           </div>
         </div>
+        <SettingsRow
+          label="Provider ID"
+          description="System-generated UUID; cannot be changed."
+          control={<SettingsValue value={provider.id} tone="muted" />}
+        />
         <ProviderForm
           form={editForm}
           mode="edit"
@@ -286,14 +276,16 @@ function ProviderRow({
         }
       />
       <SettingsRow
-        label="Base URL"
-        control={<SettingsValue value={provider.base_url} tone="muted" />}
+        label="Provider ID"
+        control={<SettingsValue value={provider.id} tone="muted" />}
       />
       <SettingsRow
-        label="Models"
-        control={
-          <SettingsValue value={modelsLabel(provider.models)} tone="default" />
-        }
+        label="Kind"
+        control={<SettingsValue value={provider.provider_kind} tone="muted" />}
+      />
+      <SettingsRow
+        label="Base URL"
+        control={<SettingsValue value={provider.base_url} tone="muted" />}
       />
       <SettingsRow
         label="API Key"
@@ -390,8 +382,8 @@ export function ProvidersPage() {
   >({});
   const [mutationError, setMutationError] = useState<string | null>(null);
   // Inline edit state. `editingId` is null in view mode; setting it to a
-  // provider id swaps that row into the edit form (Plan Task 6: editable on
-  // update; id is immutable and omitted from the edit form).
+  // provider id swaps that row into the edit form (id is immutable and
+  // shown read-only in edit mode).
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<ProviderFormState>(EMPTY_FORM);
 
@@ -405,13 +397,18 @@ export function ProvidersPage() {
   }, []);
 
   const handleFormSubmit = useCallback(() => {
+    // Create payload (Spec §3.2): name + base_url + api_key + provider_kind.
+    // id is system-generated. Empty api_key is sent as null
+    // (Some(None) = "no key on create").
+    if (form.provider_kind === "") {
+      setMutationError("Select a provider kind before saving.");
+      return;
+    }
     const payload: ProviderCreateRequestDto = {
-      id: form.id.trim(),
       name: form.name.trim(),
+      provider_kind: form.provider_kind,
       base_url: form.base_url.trim(),
-      api_key_env_name: form.api_key_env_name.trim(),
-      base_url_env_name: null,
-      models: parseModels(form.models),
+      enabled: form.enabled,
       api_key: form.api_key.length > 0 ? form.api_key : null,
     };
     setMutationError(null);
@@ -421,7 +418,7 @@ export function ProvidersPage() {
           level: "INFO",
           event_code: "provider.added",
           message: "Provider added",
-          details: { id: payload.id, name: payload.name },
+          details: { name: payload.name },
         });
         setForm(EMPTY_FORM);
         setShowForm(false);
@@ -441,12 +438,11 @@ export function ProvidersPage() {
   const handleStartEdit = useCallback((provider: ProviderDto) => {
     setMutationError(null);
     setEditForm({
-      id: provider.id, // immutable; not rendered in edit mode
       name: provider.name,
       base_url: provider.base_url,
-      api_key_env_name: provider.api_key_env_name,
-      models: provider.models.join(", "),
       api_key: "", // unused in edit mode (separate Update Key flow)
+      enabled: provider.enabled,
+      provider_kind: provider.provider_kind,
     });
     setEditingId(provider.id);
   }, []);
@@ -458,31 +454,31 @@ export function ProvidersPage() {
   const handleEditSubmit = useCallback(() => {
     if (editingId === null) return;
     const id = editingId;
+    if (editForm.provider_kind === "") {
+      setMutationError("Select a provider kind before saving.");
+      return;
+    }
     setMutationError(null);
-    // Send all editable fields (simpler than per-field null patching; the
-    // backend treats present fields as "set to this value"). enabled / api_key
-    // / base_url_env_name are left null (unchanged) — enabled has its own
-    // toggle and api_key has its own Update Key flow.
-    updateProvider.mutate(
-      {
-        id,
-        name: editForm.name.trim(),
-        base_url: editForm.base_url.trim(),
-        api_key_env_name: editForm.api_key_env_name.trim(),
-        base_url_env_name: null,
-        models: parseModels(editForm.models),
-        enabled: null,
-        api_key: null,
+    // Three-state api_key contract: OMIT api_key/enabled from the patch
+    // so the backend treats them as "no change". Only name + base_url +
+    // provider_kind are editable in the inline form. Cast `as
+    // ProviderUpdateRequestDto` — the generated TS type marks the omitted
+    // fields as required (`| null`), but the wire protocol treats absent
+    // keys as `None`.
+    const payload = {
+      id,
+      name: editForm.name.trim(),
+      base_url: editForm.base_url.trim(),
+      provider_kind: editForm.provider_kind,
+    } as ProviderUpdateRequestDto;
+    updateProvider.mutate(payload, {
+      onSuccess: () => {
+        setEditingId(null);
       },
-      {
-        onSuccess: () => {
-          setEditingId(null);
-        },
-        onError: (err: unknown) => {
-          setMutationError((err as Error)?.message ?? String(err));
-        },
+      onError: (err: unknown) => {
+        setMutationError((err as Error)?.message ?? String(err));
       },
-    );
+    });
   }, [editForm, editingId, updateProvider]);
 
   const handleEditCancel = useCallback(() => {
@@ -493,23 +489,16 @@ export function ProvidersPage() {
   const handleToggleEnabled = useCallback(
     (provider: ProviderDto) => {
       setMutationError(null);
-      updateProvider.mutate(
-        {
-          id: provider.id,
-          enabled: !provider.enabled,
-          name: null,
-          base_url: null,
-          api_key_env_name: null,
-          base_url_env_name: null,
-          models: null,
-          api_key: null,
+      // Omit name/base_url/api_key so the backend preserves them.
+      const payload = {
+        id: provider.id,
+        enabled: !provider.enabled,
+      } as ProviderUpdateRequestDto;
+      updateProvider.mutate(payload, {
+        onError: (err: unknown) => {
+          setMutationError((err as Error)?.message ?? String(err));
         },
-        {
-          onError: (err: unknown) => {
-            setMutationError((err as Error)?.message ?? String(err));
-          },
-        },
-      );
+      });
     },
     [updateProvider],
   );
@@ -517,23 +506,17 @@ export function ProvidersPage() {
   const handleUpdateApiKey = useCallback(
     (id: string, apiKey: string) => {
       setMutationError(null);
-      updateProvider.mutate(
-        {
-          id,
-          api_key: apiKey,
-          enabled: null,
-          name: null,
-          base_url: null,
-          api_key_env_name: null,
-          base_url_env_name: null,
-          models: null,
+      // Omit name/base_url/enabled so the backend preserves them. Sending
+      // api_key as a string = Some(Some("...")) = update the key.
+      const payload = {
+        id,
+        api_key: apiKey,
+      } as ProviderUpdateRequestDto;
+      updateProvider.mutate(payload, {
+        onError: (err: unknown) => {
+          setMutationError((err as Error)?.message ?? String(err));
         },
-        {
-          onError: (err: unknown) => {
-            setMutationError((err as Error)?.message ?? String(err));
-          },
-        },
-      );
+      });
     },
     [updateProvider],
   );
@@ -716,6 +699,7 @@ export function ProvidersPage() {
             ))}
           </section>
         )}
+        <ModelsSection />
         <ProfilesSection />
       </div>
     </div>

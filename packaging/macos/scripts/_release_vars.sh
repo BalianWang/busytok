@@ -25,4 +25,4 @@ unsigned_dmg_path() {
 # Phase 5: Node runtime version bundled into the .app for the pi-sidecar.
 # Pinned to a specific major.minor.patch from nodejs.org. Bump explicitly;
 # there is no auto-update (spec §419 deferred).
-SIDECAR_NODE_VERSION="22.6.0"
+SIDECAR_NODE_VERSION="22.23.1"

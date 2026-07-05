@@ -7,6 +7,7 @@ use crate::error::{Result, SubagentError};
 use crate::models::LogicalSubagent;
 
 /// Resolved identity for a delegate request.
+#[derive(Debug)]
 pub struct Resolved {
     pub subagent: LogicalSubagent,
     pub created: bool,
@@ -20,7 +21,8 @@ pub fn resolve_by_name(
     name: &str,
     cwd: &str,
     default_profile: &str,
-    default_model: Option<&str>,
+    bound_provider_id: &str,
+    bound_model_id: &str,
 ) -> Result<Resolved> {
     if !LogicalSubagent::is_valid_name(name) {
         return Err(SubagentError::InvalidName(name.to_string()));
@@ -45,23 +47,71 @@ pub fn resolve_by_name(
         .filter(|r| r.status != "deleted")
         .collect();
     match active.len() {
-        0 => Ok(Resolved {
-            subagent: create_subagent(
-                db,
-                name,
-                &canonical_cwd,
-                &repo_hash,
-                default_profile,
-                default_model,
-            )?,
-            created: true,
-        }),
+        0 => {
+            // Creation path (spec §3.3 strict): both bound fields MUST be
+            // provided and validated against the provider/model catalog.
+            // Empty strings are a programming error — the manager's
+            // `delegate()` passes empty strings only when the caller supplied
+            // `(None, None)`, which is valid for the reuse path but rejected
+            // here for creation. There is no "create without binding" path.
+            if bound_provider_id.is_empty() || bound_model_id.is_empty() {
+                return Err(SubagentError::Validation(
+                    "bound_provider_id and bound_model_id are both required to create a subagent"
+                        .into(),
+                ));
+            }
+            validate_bound_provider_model(db, bound_provider_id, bound_model_id)?;
+            Ok(Resolved {
+                subagent: create_subagent(
+                    db,
+                    name,
+                    &canonical_cwd,
+                    &repo_hash,
+                    default_profile,
+                    bound_provider_id,
+                    bound_model_id,
+                )?,
+                created: true,
+            })
+        }
         1 => Ok(Resolved {
             subagent: row_to_model(&active[0]),
             created: false,
         }),
         _ => Err(SubagentError::AmbiguousName(name.to_string())),
     }
+}
+
+/// Spec §3.3 creation-time validation: the bound provider must exist + be
+/// enabled, and the bound model must exist + be enabled under that provider.
+/// Called BEFORE inserting the logical subagent row so a failed validation
+/// never writes a half-bound row to the DB.
+fn validate_bound_provider_model(
+    db: &busytok_store::Database,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<()> {
+    let provider = db
+        .get_provider_with_secret(provider_id)
+        .map_err(SubagentError::Store)?
+        .ok_or_else(|| SubagentError::Validation(format!("provider not found: {provider_id}")))?;
+    if !provider.enabled {
+        return Err(SubagentError::Validation(format!(
+            "provider disabled: {provider_id}"
+        )));
+    }
+    let model = db
+        .get_model_by_provider_and_model_id(provider_id, model_id)
+        .map_err(SubagentError::Store)?
+        .ok_or_else(|| {
+            SubagentError::Validation(format!("model not found in provider: {model_id}"))
+        })?;
+    if !model.enabled {
+        return Err(SubagentError::Validation(format!(
+            "model disabled: {model_id}"
+        )));
+    }
+    Ok(())
 }
 
 /// Look up by UUID directly. Tombstoned (`status='deleted'`) subagents are
@@ -143,7 +193,8 @@ fn create_subagent(
     cwd: &str,
     repo_hash: &str,
     default_profile: &str,
-    default_model: Option<&str>,
+    bound_provider_id: &str,
+    bound_model_id: &str,
 ) -> Result<LogicalSubagent> {
     let now = busytok_domain::now_ms();
     // Plain UUID v4 (spec §3.2). The adapter_session_id/task_id prefixes are
@@ -158,7 +209,8 @@ fn create_subagent(
         branch: None,
         intent: None,
         default_profile: default_profile.to_string(),
-        default_model: default_model.map(|s| s.to_string()),
+        bound_provider_id: bound_provider_id.to_string(),
+        bound_model_id: bound_model_id.to_string(),
         status: "cold".to_string(),
         created_at_ms: now,
         updated_at_ms: now,
@@ -182,7 +234,8 @@ pub fn row_to_model(r: &SubagentLogicalSubagentRow) -> LogicalSubagent {
         branch: r.branch.clone(),
         intent: r.intent.clone(),
         default_profile: r.default_profile.clone(),
-        default_model: r.default_model.clone(),
+        bound_provider_id: r.bound_provider_id.clone(),
+        bound_model_id: r.bound_model_id.clone(),
         status: r.status.parse().unwrap_or_else(|s| {
             tracing::warn!(
                 event_code = "subagent.session.parse_status_failed",

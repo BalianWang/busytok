@@ -1110,7 +1110,7 @@ fn health_check_returns_healthy_on_fresh_db() {
     let info = db.health_check().unwrap();
     assert!(info.healthy, "fresh db should be healthy");
     assert_eq!(info.integrity_message, "ok");
-    assert_eq!(info.migration_version, 5);
+    assert_eq!(info.migration_version, 7);
     assert!(info.db_size_bytes > 0, "fresh db has at least one page");
     assert_eq!(info.usage_event_count, 0);
     assert!(

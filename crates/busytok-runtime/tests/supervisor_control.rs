@@ -30,8 +30,7 @@ use std::time::{Duration, Instant};
 
 use busytok_adapters::AgentLogAdapter;
 use busytok_config::{
-    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig, ProviderConfig,
-    ProviderKind,
+    BusytokPaths, BusytokSettings, DiscoverySettings, ManualRootConfig, ProviderKind,
 };
 use busytok_control::dispatch::RuntimeControl;
 use busytok_discovery::DiscoveredLogSource;
@@ -137,6 +136,63 @@ fn make_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
     BusytokSupervisor::new(db, paths)
 }
 
+/// Task 5: seed a test provider + model into SQL so the `execute_task`
+/// validation chain (bound provider exists + enabled + has api_key +
+/// bound model exists + enabled) passes. Returns `(provider_id, model_id)`
+/// for the caller to pass as `bound_provider_id` / `bound_model_id` in
+/// `SubagentDelegateRequestDto`. Mirrors the pattern in
+/// `subagent_e2e_sidecar.rs::seed_test_providers` but uses
+/// `busytok_store::provider_catalog` for schema-correct inserts.
+fn seed_bound_provider_model(db: &Database) -> (String, String) {
+    use busytok_store::provider_catalog::{
+        create_model, create_provider, CreateModelReq, CreateProviderReq,
+    };
+    let provider = create_provider(
+        db.conn(),
+        CreateProviderReq {
+            name: "Test Provider".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .expect("seed test provider");
+    let model_id = "test-model".to_string();
+    create_model(
+        db.conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: model_id.clone(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: Some(16384),
+        },
+    )
+    .expect("seed test model");
+    // Seed extra models used by `model_override` tests (gpt-5, gpt-4o).
+    for mid in ["gpt-5", "gpt-4o"] {
+        create_model(
+            db.conn(),
+            CreateModelReq {
+                provider_id: provider.id.clone(),
+                model_id: mid.into(),
+                enabled: true,
+                tags: vec![],
+                display_name: None,
+                reasoning: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+            },
+        )
+        .expect("seed extra test model");
+    }
+    (provider.id, model_id)
+}
+
 fn make_file_backed_db(tmp: &tempfile::TempDir) -> Database {
     let db_path = tmp.path().join("busytok.sqlite");
     Database::open(&db_path).unwrap()
@@ -221,9 +277,71 @@ fn make_sidecar_config() -> SidecarConfig {
         max_hot_sessions: 3,
         memory_soft_limit_mb: 800,
         memory_hard_limit_mb: 1200,
-        provider_id: String::new(),
-        api_key_env_name: String::new(),
-        base_url_env_name: String::new(),
+    }
+}
+
+/// In-memory description of a provider to seed into SQL for sidecar-wired
+/// tests. Replaces the old `settings.providers.push(ProviderConfig{...})`
+/// pattern after Task 10 removed `BusytokSettings.providers`. Tests that need
+/// a provider in the WorkerPool's map push a `TestProviderSeed` here and
+/// `seed_test_providers` writes them to SQL before the supervisor is built.
+#[derive(Clone)]
+struct TestProviderSeed {
+    id: &'static str,
+    name: &'static str,
+    base_url: &'static str,
+    api_key_env_name: &'static str,
+    models: &'static [&'static str],
+    enabled: bool,
+}
+
+const TEST_PROVIDER_SEED: TestProviderSeed = TestProviderSeed {
+    id: "test-provider",
+    name: "Test Provider",
+    base_url: "https://api.test-provider.example.com/v1",
+    api_key_env_name: "TEST_API_KEY",
+    models: &["test-model"],
+    enabled: true,
+};
+
+const TEST_PROVIDER_2_SEED: TestProviderSeed = TestProviderSeed {
+    id: "test-provider-2",
+    name: "Test Provider 2",
+    base_url: "https://api.test-provider-2.example.com/v1",
+    api_key_env_name: "TEST_API_KEY_2",
+    models: &["test-model"],
+    enabled: true,
+};
+
+/// Seed a list of `TestProviderSeed` into SQL. Mirrors the old
+/// `seed_providers_from_settings` flow but reads from a `[TestProviderSeed]`
+/// instead of `settings.providers` (which no longer exists). Models are NOT
+/// seeded here (use `seed_model_to_sql` / `seed_model_to_db` for that — they
+/// use plain INSERT and would conflict with a duplicate (provider_id, model_id)
+/// row). Uses `INSERT OR REPLACE` so re-seeding overwrites cleanly.
+fn seed_test_providers(db: &Database, seeds: &[TestProviderSeed]) {
+    use rusqlite::params;
+    let now = busytok_domain::now_ms();
+    for p in seeds {
+        let api_key = std::env::var(format!("BUSYTOK_{}", p.api_key_env_name))
+            .or_else(|_| std::env::var(p.api_key_env_name))
+            .ok();
+        db.conn()
+            .execute(
+                "INSERT OR REPLACE INTO providers \
+                 (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    p.id,
+                    p.name,
+                    serde_json::to_string(&ProviderKind::OpenAiCompatible).unwrap(),
+                    p.base_url,
+                    p.enabled as i64,
+                    api_key,
+                    now,
+                ],
+            )
+            .expect("seed provider to SQL");
     }
 }
 
@@ -231,36 +349,36 @@ fn make_sidecar_config() -> SidecarConfig {
 /// takes the sidecar wiring path. The injected `SidecarConfig` means
 /// `resolve_sidecar_config` is skipped, so `node_runtime`/`system_node_path`
 /// are irrelevant here.
-fn make_sidecar_settings() -> BusytokSettings {
+///
+/// Returns the settings plus the list of `TestProviderSeed`s that must be
+/// seeded into SQL before constructing the supervisor (so `construct_sidecar`
+/// finds the provider and builds the WorkerPool's map). Callers pass the
+/// seeds to `make_sidecar_stopped_supervisor_with_settings` or
+/// `seed_test_providers` directly.
+fn make_sidecar_settings() -> (BusytokSettings, Vec<TestProviderSeed>) {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
 
-    // Add a test provider + bind profiles so the WorkerPool can route.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider".to_string(),
-        name: "Test Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    for profile in settings.subagent.profiles.values_mut() {
-        profile.provider_id = Some("test-provider".to_string());
-    }
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
+    // Pre-set the second-provider env var so tests that add a `test-provider-2`
+    // seed don't need to remember to set it. Harmless if unused.
+    std::env::set_var("BUSYTOK_TEST_API_KEY_2", "test-key-2");
 
-    settings
+    (settings, vec![TEST_PROVIDER_SEED.clone()])
 }
 
 /// Construct a supervisor with `pi_sidecar.enabled = true` and the mock sidecar
 /// bundle injected via `new_with_sidecar_config`. The sidecar child is NOT
 /// started (`ensure_started` is never called), so `worker_snapshot()` reports
-/// `Stopped` — the "configured-but-stopped" posture under test.
+/// `Stopped` — the "configured-but-stopped" posture under test. Providers from
+/// `make_sidecar_settings()` are seeded into SQL before construction so
+/// `construct_sidecar` (Task 7: reads from SQL, not TOML) can build the
+/// `WorkerPool`'s provider map.
 fn make_sidecar_stopped_supervisor(db: Database, tmp: &tempfile::TempDir) -> BusytokSupervisor {
+    let (settings, seeds) = make_sidecar_settings();
+    seed_test_providers(&db, &seeds);
     let paths = BusytokPaths::for_test(tmp.path());
-    make_sidecar_settings()
+    settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
     BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
@@ -1578,7 +1696,7 @@ fn seed_usage_by_project_day_row(
     project_id: &str,
     project_path: &str,
     agent: &str,
-    model: &str,
+    model: Option<&str>,
     total_tokens: i64,
     cost_usd: Option<f64>,
     event_count: i64,
@@ -1614,7 +1732,7 @@ fn seed_usage_by_model_day_row(
     generation_id: &str,
     date: &str,
     agent: &str,
-    model: &str,
+    model: Option<&str>,
     total_tokens: i64,
     cost_usd: Option<f64>,
     event_count: i64,
@@ -1808,7 +1926,7 @@ async fn breakdown_list_project() {
         "hash-a",
         "/repo/a",
         "claude_code",
-        "model-a",
+        Some("model-a"),
         300,
         None,
         2,
@@ -1821,7 +1939,7 @@ async fn breakdown_list_project() {
         "hash-b",
         "/repo/b",
         "codex",
-        "model-b",
+        Some("model-b"),
         300,
         None,
         1,
@@ -1871,7 +1989,7 @@ async fn breakdown_list_model() {
         "gen-breakdown-model",
         &date,
         "claude_code",
-        "model-a",
+        Some("model-a"),
         100,
         None,
         1,
@@ -1882,7 +2000,7 @@ async fn breakdown_list_model() {
         "gen-breakdown-model",
         &date,
         "codex",
-        "model-b",
+        Some("model-b"),
         200,
         None,
         1,
@@ -1895,7 +2013,7 @@ async fn breakdown_list_model() {
         "hash-a",
         "/repo/a",
         "claude_code",
-        "model-a",
+        Some("model-a"),
         100,
         None,
         1,
@@ -1908,7 +2026,7 @@ async fn breakdown_list_model() {
         "hash-b",
         "/repo/b",
         "codex",
-        "model-b",
+        Some("model-b"),
         200,
         None,
         1,
@@ -3450,6 +3568,10 @@ async fn initial_scan_promotes_active_generation_metadata() {
 async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes (bound provider exists + enabled + has api_key + bound
+    // model exists + enabled).
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let supervisor = make_supervisor(db, &tmp);
 
     // delegate (mock execution)
@@ -3466,6 +3588,8 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -3537,28 +3661,108 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// providers.* (Phase 1: Credential Foundation)
+// providers.* (SQL-backed provider/model catalog)
 // ---------------------------------------------------------------------------
 //
 // The settings-CRUD code paths (create without api_key, list, update without
-// api_key, delete) never touch the OS keychain and are safe to run in CI on
-// every platform. `provider_to_dto` calls `ProviderCredentialStore::has_key`,
-// which is a read that returns `false` on `NoEntry` — also safe for CI.
+// api_key, delete) never touch credentials and are safe to run in CI on
+// every platform. `provider_to_dto` derives `has_api_key` from the SQL row's
+// `api_key` column (NULL → false, non-NULL → true) — no OS keychain involved.
 //
-// Tests that exercise the api_key flow (create/update with a non-empty key,
-// or delete of a provider that has a key) touch the real macOS Keychain and
-// are gated behind `#[cfg(target_os = "macos")] #[ignore]`.
+// Tests that exercise the api_key flow (create/update with a non-empty key)
+// store the key directly in SQL, not the OS keychain.
 
-fn provider_create_request(id: &str, name: &str) -> ProviderCreateRequestDto {
+fn provider_create_request(name: &str) -> ProviderCreateRequestDto {
     ProviderCreateRequestDto {
-        id: id.to_string(),
         name: name.to_string(),
+        provider_kind: ProviderKind::OpenAiCompatible,
         base_url: "https://api.example.com/v1".to_string(),
-        api_key_env_name: "EXAMPLE_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["example-model".to_string()],
+        enabled: None,
         api_key: None,
     }
+}
+
+/// Seed a provider row directly into SQL with a SPECIFIC id (bypassing the
+/// store's UUID v4 generation). Used by sidecar-coupled tests where the
+/// worker-pool provider-lookup closure reads from SQL and tests need
+/// hardcoded ids like "test-provider" to match profile bindings.
+fn seed_provider_to_sql(
+    sup: &BusytokSupervisor,
+    id: &str,
+    name: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+    enabled: bool,
+) {
+    use rusqlite::params;
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db.conn()
+        .execute(
+            "INSERT OR REPLACE INTO providers (id, name, provider_kind, base_url, enabled, api_key, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                id,
+                name,
+                serde_json::to_string(&ProviderKind::OpenAiCompatible).unwrap(),
+                base_url,
+                enabled as i64,
+                api_key,
+                now,
+            ],
+        )
+        .expect("seed provider to SQL");
+}
+
+/// Seed a model row directly into SQL with a specific provider_id + model_id.
+/// Used by profile tests that need model whitelist validation (the whitelist
+/// check now queries SQL instead of `provider.models.contains(...)`).
+fn seed_model_to_sql(sup: &BusytokSupervisor, provider_id: &str, model_id: &str, enabled: bool) {
+    let db = sup.db_handle().lock().unwrap();
+    seed_model_to_db(&db, provider_id, model_id, enabled);
+}
+
+/// Same as `seed_model_to_sql` but takes `&Database` directly — used by tests
+/// that need to seed the model BEFORE constructing the supervisor (so
+/// `construct_sidecar` sees the row).
+fn seed_model_to_db(db: &Database, provider_id: &str, model_id: &str, enabled: bool) {
+    use rusqlite::params;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let now = busytok_domain::now_ms();
+    let id = format!(
+        "seed-model-{}-{}",
+        now,
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
+    db.conn()
+        .execute(
+            "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, display_name, reasoning, context_window, max_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, 0, 128000, 16384)",
+            params![id, provider_id, model_id, enabled as i64, now],
+        )
+        .expect("seed model to SQL");
+}
+
+/// Toggle a model's `enabled` flag in SQL. Used by profile tests that need
+/// to simulate "shrinking the whitelist" (previously done via
+/// `provider_update(models: Some(vec![...]))`).
+fn set_model_enabled_in_sql(
+    sup: &BusytokSupervisor,
+    provider_id: &str,
+    model_id: &str,
+    enabled: bool,
+) {
+    use rusqlite::params;
+    let db = sup.db_handle().lock().unwrap();
+    let now = busytok_domain::now_ms();
+    db.conn()
+        .execute(
+            "UPDATE models SET enabled = ?1, updated_at_ms = ?2
+             WHERE provider_id = ?3 AND model_id = ?4",
+            params![enabled as i64, now, provider_id, model_id],
+        )
+        .expect("set model enabled in SQL");
 }
 
 #[tokio::test]
@@ -3567,48 +3771,40 @@ async fn provider_crud_round_trips_without_api_key() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Create → list shows it.
+    // Create → list shows it. id is now system-generated (UUID v4).
     let created = sup
-        .provider_create(provider_create_request("acme-prod", "Acme"))
+        .provider_create(provider_create_request("Acme"))
         .await
         .unwrap();
-    assert_eq!(created.id, "acme-prod");
     assert_eq!(created.name, "Acme");
     assert!(created.enabled);
     assert!(!created.has_api_key, "no api_key was supplied");
+    let pid = created.id.clone();
 
     let list = sup.provider_list().await.unwrap();
     assert_eq!(list.providers.len(), 1);
-    assert_eq!(list.providers[0].id, "acme-prod");
+    assert_eq!(list.providers[0].id, pid);
 
-    // Update name + models + enabled, no api_key → keychain untouched.
+    // Update name + enabled, no api_key → keychain untouched.
     let updated = sup
         .provider_update(ProviderUpdateRequestDto {
-            id: "acme-prod".to_string(),
+            id: pid.clone(),
             name: Some("Acme Renamed".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: Some(vec![
-                "example-model".to_string(),
-                "second-model".to_string(),
-            ]),
             enabled: Some(false),
+            provider_kind: None,
             api_key: None,
         })
         .await
         .unwrap();
     assert_eq!(updated.name, "Acme Renamed");
-    assert_eq!(updated.models.len(), 2);
     assert!(!updated.enabled);
     assert!(!updated.has_api_key, "still no api_key after update");
 
     // Delete → list empty.
-    sup.provider_delete(ProviderDeleteRequestDto {
-        id: "acme-prod".to_string(),
-    })
-    .await
-    .unwrap();
+    sup.provider_delete(ProviderDeleteRequestDto { id: pid.clone() })
+        .await
+        .unwrap();
     let list_after = sup.provider_list().await.unwrap();
     assert!(
         list_after.providers.is_empty(),
@@ -3617,186 +3813,31 @@ async fn provider_crud_round_trips_without_api_key() {
 }
 
 #[tokio::test]
-async fn provider_create_rejects_invalid_id() {
+async fn provider_update_with_none_api_key_is_a_noop_on_sql_store() {
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    // Underscore and dot are not in the allowed alphabet [a-z0-9-].
-    let err = sup
-        .provider_create(provider_create_request("acme_prod", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider id must contain only"),
-        "expected id validation error, got: {err}"
-    );
-
-    let err = sup
-        .provider_create(provider_create_request("acme.prod", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider id must contain only"),
-        "expected id validation error for dotted id, got: {err}"
-    );
-
-    // Nothing should have been written.
-    let list = sup.provider_list().await.unwrap();
-    assert!(list.providers.is_empty());
-}
-
-#[tokio::test]
-async fn provider_create_rejects_uppercase_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Uppercase letters are not in the allowed alphabet [a-z0-9-].
-    let err = sup
-        .provider_create(provider_create_request("UPPER-CASE", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("[a-z0-9-]"),
-        "expected id validation error mentioning [a-z0-9-], got: {err}"
-    );
-
-    // Nothing should have been written.
-    let list = sup.provider_list().await.unwrap();
-    assert!(list.providers.is_empty());
-}
-
-#[tokio::test]
-async fn provider_create_rejects_empty_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Empty id must be rejected before the char-set check (which is vacuously
-    // true for an empty string).
-    let err = sup
-        .provider_create(provider_create_request("", "Acme"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("empty"),
-        "expected empty-id validation error, got: {err}"
-    );
-
-    // Nothing should have been written.
-    let list = sup.provider_list().await.unwrap();
-    assert!(list.providers.is_empty());
-}
-
-#[tokio::test]
-async fn provider_create_rejects_duplicate_id() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    sup.provider_create(provider_create_request("dup", "First"))
+    let created = sup
+        .provider_create(provider_create_request("Noop"))
         .await
         .unwrap();
+    let pid = created.id.clone();
 
-    let err = sup
-        .provider_create(provider_create_request("dup", "Second"))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider already exists"),
-        "expected duplicate-id error, got: {err}"
-    );
-
-    let list = sup.provider_list().await.unwrap();
-    assert_eq!(
-        list.providers.len(),
-        1,
-        "duplicate create must not add a second row"
-    );
-    assert_eq!(list.providers[0].name, "First");
-}
-
-#[tokio::test]
-async fn provider_update_with_none_api_key_is_a_noop_on_keychain() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    sup.provider_create(provider_create_request("noop-key", "Noop"))
-        .await
-        .unwrap();
-
-    // Update with api_key: None must succeed without touching the keychain.
+    // Update with api_key: None must succeed (three-state: None = unchanged).
     let updated = sup
         .provider_update(ProviderUpdateRequestDto {
-            id: "noop-key".to_string(),
+            id: pid,
             name: Some("Noop Renamed".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await
         .unwrap();
     assert_eq!(updated.name, "Noop Renamed");
     assert!(!updated.has_api_key, "no api_key was ever set");
-}
-
-#[tokio::test]
-async fn provider_update_applies_env_name_fields() {
-    // Spec §3.1 / Plan Task 6: api_key_env_name and base_url_env_name are
-    // editable provider fields surfaced through ProviderUpdateRequestDto.
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    sup.provider_create(provider_create_request("env-edit", "Env Edit"))
-        .await
-        .unwrap();
-
-    let updated = sup
-        .provider_update(ProviderUpdateRequestDto {
-            id: "env-edit".to_string(),
-            name: None,
-            base_url: None,
-            api_key_env_name: Some("EDITED_API_KEY".to_string()),
-            base_url_env_name: Some("EDITED_BASE_URL".to_string()),
-            models: None,
-            enabled: None,
-            api_key: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(updated.api_key_env_name, "EDITED_API_KEY");
-    assert_eq!(
-        updated.base_url_env_name.as_deref(),
-        Some("EDITED_BASE_URL")
-    );
-
-    // A subsequent update that omits the env-name fields leaves them unchanged
-    // (patch semantics: absent == unchanged).
-    let after_omit = sup
-        .provider_update(ProviderUpdateRequestDto {
-            id: "env-edit".to_string(),
-            name: Some("Env Edit Renamed".to_string()),
-            base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
-            enabled: None,
-            api_key: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(after_omit.name, "Env Edit Renamed");
-    assert_eq!(after_omit.api_key_env_name, "EDITED_API_KEY");
-    assert_eq!(
-        after_omit.base_url_env_name.as_deref(),
-        Some("EDITED_BASE_URL")
-    );
 }
 
 #[tokio::test]
@@ -3810,10 +3851,8 @@ async fn provider_update_returns_error_for_unknown_id() {
             id: "ghost".to_string(),
             name: Some("Ghost".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await
@@ -3866,74 +3905,61 @@ async fn provider_test_connection_errors_when_no_api_key() {
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    sup.provider_create(provider_create_request("no-key", "No Key"))
+    let created = sup
+        .provider_create(provider_create_request("No Key"))
         .await
         .unwrap();
+    let pid = created.id.clone();
 
     let err = sup
-        .provider_test_connection(ProviderTestConnectionRequestDto {
-            id: "no-key".to_string(),
-        })
+        .provider_test_connection(ProviderTestConnectionRequestDto { id: pid.clone() })
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("no API key stored") || err.contains("failed to read keychain"),
-        "expected keychain-related error, got: {err}"
+        err.contains("provider has no api key"),
+        "expected no-api-key error, got: {err}"
     );
 
-    // Clean up so the keychain stays untouched (no key was set, so delete is a no-op).
-    sup.provider_delete(ProviderDeleteRequestDto {
-        id: "no-key".to_string(),
-    })
-    .await
-    .unwrap();
+    // Clean up.
+    sup.provider_delete(ProviderDeleteRequestDto { id: pid })
+        .await
+        .unwrap();
 }
 
-// --- Keychain-touching tests (manual only) -------------------------------
-
-#[cfg(target_os = "macos")]
 #[tokio::test]
-#[ignore = "touches real macOS Keychain — run with --ignored"]
-async fn provider_crud_round_trips_with_api_key_macos() {
-    use busytok_config::ProviderCredentialStore;
-
+async fn provider_update_three_state_api_key_semantics() {
+    // SQL store replaces the macOS Keychain. This test verifies the three-state
+    // api_key patch semantics directly against the SQL store:
+    //   - None            = unchanged
+    //   - Some(None)      = clear
+    //   - Some(Some(k))   = update
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let sup = make_supervisor(db, &tmp);
 
-    let provider_id = "task4-keychain-roundtrip";
-    // Defensive cleanup in case a prior run left a key behind.
-    let _ = ProviderCredentialStore::delete_key(provider_id);
-
     // Create with api_key → has_api_key true.
     let created = sup
         .provider_create(ProviderCreateRequestDto {
-            id: provider_id.to_string(),
-            name: "Keychain Roundtrip".to_string(),
+            name: "Three State".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
-            api_key_env_name: "EXAMPLE_API_KEY".to_string(),
-            base_url_env_name: None,
-            models: vec!["example-model".to_string()],
+            enabled: None,
             api_key: Some("sk-test-123".to_string()),
         })
         .await
         .unwrap();
-    assert!(
-        created.has_api_key,
-        "api_key was supplied, has_api_key should be true"
-    );
+    let pid = created.id.clone();
+    assert!(created.has_api_key, "api_key was supplied");
 
     // Update with api_key: None → key unchanged.
     let updated = sup
         .provider_update(ProviderUpdateRequestDto {
-            id: provider_id.to_string(),
-            name: Some("Keychain Roundtrip Renamed".to_string()),
+            id: pid.clone(),
+            name: Some("Three State Renamed".to_string()),
             base_url: None,
-            api_key_env_name: None,
-            base_url_env_name: None,
-            models: None,
             enabled: None,
+            provider_kind: None,
             api_key: None,
         })
         .await
@@ -3942,22 +3968,46 @@ async fn provider_crud_round_trips_with_api_key_macos() {
         updated.has_api_key,
         "api_key must still be present after update with None"
     );
-    assert_eq!(updated.name, "Keychain Roundtrip Renamed");
+    assert_eq!(updated.name, "Three State Renamed");
 
-    // Direct keychain read confirms the key value is intact.
-    let stored = ProviderCredentialStore::get_key(provider_id).unwrap();
-    assert_eq!(stored.as_deref(), Some("sk-test-123"));
-
-    // Delete cleans up both settings and keychain.
-    sup.provider_delete(ProviderDeleteRequestDto {
-        id: provider_id.to_string(),
-    })
-    .await
-    .unwrap();
+    // Update with api_key: Some(None) → clear.
+    let cleared = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: pid.clone(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            provider_kind: None,
+            api_key: Some(None),
+        })
+        .await
+        .unwrap();
     assert!(
-        !ProviderCredentialStore::has_key(provider_id),
-        "keychain entry must be removed after delete"
+        !cleared.has_api_key,
+        "api_key must be cleared after Some(None)"
     );
+
+    // Update with api_key: Some(Some(k)) → update.
+    let restored = sup
+        .provider_update(ProviderUpdateRequestDto {
+            id: pid.clone(),
+            name: None,
+            base_url: None,
+            enabled: None,
+            provider_kind: None,
+            api_key: Some(Some("sk-new-456".to_string())),
+        })
+        .await
+        .unwrap();
+    assert!(
+        restored.has_api_key,
+        "api_key must be present after Some(Some(k))"
+    );
+
+    // Delete cleans up the SQL row.
+    sup.provider_delete(ProviderDeleteRequestDto { id: pid })
+        .await
+        .unwrap();
     let list = sup.provider_list().await.unwrap();
     assert!(list.providers.is_empty());
 }
@@ -4425,213 +4475,36 @@ async fn subagent_runtime_status_tasks_recent_shows_display_name_for_deleted_sub
 /// Build sidecar-enabled settings with a single test provider whose model
 /// whitelist is `["test-model"]`. Profiles are NOT bound by default (caller
 /// binds per-test). Used by the delegate validation tests.
-fn make_unbound_sidecar_settings() -> BusytokSettings {
+///
+/// Returns the settings plus the list of `TestProviderSeed`s that must be
+/// seeded into SQL before constructing the supervisor.
+fn make_unbound_sidecar_settings() -> (BusytokSettings, Vec<TestProviderSeed>) {
     let mut settings = BusytokSettings::default();
     settings.subagent.pi_sidecar.enabled = true;
-    settings.providers.push(ProviderConfig {
-        id: "test-provider".to_string(),
-        name: "Test Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
     std::env::set_var("BUSYTOK_TEST_API_KEY", "test-key-for-e2e");
-    settings
+    // Pre-set the second-provider env var (see make_sidecar_settings).
+    std::env::set_var("BUSYTOK_TEST_API_KEY_2", "test-key-2");
+    (settings, vec![TEST_PROVIDER_SEED.clone()])
 }
 
-/// Build a sidecar-stopped supervisor from arbitrary settings. Mirrors
-/// `make_sidecar_stopped_supervisor` but accepts custom settings so the
-/// delegate validation tests can configure provider/profile bindings.
+/// Build a sidecar-stopped supervisor from arbitrary settings + provider
+/// seeds. Mirrors `make_sidecar_stopped_supervisor` but accepts custom
+/// settings + seeds so the delegate validation tests can configure
+/// provider/profile bindings. Seeds are written to SQL before construction
+/// so `construct_sidecar` can build the `WorkerPool`'s provider map
+/// (Task 7: pool reads from SQL, not TOML).
 fn make_sidecar_stopped_supervisor_with_settings(
     db: Database,
     tmp: &tempfile::TempDir,
     settings: BusytokSettings,
+    seeds: Vec<TestProviderSeed>,
 ) -> BusytokSupervisor {
+    seed_test_providers(&db, &seeds);
     let paths = BusytokPaths::for_test(tmp.path());
     settings
         .save_to_file(&paths.config_dir().join("settings.toml"))
         .expect("failed to save test settings");
     BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config())
-}
-
-/// `delegate_fails_for_unbound_profile`: when the sidecar is enabled AND the
-/// profile has `provider_id: None`, the runtime handler must reject the
-/// delegate with "profile not bound to a provider" BEFORE the manager inserts
-/// a task row. Covers spec §3.4 + Phase 3 Task 4 Step 3.
-#[tokio::test]
-async fn delegate_fails_for_unbound_profile() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    // Built-in profiles ship unbound (`provider_id: None`).
-    let settings = make_unbound_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
-
-    let err = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "reviewer".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "find the bug".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await
-        .expect_err("unbound profile must fail validation");
-
-    assert!(
-        err.to_string().contains("profile not bound to a provider"),
-        "expected 'profile not bound to a provider' error, got: {err}"
-    );
-
-    sup.shutdown_writer().await.expect("writer shutdown");
-}
-
-/// `delegate_fails_for_unknown_provider`: profile bound to a provider_id that
-/// doesn't exist in `settings.providers` → "provider not found: ...".
-#[tokio::test]
-async fn delegate_fails_for_unknown_provider() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
-    // Bind the profile to a provider that doesn't exist.
-    settings
-        .subagent
-        .profiles
-        .get_mut("pi/search-cheap")
-        .unwrap()
-        .provider_id = Some("nonexistent".to_string());
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
-
-    let err = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "reviewer".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "find the bug".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await
-        .expect_err("unknown provider must fail validation");
-
-    assert!(
-        err.to_string().contains("provider not found: nonexistent"),
-        "expected 'provider not found: nonexistent' error, got: {err}"
-    );
-
-    sup.shutdown_writer().await.expect("writer shutdown");
-}
-
-/// `delegate_fails_for_disabled_provider`: provider exists but `enabled:
-/// false` → "provider disabled: ...".
-#[tokio::test]
-async fn delegate_fails_for_disabled_provider() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
-    // Add a disabled provider + bind the profile to it.
-    settings.providers.push(ProviderConfig {
-        id: "disabled-prov".to_string(),
-        name: "Disabled Provider".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.disabled.example.com/v1".to_string(),
-        api_key_env_name: "DISABLED_API_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: false,
-    });
-    settings
-        .subagent
-        .profiles
-        .get_mut("pi/search-cheap")
-        .unwrap()
-        .provider_id = Some("disabled-prov".to_string());
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
-
-    let err = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "reviewer".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "find the bug".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await
-        .expect_err("disabled provider must fail validation");
-
-    assert!(
-        err.to_string().contains("provider disabled: disabled-prov"),
-        "expected 'provider disabled: disabled-prov' error, got: {err}"
-    );
-
-    sup.shutdown_writer().await.expect("writer shutdown");
-}
-
-/// `delegate_fails_for_model_not_in_whitelist` (M2 fix, spec §3.4): profile
-/// bound to an enabled provider, but `profile.model` is NOT in
-/// `provider.models` → "model '...' not in provider '...' whitelist". Also
-/// covers the empty-model edge case.
-#[tokio::test]
-async fn delegate_fails_for_model_not_in_whitelist() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
-    // Bind the profile to the valid test-provider, but set its model to
-    // something NOT in the provider's `["test-model"]` whitelist.
-    {
-        let profile = settings
-            .subagent
-            .profiles
-            .get_mut("pi/search-cheap")
-            .unwrap();
-        profile.provider_id = Some("test-provider".to_string());
-        profile.model = "wrong-model".to_string();
-    }
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
-
-    let err = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "reviewer".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "find the bug".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await
-        .expect_err("model not in whitelist must fail validation");
-
-    assert!(
-        err.to_string()
-            .contains("model 'wrong-model' not in provider 'test-provider' whitelist"),
-        "expected whitelist violation error, got: {err}"
-    );
-
-    sup.shutdown_writer().await.expect("writer shutdown");
 }
 
 /// `runtime_status_aggregates_multiple_workers`: when the pool has workers
@@ -4642,19 +4515,10 @@ async fn delegate_fails_for_model_not_in_whitelist() {
 async fn runtime_status_aggregates_multiple_workers() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (settings, mut seeds) = make_unbound_sidecar_settings();
     // Add a second enabled provider so the pool can spawn two workers.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-2".to_string(),
-        name: "Test Provider 2".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY_2".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    seeds.push(TEST_PROVIDER_2_SEED.clone());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     // construct_sidecar auto-spawns the FIRST enabled provider's worker.
     // Spawn the SECOND provider's worker via the pool to exercise the
@@ -4737,8 +4601,8 @@ async fn runtime_status_workers_empty_when_pool_none() {
 async fn provider_changed_removes_worker_then_respawns() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -4749,16 +4613,19 @@ async fn provider_changed_removes_worker_then_respawns() {
     assert_eq!(snaps.len(), 1, "initial state: one worker");
     assert_eq!(snaps[0].0, "test-provider");
 
+    // The provider is already seeded into SQL by
+    // `make_sidecar_stopped_supervisor_with_settings` (Task 7: pool reads
+    // from SQL, not TOML). No additional seed needed — `provider_update`
+    // will find the row and `provider_changed` will re-read it.
+
     // Trigger provider_changed via provider_update (metadata-only change:
     // update the display name). This must remove the worker.
     sup.provider_update(ProviderUpdateRequestDto {
         id: "test-provider".to_string(),
         name: Some("Updated Name".to_string()),
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: None,
         enabled: None,
+        provider_kind: None,
         api_key: None,
     })
     .await
@@ -4790,49 +4657,73 @@ async fn provider_changed_removes_worker_then_respawns() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
-/// `provider_update_respawn_picks_up_live_config` (P1 fix): the
-/// `WorkerPool`'s provider-lookup closure must read LIVE settings (not a
-/// startup snapshot), so when `provider_update` changes `base_url` /
-/// `base_url_env_name`, the respawned supervisor's config reflects the new
-/// values. Without the live-settings fix, the closure would return the stale
-/// provider snapshot captured at `construct_sidecar` time, and `ensure_worker`
-/// would build the config with the OLD `base_url` / `base_url_env_name` —
-/// silently running the sidecar against the wrong endpoint.
+/// `provider_update_respawn_picks_up_live_config` (Task 5 + Task 7): the
+/// `WorkerPool` holds a `ProviderRuntimeEntry` per provider (populated from
+/// SQL at construction, updated via `update_provider_and_kill_old` on
+/// `provider_changed`). When `provider_update` changes `base_url`,
+/// `provider_changed` re-reads the provider from SQL, updates the entry, and
+/// force-kills the old worker — so the next `ensure_worker` re-spawns. Task
+/// 5: env injection was deleted; credentials now flow via `turn_auto`
+/// params. The supervisor's env map must NOT contain `OPENAI_API_KEY` /
+/// `OPENAI_BASE_URL` — the new credentials are carried by the updated
+/// `ProviderRuntimeEntry` and threaded per-turn by the executor.
 #[tokio::test]
 async fn provider_update_respawn_picks_up_live_config() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    // Use a minimal sidecar-enabled settings with NO providers so
+    // `construct_sidecar` starts with an empty pool. The test exercises the
+    // SQL-backed `provider_create` → `provider_update` → respawn flow, so
+    // the provider must NOT exist in SQL before `provider_create`.
+    let mut settings = BusytokSettings::default();
+    settings.subagent.pi_sidecar.enabled = true;
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, vec![]);
 
     let pool = sup
         .worker_pool()
         .expect("worker_pool must be Some when sidecar is enabled");
 
-    // Initial worker: base_url_env_name defaults to OPENAI_BASE_URL (provider
-    // has base_url_env_name: None in make_sidecar_settings).
-    let initial = pool
-        .ensure_worker("test-provider")
-        .expect("ensure_worker (initial)");
+    // Create the provider in SQL via the handler. This writes the row to SQL
+    // AND calls `provider_changed` → `update_provider_and_kill_old`, which
+    // inserts the `ProviderRuntimeEntry` into the pool's map (no old worker
+    // to kill yet). construct_sidecar ran with empty SQL, so the pool's map
+    // was empty until this call.
+    let created = sup
+        .provider_create(ProviderCreateRequestDto {
+            name: "Test Provider".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test-provider.example.com/v1".into(),
+            enabled: None,
+            api_key: Some("test-key".into()),
+        })
+        .await
+        .expect("provider_create must succeed");
+    let pid = created.id.clone();
+
+    // Initial worker: Task 5 — env injection was deleted, so the supervisor's
+    // env map must NOT contain `OPENAI_API_KEY` / `OPENAI_BASE_URL`. The
+    // credentials are stored in the `ProviderRuntimeEntry` and flow via
+    // `turn_auto` params at execute() time.
+    let initial = pool.ensure_worker(&pid).expect("ensure_worker (initial)");
     let initial_cfg = initial.config();
-    assert_eq!(initial_cfg.base_url_env_name, "OPENAI_BASE_URL");
-    assert_eq!(
-        initial_cfg.env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.test-provider.example.com/v1".to_string()),
-        "initial worker env should have the original base_url"
+    assert!(
+        !initial_cfg.env.contains_key("OPENAI_BASE_URL"),
+        "initial worker must NOT inject OPENAI_BASE_URL (Task 5: turn_auto params)"
+    );
+    assert!(
+        !initial_cfg.env.contains_key("OPENAI_API_KEY"),
+        "initial worker must NOT inject OPENAI_API_KEY (Task 5: turn_auto params)"
     );
 
-    // Update BOTH base_url and base_url_env_name via provider_update. This
-    // mutates `self.settings` (the shared `Arc<Mutex<BusytokSettings>>`) and
-    // calls `provider_changed` to kill + remove the worker.
+    // Update base_url via provider_update. This mutates the SQL row AND calls
+    // `provider_changed` → `update_provider_and_kill_old` (entry updated +
+    // old worker force-killed).
     sup.provider_update(ProviderUpdateRequestDto {
-        id: "test-provider".to_string(),
+        id: pid.clone(),
         name: None,
         base_url: Some("https://api.updated.example.com/v1".to_string()),
-        api_key_env_name: None,
-        base_url_env_name: Some("UPDATED_BASE_URL".to_string()),
-        models: None,
         enabled: None,
+        provider_kind: None,
         api_key: None,
     })
     .await
@@ -4844,32 +4735,22 @@ async fn provider_update_respawn_picks_up_live_config() {
         "provider_update must remove the worker from the pool"
     );
 
-    // Re-spawn: ensure_worker builds a NEW supervisor. The pool's
-    // provider-lookup closure must read the LIVE (post-update) settings, so
-    // the new supervisor's config has the updated base_url / env name.
+    // Re-spawn: ensure_worker reads the UPDATED entry from the pool's map
+    // (update_provider_and_kill_old inserted it). Task 5: the respawned
+    // supervisor's env must still NOT contain provider env vars — the
+    // updated credentials live in the entry, threaded per-turn via
+    // `turn_auto` params.
     let respawned = pool
-        .ensure_worker("test-provider")
+        .ensure_worker(&pid)
         .expect("ensure_worker must re-spawn the worker");
     let respawned_cfg = respawned.config();
-
-    // The fix: base_url_env_name MUST be the updated value, not the original
-    // "OPENAI_BASE_URL" (which would indicate the closure read a stale snapshot).
-    assert_eq!(
-        respawned_cfg.base_url_env_name, "UPDATED_BASE_URL",
-        "respawned worker must use the updated base_url_env_name \
-         (live settings), not the startup snapshot"
+    assert!(
+        !respawned_cfg.env.contains_key("OPENAI_BASE_URL"),
+        "respawned worker must NOT inject OPENAI_BASE_URL (Task 5: turn_auto params)"
     );
-    // OPENAI_BASE_URL is always set (canonical name) and must reflect the new base_url.
-    assert_eq!(
-        respawned_cfg.env.get("OPENAI_BASE_URL"),
-        Some(&"https://api.updated.example.com/v1".to_string()),
-        "respawned worker env[OPENAI_BASE_URL] must be the updated base_url"
-    );
-    // The provider-specific alias (UPDATED_BASE_URL) must also be set to the new base_url.
-    assert_eq!(
-        respawned_cfg.env.get("UPDATED_BASE_URL"),
-        Some(&"https://api.updated.example.com/v1".to_string()),
-        "respawned worker env[UPDATED_BASE_URL] must be the updated base_url"
+    assert!(
+        !respawned_cfg.env.contains_key("OPENAI_API_KEY"),
+        "respawned worker must NOT inject OPENAI_API_KEY (Task 5: turn_auto params)"
     );
 
     sup.shutdown_writer().await.expect("writer shutdown");
@@ -4882,24 +4763,20 @@ async fn provider_update_respawn_picks_up_live_config() {
 async fn provider_deleted_removes_worker() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_unbound_sidecar_settings();
+    let (settings, mut seeds) = make_unbound_sidecar_settings();
     // Add a second provider that NO profile references — `provider_delete`
     // rejects if any profile still references the provider.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-2".to_string(),
-        name: "Test Provider 2".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY_2".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    seeds.push(TEST_PROVIDER_2_SEED.clone());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
         .expect("worker_pool must be Some when sidecar is enabled");
+
+    // The second provider is already seeded into SQL by
+    // `make_sidecar_stopped_supervisor_with_settings` (Task 7: pool reads
+    // from SQL, not TOML). No profile references it, so delete won't be
+    // blocked.
 
     // Spawn a worker for the second provider (no profile references it, so
     // `provider_delete` won't reject on profile-reference check).
@@ -4934,24 +4811,17 @@ async fn provider_deleted_removes_worker() {
 
 /// `provider_update_with_api_key_removes_worker_then_respawns` (Phase 3 Task 7):
 /// key rotation — when `provider_update` is called with
-/// `req.api_key = Some(...)`, the runtime must rotate the credential (writing
-/// the new key to the keychain) AND remove the worker so the next
-/// `ensure_worker` respawns with the rotated key. Complements the
-/// metadata-only `provider_changed_removes_worker_then_respawns` test by
-/// exercising the credential-bearing code path. Covers Phase 3 Task 7.
+/// `req.api_key = Some(Some(k))`, the runtime must persist the new key to the
+/// SQL store AND remove the worker so the next `ensure_worker` respawns with
+/// the rotated key. Complements the metadata-only
+/// `provider_changed_removes_worker_then_respawns` test by exercising the
+/// credential-bearing code path. Covers Phase 3 Task 7.
 #[tokio::test]
 async fn provider_update_with_api_key_removes_worker_then_respawns() {
-    // This test writes to the OS keychain (via provider_update → set_key).
-    // Skip on CI runners where no keyring daemon is available (e.g., Ubuntu
-    // without D-Bus secret service).
-    if busytok_config::ProviderCredentialStore::get_key("keyring-probe").is_err() {
-        eprintln!("skip: OS keyring unavailable");
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -4962,18 +4832,27 @@ async fn provider_update_with_api_key_removes_worker_then_respawns() {
     assert_eq!(snaps.len(), 1, "initial state: one worker");
     assert_eq!(snaps[0].0, "test-provider");
 
-    // Key rotation: api_key = Some(...) instead of None. This writes the
-    // new key to the OS keychain (via ProviderCredentialStore::set_key) AND
-    // triggers provider_changed -> remove_worker_and_kill.
+    // Seed SQL with the same provider id so the SQL-backed provider_update
+    // handler can find it.
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+
+    // Key rotation: api_key = Some(Some(k)) (three-state: update). This writes
+    // the new key to the SQL providers table AND triggers provider_changed ->
+    // remove_worker_and_kill.
     sup.provider_update(ProviderUpdateRequestDto {
         id: "test-provider".to_string(),
         name: None,
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: None,
         enabled: None,
-        api_key: Some("rotated-new-key".to_string()),
+        provider_kind: None,
+        api_key: Some(Some("rotated-new-key".to_string())),
     })
     .await
     .expect("provider_update with api_key rotation must succeed");
@@ -5001,10 +4880,6 @@ async fn provider_update_with_api_key_removes_worker_then_respawns() {
         "re-spawned worker must be in the pool"
     );
     assert_eq!(snaps_final[0].0, "test-provider");
-
-    // Clean up the keychain entry written by provider_update so the test
-    // doesn't leave state behind.
-    let _ = busytok_config::ProviderCredentialStore::delete_key("test-provider");
 
     sup.shutdown_writer().await.expect("writer shutdown");
 }
@@ -5038,8 +4913,8 @@ fn is_process_alive(pid: u32) -> bool {
 async fn provider_update_kills_old_process() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let settings = make_sidecar_settings();
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    let (settings, seeds) = make_sidecar_settings();
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup
         .worker_pool()
@@ -5067,6 +4942,17 @@ async fn provider_update_kills_old_process() {
         "old sidecar child (pid={old_pid}) must be alive before provider_update"
     );
 
+    // Seed SQL with the same provider id so the SQL-backed provider_update
+    // handler can find it.
+    seed_provider_to_sql(
+        &sup,
+        "test-provider",
+        "Test Provider",
+        "https://api.test-provider.example.com/v1",
+        None,
+        true,
+    );
+
     // Trigger provider_changed via provider_update (metadata-only change).
     // This calls remove_worker_and_kill -> force_kill -> child.start_kill() +
     // child.wait().await (SIGKILL on Unix).
@@ -5074,10 +4960,8 @@ async fn provider_update_kills_old_process() {
         id: "test-provider".to_string(),
         name: Some("Updated".to_string()),
         base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: None,
         enabled: None,
+        provider_kind: None,
         api_key: None,
     })
     .await
@@ -5185,7 +5069,7 @@ fn normalize_usage_populates_required_fields() {
 #[test]
 fn normalize_usage_handles_missing_tokens() {
     let usage = TaskUsage {
-        model: Some("gpt-5".to_string()),
+        model: None,
         provider: None,
         input_tokens: None,
         output_tokens: None,
@@ -5204,7 +5088,7 @@ fn normalize_usage_handles_missing_tokens() {
 #[test]
 fn normalize_usage_cost_none_when_no_catalog() {
     let usage = TaskUsage {
-        model: Some("gpt-5".to_string()),
+        model: None,
         provider: None,
         input_tokens: Some(100),
         output_tokens: Some(200),
@@ -5225,6 +5109,9 @@ async fn write_usage_event_inserts_into_usage_events() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-write-1", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5241,6 +5128,8 @@ async fn write_usage_event_inserts_into_usage_events() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5261,6 +5150,9 @@ async fn write_usage_event_idempotent_on_same_task_id() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-write-2", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5281,6 +5173,8 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5307,7 +5201,7 @@ async fn write_usage_event_idempotent_on_same_task_id() {
         model: None,
         summary: Some("re-run".to_string()),
         usage: TaskUsage {
-            model: Some("gpt-5".to_string()),
+            model: None,
             provider: Some("mock".to_string()),
             input_tokens: Some(50),
             output_tokens: Some(50),
@@ -5334,6 +5228,9 @@ async fn write_usage_event_uses_active_generation_id() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-active-for-subagent", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5350,6 +5247,8 @@ async fn write_usage_event_uses_active_generation_id() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5372,6 +5271,10 @@ async fn write_usage_event_produces_real_rollup_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-rollup", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes. The `gpt-5` model_override is also seeded by the
+    // helper so the override resolves to a valid model row.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5388,6 +5291,8 @@ async fn write_usage_event_produces_real_rollup_rows() {
             model_override: Some("gpt-5".to_string()),
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5433,6 +5338,9 @@ async fn write_usage_event_visible_in_overview_read_path() {
         .ok();
     let db2 = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db2, "gen-overview", 1000);
+    // Task 5: seed bound provider+model so the `execute_task` validation
+    // chain passes.
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db2);
     let sup = make_supervisor_with_settings(db2, &tmp, settings);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5449,6 +5357,8 @@ async fn write_usage_event_visible_in_overview_read_path() {
             model_override: None,
             source_harness: None,
             source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
         })
         .await
         .unwrap();
@@ -5494,19 +5404,10 @@ async fn write_usage_event_visible_in_overview_read_path() {
 async fn e2e_multi_provider_creates_separate_workers() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
-    let mut settings = make_sidecar_settings();
+    let (settings, mut seeds) = make_sidecar_settings();
     // Add a second provider.
-    settings.providers.push(ProviderConfig {
-        id: "test-provider-2".to_string(),
-        name: "Test Provider 2".to_string(),
-        provider_kind: ProviderKind::OpenAiCompatible,
-        base_url: "https://api.test-provider-2.example.com/v1".to_string(),
-        api_key_env_name: "TEST_API_KEY_2".to_string(),
-        base_url_env_name: None,
-        models: vec!["test-model".to_string()],
-        enabled: true,
-    });
-    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings);
+    seeds.push(TEST_PROVIDER_2_SEED.clone());
+    let sup = make_sidecar_stopped_supervisor_with_settings(db, &tmp, settings, seeds);
 
     let pool = sup.worker_pool().expect("worker_pool must be Some");
 
@@ -5526,154 +5427,6 @@ async fn e2e_multi_provider_creates_separate_workers() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
-/// `e2e_auth_failure_kills_worker` (Phase 3 Task 8): mock sidecar returns 401
-/// (AUTH_FAILURE -32010) → task fails with `error_kind: "auth"` → worker
-/// killed+removed from pool → next ensure_worker creates a new worker.
-/// Verifies the auth-fail kill path end-to-end through the delegate handler
-/// (not just the executor level — `sidecar_executor.rs` already covers that).
-///
-/// NOTE: This test spawns a real sidecar child (mock-sidecar.sh) so it is
-/// `#[serial]` to prevent parallel contamination.
-#[tokio::test]
-#[serial]
-async fn e2e_auth_failure_kills_worker() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    set_active_generation(&db, "gen-auth-fail", 1000);
-    let mut settings = make_sidecar_settings();
-    // The default profile model ("deepseek-chat") is NOT in the test
-    // provider's whitelist (["test-model"]). Set it to "test-model" so the
-    // delegate passes whitelist validation and reaches the executor (where
-    // the auth-fail mock returns -32010).
-    settings
-        .subagent
-        .profiles
-        .get_mut("pi/search-cheap")
-        .unwrap()
-        .model = "test-model".to_string();
-    let paths = BusytokPaths::for_test(tmp.path());
-    settings
-        .save_to_file(&paths.config_dir().join("settings.toml"))
-        .unwrap();
-    let mut sidecar_cfg = make_sidecar_config();
-    sidecar_cfg
-        .env
-        .insert("BUSYTOK_MOCK_AUTH_FAIL".into(), "1".into());
-    let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, sidecar_cfg);
-
-    let pool = sup.worker_pool().expect("worker_pool must be Some");
-    // Auto-spawn created one worker for test-provider (Stopped — no child).
-    assert_eq!(
-        pool.worker_snapshots().await.len(),
-        1,
-        "one worker before delegate"
-    );
-
-    // Start the sidecar child so we have a real OS PID to verify kill.
-    // The auto-spawned worker is Stopped; `ensure_started` spawns the bash
-    // child running mock-sidecar.sh.
-    let sidecar = sup
-        .sidecar_supervisor()
-        .expect("sidecar supervisor must be configured for the first enabled provider");
-    let _handle = sidecar
-        .ensure_started()
-        .await
-        .expect("ensure_started must spawn the child");
-
-    // Capture the sidecar child PID before the delegate triggers auth-fail kill.
-    let old_pid = {
-        let snaps = pool.worker_snapshots().await;
-        snaps[0]
-            .1
-            .pid
-            .expect("worker must have a PID after ensure_started")
-    };
-    assert!(
-        is_process_alive(old_pid),
-        "sidecar child (pid={old_pid}) must be alive before delegate"
-    );
-
-    // Delegate — will hit the auth-fail path. The executor's `execute()`
-    // returns Err (SidecarRpc -32010), which propagates through
-    // `execute_task` → `delegate` → `subagent_delegate`. The task row was
-    // already inserted (status="running") before execute() ran.
-    let resp = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "reviewer".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "do work".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await;
-
-    // The delegate returns Err because execute() returned Err (the `?` in
-    // `execute_task` propagates it before the success-path result
-    // persistence block runs).
-    assert!(
-        resp.is_err(),
-        "delegate must return Err on auth failure, got: {resp:?}"
-    );
-
-    // Verify the task row has error_kind = "auth". The task row was inserted
-    // (status="running") before execute() ran. The executor classifies the
-    // -32010 error as TaskErrorKind::Auth and calls remove_worker_and_kill,
-    // then returns Err. Spec §3.4 / Task 5 require the error_kind to be
-    // persisted on the task row.
-    let db_handle = sup.db_handle();
-    let error_kind: String = db_handle
-        .lock()
-        .unwrap()
-        .conn()
-        .query_row(
-            "SELECT error_kind FROM subagent_tasks ORDER BY created_at_ms DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
-    assert_eq!(
-        error_kind, "auth",
-        "task error_kind must be 'auth' after 401 (AUTH_FAILURE -32010)"
-    );
-
-    // Worker must be removed from the pool (auth-fail kill).
-    assert!(
-        pool.worker_snapshots().await.is_empty(),
-        "pool must be empty after auth-fail kill"
-    );
-
-    // The sidecar child PROCESS must actually be dead (P1b guarantee).
-    // `remove_worker_and_kill` calls `force_kill` which SIGKILLs the child;
-    // a mere `remove_worker` (without kill) would orphan the bash child.
-    // Poll up to 2s — sysinfo's process table may lag by a tick.
-    let mut killed = false;
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if !is_process_alive(old_pid) {
-            killed = true;
-            break;
-        }
-    }
-    assert!(
-        killed,
-        "sidecar child (pid={old_pid}) must be DEAD after auth-fail — \
-         remove_worker_and_kill must have force-killed it"
-    );
-
-    // Next ensure_worker creates a new worker (slot was freed).
-    pool.ensure_worker("test-provider")
-        .expect("ensure_worker re-spawns");
-    assert_eq!(pool.worker_snapshots().await.len(), 1);
-
-    sup.shutdown_writer().await.expect("writer shutdown");
-}
-
 /// `e2e_usage_events_agent_kind_is_codex` (Phase 3 Task 8, I3 fix): after
 /// delegate, the `agent` column in `usage_events` for the subagent row must
 /// be `'codex'` — verifying the `AgentKind::Codex` discriminator round-trips
@@ -5685,6 +5438,7 @@ async fn e2e_usage_events_agent_kind_is_codex() {
     let tmp = tempfile::tempdir().unwrap();
     let db = busytok_store::Database::open_in_memory().unwrap();
     set_active_generation(&db, "gen-codex", 1000);
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
@@ -5700,6 +5454,8 @@ async fn e2e_usage_events_agent_kind_is_codex() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
+        bound_provider_id: Some(bound_provider_id),
+        bound_model_id: Some(bound_model_id),
     })
     .await
     .unwrap();
@@ -5721,221 +5477,6 @@ async fn e2e_usage_events_agent_kind_is_codex() {
     );
 
     sup.shutdown_writer().await.expect("writer shutdown");
-}
-
-/// `queued_task_bridges_usage_events_through_dispatcher_hook` (P1 #2 fix):
-/// when a task is queued (because the pressure gate is paused) and later
-/// executed by the background `TaskDispatcher` after the gate clears, the
-/// post-task completion hook MUST bridge the queued task's usage into the
-/// unified `usage_events` + rollup tables — the SAME seam synchronous
-/// `delegate()` uses. Without the hook, queued tasks' usage is invisible in
-/// Overview / Activity / receipt reads.
-///
-/// Sequence:
-/// 1. Pause the gate → delegate returns `Queued`.
-/// 2. Assert NO usage_events / daily_usage / model_summary rows exist yet
-///    (proves the queued task hasn't been bridged — guards against tests
-///    that pass simply because the sync seam wrote events before queueing).
-/// 3. Resume the gate → dispatcher picks up + executes the queued task.
-/// 4. Assert usage_events has a row tagged with the active generation_id,
-///    and daily_usage / model_summary have rollup rows.
-///
-/// NOTE: spawns a real sidecar child (mock-sidecar.sh) — `#[serial]`.
-#[tokio::test]
-#[serial]
-async fn queued_task_bridges_usage_events_through_dispatcher_hook() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = busytok_store::Database::open_in_memory().unwrap();
-    set_active_generation(&db, "gen-queued-bridge", 1000);
-    let mut settings = make_sidecar_settings();
-    // The default profile model ("deepseek-chat") is NOT in the test
-    // provider's whitelist (["test-model"]). Set it to "test-model" so the
-    // delegate passes whitelist validation and the dispatcher can execute it.
-    settings
-        .subagent
-        .profiles
-        .get_mut("pi/search-cheap")
-        .unwrap()
-        .model = "test-model".to_string();
-    let paths = BusytokPaths::for_test(tmp.path());
-    settings
-        .save_to_file(&paths.config_dir().join("settings.toml"))
-        .unwrap();
-    let sup = BusytokSupervisor::new_with_sidecar_config(db, paths, make_sidecar_config());
-    sup.hydrate_status_from_db().unwrap();
-
-    let gate = sup
-        .pressure_gate()
-        .expect("pressure_gate must be Some when sidecar is enabled")
-        .clone();
-
-    // 1. Pause the gate → next delegate must queue.
-    gate.set_action(busytok_subagent::PressureAction::PauseNewTasks);
-    assert!(gate.is_paused(), "gate must be paused before delegate");
-
-    let resp = sup
-        .subagent_delegate(SubagentDelegateRequestDto {
-            subagent_name: "queued-bridge".to_string(),
-            subagent_id: None,
-            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-            profile: "pi/search-cheap".to_string(),
-            intent: None,
-            prompt: "queued bridge work".to_string(),
-            prompt_artifact_ref: None,
-            timeout_seconds: None,
-            model_override: None,
-            source_harness: None,
-            source_session_id: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status, "queued",
-        "delegate must return Queued when gate is paused, got: {:?}",
-        resp.status
-    );
-    let sub_id = resp.subagent_id.clone();
-    let task_id = resp.task_id.clone();
-
-    // 2. Pre-condition: NO usage_events / rollups for this task yet.
-    //    This proves the queued task hasn't been bridged (the sync seam
-    //    didn't fire — only the dispatcher hook can produce these rows).
-    {
-        let db_ref = sup.db_handle().lock().unwrap();
-        let event_count = count_rows(
-            &db_ref,
-            "usage_events",
-            &format!("client_kind = 'subagent' AND dedupe_key = '{task_id}'"),
-        );
-        assert_eq!(
-            event_count, 0,
-            "no usage_event row should exist for the queued task before dispatcher runs"
-        );
-        let daily_count = count_rows(
-            &db_ref,
-            "daily_usage",
-            "generation_id = 'gen-queued-bridge'",
-        );
-        assert_eq!(
-            daily_count, 0,
-            "no daily_usage rollup should exist before dispatcher runs"
-        );
-        let model_count = count_rows(&db_ref, "model_summary", "1=1");
-        assert_eq!(
-            model_count, 0,
-            "no model_summary rollup should exist before dispatcher runs"
-        );
-        // Sanity: the task row itself is queued.
-        let task_status: String = db_ref
-            .conn()
-            .query_row(
-                "SELECT status FROM subagent_tasks WHERE id = ?1",
-                rusqlite::params![&task_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(task_status, "queued", "task row must be in 'queued' status");
-    }
-
-    // 3. Resume the gate → dispatcher should pick up + execute the queued
-    //    task. Poll for up to 10s for the task to complete (the dispatcher
-    //    ticks at 200ms, and the mock sidecar needs to spawn a bash child).
-    gate.set_action(busytok_subagent::PressureAction::Resume);
-    assert!(!gate.is_paused(), "gate must be resumed before polling");
-
-    let mut completed = false;
-    for _ in 0..100 {
-        let status_now = {
-            let db_ref = sup.db_handle().lock().unwrap();
-            db_ref
-                .conn()
-                .query_row(
-                    "SELECT status FROM subagent_tasks WHERE id = ?1",
-                    rusqlite::params![&task_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap_or_default()
-        };
-        if status_now == "completed" {
-            completed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        completed,
-        "queued task must be executed by the dispatcher after gate clears"
-    );
-
-    // 4. Post-condition: usage_events + rollups are NOW present (the
-    //    dispatcher's post-task completion hook bridged them through the
-    //    same `bridge_subagent_usage` seam as synchronous `delegate()`).
-    let db_ref = sup.db_handle().lock().unwrap();
-
-    // Diagnostic: collect all subagent usage_events so an assertion failure
-    // message shows whether the hook wrote ANYTHING (and with what
-    // dedupe_key / generation_id), instead of just "left: None, right: Some".
-    let all_subagent_events: Vec<(String, String)> = db_ref
-        .conn()
-        .prepare(
-            "SELECT dedupe_key, generation_id FROM usage_events WHERE client_kind = 'subagent'",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-
-    let event_gen = db_ref
-        .conn()
-        .query_row(
-            "SELECT generation_id FROM usage_events WHERE client_kind = 'subagent' LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok();
-    assert_eq!(
-        event_gen.as_deref(),
-        Some("gen-queued-bridge"),
-        "queued task's usage_event must use the active generation_id \
-         (proves the dispatcher hook sourced it from generation_manager, \
-         not a synthetic placeholder). All subagent events: {all_subagent_events:?}"
-    );
-
-    let daily_count = count_rows(
-        &db_ref,
-        "daily_usage",
-        "agent = 'codex' AND generation_id = 'gen-queued-bridge'",
-    );
-    assert!(
-        daily_count >= 1,
-        "daily_usage should have >=1 row for agent='codex' after dispatcher runs, got {daily_count}"
-    );
-
-    // The mock sidecar always returns model="deepseek-chat" in its canned
-    // response (regardless of the profile model the runtime requested).
-    // Assert against the sidecar's reported model, not the profile model.
-    let model_count = count_rows(&db_ref, "model_summary", "model = 'deepseek-chat'");
-    assert!(
-        model_count >= 1,
-        "model_summary should have >=1 row for model='deepseek-chat' after dispatcher runs, got {model_count}"
-    );
-
-    // Drop the db guard before awaiting shutdown (clippy::await_holding_lock).
-    drop(db_ref);
-
-    // Graceful shutdown: stop the sidecar child + drain the dispatcher +
-    // flush the writer. Order matters: shutdown_sidecar first so the child
-    // is dead, then shutdown_writer so the dispatcher is drained before the
-    // writer's final flush + WAL checkpoint.
-    sup.shutdown_sidecar().await;
-    sup.shutdown_writer().await.expect("writer shutdown");
-
-    // Suppress unused-variable warning for `sub_id` (kept for debuggability
-    // — readers can inspect the task row by subagent_id if the test fails).
-    let _ = sub_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -5968,8 +5509,6 @@ async fn profile_crud_round_trips() {
     let created = sup
         .profile_create(ProfileCreateRequestDto {
             id: "my-reviewer".to_string(),
-            model: "deepseek-chat".to_string(),
-            provider_id: None,
             tools: Some(vec!["read".to_string(), "grep".to_string()]),
             context_budget_tokens: Some(4000),
             timeout_seconds: Some(150),
@@ -5979,19 +5518,16 @@ async fn profile_crud_round_trips() {
         .unwrap();
     assert_eq!(created.id, "my-reviewer");
     assert!(!created.is_builtin);
-    assert_eq!(created.model, "deepseek-chat");
     assert_eq!(created.context_budget_tokens, 4000);
 
     // Settings snapshot now shows 4 profiles.
     let snapshot = sup.settings_snapshot().await.unwrap();
     assert_eq!(snapshot.data.subagent.profiles.len(), 4);
 
-    // Update model + provider_id (patch semantics).
+    // No-op update (patch semantics).
     let updated = sup
         .profile_update(ProfileUpdateRequestDto {
             id: "my-reviewer".to_string(),
-            provider_id: Some("".to_string()), // unbind (empty string = None)
-            model: Some("qwen-coder".to_string()),
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -5999,9 +5535,6 @@ async fn profile_crud_round_trips() {
         })
         .await
         .unwrap();
-    assert_eq!(updated.model, "qwen-coder");
-    // provider_id was Some("") → unbound → None.
-    assert_eq!(updated.provider_id, None);
     // tools/context_budget_tokens unchanged (patch semantics).
     assert_eq!(updated.tools, vec!["read", "grep"]);
     assert_eq!(updated.context_budget_tokens, 4000);
@@ -6027,8 +5560,6 @@ async fn profile_create_rejects_builtin_name() {
     let err = sup
         .profile_create(ProfileCreateRequestDto {
             id: "pi/search-cheap".to_string(),
-            model: "deepseek-chat".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6063,181 +5594,6 @@ async fn profile_delete_rejects_builtin() {
 }
 
 #[tokio::test]
-async fn profile_update_rejects_disabled_provider() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create a disabled provider.
-    sup.provider_create(provider_create_request("disabled-p", "Disabled"))
-        .await
-        .unwrap();
-    sup.provider_update(ProviderUpdateRequestDto {
-        id: "disabled-p".to_string(),
-        name: None,
-        base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: Some(vec!["some-model".to_string()]),
-        enabled: Some(false),
-        api_key: None,
-    })
-    .await
-    .unwrap();
-
-    // Try to bind a profile to the disabled provider → rejected.
-    let err = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "pi/search-cheap".to_string(),
-            provider_id: Some("disabled-p".to_string()),
-            model: Some("some-model".to_string()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("disabled provider"),
-        "expected disabled-provider rejection, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_rejects_stale_model_on_rebind() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create a provider with model "model-a".
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-
-    // Bind profile to provider with model-a.
-    sup.profile_update(ProfileUpdateRequestDto {
-        id: "pi/search-cheap".to_string(),
-        provider_id: Some("test-p".to_string()),
-        model: Some("model-a".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Provider updates model list to ["model-b"] only — model-a is now stale.
-    sup.provider_update(ProviderUpdateRequestDto {
-        id: "test-p".to_string(),
-        name: None,
-        base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: Some(vec!["model-b".to_string()]),
-        enabled: None,
-        api_key: None,
-    })
-    .await
-    .unwrap();
-
-    // Re-bind to the same provider (provider_id = Some("test-p")) without
-    // changing the model → the rebind path validates the effective model
-    // (model-a) against the new whitelist (["model-b"]) and rejects.
-    let err = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "pi/search-cheap".to_string(),
-            provider_id: Some("test-p".to_string()), // re-bind same provider
-            model: None,                             // not changing model
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
-        "expected stale-model rejection, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_patches_tools_without_triggering_stale_check() {
-    // Patching only `tools` (neither provider_id nor model) must NOT run
-    // the whitelist validation — the service trusts the existing binding
-    // and only the UI surfaces stale-model warnings for already-bound profiles.
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    sup.profile_update(ProfileUpdateRequestDto {
-        id: "pi/search-cheap".to_string(),
-        provider_id: Some("test-p".to_string()),
-        model: Some("model-a".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Shrink the provider's whitelist so model-a is no longer in it.
-    sup.provider_update(ProviderUpdateRequestDto {
-        id: "test-p".to_string(),
-        name: None,
-        base_url: None,
-        api_key_env_name: None,
-        base_url_env_name: None,
-        models: Some(vec!["model-b".to_string()]),
-        enabled: None,
-        api_key: None,
-    })
-    .await
-    .unwrap();
-
-    // Patch ONLY tools — should succeed despite the stale model, because
-    // the service does not re-validate existing bindings on unrelated patches.
-    let updated = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "pi/search-cheap".to_string(),
-            provider_id: None, // unchanged
-            model: None,       // unchanged
-            tools: Some(vec!["new-tool".to_string()]),
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(updated.tools, vec!["new-tool".to_string()]);
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
 async fn settings_snapshot_includes_subagent_profiles() {
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -6254,72 +5610,6 @@ async fn settings_snapshot_includes_subagent_profiles() {
         .find(|p| p.id == "pi/search-cheap")
         .unwrap();
     assert!(search.is_builtin);
-    assert_eq!(search.model, "deepseek-chat");
-    assert_eq!(search.provider_id, None);
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_create_rejects_nonexistent_provider() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    let err = sup
-        .profile_create(ProfileCreateRequestDto {
-            id: "my-profile".to_string(),
-            model: "some-model".to_string(),
-            provider_id: Some("nonexistent-provider".to_string()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("provider not found"),
-        "expected provider-not-found error, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_create_rejects_model_not_in_whitelist() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create a provider with only "model-a".
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-
-    // Try to create a profile bound to that provider with a model NOT in its whitelist.
-    let err = sup
-        .profile_create(ProfileCreateRequestDto {
-            id: "my-profile".to_string(),
-            model: "model-b".to_string(),
-            provider_id: Some("test-p".to_string()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
-        "expected whitelist rejection, got: {err}"
-    );
     sup.shutdown_writer().await.unwrap();
 }
 
@@ -6332,8 +5622,6 @@ async fn profile_update_rejects_nonexistent_profile() {
     let err = sup
         .profile_update(ProfileUpdateRequestDto {
             id: "nonexistent-profile".to_string(),
-            provider_id: None,
-            model: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6376,8 +5664,6 @@ async fn profile_create_rejects_duplicate_id() {
     // First create succeeds.
     sup.profile_create(ProfileCreateRequestDto {
         id: "my-profile".to_string(),
-        model: "some-model".to_string(),
-        provider_id: None,
         tools: None,
         context_budget_tokens: None,
         timeout_seconds: None,
@@ -6390,8 +5676,6 @@ async fn profile_create_rejects_duplicate_id() {
     let err = sup
         .profile_create(ProfileCreateRequestDto {
             id: "my-profile".to_string(),
-            model: "other-model".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6403,53 +5687,6 @@ async fn profile_create_rejects_duplicate_id() {
         err.to_string().contains("already exists"),
         "expected already-exists error, got: {err}"
     );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_unbinds_provider_with_empty_string() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create a provider + bind a user profile to it.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    sup.profile_create(ProfileCreateRequestDto {
-        id: "my-profile".to_string(),
-        model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Unbind via Some("").
-    let updated = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "my-profile".to_string(),
-            provider_id: Some("".to_string()),
-            model: None,
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(updated.provider_id, None);
     sup.shutdown_writer().await.unwrap();
 }
 
@@ -6476,8 +5713,6 @@ async fn profile_update_with_all_none_patch_is_noop() {
     let after = sup
         .profile_update(ProfileUpdateRequestDto {
             id: "pi/search-cheap".to_string(),
-            provider_id: None,
-            model: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6487,71 +5722,9 @@ async fn profile_update_with_all_none_patch_is_noop() {
         .unwrap();
 
     // Profile is returned unchanged.
-    assert_eq!(after.model, before.model);
-    assert_eq!(after.provider_id, before.provider_id);
     assert_eq!(after.tools, before.tools);
     assert_eq!(after.context_budget_tokens, before.context_budget_tokens);
     assert_eq!(after.timeout_seconds, before.timeout_seconds);
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_changes_provider_and_model_together() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create two providers, each with a different model.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "prov-a".to_string(),
-        name: "Prov A".to_string(),
-        base_url: "https://a.test/v1".to_string(),
-        api_key_env_name: "A_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "prov-b".to_string(),
-        name: "Prov B".to_string(),
-        base_url: "https://b.test/v1".to_string(),
-        api_key_env_name: "B_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-b".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    // Create a profile bound to prov-a/model-a.
-    sup.profile_create(ProfileCreateRequestDto {
-        id: "my-profile".to_string(),
-        model: "model-a".to_string(),
-        provider_id: Some("prov-a".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Atomically switch to prov-b/model-b.
-    let updated = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "my-profile".to_string(),
-            provider_id: Some("prov-b".to_string()),
-            model: Some("model-b".to_string()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(updated.provider_id, Some("prov-b".to_string()));
-    assert_eq!(updated.model, "model-b");
     sup.shutdown_writer().await.unwrap();
 }
 
@@ -6565,8 +5738,6 @@ async fn profile_create_rejects_invalid_id_format() {
     let err = sup
         .profile_create(ProfileCreateRequestDto {
             id: "My Profile".to_string(),
-            model: "some-model".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6582,55 +5753,6 @@ async fn profile_create_rejects_invalid_id_format() {
 }
 
 #[tokio::test]
-async fn profile_update_patches_only_model_on_bound_profile() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create provider + profile bound to it.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string(), "model-b".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    sup.profile_create(ProfileCreateRequestDto {
-        id: "my-profile".to_string(),
-        model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Patch only the model (provider_id stays None = unchanged).
-    let updated = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "my-profile".to_string(),
-            provider_id: None,
-            model: Some("model-b".to_string()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap();
-    // Provider unchanged, model updated.
-    assert_eq!(updated.provider_id, Some("test-p".to_string()));
-    assert_eq!(updated.model, "model-b");
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
 async fn profile_create_applies_defaults_for_omitted_fields() {
     let db = Database::open_in_memory().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -6640,8 +5762,6 @@ async fn profile_create_applies_defaults_for_omitted_fields() {
     let dto = sup
         .profile_create(ProfileCreateRequestDto {
             id: "my-profile".to_string(),
-            model: "some-model".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6667,8 +5787,6 @@ async fn profile_create_rejects_empty_id() {
     let err = sup
         .profile_create(ProfileCreateRequestDto {
             id: "".to_string(),
-            model: "some-model".to_string(),
-            provider_id: None,
             tools: None,
             context_budget_tokens: None,
             timeout_seconds: None,
@@ -6679,159 +5797,6 @@ async fn profile_create_rejects_empty_id() {
     assert!(
         err.to_string().contains("profile id must not be empty"),
         "expected empty-id rejection, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_create_rejects_empty_model() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    let err = sup
-        .profile_create(ProfileCreateRequestDto {
-            id: "my-profile".to_string(),
-            model: "".to_string(),
-            provider_id: None,
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("model must not be empty"),
-        "expected empty-model rejection, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_rejects_model_not_in_whitelist_on_model_only_patch() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create provider with model "model-a" only.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-
-    // Bind profile to provider with the whitelisted model.
-    sup.profile_create(ProfileCreateRequestDto {
-        id: "my-profile".to_string(),
-        model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Patch only the model to a value NOT in the provider whitelist.
-    let err = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "my-profile".to_string(),
-            provider_id: None,
-            model: Some("model-b".to_string()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not in provider") || err.to_string().contains("whitelist"),
-        "expected whitelist rejection on model-only patch, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_rejects_empty_model_unbound() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Built-in profile ships unbound; patch model to empty string.
-    let err = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "pi/search-cheap".to_string(),
-            provider_id: None,
-            model: Some(String::new()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("model must not be empty"),
-        "expected empty-model rejection on unbound profile, got: {err}"
-    );
-    sup.shutdown_writer().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_update_rejects_empty_model_bound() {
-    let db = Database::open_in_memory().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sup = make_supervisor(db, &tmp);
-
-    // Create provider + bind profile to it.
-    sup.provider_create(ProviderCreateRequestDto {
-        id: "test-p".to_string(),
-        name: "Test".to_string(),
-        base_url: "https://api.test.com/v1".to_string(),
-        api_key_env_name: "TEST_KEY".to_string(),
-        base_url_env_name: None,
-        models: vec!["model-a".to_string()],
-        api_key: None,
-    })
-    .await
-    .unwrap();
-    sup.profile_create(ProfileCreateRequestDto {
-        id: "my-profile".to_string(),
-        model: "model-a".to_string(),
-        provider_id: Some("test-p".to_string()),
-        tools: None,
-        context_budget_tokens: None,
-        timeout_seconds: None,
-        write_access: None,
-    })
-    .await
-    .unwrap();
-
-    // Patch model to empty string while provider is bound.
-    let err = sup
-        .profile_update(ProfileUpdateRequestDto {
-            id: "my-profile".to_string(),
-            provider_id: None,
-            model: Some(String::new()),
-            tools: None,
-            context_budget_tokens: None,
-            timeout_seconds: None,
-            write_access: None,
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("model must not be empty"),
-        "expected empty-model rejection on bound profile, got: {err}"
     );
     sup.shutdown_writer().await.unwrap();
 }
