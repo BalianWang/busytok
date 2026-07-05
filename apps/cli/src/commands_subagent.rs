@@ -7,7 +7,7 @@ use busytok_control::ControlClient;
 use busytok_protocol::dto::{
     ModelCatalogEntryDto, ModelListRequestDto, ModelListResponseDto, SubagentDelegateRequestDto,
     SubagentDeleteRequestDto, SubagentListRequestDto, SubagentResolveRequestDto,
-    SubagentTasksRequestDto,
+    SubagentTaskGetRequestDto, SubagentTasksRequestDto,
 };
 use busytok_protocol::{ControlRequest, ControlResponse};
 
@@ -204,6 +204,20 @@ pub async fn handle_delete(
         .context("subagent.delete RPC failed")?;
     let data = unwrap_ok(resp)?;
     print_ack(&data, "text")
+}
+
+pub async fn handle_task_get(task_id: String, output: String) -> Result<()> {
+    let mut client = connect().await?;
+    let req = SubagentTaskGetRequestDto { task_id };
+    let resp = client
+        .call(ControlRequest::new(
+            "subagent.task_get",
+            serde_json::to_value(&req)?,
+        ))
+        .await
+        .context("subagent.task_get RPC failed")?;
+    let data = unwrap_ok(resp)?;
+    print_task_detail(&data, &output)
 }
 
 /// Extract the Ok payload or bail with the control error message.
@@ -410,9 +424,65 @@ fn print_ack(value: &serde_json::Value, output: &str) -> Result<()> {
     })
 }
 
+/// Print a single task detail record (`SubagentTaskDetailDto`).
+///
+/// This is a DEDICATED formatter — do NOT reuse `print_detail` (that is for
+/// subagent identity, which has a different field set: bound_provider_id /
+/// bound_model_id instead of result_summary / error / error_kind /
+/// timestamps).
+///
+/// Optional `String` fields route through `or_dash` so absent values render
+/// as `-` (not `?`). Optional `i64` fields (`started_at_ms`,
+/// `completed_at_ms`) are formatted as strings and use `-` for `None`. The
+/// required `created_at_ms` field falls back to `0` defensively.
+fn print_task_detail(value: &serde_json::Value, output: &str) -> Result<()> {
+    print_json_or(value, output, |v| {
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let subagent_id = v.get("subagent_id").and_then(|s| s.as_str()).unwrap_or("?");
+        let subagent_name = or_dash(v.get("subagent_name").and_then(|s| s.as_str()));
+        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+        let profile = v.get("profile").and_then(|s| s.as_str()).unwrap_or("?");
+        let model_override = or_dash(v.get("model_override").and_then(|s| s.as_str()));
+        let source_harness = or_dash(v.get("source_harness").and_then(|s| s.as_str()));
+        let source_session_id = or_dash(v.get("source_session_id").and_then(|s| s.as_str()));
+        let created_at_ms = v.get("created_at_ms").and_then(|n| n.as_i64()).unwrap_or(0);
+        let started_at_ms = v
+            .get("started_at_ms")
+            .and_then(|n| n.as_i64())
+            .map_or("-".to_string(), |n| n.to_string());
+        let completed_at_ms = v
+            .get("completed_at_ms")
+            .and_then(|n| n.as_i64())
+            .map_or("-".to_string(), |n| n.to_string());
+        let result_summary = or_dash(v.get("result_summary").and_then(|s| s.as_str()));
+        let error = or_dash(v.get("error").and_then(|s| s.as_str()));
+        let error_kind = or_dash(v.get("error_kind").and_then(|s| s.as_str()));
+        println!("id:                {id}");
+        println!("subagent_id:       {subagent_id}");
+        println!("subagent_name:     {subagent_name}");
+        println!("status:            {status}");
+        println!("profile:           {profile}");
+        println!("model_override:    {model_override}");
+        println!("source_harness:    {source_harness}");
+        println!("source_session_id: {source_session_id}");
+        println!("created_at_ms:     {created_at_ms}");
+        println!("started_at_ms:     {started_at_ms}");
+        println!("completed_at_ms:   {completed_at_ms}");
+        println!("result_summary:    {result_summary}");
+        println!("error:             {error}");
+        println!("error_kind:        {error_kind}");
+    })
+}
+
+/// Render an optional string as `-` when absent. Used by `print_task_detail`
+/// for optional `String` fields on the task record.
+fn or_dash(v: Option<&str>) -> &str {
+    v.unwrap_or("-")
+}
+
 /// Shared helper: `json` output prints pretty JSON; any other value runs the
 /// supplied text-mode closure. Centralizes the `match output { "json" => …, _ => … }`
-/// pattern previously repeated across `print_delegate`/`print_array`/`print_detail`/`print_ack`.
+/// pattern previously repeated across `print_delegate`/`print_array`/`print_detail`/`print_ack`/`print_task_detail`.
 fn print_json_or(
     value: &serde_json::Value,
     output: &str,
@@ -749,6 +819,10 @@ mod tests {
         show_response: SubagentDetailDto,
         tasks_response: SubagentTasksResponseDto,
         delete_should_fail: AtomicBool,
+        /// When set, `subagent_task_get` bails with "task not found" so
+        /// tests can exercise the `ControlResponse::Err` path through
+        /// `unwrap_ok` (e.g. missing-task error surfacing).
+        task_get_should_fail: AtomicBool,
         /// Optional canned response for `model_list` (used by
         /// `resolve_bound_fields` auto-resolution tests). When `None`,
         /// `model_list` delegates to the inner runtime.
@@ -802,6 +876,7 @@ mod tests {
                     }],
                 },
                 delete_should_fail: AtomicBool::new(false),
+                task_get_should_fail: AtomicBool::new(false),
                 model_list_response: None,
                 last_delegate_request: Mutex::new(None),
             }
@@ -1007,6 +1082,9 @@ mod tests {
             &self,
             req: SubagentTaskGetRequestDto,
         ) -> Result<SubagentTaskDetailDto> {
+            if self.task_get_should_fail.load(Ordering::SeqCst) {
+                anyhow::bail!("task not found")
+            }
             self.inner.subagent_task_get(req).await
         }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
@@ -2353,5 +2431,116 @@ mod tests {
         let _ = rt
             .profile_delete(ProfileDeleteRequestDto { id: "pr".into() })
             .await;
+    }
+
+    // ── print_task_detail ────────────────────────────────────────────
+    //
+    // Dedicated renderer for `handle_task_get` — task records have a
+    // different shape than subagent identity (no bound fields; adds
+    // result_summary/error/error_kind/timestamps). Do NOT reuse
+    // `print_detail`, which is for subagent identity.
+
+    #[test]
+    fn print_task_detail_text_with_full_payload() {
+        // All fields present — text branch should print every field
+        // (id/subagent_id/subagent_name/status/profile/model_override/
+        // source_harness/source_session_id/created_at_ms/started_at_ms/
+        // completed_at_ms/result_summary/error/error_kind).
+        let v = json!({
+            "id": "task-1",
+            "subagent_id": "sa-1",
+            "subagent_name": "dev",
+            "status": "completed",
+            "profile": "default",
+            "model_override": "gpt-5",
+            "source_harness": "cli",
+            "source_session_id": "sess-1",
+            "created_at_ms": 1700000000_i64,
+            "started_at_ms": 1700000001_i64,
+            "completed_at_ms": 1700000002_i64,
+            "result_summary": "did the thing",
+            "error": null,
+            "error_kind": null,
+        });
+        assert!(print_task_detail(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_task_detail_text_renders_dash_for_absent_optional_fields() {
+        // Optional fields absent (None / missing) — text branch should
+        // render `-` for each optional field. Required string fields fall
+        // back to `?`; the required `created_at_ms` falls back to 0.
+        let v = json!({
+            "id": "task-2",
+            "subagent_id": "sa-2",
+            "status": "pending",
+            "profile": "default",
+            "created_at_ms": 1700000000_i64,
+        });
+        assert!(print_task_detail(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_task_detail_text_missing_all_fields_uses_defaults() {
+        // Empty object — every `unwrap_or` / `or_dash` fallback fires.
+        let v = json!({});
+        assert!(print_task_detail(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_task_detail_json_output_pretty_prints_payload() {
+        let v = json!({"id": "task-3"});
+        assert!(print_task_detail(&v, "json").is_ok());
+    }
+
+    // ── handle_task_get ──────────────────────────────────────────────
+    //
+    // End-to-end coverage for the new `subagent task --task-id` handler.
+    // The `SubagentRuntime` test wrapper delegates `subagent_task_get`
+    // to the inner `TestRuntimeControl`, which returns
+    // `Ok(Default::default())` — enough to verify the RPC round-trip and
+    // the formatter wiring without depending on a real store.
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_get_invokes_subagent_task_get_rpc_and_prints_text() {
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_get("task-1".to_string(), "text".to_string()).await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_task_get text: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_get_invokes_subagent_task_get_rpc_with_json_output() {
+        // JSON output returns the raw DTO from the runtime — verify the
+        // round-trip succeeds (no formatter errors on Default::default()).
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_get("task-1".to_string(), "json".to_string()).await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_task_get json: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_get_propagates_rpc_error_when_runtime_errors() {
+        // Use a runtime whose `subagent_task_get` always fails — verify
+        // the error path through `unwrap_ok` is taken and the runtime
+        // error message surfaces to the caller.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.task_get_should_fail.store(true, Ordering::SeqCst);
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_get("missing-task".to_string(), "text".to_string()).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("task not found"),
+            "expected the runtime error to surface, got: {err}"
+        );
     }
 }

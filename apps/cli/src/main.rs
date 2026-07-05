@@ -195,6 +195,14 @@ enum SubagentCommand {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Look up a single task by its task_id
+    Task {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -647,6 +655,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 hard,
                 yes,
             } => commands_subagent::handle_delete(name, id, cwd, hard, yes).await,
+            SubagentCommand::Task { task_id, output } => {
+                commands_subagent::handle_task_get(task_id, output).await
+            }
         },
 
         Command::Models {
@@ -1150,6 +1161,75 @@ mod tests {
         assert!(
             err.contains("expected agent:path"),
             "should surface the parser error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn args_parses_subagent_task_with_task_id() {
+        // `busytok subagent task --task-id task-1` parses into
+        // `SubagentCommand::Task` with `output` defaulting to "text".
+        let args =
+            Args::try_parse_from(["busytok", "subagent", "task", "--task-id", "task-1"]).unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand: SubagentCommand::Task { task_id, output },
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(output, "text");
+            }
+            other => panic!("expected Subagent::Task, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_subagent_task_with_json_output() {
+        // `--output json` overrides the default text mode.
+        let args = Args::try_parse_from([
+            "busytok",
+            "subagent",
+            "task",
+            "--task-id",
+            "task-1",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand: SubagentCommand::Task { task_id, output },
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(output, "json");
+            }
+            other => panic!("expected Subagent::Task with json output, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_rejects_subagent_task_without_task_id() {
+        // `--task-id` is required; omitting it must produce a clap error.
+        let result = Args::try_parse_from(["busytok", "subagent", "task"]);
+        assert!(
+            result.is_err(),
+            "should reject `subagent task` without --task-id"
+        );
+    }
+
+    #[test]
+    fn args_rejects_subagent_task_with_invalid_output_value() {
+        // `--output` only accepts "json" or "text" (value_parser).
+        let result = Args::try_parse_from([
+            "busytok",
+            "subagent",
+            "task",
+            "--task-id",
+            "task-1",
+            "--output",
+            "yaml",
+        ]);
+        assert!(
+            result.is_err(),
+            "should reject `--output yaml` for subagent task"
         );
     }
 }
