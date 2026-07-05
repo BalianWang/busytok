@@ -24,6 +24,7 @@ describe('turn_auto with pool (mock path)', () => {
       logical_subagent_name: 'a',
       cwd: '/tmp',
       profile: 'pi/search-cheap',
+      model: 'test-model',
       prompt: 'do 1',
     };
     const result1 = await handler(params1) as { session_reused: boolean; adapter_session_id: string };
@@ -40,16 +41,16 @@ describe('turn_auto with pool (mock path)', () => {
     const pool = new SessionPool(1);
     const handler = turnAutoHandlerWithPool(pool);
     await handler(
-      { logical_subagent_id: 'sub-a', cwd: '/tmp', profile: 'p', prompt: 'x' },
+      { logical_subagent_id: 'sub-a', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
     );
     await expect(
       handler(
-        { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', prompt: 'x' },
+        { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
       ),
     ).rejects.toThrow(SidecarError);
     try {
       await handler(
-        { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', prompt: 'x' },
+        { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
       );
     } catch (e) {
       expect((e as SidecarError).code).toBe(-32002);

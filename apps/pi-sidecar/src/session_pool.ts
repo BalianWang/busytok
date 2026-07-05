@@ -5,6 +5,7 @@ import {
   type SessionFactory,
 } from './pi_session.js';
 import { SidecarError } from './errors.js';
+import { logger } from './logger.js';
 
 /**
  * Sidecar-side hot session pool with LRU tracking (spec §5.2).
@@ -36,7 +37,12 @@ export class SessionPool {
 
   /**
    * Ensure a hot session exists for `logical_subagent_id`.
-   * - Hit: bump LRU, return `{ session, reused: true }`.
+   * - Hit (same model): bump LRU, return `{ session, reused: true }`.
+   * - Hit (model mismatch): forced cold miss — evict the old session and
+   *   fall through to the miss path so a fresh session is created with the
+   *   new model. This is what makes a task-level `model_override` take
+   *   effect on a hot session (P1-1): without it, the old session bound to
+   *   the previous model would be silently reused.
    * - Miss + capacity: call the factory, add to pool, return `{ reused: false }`.
    * - Miss + full: throw HOT_SESSION_LIMIT_REACHED with `data.candidate`.
    *
@@ -54,11 +60,30 @@ export class SessionPool {
     if (existing !== undefined) {
       const session = this.sessions.get(existing);
       if (session) {
-        this.touch(existing);
-        return { session, reused: true };
+        // P1-1: forced cold miss on model mismatch. A task-level
+        // `model_override` changes the effective model; the old session
+        // (bound to a different model) MUST be evicted and a fresh one
+        // created so the override actually takes effect. The Rust side
+        // already computes effective_model_id = model_override.unwrap_or(bound).
+        if (session.resolvedModel !== opts.model) {
+          // Evict the old session (frees the slot + disposes the SDK
+          // session), then fall through to the miss path below to create
+          // a fresh session bound to opts.model.
+          logger.debug('session_pool.model_mismatch_evict', {
+            logical_subagent_id,
+            adapter_session_id: existing,
+            old_model: session.resolvedModel,
+            new_model: opts.model,
+          });
+          this.close(existing);
+        } else {
+          this.touch(existing);
+          return { session, reused: true };
+        }
+      } else {
+        // Defensive: stale subagent mapping without a session entry.
+        this.subagentMap.delete(logical_subagent_id);
       }
-      // Defensive: stale subagent mapping without a session entry.
-      this.subagentMap.delete(logical_subagent_id);
     }
     // 2. Miss + full — throw HOT_SESSION_LIMIT_REACHED with `data.candidate`.
     if (this.sessions.size >= this.maxHot) {

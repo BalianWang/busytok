@@ -149,8 +149,9 @@ fn seed_provider_model(db: &Database) -> (String, String) {
             tags: vec![],
             display_name: None,
             reasoning: None,
-            context_window: None,
-            max_tokens: None,
+            // I-2: execute_task fails fast on NULL context_window / max_tokens.
+            context_window: Some(128000),
+            max_tokens: Some(16384),
         })
         .unwrap();
     (provider.id, model.model_id)

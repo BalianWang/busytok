@@ -48,17 +48,19 @@ pub fn resolve_by_name(
         .collect();
     match active.len() {
         0 => {
-            // Creation path: validate provider + model before insert.
-            // Spec §3.3 "both or neither": the manager's `delegate()` enforces
-            // that bound fields are either both present (Some, Some) or both
-            // absent (None, None). When both are absent the manager passes
-            // empty strings here — skip validation and persist empty bound
-            // fields (INTERIM until Task 4 makes bound fields required in the
-            // DTO). When both are present (non-empty), validate them against
-            // the provider/model catalog.
-            if !bound_provider_id.is_empty() || !bound_model_id.is_empty() {
-                validate_bound_provider_model(db, bound_provider_id, bound_model_id)?;
+            // Creation path (spec §3.3 strict): both bound fields MUST be
+            // provided and validated against the provider/model catalog.
+            // Empty strings are a programming error — the manager's
+            // `delegate()` passes empty strings only when the caller supplied
+            // `(None, None)`, which is valid for the reuse path but rejected
+            // here for creation. There is no "create without binding" path.
+            if bound_provider_id.is_empty() || bound_model_id.is_empty() {
+                return Err(SubagentError::Validation(
+                    "bound_provider_id and bound_model_id are both required to create a subagent"
+                        .into(),
+                ));
             }
+            validate_bound_provider_model(db, bound_provider_id, bound_model_id)?;
             Ok(Resolved {
                 subagent: create_subagent(
                     db,

@@ -2042,6 +2042,194 @@ async fn execute_task_fails_when_bound_model_disabled() {
     );
 }
 
+// --- I-2: fail-fast on missing context_window / max_tokens metadata ---------
+
+/// `execute_task_fails_when_model_missing_context_window` — I-2 spec §4.3
+/// fail-fast: a model with NULL `context_window` must be rejected at
+/// validation time (not deferred to the Pi SDK, which would interpret 0 as
+/// "no context" — silent breakage). The reuse path is exercised
+/// (`subagent_id` set, bound fields from row) so the subagent's persisted
+/// binding is the source of truth.
+#[tokio::test]
+async fn execute_task_fails_when_model_missing_context_window() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-no-ctx".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    // Create a model with NULL context_window (simulates a pre-existing/seed
+    // model before the metadata backfill, or a direct SQL insert).
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: None, // missing — execute_task must reject
+            max_tokens: Some(16384),
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-no-ctx".into(),
+            name: "test-sub-no-ctx".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-no-ctx"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-no-ctx".into(),
+        subagent_id: Some("sub-no-ctx".into()), // reuse path — bound fields from row
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let err = manager.delegate(req).await.unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("missing context_window metadata"),
+        "expected 'missing context_window metadata' in error, got: {msg}"
+    );
+}
+
+/// `execute_task_fails_when_model_missing_max_tokens` — I-2 companion: a
+/// model with NULL `max_tokens` must also be rejected at validation time.
+#[tokio::test]
+async fn execute_task_fails_when_model_missing_max_tokens() {
+    use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentMemoryRow};
+
+    let _guard = install_tracing();
+    let db = std::sync::Arc::new(std::sync::Mutex::new(Database::open_in_memory().unwrap()));
+    let provider = create_provider(
+        db.lock().unwrap().conn(),
+        CreateProviderReq {
+            name: "P1-no-max".into(),
+            provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        },
+    )
+    .unwrap();
+    let model = create_model(
+        db.lock().unwrap().conn(),
+        CreateModelReq {
+            provider_id: provider.id.clone(),
+            model_id: "gpt-4o".into(),
+            enabled: true,
+            tags: vec![],
+            display_name: None,
+            reasoning: None,
+            context_window: Some(128000),
+            max_tokens: None, // missing — execute_task must reject
+        },
+    )
+    .unwrap();
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: "sub-no-max".into(),
+            name: "test-sub-no-max".into(),
+            project_id: "h".into(),
+            repo_path: "/tmp".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: provider.id.clone(),
+            bound_model_id: model.model_id.clone(),
+            status: "cold".into(),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            last_active_at_ms: None,
+        })
+        .unwrap();
+        g.subagent_upsert_memory(&SubagentMemoryRow::new_empty("sub-no-max"))
+            .unwrap();
+    }
+
+    let manager = SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "mock",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+
+    let req = DelegateRequest {
+        subagent_name: "test-sub-no-max".into(),
+        subagent_id: Some("sub-no-max".into()),
+        cwd: "/tmp".into(),
+        profile: "pi/search-cheap".into(),
+        intent: None,
+        prompt: "hi".into(),
+        prompt_artifact_ref: None,
+        timeout_seconds: None,
+        model_override: None,
+        source_harness: None,
+        source_session_id: None,
+        bound_provider_id: None,
+        bound_model_id: None,
+    };
+    let err = manager.delegate(req).await.unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation variant, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("missing max_tokens metadata"),
+        "expected 'missing max_tokens metadata' in error, got: {msg}"
+    );
+}
+
 // --- Task 9: coverage-gap closures for execute_task validation paths --------
 
 /// Spec §3.3 "both or neither": delegating with only one of

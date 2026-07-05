@@ -67,7 +67,10 @@ export interface TurnAutoParams {
   logical_subagent_name?: string;
   cwd: string;
   profile: string;
-  model?: string;
+  /** Model ID — REQUIRED. The Rust side always sends the bound model
+   *  (or model_override) since subagent binding makes routing explicit
+   *  (spec §3.3 + §4.3). Tightened from optional in Phase 3. */
+  model: string;
   /** Provider ID — now REQUIRED (was optional in Phase 3). The Rust side
    *  always sends it since subagent binding makes provider routing explicit. */
   provider_id: string;

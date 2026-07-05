@@ -123,12 +123,27 @@ fn seed_test_providers(db: &busytok_store::Database, seeds: &[TestProviderSeed])
             .expect("seed provider to SQL");
         for model_id in p.models {
             let model_pk = format!("seed-{}-{}", p.id, model_id);
+            // I-2: `execute_task` fails fast on NULL context_window / max_tokens.
+            // The migration 0007 backfill only runs at migration time, so test
+            // seeds must supply both values explicitly. Defaults match the
+            // manager.rs test seeds (128000 context, 16384 max_tokens).
             db.conn()
                 .execute(
                     "INSERT OR REPLACE INTO models \
-                     (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![model_pk, p.id, model_id, 1_i64, now],
+                     (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, \
+                      display_name, reasoning, context_window, max_tokens) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        model_pk,
+                        p.id,
+                        model_id,
+                        1_i64,
+                        now,
+                        model_id,    // display_name falls back to model_id
+                        0_i64,       // reasoning = false
+                        128_000_i64, // context_window
+                        16_384_i64,  // max_tokens
+                    ],
                 )
                 .expect("seed model to SQL");
         }
@@ -2110,6 +2125,11 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     let db2 = Arc::new(std::sync::Mutex::new(
         busytok_store::Database::open_in_memory().unwrap(),
     ));
+    // I-1: the creation path now requires valid bound_provider_id +
+    // bound_model_id (spec §3.3 strict). Seed the test provider + model
+    // into db2 so the resolver's validate_bound_provider_model passes.
+    // The model seed includes context_window + max_tokens (I-2 fail-fast).
+    seed_test_providers(&db2.lock().unwrap(), &[TEST_PROVIDER_SEED.clone()]);
     let settings2 = busytok_config::SubagentSettings {
         enabled: true,
         ..Default::default()
@@ -2136,8 +2156,8 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
         model_override: None,
         source_harness: None,
         source_session_id: None,
-        bound_provider_id: None,
-        bound_model_id: None,
+        bound_provider_id: Some(TEST_PROVIDER_SEED.id.to_string()),
+        bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
     };
     // §8.3 step 2 "queue only": delegate() accepts the task and returns
     // DelegateResult { status: Queued } — NOT an error. The background

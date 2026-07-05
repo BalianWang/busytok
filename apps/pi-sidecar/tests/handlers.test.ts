@@ -24,15 +24,15 @@ function stubSdk(id: string): SdkSession {
     dispose: () => {},
   };
 }
-function fakeSession(adapterId: string, subagent: string): PiSdkSession {
-  return new PiSdkSession(stubSdk(adapterId), subagent, adapterId);
+function fakeSession(adapterId: string, subagent: string, model = 'test-model'): PiSdkSession {
+  return new PiSdkSession(stubSdk(adapterId), subagent, adapterId, 'test-provider', model);
 }
 function fakeFactory(...ids: string[]): SessionFactory {
   let i = 0;
-  return async (subagent: string) => fakeSession(ids[i++] ?? `fallback_${i}`, subagent);
+  return async (subagent: string, opts) => fakeSession(ids[i++] ?? `fallback_${i}`, subagent, opts.model);
 }
 
-const OPTS = { cwd: '/tmp' };
+const OPTS = { cwd: '/tmp', model: 'test-model' };
 
 describe('initialize handler', () => {
   it('returns protocol version on match', async () => {
@@ -93,7 +93,7 @@ describe('turn_auto handler (mock path)', () => {
     const pool = new SessionPool(3);
     const handler = turnAutoHandlerWithPool(pool);
     const result = await handler(
-      { logical_subagent_id: 'sa_1', prompt: 'do the thing', cwd: '/tmp', profile: 'pi/default' },
+      { logical_subagent_id: 'sa_1', prompt: 'do the thing', cwd: '/tmp', profile: 'pi/default', model: 'test-model' },
       noopCtx,
     ) as {
       adapter_session_id: string; status: string;

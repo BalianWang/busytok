@@ -8,6 +8,20 @@ ALTER TABLE models ADD COLUMN reasoning INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE models ADD COLUMN context_window INTEGER;
 ALTER TABLE models ADD COLUMN max_tokens INTEGER;
 
+-- I-2 backfill: pre-existing/seed models may have NULL context_window /
+-- max_tokens (the columns above are nullable for migration safety). The
+-- application layer (`execute_task`) fails fast on NULL metadata to prevent
+-- silent breakage in the Pi SDK (which would interpret 0 as "no context" /
+-- "no output"). This backfill sets sane defaults (8192 context, 4096
+-- max_tokens) so existing models remain usable after the migration. New
+-- models created via `model_create` always supply both values (DTO requires
+-- them). NOT NULL constraints are NOT added here because SQLite cannot add
+-- NOT NULL to existing columns without a table rebuild, which is risky for
+-- a metadata-only change. The application-layer fail-fast covers any future
+-- NULLs that could arise from direct SQL inserts or partial migrations.
+UPDATE models SET context_window = 8192 WHERE context_window IS NULL;
+UPDATE models SET max_tokens = 4096 WHERE max_tokens IS NULL;
+
 -- 2. Drop child tables that FK to subagent_logical_subagents (no ON DELETE CASCADE).
 --    Order matters: drop referencing tables first.
 DROP TABLE IF EXISTS subagent_usage_records;

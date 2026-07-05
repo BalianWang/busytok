@@ -96,6 +96,24 @@ function ModelRow({
         }
       />
       <SettingsRow
+        label="Metadata"
+        control={
+          <SettingsActionGroup direction="row">
+            <SettingsValue
+              value={`Context: ${model.context_window != null ? model.context_window.toLocaleString() : "—"} tokens`}
+              tone="muted"
+            />
+            <SettingsValue
+              value={`Max output: ${model.max_tokens != null ? model.max_tokens.toLocaleString() : "—"} tokens`}
+              tone="muted"
+            />
+            {model.reasoning && (
+              <SettingsValue value="Reasoning" />
+            )}
+          </SettingsActionGroup>
+        }
+      />
+      <SettingsRow
         label="Tags"
         control={
           editingTags ? (

@@ -212,6 +212,49 @@ fn resolve_by_name_rejects_disabled_model() {
     assert!(msg.contains("model disabled"), "got: {msg}");
 }
 
+// --- I-1 fix: creation path rejects empty bound fields (spec §3.3 strict) ---
+
+/// Spec §3.3: there is no "create without binding" path. The creation path
+/// (0 active matches) must reject empty `bound_provider_id` / `bound_model_id`
+/// with `SubagentError::Validation`. The INTERIM scaffold that skipped
+/// validation for empty strings has been removed.
+#[test]
+fn resolve_by_name_rejects_empty_bound_fields_on_creation_path() {
+    let db = Database::open_in_memory().unwrap();
+    // No prior subagent → creation path. Empty bound fields must be rejected.
+    let err = resolve_by_name(&db, "fresh-sub", "/tmp/repo", "pi/search-cheap", "", "")
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, SubagentError::Validation(_)),
+        "expected SubagentError::Validation, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bound_provider_id and bound_model_id are both required"),
+        "expected 'both required' message, got: {msg}"
+    );
+}
+
+/// Same invariant, but only `bound_provider_id` is empty (model is set).
+/// Still a creation-path rejection.
+#[test]
+fn resolve_by_name_rejects_partial_empty_bound_fields_on_creation_path() {
+    let db = Database::open_in_memory().unwrap();
+    let (_pid, mid) = seed_provider_model(&db);
+    let err = resolve_by_name(
+        &db,
+        "fresh-sub-partial",
+        "/tmp/repo",
+        "pi/search-cheap",
+        "",
+        &mid,
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, SubagentError::Validation(_)));
+}
+
 // NOTE: `resolve_by_name` / `lookup_by_name` have an `AmbiguousName` branch
 // (matches.len() > 1) and `row_to_model` has an `unwrap_or(Cold)` status
 // fallback. Both branches are unreachable through the public DB API because

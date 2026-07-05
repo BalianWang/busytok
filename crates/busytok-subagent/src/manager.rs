@@ -165,10 +165,15 @@ impl SubagentManager {
             ));
         }
 
-        // Spec §3.3: bound fields are conditionally required (create path
-        // only). Both must be present or both absent — one without the other
-        // is a validation error. Ignored when reusing an existing subagent
-        // (name path hit OR subagent_id shortcut).
+        // Spec §3.3: bound fields are conditionally required. One without the
+        // other is a validation error (`(Some, None)` / `(None, Some)`).
+        // `(None, None)` is permitted at this layer for the reuse path (name
+        // hit OR `subagent_id` shortcut) — the caller may not know whether the
+        // subagent exists. The resolver's creation path (0 active matches)
+        // rejects empty bound fields with `SubagentError::Validation`, so a
+        // `(None, None)` request that misses the name lookup fails fast with
+        // "bound_provider_id and bound_model_id are both required to create a
+        // subagent". There is no "create without binding" path (spec §3.3).
         let bound_pair = match (&req.bound_provider_id, &req.bound_model_id) {
             (Some(p), Some(m)) => Some((p.clone(), m.clone())),
             (None, None) => None,
@@ -506,8 +511,24 @@ impl SubagentManager {
                 // 瞬态：不写回 task row，不进日志明文，不进 DTO/response/diagnostic.
                 provider_api_key: resolved_provider.api_key.clone().unwrap_or_default(),
                 model_reasoning: resolved_model.reasoning,
-                model_context_window: resolved_model.context_window.unwrap_or(0),
-                model_max_tokens: resolved_model.max_tokens.unwrap_or(0),
+                // I-2 fail-fast: context_window + max_tokens are required at
+                // execute time. Pre-existing/seed models may have NULL for
+                // these columns (migration 0007 adds them as nullable).
+                // `unwrap_or(0)` would propagate 0 into the Pi SDK's
+                // `registerProvider({ contextWindow: 0, maxTokens: 0 })`,
+                // which the SDK may interpret as "no context" / "no output" —
+                // silent breakage. Fail fast with a Validation error instead
+                // so the operator re-creates the model with proper metadata.
+                model_context_window: resolved_model.context_window.ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "model '{effective_model_id}' missing context_window metadata; re-create the model with context_window + max_tokens"
+                    ))
+                })?,
+                model_max_tokens: resolved_model.max_tokens.ok_or_else(|| {
+                    SubagentError::Validation(format!(
+                        "model '{effective_model_id}' missing max_tokens metadata; re-create the model with context_window + max_tokens"
+                    ))
+                })?,
                 model_display_name: resolved_model.display_name.clone(),
             };
             (

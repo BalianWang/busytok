@@ -3737,8 +3737,8 @@ fn seed_model_to_db(db: &Database, provider_id: &str, model_id: &str, enabled: b
     );
     db.conn()
         .execute(
-            "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            "INSERT INTO models (id, provider_id, model_id, enabled, created_at_ms, updated_at_ms, display_name, reasoning, context_window, max_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, 0, 128000, 16384)",
             params![id, provider_id, model_id, enabled as i64, now],
         )
         .expect("seed model to SQL");

@@ -165,6 +165,7 @@ export const defaultSessionFactory = async (
     logical_subagent_id,
     session.sessionId,
     opts.provider_id,
+    opts.model,
   );
 };
 
@@ -182,6 +183,12 @@ export class PiSdkSession {
   last_used_at_ms: number;
   private readonly sdk: SdkSession;
   private readonly resolvedProvider: string;
+  /**
+   * The model this session was created with (from `CreateSessionOpts.model`).
+   * The hot pool compares this against `opts.model` on a hit to detect a
+   * task-level `model_override` change and force a cold miss (P1-1).
+   */
+  readonly resolvedModel: string;
   private closed = false;
 
   constructor(
@@ -189,11 +196,13 @@ export class PiSdkSession {
     logical_subagent_id: string,
     adapter_session_id: string,
     resolvedProvider: string,
+    resolvedModel: string,
   ) {
     this.sdk = sdk;
     this.logical_subagent_id = logical_subagent_id;
     this.adapter_session_id = adapter_session_id;
     this.resolvedProvider = resolvedProvider;
+    this.resolvedModel = resolvedModel;
     const now = Date.now();
     this.created_at_ms = now;
     this.last_used_at_ms = now;

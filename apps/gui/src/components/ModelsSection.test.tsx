@@ -210,6 +210,53 @@ describe("ModelsSection", () => {
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
   });
 
+  it("surfaces model metadata (context_window, max_tokens, reasoning badge) in each row", () => {
+    mockUseModels.mockReturnValue(
+      mockModelsQuery(
+        makeListResponse([
+          makeModel({
+            model_db_id: "m-1",
+            model_id: "deepseek-chat",
+            context_window: 128000,
+            max_tokens: 16384,
+            reasoning: true,
+          }),
+        ]),
+      ),
+    );
+    renderSection();
+    // Context window + max tokens are formatted with thousands separators.
+    expect(screen.getByText(/Context:.*128,000.*tokens/)).toBeTruthy();
+    expect(screen.getByText(/Max output:.*16,384.*tokens/)).toBeTruthy();
+    // Reasoning badge appears in the metadata row. The create form's
+    // checkbox label also says "Reasoning", so there are 2 matches:
+    // the badge span + the create-form label.
+    expect(screen.getAllByText(/^Reasoning$/)).toHaveLength(2);
+  });
+
+  it("renders em-dash fallback for null metadata and omits reasoning badge when false", () => {
+    mockUseModels.mockReturnValue(
+      mockModelsQuery(
+        makeListResponse([
+          makeModel({
+            model_db_id: "m-1",
+            model_id: "deepseek-chat",
+            context_window: null,
+            max_tokens: null,
+            reasoning: false,
+          }),
+        ]),
+      ),
+    );
+    renderSection();
+    // Null metadata renders "—" fallback in both Context and Max output slots.
+    expect(screen.getByText(/Context:.*—.*tokens/)).toBeTruthy();
+    expect(screen.getByText(/Max output:.*—.*tokens/)).toBeTruthy();
+    // No "Reasoning" badge in the metadata row when reasoning=false.
+    // The create form's checkbox label still says "Reasoning" (1 match).
+    expect(screen.getAllByText(/^Reasoning$/)).toHaveLength(1);
+  });
+
   it("renders empty state when no models match filter", () => {
     mockUseModels.mockReturnValue(mockModelsQuery(makeListResponse([])));
     renderSection();

@@ -17,16 +17,18 @@ function stubSdk(id: string): SdkSession {
     dispose: () => {},
   };
 }
-function fakeSession(adapterId: string, subagent: string): PiSdkSession {
-  return new PiSdkSession(stubSdk(adapterId), subagent, adapterId);
+function fakeSession(adapterId: string, subagent: string, model = 'test-model'): PiSdkSession {
+  return new PiSdkSession(stubSdk(adapterId), subagent, adapterId, 'test-provider', model);
 }
-/** Factory that yields sessions with the given adapter_session_ids, in order. */
+/** Factory that yields sessions with the given adapter_session_ids, in order.
+ * Threads `opts.model` into each session's `resolvedModel` so the pool's
+ * model-mismatch cold-miss (P1-1) is exercisable. */
 function fakeFactory(...ids: string[]): SessionFactory {
   let i = 0;
-  return async (subagent: string) => fakeSession(ids[i++] ?? `fallback_${i}`, subagent);
+  return async (subagent: string, opts) => fakeSession(ids[i++] ?? `fallback_${i}`, subagent, opts.model);
 }
 
-const OPTS = { cwd: '/tmp' };
+const OPTS = { cwd: '/tmp', model: 'test-model' };
 
 describe('SessionPool', () => {
   it('ensure creates new session when under limit', async () => {
@@ -102,5 +104,65 @@ describe('SessionPool', () => {
     const result = await pool.ensure('sub-a', OPTS);
     expect(result.session.adapter_session_id).toBe('from-ctor');
     expect(result.reused).toBe(false);
+  });
+
+  it('ensure evicts + recreates session when model changes (model_override on hot session)', async () => {
+    // P1-1 regression: a task-level `model_override` changes the effective
+    // model. The hot pool MUST evict the old session (bound to the previous
+    // model) and create a fresh one — NOT silently reuse the old session.
+    const pool = new SessionPool(3);
+    await pool.ensure('sub-a', { ...OPTS, model: 'model-a' }, fakeFactory('sess-1'));
+    expect(pool.size()).toBe(1);
+    expect(pool.get('sess-1')).toBeDefined();
+
+    const result = await pool.ensure(
+      'sub-a',
+      { ...OPTS, model: 'model-b' },
+      fakeFactory('sess-2'),
+    );
+
+    // A new session was created (not reused).
+    expect(result.reused).toBe(false);
+    expect(result.session.adapter_session_id).toBe('sess-2');
+    expect(result.session.resolvedModel).toBe('model-b');
+    // Pool size stays 1: old session evicted, new one created.
+    expect(pool.size()).toBe(1);
+    // The old session is gone.
+    expect(pool.get('sess-1')).toBeUndefined();
+    // The new session is present.
+    expect(pool.get('sess-2')).toBeDefined();
+  });
+
+  it('ensure reuses session when model is unchanged (same model string)', async () => {
+    // P1-1 sanity: when the model matches, the hot session is reused as before.
+    const pool = new SessionPool(3);
+    await pool.ensure('sub-a', { ...OPTS, model: 'same-model' }, fakeFactory('sess-1'));
+    const result = await pool.ensure(
+      'sub-a',
+      { ...OPTS, model: 'same-model' },
+      fakeFactory('sess-2'),
+    );
+    expect(result.reused).toBe(true);
+    expect(result.session.adapter_session_id).toBe('sess-1');
+    expect(pool.size()).toBe(1);
+  });
+
+  it('ensure cold-miss on model mismatch frees a slot when pool is full', async () => {
+    // P1-1: when the pool is full and a model override arrives for an
+    // existing subagent, the old session is evicted (freeing a slot) and a
+    // new one created — HOT_SESSION_LIMIT_REACHED is NOT thrown because the
+    // eviction made room.
+    const pool = new SessionPool(1);
+    await pool.ensure('sub-a', { ...OPTS, model: 'model-a' }, fakeFactory('sess-1'));
+    expect(pool.size()).toBe(1);
+    const result = await pool.ensure(
+      'sub-a',
+      { ...OPTS, model: 'model-b' },
+      fakeFactory('sess-2'),
+    );
+    expect(result.reused).toBe(false);
+    expect(result.session.adapter_session_id).toBe('sess-2');
+    expect(pool.size()).toBe(1);
+    expect(pool.get('sess-1')).toBeUndefined();
   });
 });
