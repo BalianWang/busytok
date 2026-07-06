@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, fireEvent } from "@testing-library/react";
-import type { ProviderDto, ModelCatalogEntryDto } from "@busytok/protocol-types";
+import type { ProviderDto, ModelCatalogEntryDto, ModelCreateRequestDto, ModelUpdateRequestDto } from "@busytok/protocol-types";
 import { ProviderCard } from "./ProviderCard";
 
 afterEach(() => cleanup());
@@ -25,7 +25,7 @@ const makeModel = (overrides: Partial<ModelCatalogEntryDto> = {}): ModelCatalogE
   model_db_id: "model-db-1",
   model_id: "deepseek-chat",
   model_enabled: true,
-  tags: ["cheap", "fast"],
+  tags: [],
   display_name: "deepseek-chat",
   reasoning: false,
   context_window: 200000,
@@ -59,6 +59,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     expect(screen.getByText("deepseek_openai")).toBeDefined();
@@ -77,6 +81,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     expect(screen.getByText(/abc-123/)).toBeDefined();
@@ -96,6 +104,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     expect(screen.getByText("deepseek-chat")).toBeDefined();
@@ -113,6 +125,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     expect(screen.getByText("cheap")).toBeDefined();
@@ -130,6 +146,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     expect(screen.getByText(/暂无 model/)).toBeDefined();
@@ -146,6 +166,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     expect(screen.getByText(/加载中/)).toBeDefined();
@@ -163,6 +187,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={onEdit}
         onTestConnection={vi.fn()}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /编辑/i }));
@@ -181,6 +209,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={onTestConnection}
         onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
@@ -200,6 +232,10 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={onDelete}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
@@ -221,10 +257,219 @@ describe("ProviderCard (view mode)", () => {
         onEdit={vi.fn()}
         onTestConnection={vi.fn()}
         onDelete={onDelete}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
     expect(onDelete).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
+  });
+});
+
+describe("ProviderCard model create", () => {
+  it("shows inline create form when + Add Model clicked", () => {
+    render(
+      <ProviderCard
+        provider={makeProvider()}
+        models={[]}
+        isModelsLoading={false}
+        providerMutations={noopMutations}
+        modelMutations={noopModelMutations}
+        onEdit={vi.fn()}
+        onTestConnection={vi.fn()}
+        onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
+    expect(screen.getByPlaceholderText(/model name/i)).toBeDefined();
+  });
+
+  it("calls onModelCreate with derived payload on Save", () => {
+    const onModelCreate = vi.fn();
+    render(
+      <ProviderCard
+        provider={makeProvider()}
+        models={[]}
+        isModelsLoading={false}
+        providerMutations={noopMutations}
+        modelMutations={noopModelMutations}
+        onEdit={vi.fn()}
+        onTestConnection={vi.fn()}
+        onDelete={vi.fn()}
+        onModelCreate={onModelCreate}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
+    fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    const expected: ModelCreateRequestDto = {
+      provider_id: "prov-1",
+      model_id: "deepseek-chat",
+      display_name: "deepseek-chat",
+      context_window: 200000,
+      max_tokens: 8192,
+      reasoning: true,
+      enabled: true,
+      tags: [],
+    };
+    expect(onModelCreate).toHaveBeenCalledWith(expected);
+  });
+
+  it("parses tags from comma-separated input", () => {
+    const onModelCreate = vi.fn();
+    render(
+      <ProviderCard
+        provider={makeProvider()}
+        models={[]}
+        isModelsLoading={false}
+        providerMutations={noopMutations}
+        modelMutations={noopModelMutations}
+        onEdit={vi.fn()}
+        onTestConnection={vi.fn()}
+        onDelete={vi.fn()}
+        onModelCreate={onModelCreate}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
+    fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
+    fireEvent.change(screen.getByPlaceholderText(/tags/i), { target: { value: "cheap, fast" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(onModelCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ tags: ["cheap", "fast"] }),
+    );
+  });
+});
+
+describe("ProviderCard model delete", () => {
+  it("calls onModelDelete after confirm", () => {
+    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    const onModelDelete = vi.fn();
+    render(
+      <ProviderCard
+        provider={makeProvider()}
+        models={[makeModel()]}
+        isModelsLoading={false}
+        providerMutations={noopMutations}
+        modelMutations={noopModelMutations}
+        onEdit={vi.fn()}
+        onTestConnection={vi.fn()}
+        onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={onModelDelete}
+      />,
+    );
+    // The model row's 删除 button is the last 删除 in the DOM (provider delete
+    // is in the header, rendered before the model rows).
+    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+    expect(onModelDelete).toHaveBeenCalledWith(makeModel());
+    confirmSpy.mockRestore();
+  });
+});
+
+describe("ProviderCard model edit", () => {
+  const renderCardWithModel = (overrides: { onModelUpdate?: ReturnType<typeof vi.fn>; onModelTagsUpdate?: ReturnType<typeof vi.fn> } = {}) => {
+    const onModelUpdate = overrides.onModelUpdate ?? vi.fn();
+    const onModelTagsUpdate = overrides.onModelTagsUpdate ?? vi.fn();
+    const result = render(
+      <ProviderCard
+        provider={makeProvider()}
+        models={[makeModel()]}
+        isModelsLoading={false}
+        providerMutations={noopMutations}
+        modelMutations={noopModelMutations}
+        onEdit={vi.fn()}
+        onTestConnection={vi.fn()}
+        onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={onModelUpdate}
+        onModelTagsUpdate={onModelTagsUpdate}
+        onModelDelete={vi.fn()}
+      />,
+    );
+    return { ...result, onModelUpdate, onModelTagsUpdate };
+  };
+
+  it("shows edit form with current model values when 编辑 clicked", () => {
+    renderCardWithModel();
+    // Click the model-row 编辑 button (the last one — provider 编辑 is in the header).
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // Edit form should show current display_name, context_window, max_tokens, reasoning.
+    expect(screen.getByDisplayValue("deepseek-chat")).toBeDefined(); // display_name
+    expect(screen.getByDisplayValue("200000")).toBeDefined(); // context_window
+    expect(screen.getByDisplayValue("8192")).toBeDefined(); // max_tokens
+    // makeModel has reasoning: false.
+    expect((screen.getByRole("checkbox", { name: /reasoning/i }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("calls onModelUpdate with only changed fields on save (single-state Option semantics)", () => {
+    const { onModelUpdate } = renderCardWithModel();
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // Change only display_name; leave other fields unchanged.
+    const nameInput = screen.getByDisplayValue("deepseek-chat");
+    fireEvent.change(nameInput, { target: { value: "DeepSeek Chat" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // First arg is the model being edited; second is the patch with id + only changed field.
+    expect(onModelUpdate).toHaveBeenCalledWith(
+      makeModel(),
+      expect.objectContaining({
+        id: "model-db-1",
+        display_name: "DeepSeek Chat",
+      }),
+    );
+    // Unchanged fields must NOT be in the patch (omit = no change per ModelUpdateRequestDto semantics).
+    const call = onModelUpdate.mock.calls[0][1] as ModelUpdateRequestDto;
+    expect(call.context_window).toBeUndefined();
+    expect(call.max_tokens).toBeUndefined();
+    expect(call.reasoning).toBeUndefined();
+    expect(call.enabled).toBeUndefined();
+  });
+
+  it("calls onModelTagsUpdate when tags changed on save", () => {
+    const { onModelTagsUpdate } = renderCardWithModel();
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // Change the tags input (empty in makeModel → set to "cheap,fast").
+    const tagsInput = screen.getByPlaceholderText(/tags/i);
+    fireEvent.change(tagsInput, { target: { value: "cheap,fast" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(onModelTagsUpdate).toHaveBeenCalledWith("deepseek-chat", ["cheap", "fast"]);
+  });
+
+  it("does not call onModelTagsUpdate when tags unchanged", () => {
+    const { onModelTagsUpdate } = renderCardWithModel({
+      onModelTagsUpdate: vi.fn(),
+    });
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // Don't touch tags — leave them as-is (empty in makeModel).
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(onModelTagsUpdate).not.toHaveBeenCalled();
+  });
+
+  it("exits edit mode on Cancel", () => {
+    renderCardWithModel();
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.click(screen.getByRole("button", { name: /取消/i }));
+    // Edit form should be gone; the model row's view mode should show again.
+    expect(screen.queryByRole("checkbox", { name: /reasoning/i })).toBeNull();
   });
 });
