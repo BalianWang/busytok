@@ -18,6 +18,7 @@ use busytok_runtime::BusytokSupervisor;
 use busytok_store::Database;
 
 pub mod models;
+pub mod provider;
 
 /// Connect to the control server and return a client.
 pub(crate) async fn connect_client() -> Result<ControlClient> {
