@@ -428,8 +428,8 @@ export interface UseModelsFilter {
   /**
    * When `false` (default), the query is disabled entirely (no fetch).
    * Callers that always want the query active can pass `true`; callers
-   * that need to skip fetches when the filter is empty (e.g. ProfilesSection
-   * has no selected provider) pass `false`.
+   * that need to skip fetches when the filter is empty (e.g. a caller with
+   * no selected provider) pass `false`.
    */
   enabled?: boolean;
 }
@@ -441,8 +441,8 @@ export function useModels(filter: UseModelsFilter = {}) {
     tags: filter.tags ?? [],
     include_disabled: filter.includeDisabled ?? false,
   };
-  // `enabled` defaults to true; ProfilesSection passes `!!providerId` so
-  // an unbound editing row does not trigger a fetch.
+  // `enabled` defaults to true; callers that want to skip fetches when the
+  // filter is empty pass `false`.
   const isEnabled = filter.enabled ?? true;
   return useQuery<ModelListResponseDto>({
     queryKey: queryKeys.modelsList(request),

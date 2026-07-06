@@ -311,8 +311,8 @@ describe("useBusytokData", () => {
     calls[2].onSuccess();
 
     // tagsUpdate
-    calls[3].mutationFn({ modelId: "deepseek-chat", tags: ["chat"] });
-    expect(mockClient.modelTagsUpdate).toHaveBeenCalledWith("deepseek-chat", ["chat"]);
+    calls[3].mutationFn({ modelId: "model-db-1", tags: ["chat"] });
+    expect(mockClient.modelTagsUpdate).toHaveBeenCalledWith("model-db-1", ["chat"]);
     calls[3].onSuccess();
 
     // All four onSuccess callbacks invalidate the models catalog.

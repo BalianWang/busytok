@@ -431,14 +431,12 @@ describe("ProvidersPage (rewritten)", () => {
   });
 
   it("emits model.tags.updated event on successful tags update", () => {
+    const mutateSpy = vi.fn((payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
-      tagsUpdate: {
-        mutate: vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
-          opts?.onSuccess?.();
-        }),
-        isPending: false,
-      },
+      tagsUpdate: { mutate: mutateSpy, isPending: false },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
     const editButtons = screen.getAllByRole("button", { name: /编辑/i });
@@ -447,6 +445,12 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "cheap,fast" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Regression (C1): mutate must receive the SQL PK (model_db_id), not the
+    // human-readable model_id string. makeModel() sets them distinctly.
+    expect(mutateSpy).toHaveBeenCalledWith(
+      { modelId: "model-db-1", tags: ["cheap", "fast"] },
+      expect.anything(),
+    );
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "model.tags.updated",
@@ -460,14 +464,12 @@ describe("ProvidersPage (rewritten)", () => {
   });
 
   it("emits model.tags.update.failed event on failed tags update", () => {
+    const mutateSpy = vi.fn((payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+      opts?.onError?.(new Error("tags update failed"));
+    });
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
-      tagsUpdate: {
-        mutate: vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-          opts?.onError?.(new Error("tags update failed"));
-        }),
-        isPending: false,
-      },
+      tagsUpdate: { mutate: mutateSpy, isPending: false },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
     const editButtons = screen.getAllByRole("button", { name: /编辑/i });
@@ -476,6 +478,12 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "cheap,fast" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Regression (C1): same payload assertion as the success case; only the
+    // opts differ (onError instead of onSuccess).
+    expect(mutateSpy).toHaveBeenCalledWith(
+      { modelId: "model-db-1", tags: ["cheap", "fast"] },
+      expect.anything(),
+    );
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "model.tags.update.failed",

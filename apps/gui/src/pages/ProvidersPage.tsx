@@ -176,7 +176,7 @@ export function ProvidersPage() {
     tags: string[],
   ) => {
     modelMutations.tagsUpdate.mutate(
-      { modelId: model.model_id, tags },
+      { modelId: model.model_db_id, tags },
       {
         onSuccess: () => {
           reportFrontendEventSafely({

@@ -179,8 +179,8 @@ export function ProviderCard({
   const handleEditSubmit = (m: ModelCatalogEntryDto) => {
     if (!editDraft) return;
     // Single-state Option<T>: only include fields that changed. Omit = no change
-    // (serde deserializes both missing and null to None, so this is wire-compatible
-    // with the existing ModelsSection pattern that sends null for unchanged fields).
+    // (serde deserializes both missing and null to None, so omitting is wire-
+    // compatible with the DTO's Option<T> contract).
     const patch: Partial<ModelUpdateRequestDto> & { id: string } = { id: m.model_db_id };
     if (editDraft.display_name && editDraft.display_name !== (m.display_name ?? "")) {
       patch.display_name = editDraft.display_name;
