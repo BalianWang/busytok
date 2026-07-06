@@ -228,4 +228,24 @@ sign_sidecar_node_binaries() {
             echo "  WARNING: node binary not found at $node_path — skipping sign"
         fi
     done
+
+    # Sign native Node.js addons (*.node files) inside the Pi SDK's
+    # transitive node_modules. Apple notarization requires every Mach-O
+    # binary in the bundle to be signed. These come from npm packages
+    # (e.g. @mariozechner/clipboard-darwin-*, @earendil-works/pi-tui).
+    # Only files matching "darwin" or "universal" are macOS native —
+    # linux/win32 cross-platform binaries are harmless but signing them
+    # is a no-op (codesign ignores non-Mach-O files).
+    echo "  signing native Node.js addons (*.node) in pi-sidecar/node_modules..."
+    local signed_addons=0
+    while IFS= read -r addon; do
+        if [ -f "$addon" ]; then
+            codesign --sign "$developer_id" \
+                --options runtime \
+                $timestamp_flag \
+                --force \
+                "$addon" 2>/dev/null && signed_addons=$((signed_addons + 1))
+        fi
+    done < <(find "$sidecar_dir/node_modules" -name "*.node" -type f 2>/dev/null)
+    echo "  signed $signed_addons native addons"
 }
