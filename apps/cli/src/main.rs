@@ -151,17 +151,17 @@ enum ProviderCommand {
     /// Create a new provider
     Add {
         #[arg(long)]
-        base_url: String,
+        url: String,
         #[arg(long)]
-        api_key: String,
+        key: String,
         #[arg(long, default_value = "openai_compatible", value_parser = ["openai_compatible", "anthropic_compatible"])]
         kind: String,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
-        model_name: Option<String>,
+        model: Option<String>,
         #[arg(long)]
-        model_tags: Option<String>,
+        tags: Option<String>,
     },
     /// Show provider details
     Show { id: String },
@@ -171,9 +171,9 @@ enum ProviderCommand {
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
-        base_url: Option<String>,
+        url: Option<String>,
         #[arg(long)]
-        api_key: Option<String>,
+        key: Option<String>,
         #[arg(long, value_parser = ["openai_compatible", "anthropic_compatible"])]
         kind: Option<String>,
         #[arg(long)]
@@ -186,7 +186,7 @@ enum ProviderCommand {
         yes: bool,
     },
     /// Test connection to a provider
-    TestConnection { id: String },
+    Test { id: String },
     /// Manage models under a provider
     Model {
         #[command(subcommand)]
@@ -232,7 +232,7 @@ enum ProviderModelCommand {
         reasoning: Option<bool>,
         #[arg(long)]
         enabled: Option<bool>,
-        #[arg(long = "name")]
+        #[arg(long)]
         display_name: Option<String>,
     },
     /// Delete a model (may break bound subagents)
@@ -1364,9 +1364,9 @@ mod tests {
             "busytok",
             "provider",
             "add",
-            "--base-url",
+            "--url",
             "https://api.deepseek.com/v1",
-            "--api-key",
+            "--key",
             "sk-test",
         ])
         .unwrap();
@@ -1374,20 +1374,20 @@ mod tests {
             Some(Command::Provider {
                 subcommand:
                     ProviderCommand::Add {
-                        base_url,
-                        api_key,
+                        url,
+                        key,
                         kind,
                         name,
-                        model_name,
-                        model_tags,
+                        model,
+                        tags,
                     },
             }) => {
-                assert_eq!(base_url, "https://api.deepseek.com/v1");
-                assert_eq!(api_key, "sk-test");
+                assert_eq!(url, "https://api.deepseek.com/v1");
+                assert_eq!(key, "sk-test");
                 assert_eq!(kind, "openai_compatible");
                 assert!(name.is_none());
-                assert!(model_name.is_none());
-                assert!(model_tags.is_none());
+                assert!(model.is_none());
+                assert!(tags.is_none());
             }
             other => panic!("expected Provider Add, got: {other:?}"),
         }
@@ -1399,17 +1399,17 @@ mod tests {
             "busytok",
             "provider",
             "add",
-            "--base-url",
+            "--url",
             "https://api.deepseek.com/v1",
-            "--api-key",
+            "--key",
             "sk-test",
             "--kind",
             "anthropic_compatible",
             "--name",
             "custom_name",
-            "--model-name",
+            "--model",
             "claude-3-opus",
-            "--model-tags",
+            "--tags",
             "fast,reasoning",
         ])
         .unwrap();
@@ -1417,19 +1417,19 @@ mod tests {
             Some(Command::Provider {
                 subcommand:
                     ProviderCommand::Add {
-                        base_url,
-                        api_key,
+                        url,
+                        key,
                         kind,
                         name,
-                        model_name,
-                        model_tags,
+                        model,
+                        tags,
                     },
             }) => {
                 assert_eq!(kind, "anthropic_compatible");
                 assert_eq!(name.as_deref(), Some("custom_name"));
-                assert_eq!(model_name.as_deref(), Some("claude-3-opus"));
-                assert_eq!(model_tags.as_deref(), Some("fast,reasoning"));
-                (base_url, api_key); // unused
+                assert_eq!(model.as_deref(), Some("claude-3-opus"));
+                assert_eq!(tags.as_deref(), Some("fast,reasoning"));
+                (url, key); // unused
             }
             other => panic!("expected Provider Add, got: {other:?}"),
         }
@@ -1547,9 +1547,9 @@ mod tests {
             "busytok",
             "provider",
             "add",
-            "--base-url",
+            "--url",
             "https://api.deepseek.com",
-            "--api-key",
+            "--key",
             "sk-test",
             "--kind",
             "invalid_kind",
