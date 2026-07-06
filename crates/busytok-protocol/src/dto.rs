@@ -1424,32 +1424,20 @@ pub struct SubagentTaskSummaryDto {
 pub struct SubagentTaskDetailDto {
     pub id: String,
     pub subagent_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_harness: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_session_id: Option<String>,
     pub profile: String,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_artifact_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<i64>,
     pub created_at_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_ms: Option<i64>,
 }
 
@@ -2744,8 +2732,8 @@ mod tests {
         assert_eq!(json["prompt"], "do the thing");
         assert_eq!(json["prompt_artifact_ref"], "artifact-1");
         assert_eq!(json["result_summary"], "ok");
-        assert!(json.get("error").is_none());
-        assert!(json.get("error_kind").is_none());
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["error_kind"], serde_json::Value::Null);
         assert_eq!(json["model_override"], "gpt-4o");
         assert_eq!(json["timeout_seconds"], 120);
         assert_eq!(json["created_at_ms"], 1_000);
@@ -2773,8 +2761,8 @@ mod tests {
     }
 
     #[test]
-    fn subagent_task_detail_dto_optional_fields_can_be_null_or_omitted() {
-        // All optional fields explicitly null on the wire.
+    fn subagent_task_detail_dto_optional_fields_serialize_as_null() {
+        // Missing optional fields on the wire deserialize as None.
         let nulls: SubagentTaskDetailDto = serde_json::from_str(
             r#"{"id":"t","subagent_id":"s","profile":"p","status":"pending","created_at_ms":100}"#,
         )
@@ -2797,7 +2785,7 @@ mod tests {
         assert!(nulls.started_at_ms.is_none());
         assert!(nulls.completed_at_ms.is_none());
 
-        // Optional fields set to null on the wire (rather than omitted).
+        // Optional fields explicitly null on the wire also deserialize as None.
         let explicit_nulls: SubagentTaskDetailDto = serde_json::from_str(
             r#"{"id":"t","subagent_id":"s","subagent_name":null,"source_harness":null,"source_session_id":null,"profile":"p","status":"pending","prompt":null,"prompt_artifact_ref":null,"result_summary":null,"error":null,"error_kind":null,"model_override":null,"timeout_seconds":null,"created_at_ms":100,"started_at_ms":null,"completed_at_ms":null}"#,
         )
@@ -2828,9 +2816,9 @@ mod tests {
             completed_at_ms: Some(6_000),
         };
         let json = serde_json::to_value(&degraded).unwrap();
-        // subagent_name is skipped on serialize when None (mirrors
-        // SubagentRuntimeTaskDto / SubagentDelegateResponseDto conventions).
-        assert!(json.get("subagent_name").is_none());
+        // None serializes as explicit null — consistent with the TS contract
+        // (field: string | null, key always present).
+        assert_eq!(json["subagent_name"], serde_json::Value::Null);
         assert_eq!(json["error"], "boom");
         assert_eq!(json["error_kind"], "timeout");
         let back: SubagentTaskDetailDto = serde_json::from_value(json).unwrap();
