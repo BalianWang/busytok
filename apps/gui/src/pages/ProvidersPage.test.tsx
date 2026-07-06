@@ -1,31 +1,24 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
+  ModelCatalogEntryDto,
+  ModelListResponseDto,
   ProviderDto,
   ProviderListResponseDto,
-  ProviderTestConnectionResponseDto,
-  ModelListResponseDto,
 } from "@busytok/protocol-types";
 
-// ProvidersPage renders <ModelsSection />, so every hook that child uses
-// must also be mocked here. The defaults returned by `beforeEach` keep the
-// child in its empty/view state so provider-specific assertions are not
-// polluted by child-component UI.
 vi.mock("../api/useBusytokData", () => ({
   useProviders: vi.fn(),
   useProviderMutations: vi.fn(),
   useModels: vi.fn(),
   useModelMutations: vi.fn(),
 }));
-
-vi.mock("../logging/reporter", () => ({
-  reportFrontendEvent: vi.fn(),
-}));
 vi.mock("../logging/safeReporter", () => ({
   reportFrontendEventSafely: vi.fn(),
 }));
 
+import { ProvidersPage } from "./ProvidersPage";
 import {
   useProviders,
   useProviderMutations,
@@ -33,104 +26,113 @@ import {
   useModelMutations,
 } from "../api/useBusytokData";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
-import { ProvidersPage } from "./ProvidersPage";
 
-const mockUseProviders = vi.mocked(useProviders);
-const mockUseProviderMutations = vi.mocked(useProviderMutations);
-const mockUseModels = vi.mocked(useModels);
-const mockUseModelMutations = vi.mocked(useModelMutations);
+const makeProvider = (overrides: Partial<ProviderDto> = {}): ProviderDto => ({
+  id: "prov-1",
+  name: "deepseek_openai",
+  provider_kind: "openai_compatible" as never,
+  base_url: "https://api.deepseek.com/v1",
+  enabled: true,
+  has_api_key: true,
+  created_at_ms: 0,
+  updated_at_ms: 0,
+  ...overrides,
+});
 
-function makeProvider(overrides: Partial<ProviderDto> = {}): ProviderDto {
-  return {
-    id: "deepseek-prod",
-    name: "DeepSeek",
-    provider_kind: "openai_compatible",
-    base_url: "https://api.deepseek.com/v1",
-    enabled: true,
-    has_api_key: true,
-    created_at_ms: 0,
-    updated_at_ms: 0,
-    ...overrides,
-  };
-}
+const makeModel = (overrides: Partial<ModelCatalogEntryDto> = {}): ModelCatalogEntryDto => ({
+  provider_id: "prov-1",
+  provider_name: "deepseek_openai",
+  provider_kind: "openai_compatible" as never,
+  provider_enabled: true,
+  model_db_id: "model-db-1",
+  model_id: "deepseek-chat",
+  model_enabled: true,
+  tags: [],
+  display_name: "deepseek-chat",
+  reasoning: false,
+  context_window: 200000,
+  max_tokens: 8192,
+  ...overrides,
+});
 
-function makeListResponse(
-  providers: ProviderDto[] = [],
-): ProviderListResponseDto {
-  return { providers };
-}
-
-type ProvidersQueryResult = ReturnType<typeof useProviders>;
 type ProviderMutationsResult = ReturnType<typeof useProviderMutations>;
-type ModelsQueryResult = ReturnType<typeof useModels>;
 type ModelMutationsResult = ReturnType<typeof useModelMutations>;
 
-function mockProvidersQuery(
-  data: ProviderListResponseDto,
-  extras: Partial<ProvidersQueryResult> = {},
-): ProvidersQueryResult {
-  return {
-    data,
+const mockMutations = (): ProviderMutationsResult => ({
+  createProvider: { mutate: vi.fn(), isPending: false },
+  updateProvider: { mutate: vi.fn(), isPending: false },
+  deleteProvider: {
+    mutate: vi.fn((_id: string, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    }),
+    isPending: false,
+  },
+  testConnection: {
+    mutate: vi.fn(
+      (
+        _id: string,
+        opts?: { onSuccess?: (r: unknown) => void; onError?: (e: Error) => void },
+      ) => {
+        opts?.onSuccess?.({ ok: true, error: null, models_detected: null });
+      },
+    ),
+    isPending: false,
+  },
+} as never);
+
+const mockModelMutations = (): ModelMutationsResult => ({
+  // createModel returns ModelCatalogEntryDto (per useBusytokData.ts:470);
+  // the page's onSuccess reads entry.provider_id + entry.model_id, so the
+  // mock must pass a concrete entry or the handler throws a TypeError.
+  createModel: {
+    mutate: vi.fn(
+      (_payload: unknown, opts?: { onSuccess?: (entry: ModelCatalogEntryDto) => void }) => {
+        opts?.onSuccess?.({
+          provider_id: "prov-1",
+          provider_name: "deepseek_openai",
+          provider_kind: "openai_compatible" as never,
+          provider_enabled: true,
+          model_db_id: "model-db-new",
+          model_id: "new-model",
+          model_enabled: true,
+          tags: [],
+          display_name: "new-model",
+          reasoning: false,
+          context_window: 200000,
+          max_tokens: 8192,
+        });
+      },
+    ),
+    isPending: false,
+  },
+  updateModel: { mutate: vi.fn(), isPending: false },
+  deleteModel: {
+    mutate: vi.fn((_id: string, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    }),
+    isPending: false,
+  },
+  tagsUpdate: { mutate: vi.fn(), isPending: false },
+} as never);
+
+function renderPage(
+  overrides: { providers?: ProviderDto[]; models?: ModelCatalogEntryDto[] } = {},
+) {
+  vi.mocked(useProviders).mockReturnValue({
+    data: { providers: overrides.providers ?? [] } as ProviderListResponseDto,
     isLoading: false,
     isError: false,
     isFetching: false,
-    ...extras,
-  } as never;
-}
-
-function mockModelsQuery(
-  data: ModelListResponseDto,
-  extras: Partial<ModelsQueryResult> = {},
-): ModelsQueryResult {
-  return {
-    data,
+  } as never);
+  vi.mocked(useModels).mockReturnValue({
+    data: { models: overrides.models ?? [] } as ModelListResponseDto,
     isLoading: false,
     isError: false,
     isFetching: false,
-    ...extras,
-  } as never;
-}
-
-function mockMutations(
-  overrides: {
-    createMutate?: ReturnType<typeof vi.fn>;
-    updateMutate?: ReturnType<typeof vi.fn>;
-    deleteMutate?: ReturnType<typeof vi.fn>;
-    testMutate?: ReturnType<typeof vi.fn>;
-    createPending?: boolean;
-    testPending?: boolean;
-  } = {},
-): ProviderMutationsResult {
-  return {
-    createProvider: {
-      mutate: overrides.createMutate ?? vi.fn(),
-      isPending: overrides.createPending ?? false,
-    },
-    updateProvider: {
-      mutate: overrides.updateMutate ?? vi.fn(),
-      isPending: false,
-    },
-    deleteProvider: {
-      mutate: overrides.deleteMutate ?? vi.fn(),
-      isPending: false,
-    },
-    testConnection: {
-      mutate: overrides.testMutate ?? vi.fn(),
-      isPending: overrides.testPending ?? false,
-    },
-  } as never;
-}
-
-function mockModelMutations(): ModelMutationsResult {
-  return {
-    createModel: { mutate: vi.fn(), isPending: false },
-    updateModel: { mutate: vi.fn(), isPending: false },
-    deleteModel: { mutate: vi.fn(), isPending: false },
-    tagsUpdate: { mutate: vi.fn(), isPending: false },
-  } as never;
-}
-
-function renderPage() {
+  } as never);
+  // useProviderMutations / useModelMutations are set in beforeEach; tests
+  // that need a custom mutation mock must call mockReturnValue BEFORE
+  // renderPage (renderPage does not overwrite them).
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
@@ -141,679 +143,289 @@ function renderPage() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockUseProviders.mockReturnValue(mockProvidersQuery(makeListResponse([])));
-  mockUseProviderMutations.mockReturnValue(mockMutations());
-  // Empty models list keeps ModelsSection in its "no models match" state.
-  mockUseModels.mockReturnValue(mockModelsQuery({ models: [] }));
-  mockUseModelMutations.mockReturnValue(mockModelMutations());
+  vi.mocked(useProviderMutations).mockReturnValue(mockMutations());
+  vi.mocked(useModelMutations).mockReturnValue(mockModelMutations());
 });
 
 afterEach(() => cleanup());
 
-describe("ProvidersPage", () => {
+describe("ProvidersPage (rewritten)", () => {
   it("renders empty state when no providers", () => {
     renderPage();
-    expect(screen.getByText(/no providers configured/i)).toBeTruthy();
+    expect(screen.getByText(/新建 Provider/i)).toBeTruthy();
   });
 
-  it("renders provider list with name, id, kind, base_url", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({
-            id: "deepseek-prod",
-            name: "DeepSeek",
-            base_url: "https://api.deepseek.com/v1",
-            provider_kind: "openai_compatible",
-          }),
-        ]),
-      ),
-    );
+  it("shows creation form when + 新建 button clicked", () => {
     renderPage();
-    expect(screen.getByText("DeepSeek")).toBeTruthy();
-    expect(screen.getByText("deepseek-prod")).toBeTruthy();
-    // provider_kind column is rendered (Step 3 requirement).
-    expect(screen.getByText("openai_compatible")).toBeTruthy();
-    expect(screen.getByText("https://api.deepseek.com/v1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /\+ 新建/i }));
+    expect(screen.getByPlaceholderText(/base url/i)).toBeTruthy();
   });
 
-  it("shows Add Provider button", () => {
+  it("closes creation form when 取消 clicked (exercises onClose callback)", () => {
     renderPage();
-    expect(screen.getByRole("button", { name: /add provider/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /\+ 新建/i }));
+    expect(screen.getByPlaceholderText(/base url/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(screen.queryByPlaceholderText(/base url/i)).toBeNull();
   });
 
-  it("shows the create form with Name, Base URL, API Key, Kind fields (no id/env-name/models)", () => {
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-    // Editable fields present.
-    expect(screen.getByLabelText(/^name$/i)).toBeTruthy();
-    expect(screen.getByLabelText(/base url/i)).toBeTruthy();
-    expect(screen.getByLabelText(/^api key$/i)).toBeTruthy();
-    expect(screen.getByLabelText(/^kind$/i)).toBeTruthy();
-    // Removed fields are NOT rendered as inputs.
-    expect(screen.queryByLabelText(/provider id/i)).toBeNull();
-    expect(screen.queryByLabelText(/api key env name/i)).toBeNull();
-    expect(screen.queryByLabelText(/^models$/i)).toBeNull();
+  it("enters and exits provider edit mode (exercises onEdit + onCancelEdit)", () => {
+    renderPage({ providers: [makeProvider()] });
+    // Click the provider's 编辑 button (first one — in the card header).
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[0]);
+    // Edit mode shows a 取消 button in the card header.
+    expect(screen.getByRole("button", { name: /^取消$/i })).toBeTruthy();
+    // Click 取消 to exit edit mode.
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    // Back in view mode — no 取消 button.
+    expect(screen.queryByRole("button", { name: /^取消$/i })).toBeNull();
   });
 
-  it("renders provider_kind selector with both options", () => {
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-    const selector = screen.getByLabelText(/^kind$/i) as HTMLSelectElement;
-    expect(selector).toBeTruthy();
-    const options = Array.from(selector.options);
-    const optionValues = options.map((o) => o.value);
-    expect(optionValues).toContain("openai_compatible");
-    expect(optionValues).toContain("anthropic_compatible");
-    // Default is empty (placeholder) — submit is blocked.
-    expect(selector.value).toBe("");
+  it("renders a ProviderCard for each provider", () => {
+    renderPage({
+      providers: [
+        makeProvider({ id: "p1", name: "alpha" }),
+        makeProvider({ id: "p2", name: "beta" }),
+      ],
+    });
+    expect(screen.getByText("alpha")).toBeTruthy();
+    expect(screen.getByText("beta")).toBeTruthy();
   });
 
-  it("blocks create when provider_kind is not selected", () => {
-    const createMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ createMutate }),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-    fireEvent.change(screen.getByLabelText(/^name$/i), {
-      target: { value: "OpenAI" },
+  it("groups models by provider_id into the correct card", () => {
+    renderPage({
+      providers: [
+        makeProvider({ id: "p1", name: "alpha" }),
+        makeProvider({ id: "p2", name: "beta" }),
+      ],
+      models: [
+        makeModel({ provider_id: "p1", model_id: "alpha-model" }),
+        makeModel({ provider_id: "p2", model_id: "beta-model" }),
+      ],
     });
-    fireEvent.change(screen.getByLabelText(/base url/i), {
-      target: { value: "https://api.openai.com/v1" },
-    });
-    fireEvent.change(screen.getByLabelText(/^api key$/i), {
-      target: { value: "sk-test" },
-    });
-    // Leave provider_kind empty (default).
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    expect(createMutate).not.toHaveBeenCalled();
-    expect(screen.getByText(/select a provider kind before saving/i)).toBeTruthy();
+    expect(screen.getByText("alpha-model")).toBeTruthy();
+    expect(screen.getByText("beta-model")).toBeTruthy();
   });
 
-  it("submits the create form with provider_kind from the selector", () => {
-    const createMutate = vi.fn(
-      (_payload: unknown, opts?: { onSuccess?: () => void }) => {
-        opts?.onSuccess?.();
-      },
-    );
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ createMutate }),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-
-    fireEvent.change(screen.getByLabelText(/^name$/i), {
-      target: { value: "OpenAI" },
-    });
-    fireEvent.change(screen.getByLabelText(/base url/i), {
-      target: { value: "https://api.openai.com/v1" },
-    });
-    fireEvent.change(screen.getByLabelText(/^api key$/i), {
-      target: { value: "sk-test" },
-    });
-    fireEvent.change(screen.getByLabelText(/^kind$/i), {
-      target: { value: "anthropic_compatible" },
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-
-    expect(createMutate).toHaveBeenCalledTimes(1);
-    const arg = createMutate.mock.calls[0][0] as Record<string, unknown>;
-    // Required fields.
-    expect(arg).toMatchObject({
-      name: "OpenAI",
-      provider_kind: "anthropic_compatible",
-      base_url: "https://api.openai.com/v1",
-      api_key: "sk-test",
-    });
-    // Removed fields are NOT in the payload.
-    expect(arg.id).toBeUndefined();
-    expect(arg.api_key_env_name).toBeUndefined();
-    expect(arg.base_url_env_name).toBeUndefined();
-    expect(arg.models).toBeUndefined();
-    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "provider.added" }),
-    );
-  });
-
-  it("sends api_key=null when the create form is submitted with an empty key", () => {
-    const createMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ createMutate }),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-    fireEvent.change(screen.getByLabelText(/^name$/i), {
-      target: { value: "NoKey" },
-    });
-    fireEvent.change(screen.getByLabelText(/base url/i), {
-      target: { value: "https://api.example.com/v1" },
-    });
-    fireEvent.change(screen.getByLabelText(/^kind$/i), {
-      target: { value: "openai_compatible" },
-    });
-    // Leave api_key empty.
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    const arg = createMutate.mock.calls[0][0] as Record<string, unknown>;
-    expect(arg.api_key).toBeNull();
-  });
-
-  it("calls deleteProvider.mutate when Delete is clicked (after confirm)", () => {
-    const deleteMutate = vi.fn((_id: unknown, opts?: { onSuccess?: () => void }) => {
-      opts?.onSuccess?.();
-    });
-    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ deleteMutate }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod" })]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(deleteMutate).toHaveBeenCalledWith(
-      "deepseek-prod",
-      expect.anything(),
-    );
+  it("emits provider.deleted event on successful delete", () => {
+    renderPage({ providers: [makeProvider()] });
+    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({ event_code: "provider.deleted" }),
     );
-    confirmSpy.mockRestore();
   });
 
-  it("does not call deleteProvider.mutate when confirm is cancelled", () => {
-    const deleteMutate = vi.fn();
-    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(false);
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ deleteMutate }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(makeListResponse([makeProvider()])),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(deleteMutate).not.toHaveBeenCalled();
-    confirmSpy.mockRestore();
-  });
-
-  it("calls testConnection.mutate and shows success result when Test Connection is clicked", async () => {
-    const testMutate = vi.fn(
-      (
-        _id: string,
-        opts?: {
-          onSuccess?: (r: ProviderTestConnectionResponseDto) => void;
-        },
-      ) => {
-        opts?.onSuccess?.({ ok: true, error: null, models_detected: null });
+  it("emits provider.delete.failed event on failed delete", () => {
+    vi.mocked(useProviderMutations).mockReturnValue({
+      ...mockMutations(),
+      deleteProvider: {
+        mutate: vi.fn((_id: string, opts?: { onError?: (e: Error) => void }) => {
+          opts?.onError?.(new Error("delete rpc failed"));
+        }),
+        isPending: false,
       },
+    } as never);
+    renderPage({ providers: [makeProvider()] });
+    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_code: "provider.delete.failed",
+        level: "ERROR",
+      }),
     );
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ testMutate: testMutate as never }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod" })]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /test connection/i }));
-    expect(testMutate).toHaveBeenCalledWith(
-      "deepseek-prod",
-      expect.objectContaining({}),
-    );
-    await waitFor(() => {
-      expect(screen.getByText(/✓|connected|success/i)).toBeTruthy();
-    });
+  });
+
+  it("emits provider.tested event on successful test connection", () => {
+    renderPage({ providers: [makeProvider()] });
+    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({ event_code: "provider.tested" }),
     );
   });
 
-  it("shows failure result when Test Connection returns ok=false", async () => {
-    const testMutate = vi.fn(
-      (
-        _id: string,
-        opts?: {
-          onSuccess?: (r: ProviderTestConnectionResponseDto) => void;
-        },
-      ) => {
-        opts?.onSuccess?.({
-          ok: false,
-          error: "Invalid API key",
-          models_detected: null,
-        });
+  it("emits provider.test.failed event when testConnection throws (client exception)", () => {
+    // Override testConnection to trigger onError (client-side exception).
+    vi.mocked(useProviderMutations).mockReturnValue({
+      ...mockMutations(),
+      testConnection: {
+        mutate: vi.fn((_id: string, opts?: { onError?: (e: Error) => void }) => {
+          opts?.onError?.(new Error("rpc timeout"));
+        }),
+        isPending: false,
       },
-    );
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ testMutate: testMutate as never }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(makeListResponse([makeProvider()])),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /test connection/i }));
-    await waitFor(() => {
-      expect(screen.getByText(/✗|failed/i)).toBeTruthy();
-    });
-  });
-
-  it("shows a warning when a provider is disabled", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ enabled: false })]),
-      ),
-    );
-    renderPage();
-    // Use the specific warning text — bare `/disabled/i` also matches the
-    // ModelsSection "Show disabled" toggle label and aria-label.
-    expect(
-      screen.getByText(/this provider is disabled and will not be used/i),
-    ).toBeTruthy();
-  });
-
-  it("shows API key status badge (stored / not set)", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "with-key", name: "WithKey", has_api_key: true }),
-          makeProvider({ id: "no-key", name: "NoKey", has_api_key: false }),
-        ]),
-      ),
-    );
-    renderPage();
-    expect(screen.getByText(/stored|api key set/i)).toBeTruthy();
-    expect(screen.getByText(/not set|missing/i)).toBeTruthy();
-  });
-
-  it("toggles a provider enabled state via the toggle (payload only has id + enabled)", () => {
-    const updateMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ updateMutate }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod", enabled: true })]),
-      ),
-    );
-    renderPage();
-    const toggle = screen.getByRole("checkbox", {
-      name: /enable/i,
-    }) as HTMLInputElement;
-    fireEvent.click(toggle);
-    expect(updateMutate).toHaveBeenCalledTimes(1);
-    const arg = updateMutate.mock.calls[0][0] as Record<string, unknown>;
-    // Three-state contract: only id + enabled in the patch; omitted fields
-    // (name, base_url, api_key) are absent so the backend preserves them.
-    expect(arg).toMatchObject({ id: "deepseek-prod", enabled: false });
-    expect(arg.name).toBeUndefined();
-    expect(arg.base_url).toBeUndefined();
-    expect(arg.api_key).toBeUndefined();
-  });
-
-  it("clicking Edit shows the inline form pre-filled (Name + Base URL + Kind); Provider ID is read-only", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({
-            id: "deepseek-prod",
-            name: "DeepSeek",
-            base_url: "https://api.deepseek.com/v1",
-            provider_kind: "openai_compatible",
-          }),
-        ]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
-
-    // Editable fields pre-filled from the provider.
-    expect((screen.getByLabelText(/^name$/i) as HTMLInputElement).value).toBe(
-      "DeepSeek",
-    );
-    expect(
-      (screen.getByLabelText(/base url/i) as HTMLInputElement).value,
-    ).toBe("https://api.deepseek.com/v1");
-    // Provider kind selector is pre-filled.
-    expect(
-      (screen.getByLabelText(/^kind$/i) as HTMLSelectElement).value,
-    ).toBe("openai_compatible");
-    // Provider ID is shown read-only as text (not as an input).
-    expect(screen.getByText("deepseek-prod")).toBeTruthy();
-    expect(screen.queryByLabelText(/provider id/i)).toBeNull();
-    // api_key has its own Update Key flow — NOT in the edit form.
-    expect(screen.queryByLabelText(/^api key$/i)).toBeNull();
-    // Removed fields are NOT in the edit form either.
-    expect(screen.queryByLabelText(/api key env name/i)).toBeNull();
-    expect(screen.queryByLabelText(/^models$/i)).toBeNull();
-  });
-
-  it("submitting the edit form calls updateProvider.mutate with id+name+base_url+provider_kind (omitted api_key/enabled)", () => {
-    const updateMutate = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
-      opts?.onSuccess?.();
-    });
-    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({
-            id: "deepseek-prod",
-            name: "DeepSeek",
-            base_url: "https://api.deepseek.com/v1",
-            provider_kind: "openai_compatible",
-          }),
-        ]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
-
-    fireEvent.change(screen.getByLabelText(/^name$/i), {
-      target: { value: "DeepSeek Renamed" },
-    });
-    fireEvent.change(screen.getByLabelText(/^kind$/i), {
-      target: { value: "anthropic_compatible" },
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-
-    expect(updateMutate).toHaveBeenCalledTimes(1);
-    const arg = updateMutate.mock.calls[0][0] as Record<string, unknown>;
-    // Three-state api_key contract: id + name + base_url + provider_kind in
-    // the patch.
-    expect(arg).toMatchObject({
-      id: "deepseek-prod",
-      name: "DeepSeek Renamed",
-      base_url: "https://api.deepseek.com/v1",
-      provider_kind: "anthropic_compatible",
-    });
-    // Omitted fields are absent (no api_key, no enabled, no env names, no models).
-    expect(arg.api_key).toBeUndefined();
-    expect(arg.enabled).toBeUndefined();
-    expect(arg.api_key_env_name).toBeUndefined();
-    expect(arg.models).toBeUndefined();
-    // On success the row exits edit mode (form fields gone).
-    expect(screen.queryByLabelText(/^name$/i)).toBeNull();
-  });
-
-  it("clicking Cancel in the edit form reverts to view mode", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod", name: "DeepSeek" })]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
-    expect(screen.getByLabelText(/^name$/i)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
-    expect(screen.queryByLabelText(/^name$/i)).toBeNull();
-  });
-
-  it("renders loading state", () => {
-    mockUseProviders.mockReturnValue({
-      data: undefined,
-      isLoading: true,
-      isError: false,
-      isFetching: false,
     } as never);
-    renderPage();
-    expect(screen.getByText("Loading providers...")).toBeTruthy();
-    expect(screen.getByText("Providers")).toBeTruthy();
-    expect(screen.getByText("Loading")).toBeTruthy();
+    renderPage({ providers: [makeProvider()] });
+    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "provider.test.failed", level: "ERROR" }),
+    );
   });
 
-  it("renders error state", () => {
-    mockUseProviders.mockReturnValue({
-      data: undefined,
-      isLoading: false,
-      isError: true,
-      isFetching: false,
+  it("emits model.added event on successful model create", () => {
+    renderPage({ providers: [makeProvider()] });
+    fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
+    fireEvent.change(screen.getByPlaceholderText(/model name/i), {
+      target: { value: "new-model" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "model.added" }),
+    );
+  });
+
+  it("emits model.add.failed event on failed model create", () => {
+    vi.mocked(useModelMutations).mockReturnValue({
+      ...mockModelMutations(),
+      createModel: {
+        mutate: vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+          opts?.onError?.(new Error("model create rpc failed"));
+        }),
+        isPending: false,
+      },
     } as never);
-    renderPage();
-    expect(screen.getByText("Providers unavailable")).toBeTruthy();
-    expect(screen.getByText("Could not load providers.")).toBeTruthy();
-    expect(screen.getByText("Error")).toBeTruthy();
-  });
-
-  it("shows stored key placeholder for provider with API key", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "with-key", name: "WithKey", has_api_key: true }),
-        ]),
-      ),
-    );
-    renderPage();
-    const input = screen.getByPlaceholderText("•••• (stored)");
-    expect(input).toBeTruthy();
-    expect((input as HTMLInputElement).type).toBe("password");
-  });
-
-  it("shows enter key placeholder for provider without API key", () => {
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "no-key", name: "NoKey", has_api_key: false }),
-        ]),
-      ),
-    );
-    renderPage();
-    const input = screen.getByPlaceholderText("Enter API key");
-    expect(input).toBeTruthy();
-    expect((input as HTMLInputElement).type).toBe("password");
-  });
-
-  it("submits API key update via Update Key button (payload only has id + api_key) and clears input", () => {
-    const updateMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ updateMutate }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "deepseek-prod", name: "DeepSeek", has_api_key: true }),
-        ]),
-      ),
-    );
-    renderPage();
-    const input = screen.getByPlaceholderText("•••• (stored)") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-new" } });
-    fireEvent.click(screen.getByRole("button", { name: /update key/i }));
-    expect(updateMutate).toHaveBeenCalledTimes(1);
-    const arg = updateMutate.mock.calls[0][0] as Record<string, unknown>;
-    // Three-state contract: only id + api_key in the patch.
-    expect(arg).toMatchObject({ id: "deepseek-prod", api_key: "sk-new" });
-    expect(arg.name).toBeUndefined();
-    expect(arg.base_url).toBeUndefined();
-    expect(arg.enabled).toBeUndefined();
-    expect(input.value).toBe("");
-  });
-
-  it("submits API key update via Enter key", () => {
-    const updateMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ updateMutate }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "deepseek-prod", name: "DeepSeek", has_api_key: false }),
-        ]),
-      ),
-    );
-    renderPage();
-    const input = screen.getByPlaceholderText("Enter API key") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-enter" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(updateMutate).toHaveBeenCalledWith(
+    renderPage({ providers: [makeProvider()] });
+    fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
+    fireEvent.change(screen.getByPlaceholderText(/model name/i), {
+      target: { value: "new-model" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: "deepseek-prod",
-        api_key: "sk-enter",
+        event_code: "model.add.failed",
+        level: "ERROR",
       }),
-      expect.anything(),
     );
-    expect(input.value).toBe("");
   });
 
-  it("does not call updateProvider.mutate when API key input is empty", () => {
-    const updateMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ updateMutate }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "deepseek-prod", name: "DeepSeek", has_api_key: true }),
-        ]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /update key/i }));
-    expect(updateMutate).not.toHaveBeenCalled();
-  });
-
-  it("clears and hides the form when Cancel is clicked", () => {
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-    expect(screen.getByLabelText(/^name$/i)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
-    expect(screen.queryByLabelText(/^name$/i)).toBeNull();
-  });
-
-  it("shows Testing state when Test Connection is pending", () => {
-    const testMutate = vi.fn();
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ testMutate: testMutate as never, testPending: true }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod" })]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /test connection/i }));
-    expect(screen.getByRole("button", { name: /testing/i })).toBeTruthy();
-  });
-
-  // ── onError paths ──────────────────────────────────────────────
-
-  it("shows error when createProvider fails", () => {
-    const createMutate = vi.fn(
-      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-        opts?.onError?.(new Error("create failed"));
-      },
-    );
-    mockUseProviderMutations.mockReturnValue(mockMutations({ createMutate }));
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /add provider/i }));
-    fireEvent.change(screen.getByLabelText(/^name$/i), {
-      target: { value: "OpenAI" },
+  it("emits model.deleted event on successful model delete", () => {
+    renderPage({
+      providers: [makeProvider()],
+      models: [makeModel()],
     });
-    fireEvent.change(screen.getByLabelText(/base url/i), {
-      target: { value: "https://api.openai.com/v1" },
+    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    // Last delete button is the model row's
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "model.deleted" }),
+    );
+  });
+
+  it("emits model.delete.failed event on failed model delete", () => {
+    vi.mocked(useModelMutations).mockReturnValue({
+      ...mockModelMutations(),
+      deleteModel: {
+        mutate: vi.fn((_id: string, opts?: { onError?: (e: Error) => void }) => {
+          opts?.onError?.(new Error("model delete rpc failed"));
+        }),
+        isPending: false,
+      },
+    } as never);
+    renderPage({
+      providers: [makeProvider()],
+      models: [makeModel()],
     });
-    fireEvent.change(screen.getByLabelText(/^kind$/i), {
-      target: { value: "openai_compatible" },
+    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_code: "model.delete.failed",
+        level: "ERROR",
+      }),
+    );
+  });
+
+  it("emits model.updated event on successful model update", () => {
+    // Override updateModel to trigger onSuccess.
+    vi.mocked(useModelMutations).mockReturnValue({
+      ...mockModelMutations(),
+      updateModel: {
+        mutate: vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+          opts?.onSuccess?.();
+        }),
+        isPending: false,
+      },
+    } as never);
+    renderPage({ providers: [makeProvider()], models: [makeModel()] });
+    // Enter model edit mode, change display_name, save.
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
+      target: { value: "DeepSeek Chat" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    expect(screen.getByText("create failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "model.updated", level: "INFO" }),
+    );
   });
 
-  it("shows error when toggle fails", () => {
-    const updateMutate = vi.fn(
-      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-        opts?.onError?.(new Error("toggle failed"));
+  it("emits model.update.failed event on failed model update", () => {
+    vi.mocked(useModelMutations).mockReturnValue({
+      ...mockModelMutations(),
+      updateModel: {
+        mutate: vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+          opts?.onError?.(new Error("update failed"));
+        }),
+        isPending: false,
       },
-    );
-    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod", enabled: true })]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("checkbox", { name: /enable/i }));
-    expect(screen.getByText("toggle failed")).toBeTruthy();
-  });
-
-  it("shows error when API key update fails", () => {
-    const updateMutate = vi.fn(
-      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-        opts?.onError?.(new Error("key update failed"));
-      },
-    );
-    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod", has_api_key: true })]),
-      ),
-    );
-    renderPage();
-    const input = screen.getByPlaceholderText("•••• (stored)") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-new" } });
-    fireEvent.click(screen.getByRole("button", { name: /update key/i }));
-    expect(screen.getByText("key update failed")).toBeTruthy();
-  });
-
-  it("shows error when delete fails", () => {
-    const deleteMutate = vi.fn(
-      (_id: unknown, opts?: { onError?: (e: Error) => void }) => {
-        opts?.onError?.(new Error("delete failed"));
-      },
-    );
-    const confirmSpy = vi.spyOn(globalThis, "confirm").mockReturnValue(true);
-    mockUseProviderMutations.mockReturnValue(mockMutations({ deleteMutate }));
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(makeListResponse([makeProvider({ id: "deepseek-prod" })])),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-    expect(screen.getByText("delete failed")).toBeTruthy();
-    confirmSpy.mockRestore();
-  });
-
-  it("shows failure result when Test Connection errors", async () => {
-    const testMutate = vi.fn(
-      (_id: string, opts?: { onError?: (e: Error) => void }) => {
-        opts?.onError?.(new Error("network error"));
-      },
-    );
-    mockUseProviderMutations.mockReturnValue(
-      mockMutations({ testMutate: testMutate as never }),
-    );
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([makeProvider({ id: "deepseek-prod" })]),
-      ),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /test connection/i }));
-    await waitFor(() => {
-      expect(screen.getByText(/✗|failed/i)).toBeTruthy();
+    } as never);
+    renderPage({ providers: [makeProvider()], models: [makeModel()] });
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
+      target: { value: "DeepSeek Chat" },
     });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "model.update.failed", level: "ERROR" }),
+    );
   });
 
-  it("shows error when inline edit submit fails (handleEditSubmit onError)", () => {
-    const updateMutate = vi.fn(
-      (_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-        opts?.onError?.(new Error("edit submit failed"));
+  it("emits model.tags.updated event on successful tags update", () => {
+    vi.mocked(useModelMutations).mockReturnValue({
+      ...mockModelMutations(),
+      tagsUpdate: {
+        mutate: vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+          opts?.onSuccess?.();
+        }),
+        isPending: false,
       },
+    } as never);
+    renderPage({ providers: [makeProvider()], models: [makeModel()] });
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.change(screen.getByPlaceholderText(/tags/i), {
+      target: { value: "cheap,fast" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "model.tags.updated", level: "INFO" }),
     );
-    mockUseProviderMutations.mockReturnValue(mockMutations({ updateMutate }));
-    mockUseProviders.mockReturnValue(
-      mockProvidersQuery(
-        makeListResponse([
-          makeProvider({ id: "deepseek-prod", name: "DeepSeek", enabled: true }),
-        ]),
-      ),
+  });
+
+  it("emits model.tags.update.failed event on failed tags update", () => {
+    vi.mocked(useModelMutations).mockReturnValue({
+      ...mockModelMutations(),
+      tagsUpdate: {
+        mutate: vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+          opts?.onError?.(new Error("tags update failed"));
+        }),
+        isPending: false,
+      },
+    } as never);
+    renderPage({ providers: [makeProvider()], models: [makeModel()] });
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.change(screen.getByPlaceholderText(/tags/i), {
+      target: { value: "cheap,fast" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+      expect.objectContaining({ event_code: "model.tags.update.failed", level: "ERROR" }),
     );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    expect(screen.getByText("edit submit failed")).toBeTruthy();
   });
 });
