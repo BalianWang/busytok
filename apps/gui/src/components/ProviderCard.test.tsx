@@ -486,3 +486,94 @@ describe("ProviderCard model edit", () => {
     expect(onModelUpdate).not.toHaveBeenCalled();
   });
 });
+
+describe("ProviderCard edit mode", () => {
+  // Render the card in edit mode with a default updateProvider mock that
+  // invokes the onSuccess callback (so the component's success path runs).
+  // The mock is exposed so each test can assert on its calls.
+  const renderCardInEditMode = (overrides: { updateProvider?: ReturnType<typeof vi.fn>; onCancelEdit?: ReturnType<typeof vi.fn> } = {}) => {
+    const updateProvider = overrides.updateProvider ?? vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
+    const onCancelEdit = overrides.onCancelEdit ?? vi.fn();
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: updateProvider, isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        provider={makeProvider()}
+        models={[makeModel()]}
+        isModelsLoading={false}
+        providerMutations={providerMutations}
+        modelMutations={noopModelMutations}
+        onEdit={vi.fn()}
+        onTestConnection={vi.fn()}
+        onDelete={vi.fn()}
+        onModelCreate={vi.fn()}
+        onModelUpdate={vi.fn()}
+        onModelTagsUpdate={vi.fn()}
+        onModelDelete={vi.fn()}
+        isEditing={true}
+        onCancelEdit={onCancelEdit}
+      />,
+    );
+    return { updateProvider, onCancelEdit };
+  };
+
+  it("renders editable inputs for base url, api key, kind, name when isEditing", () => {
+    renderCardInEditMode();
+    expect(screen.getByDisplayValue("https://api.deepseek.com/v1")).toBeDefined();
+    expect(screen.getByDisplayValue("deepseek_openai")).toBeDefined();
+    // API key field shows placeholder for new key
+    expect(screen.getByPlaceholderText(/new api key/i)).toBeDefined();
+  });
+
+  it("disables model operation buttons when editing", () => {
+    renderCardInEditMode();
+    const addModelButton = screen.getByRole("button", { name: /\+ Add Model/i }) as HTMLButtonElement;
+    expect(addModelButton.disabled).toBe(true);
+  });
+
+  it("shows notice when editing", () => {
+    renderCardInEditMode();
+    expect(screen.getByText(/正在编辑 Provider 信息/i)).toBeDefined();
+  });
+
+  it("calls updateProvider with patch on Save", () => {
+    const { updateProvider } = renderCardInEditMode();
+    fireEvent.change(screen.getByDisplayValue("https://api.deepseek.com/v1"), { target: { value: "https://api.deepseek.com/v2" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(updateProvider).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "prov-1",
+        base_url: "https://api.deepseek.com/v2",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("omits api_key from patch when key field is empty (no change)", () => {
+    const { updateProvider } = renderCardInEditMode();
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    const call = (updateProvider as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as Record<string, unknown>;
+    expect(call.api_key).toBeUndefined();
+  });
+
+  it("includes api_key in patch when key field is filled", () => {
+    const { updateProvider } = renderCardInEditMode();
+    fireEvent.change(screen.getByPlaceholderText(/new api key/i), { target: { value: "sk-new" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    const call = (updateProvider as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as Record<string, unknown>;
+    expect(call.api_key).toBe("sk-new");
+  });
+
+  it("calls onCancelEdit on Cancel button click", () => {
+    const onCancelEdit = vi.fn();
+    renderCardInEditMode({ onCancelEdit });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(onCancelEdit).toHaveBeenCalledOnce();
+  });
+});

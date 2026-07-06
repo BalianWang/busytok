@@ -1,12 +1,15 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   ModelCatalogEntryDto,
   ModelCreateRequestDto,
   ModelUpdateRequestDto,
   ProviderDto,
+  ProviderKind,
+  ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
 import type { useProviderMutations, useModelMutations } from "../api/useBusytokData";
 import { parseTags } from "../pages/providerFormUtils";
+import { reportFrontendEventSafely } from "../logging/safeReporter";
 
 interface ProviderCardProps {
   provider: ProviderDto;
@@ -21,6 +24,8 @@ interface ProviderCardProps {
   onModelUpdate: (model: ModelCatalogEntryDto, patch: ModelUpdateRequestDto) => void;
   onModelTagsUpdate: (modelId: string, tags: string[]) => void;
   onModelDelete: (model: ModelCatalogEntryDto) => void;
+  isEditing?: boolean;
+  onCancelEdit?: () => void;
 }
 
 const KIND_LABEL: Record<string, string> = {
@@ -42,6 +47,13 @@ interface ModelEditDraft {
   enabled: boolean;
 }
 
+interface ProviderEditDraft {
+  name: string;
+  base_url: string;
+  api_key: string;
+  provider_kind: ProviderKind;
+}
+
 function toEditDraft(m: ModelCatalogEntryDto): ModelEditDraft {
   return {
     display_name: m.display_name ?? "",
@@ -57,6 +69,7 @@ export function ProviderCard({
   provider,
   models,
   isModelsLoading,
+  providerMutations,
   onEdit,
   onTestConnection,
   onDelete,
@@ -64,11 +77,63 @@ export function ProviderCard({
   onModelUpdate,
   onModelTagsUpdate,
   onModelDelete,
+  isEditing = false,
+  onCancelEdit,
 }: ProviderCardProps) {
   const [showCreateModel, setShowCreateModel] = useState(false);
   const [newModelDraft, setNewModelDraft] = useState<NewModelDraft>({ modelId: "", tags: "" });
   const [editingModelDbId, setEditingModelDbId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<ModelEditDraft | null>(null);
+  const [providerEditDraft, setProviderEditDraft] = useState<ProviderEditDraft | null>(null);
+
+  // Initialize/clear provider edit draft via useEffect — never setState during
+  // render (React 19 + StrictMode render phase must be pure).
+  useEffect(() => {
+    if (isEditing) {
+      setProviderEditDraft({
+        name: provider.name,
+        base_url: provider.base_url,
+        api_key: "",
+        provider_kind: provider.provider_kind,
+      });
+    } else {
+      setProviderEditDraft(null);
+    }
+  }, [isEditing, provider.id, provider.name, provider.base_url, provider.provider_kind]);
+
+  const handleSaveProviderEdit = () => {
+    if (!providerEditDraft) return;
+    // Three-state api_key: empty string = omit (undefined → no change).
+    // The "clear key" flow (api_key = null) is out of scope for v1.
+    // Typing a new value = update.
+    const patch: ProviderUpdateRequestDto = {
+      id: provider.id,
+      name: providerEditDraft.name,
+      base_url: providerEditDraft.base_url,
+      enabled: null, // not editable in v1 edit form → no change
+      provider_kind: providerEditDraft.provider_kind,
+      api_key: providerEditDraft.api_key.length > 0 ? providerEditDraft.api_key : undefined,
+    };
+    providerMutations.updateProvider.mutate(patch, {
+      onSuccess: () => {
+        reportFrontendEventSafely({
+          level: "INFO",
+          event_code: "provider.updated",
+          message: "Provider updated",
+          details: { id: provider.id, name: providerEditDraft.name },
+        });
+        onCancelEdit?.();
+      },
+      onError: (err: Error) => {
+        reportFrontendEventSafely({
+          level: "ERROR",
+          event_code: "provider.update.failed",
+          message: "Provider update failed",
+          details: { id: provider.id, error: err.message },
+        });
+      },
+    });
+  };
 
   const handleProviderDelete = () => {
     const ok = globalThis.confirm(
@@ -147,6 +212,75 @@ export function ProviderCard({
     cancelModelEdit();
   };
 
+  // ─── Edit mode render ────────────────────────────────────────────────
+  // Header fields become editable inputs; models section stays visible but
+  // all model operations are disabled with a notice (per spec §4).
+  if (isEditing && providerEditDraft) {
+    const draft = providerEditDraft;
+    return (
+      <div className="provider-card">
+        <div className="provider-card__header">
+          <input
+            type="text"
+            value={draft.name}
+            onChange={(e) => setProviderEditDraft({ ...draft, name: e.target.value })}
+          />
+          <select
+            value={draft.provider_kind}
+            onChange={(e) => setProviderEditDraft({ ...draft, provider_kind: e.target.value as ProviderKind })}
+          >
+            <option value="openai_compatible">openai_compatible</option>
+            <option value="anthropic_compatible">anthropic_compatible</option>
+          </select>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+            <button type="button" onClick={handleSaveProviderEdit}>保存</button>
+            <button type="button" onClick={onCancelEdit}>取消</button>
+          </div>
+        </div>
+        <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+          <label>
+            Base URL
+            <input
+              type="text"
+              value={draft.base_url}
+              onChange={(e) => setProviderEditDraft({ ...draft, base_url: e.target.value })}
+            />
+          </label>
+          <label>
+            New API Key (leave empty to keep current)
+            <input
+              type="password"
+              placeholder="new api key (optional)"
+              value={draft.api_key}
+              onChange={(e) => setProviderEditDraft({ ...draft, api_key: e.target.value })}
+            />
+          </label>
+          <div style={{ fontFamily: "monospace", fontSize: "0.85rem", color: "var(--color-text-muted)" }}>
+            ID: {provider.id}
+          </div>
+        </div>
+        <div className="provider-card__notice">正在编辑 Provider 信息，Models 操作暂不可用</div>
+        <div className="provider-card__models provider-card__models--disabled">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <strong>Models</strong>
+            <button type="button" disabled>+ Add Model</button>
+          </div>
+          {models.map((m) => (
+            <div key={m.model_db_id} className="model-row">
+              <span className="model-row__name">{m.model_id}</span>
+              <span>{m.model_enabled ? "●enabled" : "○disabled"}</span>
+              <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                <button type="button" disabled>编辑</button>
+                <button type="button" disabled>删除</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── View mode render ────────────────────────────────────────────────
   return (
     <div className="provider-card">
       <div className="provider-card__header">
