@@ -175,11 +175,10 @@ fn print_providers_table(providers: &[ProviderDto]) {
         width_u = w_url
     );
     for p in providers {
-        let id_short = if p.id.len() > w_id {
-            &p.id[..w_id]
-        } else {
-            &p.id
-        };
+        // Char-safe truncation: byte-slicing `&p.id[..w_id]` panics if a
+        // multi-byte UTF-8 char straddles the boundary. `chars().take(n)`
+        // yields at most `n` scalar values, so shorter IDs are returned whole.
+        let id_short: String = p.id.chars().take(w_id).collect();
         // `{:?}` on `ProviderKind::OpenAiCompatible` yields "OpenAiCompatible"
         // → "openaicompatible" (no underscore). Map to the wire string the GUI
         // and CLI flag parser both use.
@@ -845,6 +844,8 @@ mod tests {
     struct ProvidersRuntime {
         inner: TestRuntimeControl,
         providers: Vec<ProviderDto>,
+        models: Vec<ModelCatalogEntryDto>,
+        test_result: ProviderTestConnectionResponseDto,
     }
 
     #[async_trait]
@@ -858,6 +859,92 @@ mod tests {
         // succeed; the inner `TestRuntimeControl` bails with "not yet
         // implemented". Override to return Ok so the success-path test passes.
         async fn provider_delete(&self, _req: ProviderDeleteRequestDto) -> anyhow::Result<()> {
+            Ok(())
+        }
+        // Echo the create request back as a ProviderDto so `handle_add` /
+        // `handle_model_add` happy-path tests succeed without a SQL backend.
+        async fn provider_create(
+            &self,
+            req: ProviderCreateRequestDto,
+        ) -> anyhow::Result<ProviderDto> {
+            Ok(ProviderDto {
+                id: "prov-new".to_string(),
+                name: req.name,
+                provider_kind: req.provider_kind,
+                base_url: req.base_url,
+                enabled: req.enabled.unwrap_or(true),
+                has_api_key: req.api_key.is_some(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+        }
+        // Echo the update request back, applying patch fields over the first
+        // seeded provider (or a default) so `handle_update` succeeds.
+        async fn provider_update(
+            &self,
+            req: ProviderUpdateRequestDto,
+        ) -> anyhow::Result<ProviderDto> {
+            let base = self.providers.first().cloned().unwrap_or(ProviderDto {
+                id: req.id.clone(),
+                name: "updated".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.example.com".to_string(),
+                enabled: true,
+                has_api_key: true,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+            Ok(ProviderDto {
+                id: req.id,
+                name: req.name.unwrap_or(base.name),
+                provider_kind: req.provider_kind.unwrap_or(base.provider_kind),
+                base_url: req.base_url.unwrap_or(base.base_url),
+                enabled: req.enabled.unwrap_or(base.enabled),
+                has_api_key: base.has_api_key,
+                created_at_ms: base.created_at_ms,
+                updated_at_ms: 0,
+            })
+        }
+        async fn provider_test_connection(
+            &self,
+            _req: ProviderTestConnectionRequestDto,
+        ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
+            Ok(self.test_result.clone())
+        }
+        async fn model_list(
+            &self,
+            _req: ModelListRequestDto,
+        ) -> anyhow::Result<ModelListResponseDto> {
+            Ok(ModelListResponseDto {
+                models: self.models.clone(),
+            })
+        }
+        async fn model_create(
+            &self,
+            req: ModelCreateRequestDto,
+        ) -> anyhow::Result<ModelCatalogEntryDto> {
+            Ok(ModelCatalogEntryDto {
+                provider_id: req.provider_id,
+                provider_name: "test_provider".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                provider_enabled: true,
+                model_db_id: "model-db-new".to_string(),
+                model_id: req.model_id,
+                model_enabled: req.enabled.unwrap_or(true),
+                tags: req.tags,
+                display_name: req.display_name,
+                reasoning: req.reasoning.unwrap_or(false),
+                context_window: Some(req.context_window),
+                max_tokens: Some(req.max_tokens),
+            })
+        }
+        async fn model_update(&self, _req: ModelUpdateRequestDto) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn model_delete(&self, _req: ModelDeleteRequestDto) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn model_tags_update(&self, _req: ModelTagUpdateDto) -> anyhow::Result<()> {
             Ok(())
         }
         // Everything else delegates to the inner runtime. The boilerplate is
@@ -1060,45 +1147,6 @@ mod tests {
         ) -> anyhow::Result<SubagentTaskDetailDto> {
             self.inner.subagent_task_get(req).await
         }
-        async fn provider_create(
-            &self,
-            req: ProviderCreateRequestDto,
-        ) -> anyhow::Result<ProviderDto> {
-            self.inner.provider_create(req).await
-        }
-        async fn provider_update(
-            &self,
-            req: ProviderUpdateRequestDto,
-        ) -> anyhow::Result<ProviderDto> {
-            self.inner.provider_update(req).await
-        }
-        async fn provider_test_connection(
-            &self,
-            req: ProviderTestConnectionRequestDto,
-        ) -> anyhow::Result<ProviderTestConnectionResponseDto> {
-            self.inner.provider_test_connection(req).await
-        }
-        async fn model_create(
-            &self,
-            req: ModelCreateRequestDto,
-        ) -> anyhow::Result<ModelCatalogEntryDto> {
-            self.inner.model_create(req).await
-        }
-        async fn model_list(
-            &self,
-            req: ModelListRequestDto,
-        ) -> anyhow::Result<ModelListResponseDto> {
-            self.inner.model_list(req).await
-        }
-        async fn model_update(&self, req: ModelUpdateRequestDto) -> anyhow::Result<()> {
-            self.inner.model_update(req).await
-        }
-        async fn model_delete(&self, req: ModelDeleteRequestDto) -> anyhow::Result<()> {
-            self.inner.model_delete(req).await
-        }
-        async fn model_tags_update(&self, req: ModelTagUpdateDto) -> anyhow::Result<()> {
-            self.inner.model_tags_update(req).await
-        }
         async fn pi_sidecar_locator_update(
             &self,
             req: PiSidecarLocatorUpdateRequestDto,
@@ -1150,11 +1198,35 @@ mod tests {
         }
     }
 
-    // Helper: spawn a test server with canned providers
+    // Helper: spawn a test server with canned providers (and default empty
+    // models + a successful test-connection response).
     async fn spawn_providers_server(providers: Vec<ProviderDto>) -> (ServerHarness, String) {
+        spawn_providers_server_full(providers, vec![], default_test_result()).await
+    }
+
+    // Helper: spawn a test server with full control over canned providers,
+    // models, and the `provider.test_connection` response.
+    async fn spawn_providers_server_full(
+        providers: Vec<ProviderDto>,
+        models: Vec<ModelCatalogEntryDto>,
+        test_result: ProviderTestConnectionResponseDto,
+    ) -> (ServerHarness, String) {
         let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
-        let runtime: Arc<dyn RuntimeControl> = Arc::new(ProvidersRuntime { inner, providers });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(ProvidersRuntime {
+            inner,
+            providers,
+            models,
+            test_result,
+        });
         spawn_server(runtime).await
+    }
+
+    fn default_test_result() -> ProviderTestConnectionResponseDto {
+        ProviderTestConnectionResponseDto {
+            ok: true,
+            error: None,
+            models_detected: Some(vec!["model-a".to_string(), "model-b".to_string()]),
+        }
     }
 
     fn sample_provider() -> ProviderDto {
@@ -1167,6 +1239,23 @@ mod tests {
             has_api_key: true,
             created_at_ms: 0,
             updated_at_ms: 0,
+        }
+    }
+
+    fn sample_model_entry() -> ModelCatalogEntryDto {
+        ModelCatalogEntryDto {
+            provider_id: "prov-1".to_string(),
+            provider_name: "deepseek_openai".to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            provider_enabled: true,
+            model_db_id: "model-db-1".to_string(),
+            model_id: "deepseek-chat".to_string(),
+            model_enabled: true,
+            tags: vec!["cheap".to_string()],
+            display_name: Some("DeepSeek Chat".to_string()),
+            reasoning: false,
+            context_window: Some(64000),
+            max_tokens: Some(8192),
         }
     }
 
@@ -1279,5 +1368,247 @@ mod tests {
         let result = handle_show("nonexistent".to_string()).await;
         drop(harness);
         assert!(result.is_err());
+    }
+
+    // ── handle_add: provider create (+ optional model create) ──────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_add_succeeds_without_model() {
+        let (harness, socket) = spawn_providers_server(vec![]).await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_add(
+            "https://api.deepseek.com/v1".to_string(),
+            "sk-test".to_string(),
+            "openai_compatible".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_add failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_add_succeeds_with_model_and_tags() {
+        // Exercises both provider.create and model.create paths.
+        let (harness, socket) = spawn_providers_server(vec![]).await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_add(
+            "https://api.deepseek.com/v1".to_string(),
+            "sk-test".to_string(),
+            "openai_compatible".to_string(),
+            None,
+            Some("deepseek-chat".to_string()),
+            Some("cheap,fast".to_string()),
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_add with model failed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── handle_update: provider update ─────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_update_succeeds_with_name_change() {
+        let (harness, socket) = spawn_providers_server(vec![sample_provider()]).await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_update(
+            "prov-1".to_string(),
+            Some("renamed_provider".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_update failed: {:?}", result.err());
+    }
+
+    // ── handle_test: provider test_connection ──────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_test_succeeds() {
+        // `default_test_result()` returns ok:true with 2 detected models,
+        // exercising the success-rendering branch of handle_test.
+        let (harness, socket) = spawn_providers_server(vec![sample_provider()]).await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_test("prov-1".to_string()).await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_test failed: {:?}", result.err());
+    }
+
+    // ── handle_model_list: model list ──────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_list_table_succeeds() {
+        let (harness, socket) = spawn_providers_server_full(
+            vec![sample_provider()],
+            vec![sample_model_entry()],
+            default_test_result(),
+        )
+        .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_model_list("prov-1".to_string(), false).await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_model_list table failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_list_json_succeeds() {
+        let (harness, socket) = spawn_providers_server_full(
+            vec![sample_provider()],
+            vec![sample_model_entry()],
+            default_test_result(),
+        )
+        .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_model_list("prov-1".to_string(), true).await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_model_list json failed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── handle_model_add: model create ─────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_add_succeeds() {
+        let (harness, socket) =
+            spawn_providers_server_full(vec![sample_provider()], vec![], default_test_result())
+                .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_model_add(
+            "prov-1".to_string(),
+            "deepseek-chat".to_string(),
+            Some("cheap,fast".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_model_add failed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── handle_model_update: model update + optional tags update ───────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_update_succeeds_with_tags_change() {
+        // Passes a tags change so both model.update AND model.tags.update are
+        // exercised. Both overrides must return Ok for the handler to succeed.
+        let (harness, socket) = spawn_providers_server_full(
+            vec![sample_provider()],
+            vec![sample_model_entry()],
+            default_test_result(),
+        )
+        .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_model_update(
+            "prov-1".to_string(),
+            "deepseek-chat".to_string(),
+            Some("cheap,fast,reasoning".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_model_update with tags failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_update_fails_for_missing_model() {
+        // model.list returns empty → model_id lookup bails with "model not
+        // found". Mirrors handle_show_fails_for_missing_provider.
+        let (harness, socket) =
+            spawn_providers_server_full(vec![sample_provider()], vec![], default_test_result())
+                .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_model_update(
+            "prov-1".to_string(),
+            "nonexistent-model".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_err(),
+            "handle_model_update should fail for missing model"
+        );
+    }
+
+    // ── handle_model_delete: model delete with --yes ───────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_delete_succeeds_with_yes_flag() {
+        let (harness, socket) = spawn_providers_server_full(
+            vec![sample_provider()],
+            vec![sample_model_entry()],
+            default_test_result(),
+        )
+        .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result =
+            handle_model_delete("prov-1".to_string(), "deepseek-chat".to_string(), true).await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_model_delete with --yes failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_model_delete_fails_for_missing_model() {
+        let (harness, socket) =
+            spawn_providers_server_full(vec![sample_provider()], vec![], default_test_result())
+                .await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result =
+            handle_model_delete("prov-1".to_string(), "nonexistent-model".to_string(), true).await;
+        drop(harness);
+        assert!(
+            result.is_err(),
+            "handle_model_delete should fail for missing model"
+        );
     }
 }
