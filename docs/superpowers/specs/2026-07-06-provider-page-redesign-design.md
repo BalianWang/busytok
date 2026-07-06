@@ -43,8 +43,7 @@ Redesign the Provider page UI for simplicity and clarity, delete the Profiles se
 
 **`apps/gui/src/api/busytokClient.ts`:**
 - Delete `profileCreate`, `profileUpdate`, `profileDelete` methods (lines 210-215)
-- Delete `ProfileCreateRequestDto`, `ProfileUpdateRequestDto` imports (lines 44-46)
-- Keep `ProfileDto` import (still referenced by generated `SettingsSubagentDto`)
+- Delete `ProfileCreateRequestDto`, `ProfileUpdateRequestDto`, `ProfileDto` imports (lines 44-46). `ProfileDto` is unused after removing the profile methods; the generated `SettingsSubagentDto` in `@busytok/protocol-types` still carries `ProfileDto` but that's a separate package, not this import.
 
 ### Preserve
 - `useSettingsSnapshot` hook — shared by other settings UI
@@ -78,6 +77,10 @@ function deriveProviderName(url: string, kind: string): string {
   return `${domain}_${kindShort}`;                       // "deepseek_openai"
 }
 ```
+
+**Edge cases:**
+- `https://localhost:8080/v1` → `parts = ["localhost"]`, `parts[-2]` is undefined → falls back to `|| host` → `"localhost_openai"`. Acceptable.
+- `https://api.co.uk/v1` → `parts[-2]` = `"co"` → `"co_openai"`. Wrong but acceptable for v1 (rare case for API endpoints). Users can always edit the name afterward.
 
 **Collision handling:** Before submitting, check the derived name against existing provider names. If collision, append `_2`, `_3`, etc. until unique:
 
@@ -123,7 +126,7 @@ Validation runs on blur and on submit. Error message shown below the input field
 1. Validate Base URL + API Key + Kind
 2. Derive unique provider name from existing providers list
 3. Call `provider.create` with `{ name, provider_kind, base_url, api_key, enabled: true }`
-4. If Model Name is non-empty: call `model.create` with `{ provider_id, model_id, display_name: null, context_window: 200000, max_tokens: 8192, reasoning: true, enabled: true }` and parse tags via `parseTags()`
+4. If Model Name is non-empty: call `model.create` with `{ provider_id, model_id, display_name: <model_id>, context_window: 200000, max_tokens: 8192, reasoning: true, enabled: true, tags: parseTags(tagsInput) }` (display_name sent explicitly as model_id because the backend stores NULL without fallback)
 5. On success: close form, invalidate `providers` + `models` queries
 6. On error: if provider created but model failed, keep provider (no rollback), show error message
 
@@ -166,6 +169,7 @@ Vertical stack within a `settings-panel` card:
 
 **Models section:**
 - "Models" label + "+ Add Model" button on the right
+- Models are fetched via a single `useModels({})` call (all providers, no filter) and grouped client-side by `provider_id` into a `Map<provider_id, ModelCatalogEntryDto[]>`. Each card renders its models from this map. This is 1 query vs N-per-card.
 - Each model is a row: model_id + enabled toggle + tags (chips) + Edit / Delete buttons
 - Clicking Edit on a model row expands it inline to show editable fields
 - Clicking "+ Add Model" shows a new model row at the bottom with inline form
@@ -175,6 +179,7 @@ Vertical stack within a `settings-panel` card:
 When user clicks Edit on the provider:
 - **Header row** fields become inputs: Base URL (text), API Key (password, with "Update Key" label), Kind (select)
 - **Info row** shows Provider ID (read-only) + Provider Name (editable text input)
+- **API Key convention:** empty input = no change (omit from patch). To clear the key, user must use a separate "Clear Key" action (not in v1 scope). Typing a new value = update key.
 - **Save / Cancel** buttons replace the action buttons in the header
 - **Models section stays visible** but:
   - All model operation buttons (Add Model, Edit, Delete) are `disabled` with reduced opacity
@@ -214,7 +219,7 @@ The form has an expandable "高级设置" section (default collapsed) containing
 - Reasoning (checkbox, default checked)
 
 If user leaves advanced fields empty, the submit payload uses:
-- `display_name: null` (backend defaults to model_id)
+- `display_name: <model_id>` (sent explicitly — backend stores NULL without fallback to model_id)
 - `context_window: 200000`
 - `max_tokens: 8192`
 - `reasoning: true`
@@ -231,7 +236,7 @@ Clicking Edit on a model row expands it to show:
 - Enabled (toggle)
 - Save / Cancel buttons
 
-On Save: call `model.update` with changed fields. If tags changed, call `model.tags.update`.
+On Save: call `model.update` with changed fields. If tags changed, call `model.tags.update`. **Note:** `ModelUpdateRequestDto` fields are single-state `Option<T>` — omit = no change, `Some(v)` = set. There is no way to clear a field to null. Empty `display_name` input means "leave unchanged", not "clear".
 
 ### Model delete
 
@@ -323,7 +328,7 @@ enum ProviderCommand {
         url: String,
         #[arg(long)]
         key: String,
-        #[arg(long, default_value = "openai_compatible")]
+        #[arg(long, default_value = "openai_compatible", value_parser = ["openai_compatible", "anthropic_compatible"])]
         kind: String,
         #[arg(long)]
         name: Option<String>,
@@ -345,6 +350,8 @@ enum ProviderCommand {
         url: Option<String>,
         #[arg(long)]
         key: Option<String>,
+        #[arg(long, value_parser = ["openai_compatible", "anthropic_compatible"])]
+        kind: Option<String>,
         #[arg(long)]
         enabled: Option<bool>,
     },
@@ -437,27 +444,33 @@ New file `apps/cli/src/commands/provider.rs`:
 - `handle(cmd: ProviderCommand) -> Result<()>` — dispatch
 - Each subcommand handler:
   - `handle_list(json: bool)` — call `provider.list`, print table or JSON
-  - `handle_add(url, key, kind, name, model, tags)` — derive name if not given, call `provider.create`, optionally call `model.create`
+  - `handle_add(url, key, kind, name, model, tags)` — derive name if not given, call `provider.create`, optionally call `model.create` with defaults (`context_window: 200000, max_tokens: 8192, reasoning: true, display_name: <model_id>`)
   - `handle_show(id)` — call `provider.list`, find by id, print detail
-  - `handle_update(id, ...)` — build patch DTO, call `provider.update`
+  - `handle_update(id, name, url, key, kind, enabled)` — build patch DTO, call `provider.update`
   - `handle_delete(id)` — confirm, call `provider.delete`
   - `handle_test(id)` — call `provider.test_connection`, print result
   - `handle_model_list(provider_id, json)` — call `model.list` with provider filter
-  - `handle_model_add(provider_id, name, ...)` — call `model.create` with defaults
-  - `handle_model_update(provider_id, model_id, ...)` — call `model.update` + `model.tags.update` if tags changed
-  - `handle_model_delete(provider_id, model_id)` — confirm, call `model.delete`
+  - `handle_model_add(provider_id, name, tags, context_window, max_tokens, reasoning, display_name)` — call `model.create` with defaults: `context_window.unwrap_or(200000)`, `max_tokens.unwrap_or(8192)`, `display_name.unwrap_or(name.clone())`
+  - `handle_model_update(provider_id, model_id, ...)` — first call `model.list` with provider filter to resolve the internal DB UUID (`model_db_id`) from the user-facing `model_id` string, then call `model.update` with `id: model_db_id`. Call `model.tags.update` if tags changed. **Note:** `ModelUpdateRequestDto` fields are single-state `Option<T>` (omit = no change, `Some(v)` = set); there is no way to clear a field to null. The edit form must treat empty `display_name` as "leave unchanged" rather than "clear".
+  - `handle_model_delete(provider_id, model_id)` — resolve `model_db_id` via `model.list` (same as update), confirm, call `model.delete` with `{ id: model_db_id }`
 
 ### CLI name auto-generation
 
-Same logic as UI — `derive_provider_name(url, kind)` in Rust:
+Same logic as UI — `derive_provider_name(url, kind)` in Rust. No `url` crate dependency; manual host extraction (the URL is already validated by `validateBaseUrl` on the UI side, and the CLI validates before calling this):
 ```rust
-fn derive_provider_name(url: &str, kind: &str) -> Result<String> {
-    let parsed = url::Url::parse(url).context("invalid URL")?;
-    let host = parsed.host_str().context("URL has no host")?;
+fn extract_host(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let before_path = after_scheme.split('/').next()?;
+    let before_colon = before_path.split(':').next()?;
+    Some(before_colon)
+}
+
+fn derive_provider_name(url: &str, kind: &str) -> Option<String> {
+    let host = extract_host(url)?;
     let parts: Vec<&str> = host.split('.').collect();
     let domain = parts.get(parts.len().saturating_sub(2)).copied().unwrap_or(host);
     let kind_short = kind.replace("_compatible", "");
-    Ok(format!("{}_{}", domain, kind_short))
+    Some(format!("{}_{}", domain, kind_short))
 }
 ```
 
@@ -508,12 +521,15 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 ### GUI tests
 - `ProvidersPage.test.tsx` — test provider create (with/without model), provider edit (inline header), provider delete, model inline edit, model add from card, model delete
 - Remove `ProfilesSection.test.tsx` and `ModelsSection.test.tsx`
+- Remove `useProfileMutations` mock from `ProvidersPage.test.tsx` (stale mock will cause lint/test failure)
 
 ### CLI tests
 - Parser tests: `busytok provider add --url ... --key ... --kind ...`, `busytok provider model add <id> --name ...`
 - Handler tests: mock `ControlClient`, verify correct RPC calls and output formatting
 - Name derivation test: `deriveProviderName("https://api.deepseek.com/v1", "openai_compatible")` → `"deepseek_openai"`
-- Collision test: existing names include `"deepseek_openai"` → derived name is `"deepseek_openai_2"`
+- Collision test: existing names include `"deepseek_openai"` → derived name is `"deepseek_openai_2"`; also test when `_2` exists → should produce `_3`
+- URL validation test: `validateBaseUrl("api.deepseek.com")` → error (missing protocol); `validateBaseUrl("https://api.deepseek.com/v1")` → null (valid)
+- Edge case: `deriveProviderName("https://localhost:8080/v1", "openai_compatible")` → `"localhost_openai"` (single-part host falls back to full host)
 
 ### What NOT to test
 - Backend RPCs (already tested in protocol/runtime crates)
@@ -524,7 +540,7 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 ## 10. Constraints
 
 - Reuse all existing RPCs (`provider.list/create/update/delete/test_connection`, `model.list/create/update/delete/tags.update`). No backend changes.
-- No new npm dependencies. No new Rust crates (use `url` crate already in workspace for URL parsing in CLI).
+- No new npm dependencies. No new Rust crates — URL host extraction in CLI uses manual string parsing (`extract_host`), not the `url` crate.
 - Rust: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test --workspace` must pass.
 - Frontend: `pnpm test`, `pnpm lint`, `pnpm build` must pass.
 - The existing `busytok models` command stays unchanged (backward compat).
