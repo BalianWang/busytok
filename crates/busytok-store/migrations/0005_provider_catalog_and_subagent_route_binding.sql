@@ -1,36 +1,72 @@
--- 0007_subagent_route_binding_and_model_metadata.sql
--- Spec §2.2 + §2.3: add model metadata columns + rebuild subagent_logical_subagents
--- with NOT NULL bound_provider_id + bound_model_id (drops default_model).
+-- 0005_provider_catalog_and_subagent_route_binding.sql
+-- Consolidated v5 migration: provider catalog + subagent route binding +
+-- model metadata (merges former 0005/0006/0007 into a single migration).
+-- Executed atomically within one transaction by the migrator.
+--
+-- Sections:
+--   A. Provider catalog tables: providers / models / model_tags (former 0006)
+--   B. Model metadata columns (former 0007 §1)
+--   C. Rebuild subagent_logical_subagents + child tables with NOT NULL
+--      bound_provider_id / bound_model_id (former 0007 §2-4)
+--
+-- Note: error_kind (former 0005) is included inline in the CREATE TABLE
+-- subagent_tasks definition in section C, not as a separate ALTER TABLE,
+-- because section C drops and recreates the table.
 
--- 1. models table metadata (spec §2.2)
+-- ── A. Provider catalog ───────────────────────────────────────────────────
+
+CREATE TABLE providers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  provider_kind TEXT NOT NULL DEFAULT 'openai_compatible',
+  base_url TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  api_key TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE models (
+  id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
+  UNIQUE (provider_id, model_id)
+);
+
+CREATE TABLE model_tags (
+  model_id TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (model_id) REFERENCES models(id) ON DELETE CASCADE,
+  UNIQUE (model_id, tag)
+);
+
+CREATE INDEX idx_models_provider_id ON models(provider_id);
+CREATE INDEX idx_model_tags_tag ON model_tags(tag);
+
+-- ── B. Model metadata columns ─────────────────────────────────────────────
+
 ALTER TABLE models ADD COLUMN display_name TEXT;
 ALTER TABLE models ADD COLUMN reasoning INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE models ADD COLUMN context_window INTEGER;
 ALTER TABLE models ADD COLUMN max_tokens INTEGER;
 
--- I-2 backfill: pre-existing/seed models may have NULL context_window /
--- max_tokens (the columns above are nullable for migration safety). The
--- application layer (`execute_task`) fails fast on NULL metadata to prevent
--- silent breakage in the Pi SDK (which would interpret 0 as "no context" /
--- "no output"). This backfill sets sane defaults (8192 context, 4096
--- max_tokens) so existing models remain usable after the migration. New
--- models created via `model_create` always supply both values (DTO requires
--- them). NOT NULL constraints are NOT added here because SQLite cannot add
--- NOT NULL to existing columns without a table rebuild, which is risky for
--- a metadata-only change. The application-layer fail-fast covers any future
--- NULLs that could arise from direct SQL inserts or partial migrations.
+-- Backfill sane defaults for nullable metadata columns. NOT NULL constraints
+-- are not added because SQLite cannot add NOT NULL to existing columns
+-- without a table rebuild. The application layer fails fast on NULL metadata.
 UPDATE models SET context_window = 8192 WHERE context_window IS NULL;
 UPDATE models SET max_tokens = 4096 WHERE max_tokens IS NULL;
 
--- 2. Drop child tables that FK to subagent_logical_subagents (no ON DELETE CASCADE).
---    Order matters: drop referencing tables first.
+-- ── C. Rebuild subagent_logical_subagents with bound fields ───────────────
+
 DROP TABLE IF EXISTS subagent_usage_records;
 DROP TABLE IF EXISTS subagent_harness_bindings;
 DROP TABLE IF EXISTS subagent_tasks;
 DROP TABLE IF EXISTS subagent_memory;
 
--- 3. Drop and recreate the parent table with bound_provider_id + bound_model_id
---    NOT NULL (no default_model). Existing data is discarded (project未上线).
 DROP TABLE IF EXISTS subagent_logical_subagents;
 
 CREATE TABLE subagent_logical_subagents (
@@ -58,12 +94,6 @@ CREATE INDEX idx_subagent_logical_last_active
 CREATE UNIQUE INDEX idx_subagent_unique_active_name
     ON subagent_logical_subagents(project_id, repo_hash, name)
     WHERE status != 'deleted';
-
--- 4. Recreate child tables with schema equivalent to migrations 0003+0004+0005
---    applied (subagent_tasks has timeout_seconds/model_override from 0004 and
---    error_kind from 0005; do NOT use only the 0003 definition). All five
---    child tables from 0003 are recreated: subagent_memory, subagent_tasks,
---    subagent_harness_bindings, subagent_usage_records, subagent_resource_events.
 
 CREATE TABLE subagent_memory (
     id TEXT PRIMARY KEY,
@@ -154,12 +184,6 @@ CREATE TABLE subagent_usage_records (
 
 CREATE INDEX idx_subagent_usage_task ON subagent_usage_records(task_id);
 
--- subagent_resource_events (from 0003) — resource monitor events for
--- hot/warm sessions. Has no FK to subagent_logical_subagents (target_id
--- is a free-form string that can reference subagents OR sessions), so
--- it survives the parent rebuild without orphan concerns. Must be
--- recreated here to keep the child-table set equivalent to the current
--- full schema (0003+0004+0005 applied).
 DROP TABLE IF EXISTS subagent_resource_events;
 
 CREATE TABLE subagent_resource_events (
