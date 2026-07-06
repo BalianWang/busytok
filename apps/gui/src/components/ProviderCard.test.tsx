@@ -472,4 +472,17 @@ describe("ProviderCard model edit", () => {
     // Edit form should be gone; the model row's view mode should show again.
     expect(screen.queryByRole("checkbox", { name: /reasoning/i })).toBeNull();
   });
+
+  it("does not clear display_name when edit input is empty (single-state Option semantics)", () => {
+    const { onModelUpdate } = renderCardWithModel();
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // Clear the display_name input to empty string.
+    const nameInput = screen.getByDisplayValue("deepseek-chat");
+    fireEvent.change(nameInput, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // onModelUpdate should NOT be called because the only changed field (display_name)
+    // is empty → treated as "leave unchanged" → patch has only {id} → no update sent.
+    expect(onModelUpdate).not.toHaveBeenCalled();
+  });
 });

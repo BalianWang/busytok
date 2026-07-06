@@ -117,7 +117,7 @@ export function ProviderCard({
     // (serde deserializes both missing and null to None, so this is wire-compatible
     // with the existing ModelsSection pattern that sends null for unchanged fields).
     const patch: Partial<ModelUpdateRequestDto> & { id: string } = { id: m.model_db_id };
-    if (editDraft.display_name !== (m.display_name ?? "")) {
+    if (editDraft.display_name && editDraft.display_name !== (m.display_name ?? "")) {
       patch.display_name = editDraft.display_name;
     }
     if (editDraft.context_window !== (m.context_window ?? 200000)) {
