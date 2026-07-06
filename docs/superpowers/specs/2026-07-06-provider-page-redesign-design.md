@@ -169,7 +169,7 @@ Vertical stack within a `settings-panel` card:
 
 **Models section:**
 - "Models" label + "+ Add Model" button on the right
-- Models are fetched via a single `useModels({})` call (all providers, no filter) and grouped client-side by `provider_id` into a `Map<provider_id, ModelCatalogEntryDto[]>`. Each card renders its models from this map. This is 1 query vs N-per-card.
+- Models are fetched via a single `useModels({ includeDisabled: true })` call (all providers, no provider filter, include disabled models so the enabled toggle can re-enable them) and grouped client-side by `provider_id` into a `Map<provider_id, ModelCatalogEntryDto[]>`. Each card renders its models from this map. This is 1 query vs N-per-card.
 - Each model is a row: model_id + enabled toggle + tags (chips) + Edit / Delete buttons
 - Clicking Edit on a model row expands it inline to show editable fields
 - Clicking "+ Add Model" shows a new model row at the bottom with inline form
@@ -223,6 +223,8 @@ If user leaves advanced fields empty, the submit payload uses:
 - `context_window: 200000`
 - `max_tokens: 8192`
 - `reasoning: true`
+- `enabled: true`
+- `tags: parseTags(tagsInput)` (empty array if no tags entered)
 
 ### Model inline edit
 
@@ -444,19 +446,32 @@ New file `apps/cli/src/commands/provider.rs`:
 - `handle(cmd: ProviderCommand) -> Result<()>` — dispatch
 - Each subcommand handler:
   - `handle_list(json: bool)` — call `provider.list`, print table or JSON
-  - `handle_add(url, key, kind, name, model, tags)` — derive name if not given, call `provider.create`, optionally call `model.create` with defaults (`context_window: 200000, max_tokens: 8192, reasoning: true, display_name: <model_id>`)
+  - `handle_add(url, key, kind, name, model, tags)` — derive name if not given, call `provider.create`, optionally call `model.create` with defaults (`context_window: 200000, max_tokens: 8192, reasoning: true, display_name: <model_id>, enabled: true, tags: parseTags(tags)`)
   - `handle_show(id)` — call `provider.list`, find by id, print detail
   - `handle_update(id, name, url, key, kind, enabled)` — build patch DTO, call `provider.update`
   - `handle_delete(id)` — confirm, call `provider.delete`
   - `handle_test(id)` — call `provider.test_connection`, print result
   - `handle_model_list(provider_id, json)` — call `model.list` with provider filter
-  - `handle_model_add(provider_id, name, tags, context_window, max_tokens, reasoning, display_name)` — call `model.create` with defaults: `context_window.unwrap_or(200000)`, `max_tokens.unwrap_or(8192)`, `display_name.unwrap_or(name.clone())`
+  - `handle_model_add(provider_id, name, tags, context_window, max_tokens, reasoning, display_name)` — call `model.create` with defaults: `context_window.unwrap_or(200000)`, `max_tokens.unwrap_or(8192)`, `display_name.unwrap_or(name.clone())`, `enabled: true`, `tags: parseTags(tags)`. Tags are parsed from comma-separated string: `tags.unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()`.
   - `handle_model_update(provider_id, model_id, ...)` — first call `model.list` with provider filter to resolve the internal DB UUID (`model_db_id`) from the user-facing `model_id` string, then call `model.update` with `id: model_db_id`. Call `model.tags.update` if tags changed. **Note:** `ModelUpdateRequestDto` fields are single-state `Option<T>` (omit = no change, `Some(v)` = set); there is no way to clear a field to null. The edit form must treat empty `display_name` as "leave unchanged" rather than "clear".
   - `handle_model_delete(provider_id, model_id)` — resolve `model_db_id` via `model.list` (same as update), confirm, call `model.delete` with `{ id: model_db_id }`
 
 ### CLI name auto-generation
 
-Same logic as UI — `derive_provider_name(url, kind)` in Rust. No `url` crate dependency; manual host extraction (the URL is already validated by `validateBaseUrl` on the UI side, and the CLI validates before calling this):
+Same logic as UI — `derive_provider_name(url, kind)` in Rust. No `url` crate dependency; manual host extraction. The CLI `handle_add` validates the URL before calling this — checks for `://` prefix and non-empty host:
+
+```rust
+fn validate_base_url(input: &str) -> Result<()> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Base URL cannot be empty");
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        anyhow::bail!("URL must start with http:// or https://");
+    }
+    Ok(())
+}
+```
 ```rust
 fn extract_host(url: &str) -> Option<&str> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
@@ -503,8 +518,8 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 ### Modified (GUI)
 - `apps/gui/src/pages/ProvidersPage.tsx` — full rewrite (provider cards + inline models + create form)
 - `apps/gui/src/pages/ProvidersPage.test.tsx` — update tests for new structure
-- `apps/gui/src/api/useBusytokData.ts` — remove `useProfileMutations`
-- `apps/gui/src/api/busytokClient.ts` — remove `profileCreate/Update/Delete`
+- `apps/gui/src/api/useBusytokData.ts` — remove `useProfileMutations`; also clean up stale comments referencing `ProfilesSection`/`ModelsSection` in the `useModels` hook doc comment
+- `apps/gui/src/api/busytokClient.ts` — remove `profileCreate/Update/Delete` and `ProfileDto` import
 - `apps/gui/src/styles/pages.css` — add `.provider-card`, `.model-row`, `.chip` classes
 
 ### Modified (CLI)
@@ -526,10 +541,10 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 ### CLI tests
 - Parser tests: `busytok provider add --url ... --key ... --kind ...`, `busytok provider model add <id> --name ...`
 - Handler tests: mock `ControlClient`, verify correct RPC calls and output formatting
-- Name derivation test: `deriveProviderName("https://api.deepseek.com/v1", "openai_compatible")` → `"deepseek_openai"`
+- Name derivation test: `derive_provider_name("https://api.deepseek.com/v1", "openai_compatible")` → `"deepseek_openai"`
 - Collision test: existing names include `"deepseek_openai"` → derived name is `"deepseek_openai_2"`; also test when `_2` exists → should produce `_3`
-- URL validation test: `validateBaseUrl("api.deepseek.com")` → error (missing protocol); `validateBaseUrl("https://api.deepseek.com/v1")` → null (valid)
-- Edge case: `deriveProviderName("https://localhost:8080/v1", "openai_compatible")` → `"localhost_openai"` (single-part host falls back to full host)
+- URL validation test: `validate_base_url("api.deepseek.com")` → error (missing protocol); `validate_base_url("https://api.deepseek.com/v1")` → Ok
+- Edge case: `derive_provider_name("https://localhost:8080/v1", "openai_compatible")` → `"localhost_openai"` (single-part host falls back to full host)
 
 ### What NOT to test
 - Backend RPCs (already tested in protocol/runtime crates)
