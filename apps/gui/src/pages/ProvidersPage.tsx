@@ -9,7 +9,6 @@ import type {
 import { useProviderMutations, useProviders } from "../api/useBusytokData";
 import { ModelsSection } from "../components/ModelsSection";
 import { PageState } from "../components/PageState";
-import { ProfilesSection } from "../components/ProfilesSection";
 import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
 import { SettingsRow } from "../components/desktop/SettingsRow";
 import { SettingsValue } from "../components/desktop/SettingsValue";
@@ -700,7 +699,6 @@ export function ProvidersPage() {
           </section>
         )}
         <ModelsSection />
-        <ProfilesSection />
       </div>
     </div>
   );

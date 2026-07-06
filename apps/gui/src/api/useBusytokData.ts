@@ -42,8 +42,6 @@ import type {
   PromptSuggestTagsResponseDto,
   ProviderCreateRequestDto,
   ProviderUpdateRequestDto,
-  ProfileCreateRequestDto,
-  ProfileUpdateRequestDto,
   ModelCatalogEntryDto,
   ModelCreateRequestDto,
   ModelListRequestDto,
@@ -485,35 +483,6 @@ export function useModelMutations() {
   });
 
   return { createModel, updateModel, deleteModel, tagsUpdate };
-}
-
-// ── Profiles (Phase 4) ───────────────────────────────────────────────
-
-/**
- * Profile mutations. All three invalidate `settingsSnapshot` on success
- * because profiles are READ via settings.snapshot (not a dedicated
- * profile.list RPC). This keeps the read+write paths consistent.
- */
-export function useProfileMutations() {
-  const client = useBusytokClient();
-  const queryClient = useQueryClient();
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: queryKeys.settingsSnapshot() });
-
-  const createProfile = useMutation({
-    mutationFn: (req: ProfileCreateRequestDto) => client.profileCreate(req),
-    onSuccess: invalidate,
-  });
-  const updateProfile = useMutation({
-    mutationFn: (req: ProfileUpdateRequestDto) => client.profileUpdate(req),
-    onSuccess: invalidate,
-  });
-  const deleteProfile = useMutation({
-    mutationFn: (id: string) => client.profileDelete(id),
-    onSuccess: invalidate,
-  });
-
-  return { createProfile, updateProfile, deleteProfile };
 }
 
 // ── Subagent runtime status ─────────────────────────────────────────

@@ -6,21 +6,17 @@ import type {
   ProviderListResponseDto,
   ProviderTestConnectionResponseDto,
   ModelListResponseDto,
-  ReadEnvelopeDto,
-  SettingsSnapshotDto,
 } from "@busytok/protocol-types";
 
-// ProvidersPage renders <ModelsSection /> and <ProfilesSection />, so every
-// hook those children use must also be mocked here. The defaults returned
-// by `beforeEach` keep the children in their empty/view states so provider-
-// specific assertions are not polluted by child-component UI.
+// ProvidersPage renders <ModelsSection />, so every hook that child uses
+// must also be mocked here. The defaults returned by `beforeEach` keep the
+// child in its empty/view state so provider-specific assertions are not
+// polluted by child-component UI.
 vi.mock("../api/useBusytokData", () => ({
   useProviders: vi.fn(),
   useProviderMutations: vi.fn(),
   useModels: vi.fn(),
   useModelMutations: vi.fn(),
-  useSettingsSnapshot: vi.fn(),
-  useProfileMutations: vi.fn(),
 }));
 
 vi.mock("../logging/reporter", () => ({
@@ -35,8 +31,6 @@ import {
   useProviderMutations,
   useModels,
   useModelMutations,
-  useSettingsSnapshot,
-  useProfileMutations,
 } from "../api/useBusytokData";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 import { ProvidersPage } from "./ProvidersPage";
@@ -45,8 +39,6 @@ const mockUseProviders = vi.mocked(useProviders);
 const mockUseProviderMutations = vi.mocked(useProviderMutations);
 const mockUseModels = vi.mocked(useModels);
 const mockUseModelMutations = vi.mocked(useModelMutations);
-const mockUseSettingsSnapshot = vi.mocked(useSettingsSnapshot);
-const mockUseProfileMutations = vi.mocked(useProfileMutations);
 
 function makeProvider(overrides: Partial<ProviderDto> = {}): ProviderDto {
   return {
@@ -154,24 +146,6 @@ beforeEach(() => {
   // Empty models list keeps ModelsSection in its "no models match" state.
   mockUseModels.mockReturnValue(mockModelsQuery({ models: [] }));
   mockUseModelMutations.mockReturnValue(mockModelMutations());
-  mockUseSettingsSnapshot.mockReturnValue({
-    data: {
-      data: {
-        subagent: {
-          enabled: true,
-          profiles: [],
-        },
-      },
-    } as unknown as ReadEnvelopeDto<SettingsSnapshotDto>,
-    isLoading: false,
-    isError: false,
-    isFetching: false,
-  } as never);
-  mockUseProfileMutations.mockReturnValue({
-    createProfile: { mutate: vi.fn(), isPending: false },
-    updateProfile: { mutate: vi.fn(), isPending: false },
-    deleteProfile: { mutate: vi.fn(), isPending: false },
-  } as never);
 });
 
 afterEach(() => cleanup());
