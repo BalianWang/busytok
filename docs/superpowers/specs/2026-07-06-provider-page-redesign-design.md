@@ -13,7 +13,7 @@ Redesign the Provider page UI for simplicity and clarity, delete the Profiles se
 - Delete Profiles UI (frontend only; backend RPCs stay)
 - Simplify Provider creation form (3 required fields + optional inline model)
 - Redesign Provider display as always-expanded cards with inline model list
-- Simplify Model creation form (name + tags required; metadata fields as optional advanced)
+- Simplify Model creation form (name required, tags optional; metadata fields as optional advanced)
 - Provider header inline-edit (models stay visible, operations disabled during edit)
 - CLI `busytok provider` subcommand group with full CRUD + model management
 
@@ -127,8 +127,9 @@ Validation runs on blur and on submit. Error message shown below the input field
 2. Derive unique provider name from existing providers list
 3. Call `provider.create` with `{ name, provider_kind, base_url, api_key, enabled: true }`
 4. If Model Name is non-empty: call `model.create` with `{ provider_id, model_id, display_name: <model_id>, context_window: 200000, max_tokens: 8192, reasoning: true, enabled: true, tags: parseTags(tagsInput) }` (display_name sent explicitly as model_id because the backend stores NULL without fallback)
-5. On success: close form, invalidate `providers` + `models` queries
-6. On error: if provider created but model failed, keep provider (no rollback), show error message
+5. **Full success (provider + optional model both succeed):** close form, invalidate `providers` + `models` queries, report `provider.added` (+ `model.added` if model was created)
+6. **Partial success (provider created, model failed):** invalidate `providers` query (the new provider must appear in the list), keep the form open with a recoverable error banner showing the model creation failure message, disable the Save button to prevent duplicate provider creation. The user can either: (a) fix the model name and retry only `model.create`, or (b) click Cancel to dismiss the form — the provider is already saved and visible in the list. The form state should track that `provider.create` already succeeded so a retry skips it and only re-attempts `model.create`.
+7. **Provider creation failed:** keep form open, show error message, do not invalidate any queries.
 
 ### Form layout
 
@@ -189,7 +190,9 @@ When user clicks Edit on the provider:
 
 ### Delete confirmation
 
-Provider delete shows `confirm("确定删除 provider 及其关联的所有 models？")`. On confirm, call `provider.delete`. The backend cascades model deletion via FK `ON DELETE CASCADE`.
+Provider delete shows `confirm("确定删除此 provider 及其关联的所有 models？\n注意：已绑定此 provider/model 的 subagents 将在下次 delegate 时失败，需要手动重新绑定。")`. On confirm, call `provider.delete`. The backend cascades model deletion via FK `ON DELETE CASCADE`, but `subagent_logical_subagents.bound_provider_id` / `bound_model_id` are NOT FK-constrained — they become dangling references. No automatic rebind is performed. Users must update affected subagents' bindings manually.
+
+Model delete shows `confirm("确定删除此 model？\n注意：已绑定此 model 的 subagents 将在下次 delegate 时失败。")` with the same dangling-reference caveat.
 
 ### Test connection
 
@@ -252,9 +255,9 @@ Reuse the existing custom CSS design system. Add new classes:
 
 ```css
 .provider-card {
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--color-border-subtle);
   border-radius: 8px;
-  background: var(--surface-bg);
+  background: var(--color-surface);
   margin-bottom: 12px;
   transition: box-shadow 0.15s ease;
 }
@@ -266,16 +269,17 @@ Reuse the existing custom CSS design system. Add new classes:
   align-items: center;
   gap: 12px;
   padding: 14px 16px;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--color-border-subtle);
 }
 .provider-card__name {
   font-weight: 600;
   font-size: 0.95rem;
+  color: var(--color-text);
 }
 .provider-card__info {
   padding: 8px 16px;
   font-size: 0.85rem;
-  color: var(--text-muted);
+  color: var(--color-text-muted);
 }
 .provider-card__models {
   padding: 12px 16px;
@@ -293,7 +297,7 @@ Reuse the existing custom CSS design system. Add new classes:
   transition: background 0.1s ease;
 }
 .model-row:hover {
-  background: var(--hover-bg);
+  background: var(--color-hover);
 }
 .chip {
   display: inline-flex;
@@ -301,12 +305,27 @@ Reuse the existing custom CSS design system. Add new classes:
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 0.75rem;
-  background: var(--chip-bg);
-  color: var(--chip-text);
+  background: var(--color-surface-subtle);
+  color: var(--color-text-muted);
 }
 ```
 
 No Tailwind, no external CSS framework. All styles go in `apps/gui/src/styles/pages.css` or `components.css`.
+
+### Design token reference
+
+The classes above use the existing token system defined in `apps/gui/src/styles/tokens.css` (light + dark variants). Do **not** introduce parallel tokens like `--border-color`, `--surface-bg`, `--text-muted`, `--hover-bg`, `--chip-bg`, or `--chip-text` — they do not exist and would silently fall back to `unset`.
+
+| Token used here | Light value | Purpose |
+|-----------------|-------------|---------|
+| `--color-border-subtle` | `rgba(15, 23, 42, 0.07)` | Card / header dividers |
+| `--color-surface` | `#FFFFFF` | Card background |
+| `--color-surface-subtle` | `#F7F8FA` | Chip background |
+| `--color-text` | `#1A1D23` | Primary text (provider name) |
+| `--color-text-muted` | `#6b7280` | Secondary text + chip text |
+| `--color-hover` | `rgba(15, 23, 42, 0.04)` | Model row hover |
+
+For status colors (enabled toggle, error banners, test-connection result), use the `--color-status-success` / `--color-status-warning` / `--color-status-danger` (+ `-soft`) family already defined in `tokens.css`.
 
 ---
 
@@ -357,9 +376,11 @@ enum ProviderCommand {
         #[arg(long)]
         enabled: Option<bool>,
     },
-    /// Delete a provider (cascades to models)
+    /// Delete a provider (cascades to models; may break bound subagents)
     Delete {
         id: String,
+        #[arg(long)]
+        yes: bool,
     },
     /// Test connection to a provider
     Test {
@@ -413,10 +434,12 @@ enum ProviderModelCommand {
         #[arg(long)]
         display_name: Option<String>,
     },
-    /// Delete a model
+    /// Delete a model (may break bound subagents)
     Delete {
         provider_id: String,
         model_id: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 ```
@@ -449,12 +472,12 @@ New file `apps/cli/src/commands/provider.rs`:
   - `handle_add(url, key, kind, name, model, tags)` — derive name if not given, call `provider.create`, optionally call `model.create` with defaults (`context_window: 200000, max_tokens: 8192, reasoning: true, display_name: <model_id>, enabled: true, tags: parseTags(tags)`)
   - `handle_show(id)` — call `provider.list`, find by id, print detail
   - `handle_update(id, name, url, key, kind, enabled)` — build patch DTO, call `provider.update`
-  - `handle_delete(id)` — confirm, call `provider.delete`
+  - `handle_delete(id, yes)` — if `yes` is false and stdin is a TTY, prompt for confirmation; if `yes` is false and stdin is NOT a TTY, bail with error ("use --yes to skip confirmation in non-interactive mode"); if `yes` is true, skip prompt. Then call `provider.delete`.
   - `handle_test(id)` — call `provider.test_connection`, print result
-  - `handle_model_list(provider_id, json)` — call `model.list` with provider filter
+  - `handle_model_list(provider_id, json)` — call `model.list` with `{ provider_id, include_disabled: true }`. `include_disabled` is mandatory here: `ModelListRequestDto` defaults it to `false` [dto.rs](file:///Users/wsd/Data/Busytok/busytok/crates/busytok-protocol/src/dto.rs), so without it disabled models would disappear from CLI management — contradicting the UI which lets users re-enable them.
   - `handle_model_add(provider_id, name, tags, context_window, max_tokens, reasoning, display_name)` — call `model.create` with defaults: `context_window.unwrap_or(200000)`, `max_tokens.unwrap_or(8192)`, `display_name.unwrap_or(name.clone())`, `enabled: true`, `tags: parseTags(tags)`. Tags are parsed from comma-separated string: `tags.unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()`.
-  - `handle_model_update(provider_id, model_id, ...)` — first call `model.list` with provider filter to resolve the internal DB UUID (`model_db_id`) from the user-facing `model_id` string, then call `model.update` with `id: model_db_id`. Call `model.tags.update` if tags changed. **Note:** `ModelUpdateRequestDto` fields are single-state `Option<T>` (omit = no change, `Some(v)` = set); there is no way to clear a field to null. The edit form must treat empty `display_name` as "leave unchanged" rather than "clear".
-  - `handle_model_delete(provider_id, model_id)` — resolve `model_db_id` via `model.list` (same as update), confirm, call `model.delete` with `{ id: model_db_id }`
+  - `handle_model_update(provider_id, model_id, ...)` — first call `model.list` with `{ provider_id, include_disabled: true }` to resolve the internal DB UUID (`model_db_id`) from the user-facing `model_id` string, then call `model.update` with `id: model_db_id`. Call `model.tags.update` if tags changed. **Note:** `ModelUpdateRequestDto` fields are single-state `Option<T>` (omit = no change, `Some(v)` = set); there is no way to clear a field to null. The edit form must treat empty `display_name` as "leave unchanged" rather than "clear".
+  - `handle_model_delete(provider_id, model_id)` — resolve `model_db_id` via `model.list` with `{ provider_id, include_disabled: true }` (same as update; a disabled model is still deletable), confirm, call `model.delete` with `{ id: model_db_id }`
 
 ### CLI name auto-generation
 
@@ -507,7 +530,45 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 
 ---
 
-## 8. File Impact Summary
+## 8. Observability (Frontend Events)
+
+The current `ProvidersPage` and `ModelsSection` emit frontend events via `reportFrontendEventSafely` (see [safeReporter.ts](file:///Users/wsd/Data/Busytok/busytok/apps/gui/src/logging/safeReporter.ts)). Since this spec deletes `ModelsSection` and rewrites `ProvidersPage`, the rewrite **must preserve equivalent events** so observability does not regress silently. The convention (established by `ProfilesSection`) is: success emits a past-tense `*.added` / `*.updated` / `*.deleted` INFO event; failure emits a `*.<verb>.failed` ERROR event.
+
+### Events to emit
+
+| Operation | Success event (INFO) | Failure event (ERROR) |
+|-----------|----------------------|------------------------|
+| Provider create | `provider.added` | `provider.add.failed` |
+| Provider update (inline edit) | `provider.updated` | `provider.update.failed` |
+| Provider delete | `provider.deleted` | `provider.delete.failed` |
+| Provider test connection | `provider.tested` (with `ok` + `error` in details) | `provider.test.failed` (on client-side exception only; RPC-returned `ok: false` still uses `provider.tested` to preserve current semantics) |
+| Model create (inline / sync) | `model.added` | `model.add.failed` |
+| Model update (inline edit) | `model.updated` | `model.update.failed` |
+| Model tags update | `model.tags.updated` | `model.tags.update.failed` |
+| Model delete | `model.deleted` | `model.delete.failed` |
+
+### Details payloads
+
+- `provider.added` / `provider.add.failed`: `{ name }` (the derived name; on partial-success retry, do not double-emit `provider.added` — track that it already succeeded)
+- `provider.updated` / `provider.update.failed`: `{ id, name }`
+- `provider.deleted` / `provider.delete.failed`: `{ id, name }`
+- `provider.tested`: `{ id, ok, error }` (matches current shape in [ProvidersPage.tsx](file:///Users/wsd/Data/Busytok/busytok/apps/gui/src/pages/ProvidersPage.tsx))
+- `model.added` / `model.add.failed`: `{ provider_id, model_id }`
+- `model.updated` / `model.update.failed`: `{ provider_id, model_id }`
+- `model.tags.updated` / `model.tags.update.failed`: `{ provider_id, model_id, tags }`
+- `model.deleted` / `model.delete.failed`: `{ provider_id, model_id }`
+
+### Partial-success note
+
+In the partial-success path (§3 step 6: provider created, model failed), emit `provider.added` once (the provider did get created) **and** `model.add.failed` with the model error. On retry of `model.create` only, emit `model.added` / `model.add.failed` as appropriate — do not re-emit `provider.added`.
+
+### Tests
+
+`ProvidersPage.test.tsx` must assert that each mutation path emits the expected event code on both success and failure (mock `reportFrontendEventSafely` and assert with `expect.objectContaining({ event_code: ... })`). The deleted `ModelsSection.test.tsx` assertions for `model.added` / `model.deleted` must be migrated into `ProvidersPage.test.tsx`.
+
+---
+
+## 9. File Impact Summary
 
 ### Deleted
 - `apps/gui/src/components/ProfilesSection.tsx`
@@ -531,7 +592,7 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 
 ---
 
-## 9. Testing
+## 10. Testing
 
 ### GUI tests
 - `ProvidersPage.test.tsx` — test provider create (with/without model), provider edit (inline header), provider delete, model inline edit, model add from card, model delete
@@ -552,7 +613,7 @@ The existing `Command::Models` (read-only list, line 122) is kept unchanged for 
 
 ---
 
-## 10. Constraints
+## 11. Constraints
 
 - Reuse all existing RPCs (`provider.list/create/update/delete/test_connection`, `model.list/create/update/delete/tags.update`). No backend changes.
 - No new npm dependencies. No new Rust crates — URL host extraction in CLI uses manual string parsing (`extract_host`), not the `url` crate.
