@@ -107,103 +107,96 @@ export function ProvidersPage() {
     });
   };
 
-  const handleModelCreate = (payload: ModelCreateRequestDto) => {
-    modelMutations.createModel.mutate(payload, {
-      onSuccess: (entry) => {
-        // Use the created entry's provider_id + model_id (canonical ids),
-        // not the db id — per spec §8 model event details payload.
-        reportFrontendEventSafely({
-          level: "INFO",
-          event_code: "model.added",
-          message: "Model added",
-          details: { provider_id: entry.provider_id, model_id: entry.model_id },
-        });
-      },
-      onError: (err: Error) => {
-        reportFrontendEventSafely({
-          level: "ERROR",
-          event_code: "model.add.failed",
-          message: "Model creation failed",
-          details: {
-            provider_id: payload.provider_id,
-            model_id: payload.model_id,
-            error: err.message,
-          },
-        });
-      },
-    });
+  const handleModelCreate = async (payload: ModelCreateRequestDto): Promise<void> => {
+    try {
+      const entry = await modelMutations.createModel.mutateAsync(payload);
+      // Use the created entry's provider_id + model_id (canonical ids),
+      // not the db id — per spec §8 model event details payload.
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.added",
+        message: "Model added",
+        details: { provider_id: entry.provider_id, model_id: entry.model_id },
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.add.failed",
+        message: "Model creation failed",
+        details: {
+          provider_id: payload.provider_id,
+          model_id: payload.model_id,
+          error: err.message,
+        },
+      });
+      throw err;
+    }
   };
 
   // The full model object is passed (not just the id) so the page can
   // emit spec-§8-correct details `{ provider_id, model_id }` — those ids
   // live on the catalog entry, not on the update patch.
-  const handleModelUpdate = (
+  // Returns a Promise so ProviderCard can await success before closing
+  // the inline form (prevents input loss on RPC failure).
+  const handleModelUpdate = async (
     model: ModelCatalogEntryDto,
     patch: ModelUpdateRequestDto,
-  ) => {
-    modelMutations.updateModel.mutate(
-      { ...patch, id: model.model_db_id },
-      {
-        onSuccess: () => {
-          reportFrontendEventSafely({
-            level: "INFO",
-            event_code: "model.updated",
-            message: "Model updated",
-            details: {
-              provider_id: model.provider_id,
-              model_id: model.model_id,
-            },
-          });
+  ): Promise<void> => {
+    try {
+      await modelMutations.updateModel.mutateAsync({ ...patch, id: model.model_db_id });
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.updated",
+        message: "Model updated",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
         },
-        onError: (err: Error) => {
-          reportFrontendEventSafely({
-            level: "ERROR",
-            event_code: "model.update.failed",
-            message: "Model update failed",
-            details: {
-              provider_id: model.provider_id,
-              model_id: model.model_id,
-              error: err.message,
-            },
-          });
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.update.failed",
+        message: "Model update failed",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          error: err.message,
         },
-      },
-    );
+      });
+      throw err;
+    }
   };
 
-  const handleModelTagsUpdate = (
+  const handleModelTagsUpdate = async (
     model: ModelCatalogEntryDto,
     tags: string[],
-  ) => {
-    modelMutations.tagsUpdate.mutate(
-      { modelId: model.model_db_id, tags },
-      {
-        onSuccess: () => {
-          reportFrontendEventSafely({
-            level: "INFO",
-            event_code: "model.tags.updated",
-            message: "Model tags updated",
-            details: {
-              provider_id: model.provider_id,
-              model_id: model.model_id,
-              tags,
-            },
-          });
+  ): Promise<void> => {
+    try {
+      await modelMutations.tagsUpdate.mutateAsync({ modelId: model.model_db_id, tags });
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.tags.updated",
+        message: "Model tags updated",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          tags,
         },
-        onError: (err: Error) => {
-          reportFrontendEventSafely({
-            level: "ERROR",
-            event_code: "model.tags.update.failed",
-            message: "Model tags update failed",
-            details: {
-              provider_id: model.provider_id,
-              model_id: model.model_id,
-              error: err.message,
-            },
-          });
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.tags.update.failed",
+        message: "Model tags update failed",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          error: err.message,
         },
-      },
-    );
+      });
+      throw err;
+    }
   };
 
   const handleModelDelete = (model: ModelCatalogEntryDto) => {
@@ -248,14 +241,27 @@ export function ProvidersPage() {
           <ProviderCreationForm onClose={() => setShowCreateForm(false)} />
         )}
 
-        {(providersQuery.data?.providers ?? []).map((provider) => (
+        {providersQuery.isError && (
+          <div className="degraded-ribbon" role="alert">
+            <span className="degraded-ribbon__dot" />
+            Provider 列表加载失败，请刷新页面重试。
+          </div>
+        )}
+
+        {modelsQuery.isError && (
+          <div className="degraded-ribbon" role="alert">
+            <span className="degraded-ribbon__dot" />
+            Model 列表加载失败，Model 操作可能不可用。请刷新页面重试。
+          </div>
+        )}
+
+        {!providersQuery.isError && (providersQuery.data?.providers ?? []).map((provider) => (
           <ProviderCard
             key={provider.id}
             provider={provider}
             models={modelsByProvider.get(provider.id) ?? []}
             isModelsLoading={modelsQuery.isLoading}
             providerMutations={providerMutations}
-            modelMutations={modelMutations}
             onEdit={() => setEditingProviderId(provider.id)}
             onTestConnection={handleTestConnection}
             onDelete={handleProviderDelete}

@@ -82,37 +82,42 @@ const mockMutations = (): ProviderMutationsResult => ({
 
 const mockModelMutations = (): ModelMutationsResult => ({
   // createModel returns ModelCatalogEntryDto (per useBusytokData.ts:470);
-  // the page's onSuccess reads entry.provider_id + entry.model_id, so the
-  // mock must pass a concrete entry or the handler throws a TypeError.
+  // the page's handleModelCreate reads entry.provider_id + entry.model_id, so
+  // the mock must resolve with a concrete entry or the handler throws.
   createModel: {
-    mutate: vi.fn(
-      (_payload: unknown, opts?: { onSuccess?: (entry: ModelCatalogEntryDto) => void }) => {
-        opts?.onSuccess?.({
-          provider_id: "prov-1",
-          provider_name: "deepseek_openai",
-          provider_kind: "openai_compatible" as never,
-          provider_enabled: true,
-          model_db_id: "model-db-new",
-          model_id: "new-model",
-          model_enabled: true,
-          tags: [],
-          display_name: "new-model",
-          reasoning: false,
-          context_window: 200000,
-          max_tokens: 8192,
-        });
-      },
-    ),
+    mutate: vi.fn(),
+    mutateAsync: vi.fn().mockResolvedValue({
+      provider_id: "prov-1",
+      provider_name: "deepseek_openai",
+      provider_kind: "openai_compatible" as never,
+      provider_enabled: true,
+      model_db_id: "model-db-new",
+      model_id: "new-model",
+      model_enabled: true,
+      tags: [],
+      display_name: "new-model",
+      reasoning: false,
+      context_window: 200000,
+      max_tokens: 8192,
+    }),
     isPending: false,
   },
-  updateModel: { mutate: vi.fn(), isPending: false },
+  updateModel: {
+    mutate: vi.fn(),
+    mutateAsync: vi.fn().mockResolvedValue(undefined),
+    isPending: false,
+  },
   deleteModel: {
     mutate: vi.fn((_id: string, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     }),
     isPending: false,
   },
-  tagsUpdate: { mutate: vi.fn(), isPending: false },
+  tagsUpdate: {
+    mutate: vi.fn(),
+    mutateAsync: vi.fn().mockResolvedValue(undefined),
+    isPending: false,
+  },
 } as never);
 
 function renderPage(
@@ -275,13 +280,14 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.added event on successful model create", () => {
+  it("emits model.added event on successful model create", async () => {
     renderPage({ providers: [makeProvider()] });
     fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
     fireEvent.change(screen.getByPlaceholderText(/model name/i), {
       target: { value: "new-model" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "model.added",
@@ -293,13 +299,12 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.add.failed event on failed model create", () => {
+  it("emits model.add.failed event on failed model create", async () => {
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
       createModel: {
-        mutate: vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-          opts?.onError?.(new Error("model create rpc failed"));
-        }),
+        mutate: vi.fn(),
+        mutateAsync: vi.fn().mockRejectedValue(new Error("model create rpc failed")),
         isPending: false,
       },
     } as never);
@@ -309,6 +314,7 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "new-model" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "model.add.failed",
@@ -370,17 +376,7 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.updated event on successful model update", () => {
-    // Override updateModel to trigger onSuccess.
-    vi.mocked(useModelMutations).mockReturnValue({
-      ...mockModelMutations(),
-      updateModel: {
-        mutate: vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
-          opts?.onSuccess?.();
-        }),
-        isPending: false,
-      },
-    } as never);
+  it("emits model.updated event on successful model update", async () => {
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
     // Enter model edit mode, change display_name, save.
     const editButtons = screen.getAllByRole("button", { name: /编辑/i });
@@ -389,6 +385,7 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "DeepSeek Chat" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "model.updated",
@@ -401,13 +398,12 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.update.failed event on failed model update", () => {
+  it("emits model.update.failed event on failed model update", async () => {
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
       updateModel: {
-        mutate: vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-          opts?.onError?.(new Error("update failed"));
-        }),
+        mutate: vi.fn(),
+        mutateAsync: vi.fn().mockRejectedValue(new Error("update failed")),
         isPending: false,
       },
     } as never);
@@ -418,6 +414,7 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "DeepSeek Chat" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "model.update.failed",
@@ -430,13 +427,11 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.tags.updated event on successful tags update", () => {
-    const mutateSpy = vi.fn((payload: unknown, opts?: { onSuccess?: () => void }) => {
-      opts?.onSuccess?.();
-    });
+  it("emits model.tags.updated event on successful tags update", async () => {
+    const mutateAsyncSpy = vi.fn().mockResolvedValue(undefined);
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
-      tagsUpdate: { mutate: mutateSpy, isPending: false },
+      tagsUpdate: { mutate: vi.fn(), mutateAsync: mutateAsyncSpy, isPending: false },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
     const editButtons = screen.getAllByRole("button", { name: /编辑/i });
@@ -445,11 +440,11 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "cheap,fast" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
-    // Regression (C1): mutate must receive the SQL PK (model_db_id), not the
-    // human-readable model_id string. makeModel() sets them distinctly.
-    expect(mutateSpy).toHaveBeenCalledWith(
+    await new Promise((r) => setTimeout(r, 0));
+    // Regression (C1): mutateAsync must receive the SQL PK (model_db_id), not
+    // the human-readable model_id string. makeModel() sets them distinctly.
+    expect(mutateAsyncSpy).toHaveBeenCalledWith(
       { modelId: "model-db-1", tags: ["cheap", "fast"] },
-      expect.anything(),
     );
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -463,13 +458,11 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.tags.update.failed event on failed tags update", () => {
-    const mutateSpy = vi.fn((payload: unknown, opts?: { onError?: (e: Error) => void }) => {
-      opts?.onError?.(new Error("tags update failed"));
-    });
+  it("emits model.tags.update.failed event on failed tags update", async () => {
+    const mutateAsyncSpy = vi.fn().mockRejectedValue(new Error("tags update failed"));
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
-      tagsUpdate: { mutate: mutateSpy, isPending: false },
+      tagsUpdate: { mutate: vi.fn(), mutateAsync: mutateAsyncSpy, isPending: false },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
     const editButtons = screen.getAllByRole("button", { name: /编辑/i });
@@ -478,11 +471,10 @@ describe("ProvidersPage (rewritten)", () => {
       target: { value: "cheap,fast" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
-    // Regression (C1): same payload assertion as the success case; only the
-    // opts differ (onError instead of onSuccess).
-    expect(mutateSpy).toHaveBeenCalledWith(
+    await new Promise((r) => setTimeout(r, 0));
+    // Regression (C1): same payload assertion as the success case.
+    expect(mutateAsyncSpy).toHaveBeenCalledWith(
       { modelId: "model-db-1", tags: ["cheap", "fast"] },
-      expect.anything(),
     );
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -494,5 +486,49 @@ describe("ProvidersPage (rewritten)", () => {
         }),
       }),
     );
+  });
+
+  it("shows error banner when providers query fails", () => {
+    vi.mocked(useProviders).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      isFetching: false,
+    } as never);
+    vi.mocked(useModels).mockReturnValue({
+      data: { models: [] } as ModelListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <ProvidersPage />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/Provider 列表加载失败/i)).toBeTruthy();
+  });
+
+  it("shows error banner when models query fails", () => {
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [makeProvider()] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useModels).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      isFetching: false,
+    } as never);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <ProvidersPage />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/Model 列表加载失败/i)).toBeTruthy();
   });
 });

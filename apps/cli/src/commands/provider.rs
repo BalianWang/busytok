@@ -56,6 +56,10 @@ fn validate_base_url(input: &str) -> Result<()> {
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         anyhow::bail!("URL must start with http:// or https://");
     }
+    let host = extract_host(trimmed).unwrap_or("");
+    if host.is_empty() {
+        anyhow::bail!("URL must have a non-empty host");
+    }
     Ok(())
 }
 
@@ -812,6 +816,16 @@ mod tests {
     #[test]
     fn validate_base_url_rejects_ftp() {
         assert!(validate_base_url("ftp://api.deepseek.com").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_empty_host_https() {
+        assert!(validate_base_url("https://").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_empty_host_http() {
+        assert!(validate_base_url("http:///foo").is_err());
     }
 
     // ─── Tag parsing ─────────────────────────────────────────────────

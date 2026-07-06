@@ -7,7 +7,7 @@ import type {
   ProviderKind,
   ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
-import type { useProviderMutations, useModelMutations } from "../api/useBusytokData";
+import type { useProviderMutations } from "../api/useBusytokData";
 import { parseTags } from "../pages/providerFormUtils";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 
@@ -16,13 +16,12 @@ interface ProviderCardProps {
   models: ModelCatalogEntryDto[];
   isModelsLoading: boolean;
   providerMutations: ReturnType<typeof useProviderMutations>;
-  modelMutations: ReturnType<typeof useModelMutations>;
   onEdit: () => void;
   onTestConnection: (id: string) => void;
   onDelete: (provider: ProviderDto) => void;
-  onModelCreate: (payload: ModelCreateRequestDto) => void;
-  onModelUpdate: (model: ModelCatalogEntryDto, patch: ModelUpdateRequestDto) => void;
-  onModelTagsUpdate: (model: ModelCatalogEntryDto, tags: string[]) => void;
+  onModelCreate: (payload: ModelCreateRequestDto) => Promise<void>;
+  onModelUpdate: (model: ModelCatalogEntryDto, patch: ModelUpdateRequestDto) => Promise<void>;
+  onModelTagsUpdate: (model: ModelCatalogEntryDto, tags: string[]) => Promise<void>;
   onModelDelete: (model: ModelCatalogEntryDto) => void;
   isEditing?: boolean;
   onCancelEdit?: () => void;
@@ -85,6 +84,7 @@ export function ProviderCard({
   const [editingModelDbId, setEditingModelDbId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<ModelEditDraft | null>(null);
   const [providerEditDraft, setProviderEditDraft] = useState<ProviderEditDraft | null>(null);
+  const [modelFormError, setModelFormError] = useState<string | null>(null);
 
   // Initialize/clear provider edit draft via useEffect — never setState during
   // render (React 19 + StrictMode render phase must be pure).
@@ -149,7 +149,7 @@ export function ProviderCard({
     if (ok) onModelDelete(model);
   };
 
-  const handleCreateSubmit = () => {
+  const handleCreateSubmit = async () => {
     if (!newModelDraft.modelId.trim()) return;
     const payload: ModelCreateRequestDto = {
       provider_id: provider.id,
@@ -161,9 +161,14 @@ export function ProviderCard({
       enabled: true,
       tags: parseTags(newModelDraft.tags),
     };
-    onModelCreate(payload);
-    setNewModelDraft({ modelId: "", tags: "" });
-    setShowCreateModel(false);
+    try {
+      await onModelCreate(payload);
+      setNewModelDraft({ modelId: "", tags: "" });
+      setShowCreateModel(false);
+      setModelFormError(null);
+    } catch (err: any) {
+      setModelFormError(err.message ?? "创建失败");
+    }
   };
 
   const startModelEdit = (m: ModelCatalogEntryDto) => {
@@ -176,7 +181,7 @@ export function ProviderCard({
     setEditDraft(null);
   };
 
-  const handleEditSubmit = (m: ModelCatalogEntryDto) => {
+  const handleEditSubmit = async (m: ModelCatalogEntryDto) => {
     if (!editDraft) return;
     // Single-state Option<T>: only include fields that changed. Omit = no change
     // (serde deserializes both missing and null to None, so omitting is wire-
@@ -197,19 +202,24 @@ export function ProviderCard({
     if (editDraft.enabled !== m.model_enabled) {
       patch.enabled = editDraft.enabled;
     }
-    if (Object.keys(patch).length > 1) {
-      // More than just `id` → there are field updates.
-      onModelUpdate(m, patch as ModelUpdateRequestDto);
+    try {
+      if (Object.keys(patch).length > 1) {
+        // More than just `id` → there are field updates.
+        await onModelUpdate(m, patch as ModelUpdateRequestDto);
+      }
+      // Tags are updated via a separate RPC. Compare parsed arrays to avoid
+      // false positives from whitespace differences in the comma-separated string.
+      const newTags = parseTags(editDraft.tags);
+      const sameTags =
+        m.tags.length === newTags.length && m.tags.every((t, i) => t === newTags[i]);
+      if (!sameTags) {
+        await onModelTagsUpdate(m, newTags);
+      }
+      cancelModelEdit();
+      setModelFormError(null);
+    } catch (err: any) {
+      setModelFormError(err.message ?? "保存失败");
     }
-    // Tags are updated via a separate RPC. Compare parsed arrays to avoid
-    // false positives from whitespace differences in the comma-separated string.
-    const newTags = parseTags(editDraft.tags);
-    const sameTags =
-      m.tags.length === newTags.length && m.tags.every((t, i) => t === newTags[i]);
-    if (!sameTags) {
-      onModelTagsUpdate(m, newTags);
-    }
-    cancelModelEdit();
   };
 
   // ─── Edit mode render ────────────────────────────────────────────────
@@ -318,8 +328,11 @@ export function ProviderCard({
             />
             <div style={{ display: "flex", gap: 8 }}>
               <button type="button" onClick={handleCreateSubmit}>保存</button>
-              <button type="button" onClick={() => { setShowCreateModel(false); setNewModelDraft({ modelId: "", tags: "" }); }}>取消</button>
+              <button type="button" onClick={() => { setShowCreateModel(false); setNewModelDraft({ modelId: "", tags: "" }); setModelFormError(null); }}>取消</button>
             </div>
+            {modelFormError && (
+              <div role="alert" style={{ color: "var(--color-status-danger)", fontSize: "0.85rem" }}>{modelFormError}</div>
+            )}
           </div>
         )}
         {isModelsLoading ? (
@@ -382,8 +395,11 @@ export function ProviderCard({
                   </label>
                   <div style={{ display: "flex", gap: 8 }}>
                     <button type="button" onClick={() => handleEditSubmit(m)}>保存</button>
-                    <button type="button" onClick={cancelModelEdit}>取消</button>
+                    <button type="button" onClick={() => { cancelModelEdit(); setModelFormError(null); }}>取消</button>
                   </div>
+                  {modelFormError && (
+                    <div role="alert" style={{ color: "var(--color-status-danger)", fontSize: "0.85rem" }}>{modelFormError}</div>
+                  )}
                 </div>
               ) : (
                 <>
