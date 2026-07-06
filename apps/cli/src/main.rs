@@ -97,6 +97,12 @@ enum Command {
         timeout: Option<u64>,
         #[arg(long, default_value = "text", value_parser = ["json", "text"])]
         output: String,
+        /// Provider ID to bind a new subagent to (required with --bind-model for new subagents)
+        #[arg(long)]
+        bind_provider: Option<String>,
+        /// Model ID to bind a new subagent to (required with --bind-provider for new subagents)
+        #[arg(long)]
+        bind_model: Option<String>,
         /// The task prompt (positional)
         prompt: String,
     },
@@ -188,6 +194,14 @@ enum SubagentCommand {
         hard: bool,
         #[arg(long)]
         yes: bool,
+    },
+
+    /// Look up a single task by its task_id
+    Task {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
     },
 }
 
@@ -596,10 +610,22 @@ async fn run(args: Args) -> anyhow::Result<()> {
             model,
             timeout,
             output,
+            bind_provider,
+            bind_model,
             prompt,
         } => {
             commands_subagent::handle_delegate(
-                subagent, id, cwd, profile, intent, model, timeout, output, prompt,
+                subagent,
+                id,
+                cwd,
+                profile,
+                intent,
+                model,
+                timeout,
+                output,
+                prompt,
+                bind_provider,
+                bind_model,
             )
             .await
         }
@@ -629,6 +655,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 hard,
                 yes,
             } => commands_subagent::handle_delete(name, id, cwd, hard, yes).await,
+            SubagentCommand::Task { task_id, output } => {
+                commands_subagent::handle_task_get(task_id, output).await
+            }
         },
 
         Command::Models {
@@ -730,6 +759,8 @@ mod tests {
             model: None,
             timeout: None,
             output: "text".to_string(),
+            bind_provider: None,
+            bind_model: None,
             prompt: "do thing".to_string(),
         };
         assert_eq!(command_name(&cmd), "delegate");
@@ -745,6 +776,73 @@ mod tests {
             },
         };
         assert_eq!(command_name(&cmd), "subagent");
+    }
+
+    #[test]
+    fn args_parses_delegate_with_bind_provider_and_bind_model() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--bind-provider",
+            "prov-1",
+            "--bind-model",
+            "model-1",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate {
+                bind_provider,
+                bind_model,
+                model,
+                ..
+            }) => {
+                assert_eq!(bind_provider.as_deref(), Some("prov-1"));
+                assert_eq!(bind_model.as_deref(), Some("model-1"));
+                // --model (task-level override) is separate and defaults to None
+                assert_eq!(model, None);
+            }
+            other => panic!("expected Delegate with bind flags, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_model_override_separate_from_bind_model() {
+        // --model maps to model_override (task-level); --bind-model maps to
+        // the bound model. Both can coexist without conflict.
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--model",
+            "gpt-4",
+            "--bind-provider",
+            "prov-1",
+            "--bind-model",
+            "model-1",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate {
+                model,
+                bind_provider,
+                bind_model,
+                ..
+            }) => {
+                assert_eq!(model.as_deref(), Some("gpt-4"));
+                assert_eq!(bind_provider.as_deref(), Some("prov-1"));
+                assert_eq!(bind_model.as_deref(), Some("model-1"));
+            }
+            other => panic!("expected Delegate with both --model and --bind-*, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1063,6 +1161,75 @@ mod tests {
         assert!(
             err.contains("expected agent:path"),
             "should surface the parser error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn args_parses_subagent_task_with_task_id() {
+        // `busytok subagent task --task-id task-1` parses into
+        // `SubagentCommand::Task` with `output` defaulting to "text".
+        let args =
+            Args::try_parse_from(["busytok", "subagent", "task", "--task-id", "task-1"]).unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand: SubagentCommand::Task { task_id, output },
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(output, "text");
+            }
+            other => panic!("expected Subagent::Task, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_subagent_task_with_json_output() {
+        // `--output json` overrides the default text mode.
+        let args = Args::try_parse_from([
+            "busytok",
+            "subagent",
+            "task",
+            "--task-id",
+            "task-1",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand: SubagentCommand::Task { task_id, output },
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(output, "json");
+            }
+            other => panic!("expected Subagent::Task with json output, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_rejects_subagent_task_without_task_id() {
+        // `--task-id` is required; omitting it must produce a clap error.
+        let result = Args::try_parse_from(["busytok", "subagent", "task"]);
+        assert!(
+            result.is_err(),
+            "should reject `subagent task` without --task-id"
+        );
+    }
+
+    #[test]
+    fn args_rejects_subagent_task_with_invalid_output_value() {
+        // `--output` only accepts "json" or "text" (value_parser).
+        let result = Args::try_parse_from([
+            "busytok",
+            "subagent",
+            "task",
+            "--task-id",
+            "task-1",
+            "--output",
+            "yaml",
+        ]);
+        assert!(
+            result.is_err(),
+            "should reject `--output yaml` for subagent task"
         );
     }
 }

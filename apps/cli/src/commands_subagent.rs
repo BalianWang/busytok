@@ -5,8 +5,9 @@ use std::io::BufRead;
 use anyhow::{bail, Context, Result};
 use busytok_control::ControlClient;
 use busytok_protocol::dto::{
-    SubagentDelegateRequestDto, SubagentDeleteRequestDto, SubagentListRequestDto,
-    SubagentResolveRequestDto, SubagentTasksRequestDto,
+    ModelCatalogEntryDto, ModelListRequestDto, ModelListResponseDto, SubagentDelegateRequestDto,
+    SubagentDeleteRequestDto, SubagentListRequestDto, SubagentResolveRequestDto,
+    SubagentTaskGetRequestDto, SubagentTasksRequestDto,
 };
 use busytok_protocol::{ControlRequest, ControlResponse};
 
@@ -27,9 +28,37 @@ pub async fn handle_delegate(
     timeout: Option<u64>,
     output: String,
     prompt: String,
+    bind_provider: Option<String>,
+    bind_model: Option<String>,
 ) -> Result<()> {
+    // Phase 1: pure shape validation that needs no RPC. Do this BEFORE
+    // `connect()` so obvious CLI misuse (e.g. `--bind-provider` without
+    // `--bind-model`) fails fast with the right error even when the service
+    // is down. `(None, None)` is a valid reuse-path passthrough and must
+    // NOT be rejected here.
+    match (&bind_provider, &bind_model) {
+        (Some(_), None) => {
+            anyhow::bail!("--bind-model is required when --bind-provider is given")
+        }
+        (None, Some(_)) => {
+            // Auto-resolution path — needs the model catalog RPC below.
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            // Direct passthrough or valid reuse path — no RPC needed.
+        }
+    }
+
     // Do NOT canonicalize cwd — the service resolver canonicalizes at one chokepoint.
     let mut client = connect().await?;
+
+    // Phase 2: auto-resolution. Only the `(None, Some(model))` branch
+    // requires a live `ControlClient` (to call `model.list`).
+    let (bound_provider_id, bound_model_id) =
+        match resolve_bound_fields(&mut client, bind_provider, bind_model).await? {
+            Some((p, m)) => (Some(p), Some(m)),
+            None => (None, None), // valid reuse-path passthrough
+        };
+
     let req = SubagentDelegateRequestDto {
         subagent_name: subagent,
         subagent_id: id,
@@ -42,11 +71,8 @@ pub async fn handle_delegate(
         model_override: model,
         source_harness: Some("cli".to_string()),
         source_session_id: None,
-        // CLI does not yet expose bound-field flags; the reuse path uses the
-        // subagent's stored bound fields, and the create path will reject
-        // (both-absent) until the GUI/CLI add explicit bound-field args.
-        bound_provider_id: None,
-        bound_model_id: None,
+        bound_provider_id,
+        bound_model_id,
     };
     let resp = client
         .call(ControlRequest::new(
@@ -78,7 +104,7 @@ pub async fn handle_list(
         .await
         .context("subagent.list RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_array(&data, "subagents", "text")
+    print_subagent_list(&data, "text")
 }
 
 pub async fn handle_show(name: Option<String>, id: Option<String>, cwd: String) -> Result<()> {
@@ -180,11 +206,97 @@ pub async fn handle_delete(
     print_ack(&data, "text")
 }
 
+pub async fn handle_task_get(task_id: String, output: String) -> Result<()> {
+    let mut client = connect().await?;
+    let req = SubagentTaskGetRequestDto { task_id };
+    let resp = client
+        .call(ControlRequest::new(
+            "subagent.task_get",
+            serde_json::to_value(&req)?,
+        ))
+        .await
+        .context("subagent.task_get RPC failed")?;
+    let data = unwrap_ok(resp)?;
+    print_task_detail(&data, &output)
+}
+
 /// Extract the Ok payload or bail with the control error message.
 fn unwrap_ok(resp: ControlResponse) -> Result<serde_json::Value> {
     match resp {
         ControlResponse::Ok(v) => Ok(v),
         ControlResponse::Err(e) => bail!("{}: {}", e.code, e.message),
+    }
+}
+
+/// Resolve (provider_id, model_id) from --bind-provider / --bind-model flags.
+/// Returns:
+/// - Ok(Some((provider, model))) when the bound fields are fully resolved
+/// - Ok(None) for the valid reuse-path passthrough case `(None, None)`
+/// - Err(...) for asymmetric or ambiguous input
+async fn resolve_bound_fields(
+    client: &mut ControlClient,
+    bind_provider: Option<String>,
+    bind_model: Option<String>,
+) -> Result<Option<(String, String)>> {
+    match (bind_provider, bind_model) {
+        (Some(p), Some(m)) => {
+            // Both given — pass through directly.
+            Ok(Some((p, m)))
+        }
+        (None, None) => {
+            // Important: do NOT reject this case in the CLI. It is valid for
+            // BOTH reuse paths:
+            //   - --id <UUID>
+            //   - --subagent <NAME> --cwd <DIR> when an active subagent with
+            //     that name already exists in the repo scope
+            // The service resolver will only reject it if the request falls
+            // through to the create path (0 active matches).
+            Ok(None)
+        }
+        (Some(_), None) => {
+            anyhow::bail!("--bind-model is required when --bind-provider is given")
+        }
+        (None, Some(model)) => {
+            // Auto-resolve provider from the model catalog.
+            // Reuse the typed model.list RPC path (same as `commands/models.rs`).
+            let req = ModelListRequestDto {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: false, // never bind to disabled provider/model
+            };
+            let resp = client
+                .call(ControlRequest::new(
+                    "model.list",
+                    serde_json::to_value(&req)?,
+                ))
+                .await?;
+            let value = unwrap_ok(resp)?;
+            let entries: Vec<ModelCatalogEntryDto> =
+                serde_json::from_value::<ModelListResponseDto>(value)?.models;
+            // include_disabled=false already filters disabled entries; the
+            // extra model_enabled && provider_enabled filter is defense-in-depth.
+            let matches: Vec<_> = entries
+                .iter()
+                .filter(|e| e.model_id == model && e.model_enabled && e.provider_enabled)
+                .collect();
+            match matches.len() {
+                0 => anyhow::bail!("model '{}' not found in catalog", model),
+                1 => {
+                    let pid = &matches[0].provider_id;
+                    eprintln!("  (auto-resolved provider: {})", pid);
+                    Ok(Some((pid.clone(), model)))
+                }
+                _ => {
+                    let providers: Vec<_> = matches.iter().map(|e| &e.provider_id).collect();
+                    anyhow::bail!(
+                        "model '{}' is available from multiple providers: {:?}\n\
+                         Use --bind-provider to disambiguate.",
+                        model,
+                        providers
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -236,6 +348,47 @@ fn print_array(value: &serde_json::Value, key: &str, output: &str) -> Result<()>
     })
 }
 
+/// Print the `subagents` array with a BINDING column
+/// (`bound_provider_id`/`bound_model_id`). Per Global Constraints, display
+/// IDs directly (no ID→name resolution). Used only by `handle_list`;
+/// `handle_tasks` keeps the generic `print_array` path.
+fn print_subagent_list(value: &serde_json::Value, output: &str) -> Result<()> {
+    print_json_or(value, output, |v| {
+        let arr = v.get("subagents").and_then(|a| a.as_array());
+        match arr {
+            Some(items) if items.is_empty() => println!("(no subagents)"),
+            Some(items) => {
+                for item in items {
+                    let id = item.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+                    let name = item
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .or_else(|| item.get("subagent_name").and_then(|s| s.as_str()))
+                        .unwrap_or("?");
+                    let bound_provider = item
+                        .get("bound_provider_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let bound_model = item
+                        .get("bound_model_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    // Post-migration-0007 the columns are NOT NULL, so this
+                    // fallback is purely defensive against malformed JSON.
+                    let binding = if bound_provider.is_empty() && bound_model.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("{bound_provider}/{bound_model}")
+                    };
+                    let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                    println!("{id:<36} {name:<20} {binding:<40} {status}");
+                }
+            }
+            None => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
+        }
+    })
+}
+
 /// Print a single subagent detail object.
 fn print_detail(value: &serde_json::Value, output: &str) -> Result<()> {
     print_json_or(value, output, |v| {
@@ -245,10 +398,20 @@ fn print_detail(value: &serde_json::Value, output: &str) -> Result<()> {
             .and_then(|s| s.as_str())
             .or_else(|| v.get("subagent_name").and_then(|s| s.as_str()))
             .unwrap_or("?");
+        let bound_provider = v
+            .get("bound_provider_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
+        let bound_model = v
+            .get("bound_model_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-        println!("id:     {id}");
-        println!("name:   {name}");
-        println!("status: {status}");
+        println!("id:       {id}");
+        println!("name:     {name}");
+        println!("provider: {bound_provider}");
+        println!("model:    {bound_model}");
+        println!("status:   {status}");
     })
 }
 
@@ -261,9 +424,74 @@ fn print_ack(value: &serde_json::Value, output: &str) -> Result<()> {
     })
 }
 
+/// Print a single task detail record (`SubagentTaskDetailDto`).
+///
+/// This is a DEDICATED formatter — do NOT reuse `print_detail` (that is for
+/// subagent identity, which has a different field set: bound_provider_id /
+/// bound_model_id instead of result_summary / error / error_kind /
+/// timestamps).
+///
+/// Optional `String` fields route through `or_dash` so absent values render
+/// as `-` (not `?`). Optional `i64` fields (`started_at_ms`,
+/// `completed_at_ms`) are formatted as strings and use `-` for `None`. The
+/// required `created_at_ms` field falls back to `0` defensively.
+fn print_task_detail(value: &serde_json::Value, output: &str) -> Result<()> {
+    print_json_or(value, output, |v| {
+        println!("{}", format_task_detail_text(v));
+    })
+}
+
+/// Pure text formatter for a single task detail record
+/// (`SubagentTaskDetailDto`). Returns the rendered string so tests can
+/// assert on the exact output (the caller is responsible for printing).
+fn format_task_detail_text(v: &serde_json::Value) -> String {
+    let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+    let subagent_id = v.get("subagent_id").and_then(|s| s.as_str()).unwrap_or("?");
+    let subagent_name = or_dash(v.get("subagent_name").and_then(|s| s.as_str()));
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+    let profile = v.get("profile").and_then(|s| s.as_str()).unwrap_or("?");
+    let model_override = or_dash(v.get("model_override").and_then(|s| s.as_str()));
+    let source_harness = or_dash(v.get("source_harness").and_then(|s| s.as_str()));
+    let source_session_id = or_dash(v.get("source_session_id").and_then(|s| s.as_str()));
+    let created_at_ms = v.get("created_at_ms").and_then(|n| n.as_i64()).unwrap_or(0);
+    let started_at_ms = v
+        .get("started_at_ms")
+        .and_then(|n| n.as_i64())
+        .map_or("-".to_string(), |n| n.to_string());
+    let completed_at_ms = v
+        .get("completed_at_ms")
+        .and_then(|n| n.as_i64())
+        .map_or("-".to_string(), |n| n.to_string());
+    let result_summary = or_dash(v.get("result_summary").and_then(|s| s.as_str()));
+    let error = or_dash(v.get("error").and_then(|s| s.as_str()));
+    let error_kind = or_dash(v.get("error_kind").and_then(|s| s.as_str()));
+    format!(
+        "id:                {id}\n\
+         subagent_id:       {subagent_id}\n\
+         subagent_name:     {subagent_name}\n\
+         status:            {status}\n\
+         profile:           {profile}\n\
+         model_override:    {model_override}\n\
+         source_harness:    {source_harness}\n\
+         source_session_id: {source_session_id}\n\
+         created_at_ms:     {created_at_ms}\n\
+         started_at_ms:     {started_at_ms}\n\
+         completed_at_ms:   {completed_at_ms}\n\
+         result_summary:    {result_summary}\n\
+         error:             {error}\n\
+         error_kind:        {error_kind}\n"
+    )
+}
+
+/// Render an optional string as `-` when absent. Used by `print_task_detail`
+/// for optional `String` fields on the task record.
+fn or_dash(v: Option<&str>) -> &str {
+    v.unwrap_or("-")
+}
+
 /// Shared helper: `json` output prints pretty JSON; any other value runs the
 /// supplied text-mode closure. Centralizes the `match output { "json" => …, _ => … }`
-/// pattern previously repeated across `print_delegate`/`print_array`/`print_detail`/`print_ack`.
+/// pattern previously repeated across `print_delegate`/`print_array`/`print_detail`/`print_ack`/`print_task_detail`.
 fn print_json_or(
     value: &serde_json::Value,
     output: &str,
@@ -281,6 +509,7 @@ fn print_json_or(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::uninlined_format_args)]
     use super::*;
+    use busytok_domain::ProviderKind;
     use busytok_protocol::dto::*;
     use busytok_protocol::{ControlError, ControlResponse};
     use serde_json::json;
@@ -380,18 +609,109 @@ mod tests {
         assert!(print_array(&v, "tasks", "text").is_ok());
     }
 
+    // ── print_subagent_list ──────────────────────────────────────────
+    //
+    // Dedicated renderer for `handle_list` — adds a BINDING column
+    // (`bound_provider_id`/`bound_model_id`) that the generic `print_array`
+    // does not show. The `print_array` tests above remain the coverage for
+    // the `handle_tasks` path.
+
+    #[test]
+    fn print_subagent_list_text_empty_prints_no_subagents_message() {
+        // Empty `subagents` array — should print `(no subagents)`.
+        let v = json!({"subagents": []});
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_text_with_bound_fields_shows_binding_column() {
+        // Non-empty list with bound fields — BINDING column renders as
+        // `{bound_provider_id}/{bound_model_id}`.
+        let v = json!({
+            "subagents": [
+                {
+                    "id": "sa-1",
+                    "name": "dev",
+                    "bound_provider_id": "openai",
+                    "bound_model_id": "gpt-5",
+                    "status": "hot"
+                },
+                {
+                    "id": "sa-2",
+                    "subagent_name": "reviewer",
+                    "bound_provider_id": "anthropic",
+                    "bound_model_id": "claude-opus",
+                    "status": "warm"
+                }
+            ]
+        });
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_text_missing_bound_fields_falls_back_to_dash() {
+        // Malformed JSON: items present but bound fields missing — the
+        // BINDING column falls back to `-`. This is purely defensive
+        // (post-migration-0007 the columns are NOT NULL).
+        let v = json!({
+            "subagents": [
+                {"id": "sa-1", "name": "dev", "status": "hot"},
+                {"id": "sa-2", "name": "reviewer", "bound_provider_id": "", "bound_model_id": "", "status": "warm"}
+            ]
+        });
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_text_when_key_absent_falls_back_to_pretty_json() {
+        // The value has no `subagents` array — should print the pretty JSON
+        // of the whole envelope (matches `print_array`'s fallback shape).
+        let v = json!({"unexpected": "shape"});
+        assert!(print_subagent_list(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_subagent_list_json_output_pretty_prints_payload() {
+        // `json` output mode pretty-prints the full envelope.
+        let v =
+            json!({"subagents": [{"id": "x", "bound_provider_id": "p", "bound_model_id": "m"}]});
+        assert!(print_subagent_list(&v, "json").is_ok());
+    }
+
     // ── print_detail ───────────────────────────────────────────────────
 
     #[test]
     fn print_detail_text_with_name_field() {
-        let v = json!({"id": "id-1", "name": "named", "status": "warm"});
+        // All fields present, including bound IDs — text branch should print
+        // id/name/provider/model/status lines.
+        let v = json!({
+            "id": "id-1",
+            "name": "named",
+            "bound_provider_id": "openai",
+            "bound_model_id": "gpt-5",
+            "status": "warm"
+        });
         assert!(print_detail(&v, "text").is_ok());
     }
 
     #[test]
     fn print_detail_text_falls_back_to_subagent_name() {
         // No `name` field — should fall back to `subagent_name`.
-        let v = json!({"id": "id-2", "subagent_name": "fallback", "status": "cold"});
+        let v = json!({
+            "id": "id-2",
+            "subagent_name": "fallback",
+            "bound_provider_id": "anthropic",
+            "bound_model_id": "claude",
+            "status": "cold"
+        });
+        assert!(print_detail(&v, "text").is_ok());
+    }
+
+    #[test]
+    fn print_detail_text_missing_bound_fields_falls_back_to_question_mark() {
+        // id/name/status present but bound fields absent — `provider` and
+        // `model` lines should print `?` (defensive fallback).
+        let v = json!({"id": "id-3", "name": "orphan", "status": "cold"});
         assert!(print_detail(&v, "text").is_ok());
     }
 
@@ -403,7 +723,7 @@ mod tests {
 
     #[test]
     fn print_detail_json_output_pretty_prints_payload() {
-        let v = json!({"id": "id-3"});
+        let v = json!({"id": "id-3", "bound_provider_id": "p", "bound_model_id": "m"});
         assert!(print_detail(&v, "json").is_ok());
     }
 
@@ -471,7 +791,7 @@ mod tests {
     use busytok_control::{dispatch::RuntimeControl, server::ControlServer, TestRuntimeControl};
     use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Hold a running `ControlServer` for the lifetime of the test.
     struct ServerHarness {
@@ -508,6 +828,20 @@ mod tests {
         show_response: SubagentDetailDto,
         tasks_response: SubagentTasksResponseDto,
         delete_should_fail: AtomicBool,
+        /// When set, `subagent_task_get` returns a real
+        /// `MethodDispatchError` (code `subagent.task_not_found`) so tests
+        /// can exercise the `ControlResponse::Err` path through `unwrap_ok`
+        /// (e.g. missing-task error surfacing).
+        task_get_should_fail: AtomicBool,
+        /// Optional canned response for `model_list` (used by
+        /// `resolve_bound_fields` auto-resolution tests). When `None`,
+        /// `model_list` delegates to the inner runtime.
+        model_list_response: Option<ModelListResponseDto>,
+        /// Captures the most recent `SubagentDelegateRequestDto` received by
+        /// `subagent_delegate`, so tests can assert the outgoing DTO carries
+        /// the expected bound fields. Wrapped in `Mutex` because the trait
+        /// method takes `&self` (not `&mut self`).
+        last_delegate_request: Mutex<Option<SubagentDelegateRequestDto>>,
     }
 
     impl SubagentRuntime {
@@ -552,6 +886,9 @@ mod tests {
                     }],
                 },
                 delete_should_fail: AtomicBool::new(false),
+                task_get_should_fail: AtomicBool::new(false),
+                model_list_response: None,
+                last_delegate_request: Mutex::new(None),
             }
         }
     }
@@ -704,8 +1041,9 @@ mod tests {
         }
         async fn subagent_delegate(
             &self,
-            _req: SubagentDelegateRequestDto,
+            req: SubagentDelegateRequestDto,
         ) -> Result<SubagentDelegateResponseDto> {
+            *self.last_delegate_request.lock().unwrap() = Some(req);
             Ok(self.delegate_response.clone())
         }
         async fn subagent_list(
@@ -750,6 +1088,21 @@ mod tests {
         ) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
             self.inner.subagent_runtime_status(req).await
         }
+        async fn subagent_task_get(
+            &self,
+            req: SubagentTaskGetRequestDto,
+        ) -> Result<SubagentTaskDetailDto> {
+            if self.task_get_should_fail.load(Ordering::SeqCst) {
+                return Err(anyhow::Error::new(
+                    busytok_control::dispatch::MethodDispatchError::from_read_error(
+                        "subagent.task_not_found",
+                        "task not found: missing-task".to_string(),
+                        serde_json::Value::Null,
+                    ),
+                ));
+            }
+            self.inner.subagent_task_get(req).await
+        }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
         }
@@ -771,8 +1124,12 @@ mod tests {
         async fn model_create(&self, req: ModelCreateRequestDto) -> Result<ModelCatalogEntryDto> {
             self.inner.model_create(req).await
         }
-        async fn model_list(&self, req: ModelListRequestDto) -> Result<ModelListResponseDto> {
-            self.inner.model_list(req).await
+        async fn model_list(&self, _req: ModelListRequestDto) -> Result<ModelListResponseDto> {
+            if let Some(resp) = &self.model_list_response {
+                Ok(resp.clone())
+            } else {
+                self.inner.model_list(_req).await
+            }
         }
         async fn model_update(&self, req: ModelUpdateRequestDto) -> Result<()> {
             self.inner.model_update(req).await
@@ -809,6 +1166,18 @@ mod tests {
         spawn_server(runtime).await
     }
 
+    /// Like `spawn_subagent_server` but also returns the `SubagentRuntime`
+    /// handle so tests can inspect captured state (e.g. the last delegate
+    /// request DTO).
+    async fn spawn_subagent_server_with_runtime() -> (ServerHarness, Arc<SubagentRuntime>, String) {
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let runtime = Arc::new(SubagentRuntime::new(inner));
+        let runtime_handle = Arc::clone(&runtime);
+        let runtime_dyn: Arc<dyn RuntimeControl> = runtime;
+        let (harness, socket) = spawn_server(runtime_dyn).await;
+        (harness, runtime_handle, socket)
+    }
+
     #[tokio::test]
     #[serial]
     async fn handle_delegate_invokes_subagent_delegate_rpc_and_prints_text() {
@@ -824,6 +1193,8 @@ mod tests {
             None,
             "text".to_string(),
             "do the thing".to_string(),
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -849,6 +1220,8 @@ mod tests {
             Some(60),
             "json".to_string(),
             "do the thing".to_string(),
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -856,6 +1229,302 @@ mod tests {
             result.is_ok(),
             "handle_delegate json output: {:?}",
             result.err()
+        );
+    }
+
+    // ── resolve_bound_fields ───────────────────────────────────────────
+    //
+    // Exercise each branch of the bound-field resolver. The `(None, None)`
+    // and `(Some, Some)` and `(Some, None)` cases short-circuit before any
+    // RPC, but still require a live `ControlClient` to satisfy the signature.
+    // The `(None, Some)` auto-resolution cases use a `SubagentRuntime` with
+    // a canned `model_list_response`.
+
+    fn sample_model_entry(provider: &str, model: &str, enabled: bool) -> ModelCatalogEntryDto {
+        ModelCatalogEntryDto {
+            provider_id: provider.to_string(),
+            provider_name: provider.to_string(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            provider_enabled: enabled,
+            model_db_id: format!("{provider}-{model}-db"),
+            model_id: model.to_string(),
+            model_enabled: enabled,
+            tags: vec![],
+            display_name: None,
+            reasoning: false,
+            context_window: None,
+            max_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_none_returns_ok_none() {
+        // (None, None) is the valid reuse-path passthrough — no RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, None).await;
+        drop(harness);
+        assert!(result.is_ok(), "err: {:?}", result.err());
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_some_some_returns_ok_some() {
+        // (Some, Some) passes through directly — no RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(
+            &mut client,
+            Some("prov-1".to_string()),
+            Some("model-1".to_string()),
+        )
+        .await;
+        drop(harness);
+        assert!(result.is_ok(), "err: {:?}", result.err());
+        let (p, m) = result.unwrap().unwrap();
+        assert_eq!(p, "prov-1");
+        assert_eq!(m, "model-1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_some_none_errors_asymmetric() {
+        // (Some, None) is asymmetric — bails without RPC.
+        let (harness, socket) = spawn_subagent_server().await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, Some("prov-1".to_string()), None).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--bind-model is required"),
+            "expected asymmetric error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_auto_resolves_when_unique() {
+        // (None, Some) with a single matching model in the catalog auto-resolves.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![
+                sample_model_entry("openai", "gpt-4", true),
+                sample_model_entry("openai", "gpt-3.5", false),
+                sample_model_entry("deepseek", "deepseek-chat", true),
+            ],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, Some("gpt-4".to_string())).await;
+        drop(harness);
+        assert!(result.is_ok(), "err: {:?}", result.err());
+        let (p, m) = result.unwrap().unwrap();
+        assert_eq!(p, "openai");
+        assert_eq!(m, "gpt-4");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_errors_when_model_not_found() {
+        // (None, Some) with no matching model in the catalog bails.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![sample_model_entry("openai", "gpt-4", true)],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, Some("nope".to_string())).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("model 'nope' not found in catalog"),
+            "expected not-found error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_errors_when_ambiguous() {
+        // (None, Some) with the same model from multiple enabled providers bails.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![
+                sample_model_entry("openai", "shared-model", true),
+                sample_model_entry("azure", "shared-model", true),
+            ],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result =
+            resolve_bound_fields(&mut client, None, Some("shared-model".to_string())).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("multiple providers"),
+            "expected ambiguity error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_bound_fields_none_some_skips_disabled_entries() {
+        // (None, Some) where the only catalog match is disabled should bail
+        // (defense-in-depth: include_disabled=false already filters these).
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.model_list_response = Some(ModelListResponseDto {
+            models: vec![sample_model_entry("openai", "gpt-4", false)],
+        });
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        let mut client = ControlClient::connect(&socket).await.unwrap();
+        let result = resolve_bound_fields(&mut client, None, Some("gpt-4".to_string())).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("model 'gpt-4' not found in catalog"),
+            "expected not-found (disabled filtered), got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_and_bind_model_succeeds() {
+        // (Some, Some) on handle_delegate — the bound fields are passed
+        // straight through to the DTO without any model.list RPC. Verify
+        // the outgoing DTO actually carries them (not just that the call
+        // returns Ok).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("prov-1".to_string()),
+            Some("model-1".to_string()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_delegate with bind flags: {:?}",
+            result.err()
+        );
+        drop(harness);
+        let captured = runtime.last_delegate_request.lock().unwrap().take().expect(
+            "subagent_delegate should have captured the request DTO — \
+             if None, the RPC never reached the runtime",
+        );
+        assert_eq!(captured.bound_provider_id, Some("prov-1".to_string()));
+        assert_eq!(captured.bound_model_id, Some("model-1".to_string()));
+        // model_override is the task-level override (separate from bound fields);
+        // passing None must leave it None.
+        assert_eq!(captured.model_override, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_without_bind_flags_passes_none_to_dto() {
+        // (None, None) reuse-path passthrough: the outgoing DTO must carry
+        // None for both bound fields, so the service resolver can decide
+        // (reject on create path, reuse stored bound fields on reuse path).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_delegate reuse path: {:?}",
+            result.err()
+        );
+        drop(harness);
+        let captured = runtime.last_delegate_request.lock().unwrap().take().expect(
+            "subagent_delegate should have captured the request DTO — \
+             if None, the RPC never reached the runtime",
+        );
+        assert_eq!(captured.bound_provider_id, None);
+        assert_eq!(captured.bound_model_id, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_only_errors() {
+        // Asymmetric (--bind-provider without --bind-model) should surface
+        // the CLI-side validation error before any delegate RPC fires.
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("prov-1".to_string()),
+            None,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--bind-model is required"),
+            "expected asymmetric bind error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_bind_provider_only_errors_without_server() {
+        // Phase 1 shape validation must run BEFORE connect(). Point the
+        // socket at a path where no server listens and confirm we still
+        // get the "--bind-model is required" error, not a connect failure.
+        std::env::set_var("BUSYTOK_SOCKET", "/nonexistent/busytok-no-server-test.sock");
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("prov-1".to_string()),
+            None,
+        )
+        .await;
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("--bind-model is required"),
+            "expected asymmetric bind error BEFORE connect, got: {err}"
         );
     }
 
@@ -1194,6 +1863,12 @@ mod tests {
             req: SubagentRuntimeStatusRequestDto,
         ) -> Result<ReadEnvelopeDto<SubagentRuntimeStatusDto>> {
             self.inner.subagent_runtime_status(req).await
+        }
+        async fn subagent_task_get(
+            &self,
+            req: SubagentTaskGetRequestDto,
+        ) -> Result<SubagentTaskDetailDto> {
+            self.inner.subagent_task_get(req).await
         }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
@@ -1772,5 +2447,188 @@ mod tests {
         let _ = rt
             .profile_delete(ProfileDeleteRequestDto { id: "pr".into() })
             .await;
+    }
+
+    // ── print_task_detail ────────────────────────────────────────────
+    //
+    // Dedicated renderer for `handle_task_get` — task records have a
+    // different shape than subagent identity (no bound fields; adds
+    // result_summary/error/error_kind/timestamps). Do NOT reuse
+    // `print_detail`, which is for subagent identity.
+
+    #[test]
+    fn print_task_detail_text_with_full_payload() {
+        // All fields present — text branch should print every field
+        // (id/subagent_id/subagent_name/status/profile/model_override/
+        // source_harness/source_session_id/created_at_ms/started_at_ms/
+        // completed_at_ms/result_summary/error/error_kind).
+        let v = json!({
+            "id": "task-1",
+            "subagent_id": "sa-1",
+            "subagent_name": "dev",
+            "status": "completed",
+            "profile": "default",
+            "model_override": "gpt-5",
+            "source_harness": "cli",
+            "source_session_id": "sess-1",
+            "created_at_ms": 1700000000_i64,
+            "started_at_ms": 1700000001_i64,
+            "completed_at_ms": 1700000002_i64,
+            "result_summary": "did the thing",
+            "error": null,
+            "error_kind": null,
+        });
+        let s = format_task_detail_text(&v);
+        assert!(s.contains("id:                task-1"), "got: {s}");
+        assert!(s.contains("subagent_id:       sa-1"), "got: {s}");
+        assert!(s.contains("subagent_name:     dev"), "got: {s}");
+        assert!(s.contains("status:            completed"), "got: {s}");
+        assert!(s.contains("profile:           default"), "got: {s}");
+        assert!(s.contains("model_override:    gpt-5"), "got: {s}");
+        assert!(s.contains("source_harness:    cli"), "got: {s}");
+        assert!(s.contains("source_session_id: sess-1"), "got: {s}");
+        assert!(s.contains("created_at_ms:     1700000000"), "got: {s}");
+        assert!(s.contains("started_at_ms:     1700000001"), "got: {s}");
+        assert!(s.contains("completed_at_ms:   1700000002"), "got: {s}");
+        assert!(s.contains("result_summary:    did the thing"), "got: {s}");
+        // `error`/`error_kind` are null → or_dash renders `-`.
+        assert!(s.contains("error:             -"), "got: {s}");
+        assert!(s.contains("error_kind:        -"), "got: {s}");
+        // Negative assertions: the text formatter intentionally omits
+        // `prompt`, `prompt_artifact_ref`, and `timeout_seconds` even when
+        // they are present in the payload.
+        assert!(
+            !s.contains("prompt:"),
+            "prompt should not appear in text output"
+        );
+        assert!(
+            !s.contains("prompt_artifact_ref:"),
+            "prompt_artifact_ref should not appear in text output"
+        );
+        assert!(
+            !s.contains("timeout_seconds:"),
+            "timeout_seconds should not appear in text output"
+        );
+    }
+
+    #[test]
+    fn print_task_detail_text_renders_dash_for_absent_optional_fields() {
+        // Optional fields absent (None / missing) — text branch should
+        // render `-` for each optional field. Required string fields fall
+        // back to `?`; the required `created_at_ms` falls back to 0.
+        let v = json!({
+            "id": "task-2",
+            "subagent_id": "sa-2",
+            "status": "pending",
+            "profile": "default",
+            "created_at_ms": 1700000000_i64,
+        });
+        let s = format_task_detail_text(&v);
+        // Required string fields render their provided values.
+        assert!(s.contains("id:                task-2"), "got: {s}");
+        assert!(s.contains("subagent_id:       sa-2"), "got: {s}");
+        assert!(s.contains("status:            pending"), "got: {s}");
+        assert!(s.contains("profile:           default"), "got: {s}");
+        assert!(s.contains("created_at_ms:     1700000000"), "got: {s}");
+        // Optional string fields must render `-` (not `?`, not empty).
+        assert!(s.contains("subagent_name:     -"), "got: {s}");
+        assert!(s.contains("model_override:    -"), "got: {s}");
+        assert!(s.contains("source_harness:    -"), "got: {s}");
+        assert!(s.contains("source_session_id: -"), "got: {s}");
+        assert!(s.contains("result_summary:    -"), "got: {s}");
+        assert!(s.contains("error:             -"), "got: {s}");
+        assert!(s.contains("error_kind:        -"), "got: {s}");
+        // Optional i64 timestamps render `-` when absent.
+        assert!(s.contains("started_at_ms:     -"), "got: {s}");
+        assert!(s.contains("completed_at_ms:   -"), "got: {s}");
+        // Sanity: a regression that rendered `?` or empty for optionals
+        // would fail the above — the literal `-` is asserted per-field.
+        assert!(
+            !s.contains("subagent_name:     ?"),
+            "optional field rendered `?` instead of `-`: {s}"
+        );
+    }
+
+    #[test]
+    fn print_task_detail_text_missing_all_fields_uses_defaults() {
+        // Empty object — every `unwrap_or` / `or_dash` fallback fires.
+        let v = json!({});
+        let s = format_task_detail_text(&v);
+        // Required string fields fall back to `?`.
+        assert!(s.contains("id:                ?"), "got: {s}");
+        assert!(s.contains("subagent_id:       ?"), "got: {s}");
+        assert!(s.contains("status:            ?"), "got: {s}");
+        assert!(s.contains("profile:           ?"), "got: {s}");
+        // Required i64 field falls back to 0.
+        assert!(s.contains("created_at_ms:     0"), "got: {s}");
+        // Optional fields still render `-`.
+        assert!(s.contains("subagent_name:     -"), "got: {s}");
+        assert!(s.contains("model_override:    -"), "got: {s}");
+        assert!(s.contains("result_summary:    -"), "got: {s}");
+        assert!(s.contains("error:             -"), "got: {s}");
+        assert!(s.contains("error_kind:        -"), "got: {s}");
+        assert!(s.contains("started_at_ms:     -"), "got: {s}");
+        assert!(s.contains("completed_at_ms:   -"), "got: {s}");
+    }
+
+    #[test]
+    fn print_task_detail_json_output_pretty_prints_payload() {
+        let v = json!({"id": "task-3"});
+        assert!(print_task_detail(&v, "json").is_ok());
+    }
+
+    // ── handle_task_get ──────────────────────────────────────────────
+    //
+    // End-to-end coverage for the new `subagent task --task-id` handler.
+    // The `SubagentRuntime` test wrapper delegates `subagent_task_get`
+    // to the inner `TestRuntimeControl`, which returns
+    // `Ok(Default::default())` — enough to verify the RPC round-trip and
+    // the formatter wiring without depending on a real store.
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_get_invokes_subagent_task_get_rpc_and_prints_text() {
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_get("task-1".to_string(), "text".to_string()).await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_task_get text: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_get_invokes_subagent_task_get_rpc_with_json_output() {
+        // JSON output returns the raw DTO from the runtime — verify the
+        // round-trip succeeds (no formatter errors on Default::default()).
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_get("task-1".to_string(), "json".to_string()).await;
+        drop(harness);
+        assert!(result.is_ok(), "handle_task_get json: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_get_propagates_rpc_error_when_runtime_errors() {
+        // Use a runtime whose `subagent_task_get` always fails — verify
+        // the error path through `unwrap_ok` is taken and the runtime
+        // error message surfaces to the caller.
+        let inner = TestRuntimeControl::with_claude_fixture().await.unwrap();
+        let mut runtime = SubagentRuntime::new(inner);
+        runtime.task_get_should_fail.store(true, Ordering::SeqCst);
+        let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
+        let (harness, socket) = spawn_server(runtime).await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_get("missing-task".to_string(), "text".to_string()).await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("subagent.task_not_found"),
+            "expected task-specific code, got: {err}"
+        );
+        assert!(
+            err.contains("task not found: missing-task"),
+            "expected task-specific message, got: {err}"
+        );
     }
 }
