@@ -213,7 +213,10 @@ describe("ProvidersPage (rewritten)", () => {
     vi.spyOn(globalThis, "confirm").mockReturnValue(true);
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "provider.deleted" }),
+      expect.objectContaining({
+        event_code: "provider.deleted",
+        details: expect.objectContaining({ id: "prov-1" }),
+      }),
     );
   });
 
@@ -234,6 +237,7 @@ describe("ProvidersPage (rewritten)", () => {
       expect.objectContaining({
         event_code: "provider.delete.failed",
         level: "ERROR",
+        details: expect.objectContaining({ id: "prov-1" }),
       }),
     );
   });
@@ -242,7 +246,10 @@ describe("ProvidersPage (rewritten)", () => {
     renderPage({ providers: [makeProvider()] });
     fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "provider.tested" }),
+      expect.objectContaining({
+        event_code: "provider.tested",
+        details: expect.objectContaining({ id: "prov-1" }),
+      }),
     );
   });
 
@@ -260,7 +267,11 @@ describe("ProvidersPage (rewritten)", () => {
     renderPage({ providers: [makeProvider()] });
     fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "provider.test.failed", level: "ERROR" }),
+      expect.objectContaining({
+        event_code: "provider.test.failed",
+        level: "ERROR",
+        details: expect.objectContaining({ id: "prov-1" }),
+      }),
     );
   });
 
@@ -272,7 +283,13 @@ describe("ProvidersPage (rewritten)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "model.added" }),
+      expect.objectContaining({
+        event_code: "model.added",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "new-model",
+        }),
+      }),
     );
   });
 
@@ -296,6 +313,10 @@ describe("ProvidersPage (rewritten)", () => {
       expect.objectContaining({
         event_code: "model.add.failed",
         level: "ERROR",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "new-model",
+        }),
       }),
     );
   });
@@ -310,7 +331,13 @@ describe("ProvidersPage (rewritten)", () => {
     // Last delete button is the model row's
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "model.deleted" }),
+      expect.objectContaining({
+        event_code: "model.deleted",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "deepseek-chat",
+        }),
+      }),
     );
   });
 
@@ -335,6 +362,10 @@ describe("ProvidersPage (rewritten)", () => {
       expect.objectContaining({
         event_code: "model.delete.failed",
         level: "ERROR",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "deepseek-chat",
+        }),
       }),
     );
   });
@@ -359,7 +390,14 @@ describe("ProvidersPage (rewritten)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "model.updated", level: "INFO" }),
+      expect.objectContaining({
+        event_code: "model.updated",
+        level: "INFO",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "deepseek-chat",
+        }),
+      }),
     );
   });
 
@@ -381,7 +419,14 @@ describe("ProvidersPage (rewritten)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "model.update.failed", level: "ERROR" }),
+      expect.objectContaining({
+        event_code: "model.update.failed",
+        level: "ERROR",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "deepseek-chat",
+        }),
+      }),
     );
   });
 
@@ -403,7 +448,14 @@ describe("ProvidersPage (rewritten)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "model.tags.updated", level: "INFO" }),
+      expect.objectContaining({
+        event_code: "model.tags.updated",
+        level: "INFO",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "deepseek-chat",
+        }),
+      }),
     );
   });
 
@@ -425,7 +477,14 @@ describe("ProvidersPage (rewritten)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({ event_code: "model.tags.update.failed", level: "ERROR" }),
+      expect.objectContaining({
+        event_code: "model.tags.update.failed",
+        level: "ERROR",
+        details: expect.objectContaining({
+          provider_id: "prov-1",
+          model_id: "deepseek-chat",
+        }),
+      }),
     );
   });
 });

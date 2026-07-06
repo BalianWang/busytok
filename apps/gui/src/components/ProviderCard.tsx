@@ -22,7 +22,7 @@ interface ProviderCardProps {
   onDelete: (provider: ProviderDto) => void;
   onModelCreate: (payload: ModelCreateRequestDto) => void;
   onModelUpdate: (model: ModelCatalogEntryDto, patch: ModelUpdateRequestDto) => void;
-  onModelTagsUpdate: (modelId: string, tags: string[]) => void;
+  onModelTagsUpdate: (model: ModelCatalogEntryDto, tags: string[]) => void;
   onModelDelete: (model: ModelCatalogEntryDto) => void;
   isEditing?: boolean;
   onCancelEdit?: () => void;
@@ -207,7 +207,7 @@ export function ProviderCard({
     const sameTags =
       m.tags.length === newTags.length && m.tags.every((t, i) => t === newTags[i]);
     if (!sameTags) {
-      onModelTagsUpdate(m.model_id, newTags);
+      onModelTagsUpdate(m, newTags);
     }
     cancelModelEdit();
   };

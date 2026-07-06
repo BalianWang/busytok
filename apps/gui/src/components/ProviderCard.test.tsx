@@ -450,7 +450,7 @@ describe("ProviderCard model edit", () => {
     const tagsInput = screen.getByPlaceholderText(/tags/i);
     fireEvent.change(tagsInput, { target: { value: "cheap,fast" } });
     fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
-    expect(onModelTagsUpdate).toHaveBeenCalledWith("deepseek-chat", ["cheap", "fast"]);
+    expect(onModelTagsUpdate).toHaveBeenCalledWith(makeModel(), ["cheap", "fast"]);
   });
 
   it("does not call onModelTagsUpdate when tags unchanged", () => {

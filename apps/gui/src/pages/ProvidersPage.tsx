@@ -171,16 +171,23 @@ export function ProvidersPage() {
     );
   };
 
-  const handleModelTagsUpdate = (modelId: string, tags: string[]) => {
+  const handleModelTagsUpdate = (
+    model: ModelCatalogEntryDto,
+    tags: string[],
+  ) => {
     modelMutations.tagsUpdate.mutate(
-      { modelId, tags },
+      { modelId: model.model_id, tags },
       {
         onSuccess: () => {
           reportFrontendEventSafely({
             level: "INFO",
             event_code: "model.tags.updated",
             message: "Model tags updated",
-            details: { model_id: modelId, tags },
+            details: {
+              provider_id: model.provider_id,
+              model_id: model.model_id,
+              tags,
+            },
           });
         },
         onError: (err: Error) => {
@@ -188,7 +195,11 @@ export function ProvidersPage() {
             level: "ERROR",
             event_code: "model.tags.update.failed",
             message: "Model tags update failed",
-            details: { model_id: modelId, error: err.message },
+            details: {
+              provider_id: model.provider_id,
+              model_id: model.model_id,
+              error: err.message,
+            },
           });
         },
       },
