@@ -41,9 +41,6 @@ import type {
   ProviderListResponseDto,
   ProviderTestConnectionResponseDto,
   ProviderUpdateRequestDto,
-  ProfileCreateRequestDto,
-  ProfileDto,
-  ProfileUpdateRequestDto,
   ModelCatalogEntryDto,
   ModelCreateRequestDto,
   ModelListRequestDto,
@@ -203,16 +200,6 @@ export function createBusytokClient(deps: { invoke: InvokeFn }) {
       call<void>("model.delete", { id }),
     modelTagsUpdate: (modelId: string, tags: string[]) =>
       call<void>("model.tags.update", { model_id: modelId, tags }),
-
-    // Profiles (Phase 4) — bare DTOs (not envelope-wrapped), mirroring provider pattern.
-    // Read path: profiles come via settings.snapshot (subagent.profiles[]).
-    // Write path: dedicated profile.* RPCs.
-    profileCreate: (request: ProfileCreateRequestDto) =>
-      call<ProfileDto>("profile.create", { ...request }),
-    profileUpdate: (request: ProfileUpdateRequestDto) =>
-      call<ProfileDto>("profile.update", { ...request }),
-    profileDelete: (id: string) =>
-      call<void>("profile.delete", { id }),
 
     // Subagent runtime status — envelope-wrapped (matches overview/settings pattern)
     subagentRuntimeStatus: () =>

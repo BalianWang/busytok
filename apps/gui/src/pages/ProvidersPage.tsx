@@ -1,706 +1,278 @@
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type {
-  ProviderCreateRequestDto,
+  ModelCatalogEntryDto,
+  ModelCreateRequestDto,
+  ModelUpdateRequestDto,
   ProviderDto,
-  ProviderKind,
-  ProviderTestConnectionResponseDto,
-  ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
-import { useProviderMutations, useProviders } from "../api/useBusytokData";
-import { ModelsSection } from "../components/ModelsSection";
-import { PageState } from "../components/PageState";
-import { ProfilesSection } from "../components/ProfilesSection";
-import { SettingsActionGroup } from "../components/desktop/SettingsActionGroup";
-import { SettingsRow } from "../components/desktop/SettingsRow";
-import { SettingsValue } from "../components/desktop/SettingsValue";
-import { ToggleSwitch } from "../components/desktop/ToggleSwitch";
+import {
+  useModelMutations,
+  useModels,
+  useProviderMutations,
+  useProviders,
+} from "../api/useBusytokData";
+import { ProviderCard } from "../components/ProviderCard";
+import { ProviderCreationForm } from "../components/ProviderCreationForm";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 
-// ── Provider form (inline add + inline edit) ────────────────────────
-//
-// Create fields (Spec §3.2): name, base_url, api_key (password),
-// provider_kind (selector — openai_compatible / anthropic_compatible).
-// `id` is system-generated (UUID v4) by the backend; the form never
-// collects it.
-//
-// Edit fields: name, base_url, provider_kind. `enabled` has its own
-// toggle on the row; `api_key` has its own Update Key flow; `id` is
-// immutable. Per Spec §7.1, patching `provider_kind` is allowed and
-// kills the worker so the next delegate re-spawns with the new API
-// shape — so the edit form exposes it as a selector.
-
-interface ProviderFormState {
-  name: string;
-  base_url: string;
-  api_key: string;
-  enabled: boolean;
-  /**
-   * Empty string until the user picks a kind from the selector. The
-   * submit handler blocks create when this is "".
-   */
-  provider_kind: ProviderKind | "";
-}
-
-const EMPTY_FORM: ProviderFormState = {
-  name: "",
-  base_url: "",
-  api_key: "",
-  enabled: true,
-  provider_kind: "",
-};
-
-interface ProviderFormProps {
-  form: ProviderFormState;
-  /**
-   * `create` shows the api_key field (initial key set). `edit` hides it —
-   * the api_key has its own Update Key flow on the provider row, and per
-   * the three-state `Option<Option<String>>` contract omitting it from
-   * the patch payload means "no change".
-   */
-  mode: "create" | "edit";
-  onChange: (patch: Partial<ProviderFormState>) => void;
-  onSubmit: () => void;
-  onCancel: () => void;
-  isSubmitting: boolean;
-}
-
-function ProviderForm({
-  form,
-  mode,
-  onChange,
-  onSubmit,
-  onCancel,
-  isSubmitting,
-}: ProviderFormProps) {
-  return (
-    <div className="settings-panel">
-      <SettingsRow
-        layout="vertical"
-        label="Name"
-        description="Display name for this provider."
-        control={
-          <input
-            type="text"
-            className="input"
-            aria-label="Name"
-            placeholder="DeepSeek"
-            value={form.name}
-            onChange={(e) => onChange({ name: e.currentTarget.value })}
-          />
-        }
-      />
-      <SettingsRow
-        layout="vertical"
-        label="Base URL"
-        description="OpenAI-compatible API base URL."
-        control={
-          <input
-            type="text"
-            className="input"
-            aria-label="Base URL"
-            placeholder="https://api.deepseek.com/v1"
-            value={form.base_url}
-            onChange={(e) => onChange({ base_url: e.currentTarget.value })}
-          />
-        }
-      />
-      {mode === "create" && (
-        <SettingsRow
-          layout="vertical"
-          label="API Key"
-          description="The actual API key. Stored in the provider catalog database, never written to settings.toml."
-          control={
-            <input
-              type="password"
-              className="input"
-              aria-label="API Key"
-              placeholder="Enter API key"
-              value={form.api_key}
-              onChange={(e) => onChange({ api_key: e.currentTarget.value })}
-            />
-          }
-        />
-      )}
-      <SettingsRow
-        layout="vertical"
-        label="Kind"
-        description="API shape: OpenAI-compatible (chat/completions) or Anthropic-compatible (messages)."
-        control={
-          <select
-            className="input"
-            aria-label="Kind"
-            value={form.provider_kind}
-            onChange={(e) =>
-              onChange({
-                provider_kind: e.currentTarget.value as ProviderKind | "",
-              })
-            }
-          >
-            <option value="">— Select kind —</option>
-            <option value="openai_compatible">OpenAI Compatible</option>
-            <option value="anthropic_compatible">Anthropic Compatible</option>
-          </select>
-        }
-      />
-      {mode === "create" && (
-        <SettingsRow
-          label="Enabled"
-          description="Disabled providers are excluded from the model catalog and sidecar routing."
-          control={
-            <ToggleSwitch
-              checked={form.enabled}
-              onChange={(checked) => onChange({ enabled: checked })}
-              aria-label="Enabled"
-            />
-          }
-        />
-      )}
-      <SettingsRow
-        label="Actions"
-        control={
-          <SettingsActionGroup direction="row">
-            <button
-              type="button"
-              className="btn btn--primary btn--sm"
-              onClick={onSubmit}
-              disabled={isSubmitting}
-            >
-              {isSubmitting ? "Saving..." : "Save"}
-            </button>
-            <button
-              type="button"
-              className="btn btn--secondary btn--sm"
-              onClick={onCancel}
-              disabled={isSubmitting}
-            >
-              Cancel
-            </button>
-          </SettingsActionGroup>
-        }
-      />
-    </div>
-  );
-}
-
-// ── Provider row ────────────────────────────────────────────────────
-
-interface ProviderRowProps {
-  provider: ProviderDto;
-  isTestPending: boolean;
-  testResult: { ok: boolean; error: string | null } | null;
-  onTestConnection: (id: string) => void;
-  onToggleEnabled: (provider: ProviderDto) => void;
-  onDelete: (provider: ProviderDto) => void;
-  onUpdateApiKey: (id: string, apiKey: string) => void;
-  // Inline edit mode. `id` is immutable and shown read-only in edit mode.
-  isEditing: boolean;
-  editForm: ProviderFormState;
-  isEditPending: boolean;
-  onEditProvider: (provider: ProviderDto) => void;
-  onEditChange: (patch: Partial<ProviderFormState>) => void;
-  onEditSubmit: () => void;
-  onEditCancel: () => void;
-}
-
-function ProviderRow({
-  provider,
-  isTestPending,
-  testResult,
-  onTestConnection,
-  onToggleEnabled,
-  onDelete,
-  onUpdateApiKey,
-  isEditing,
-  editForm,
-  isEditPending,
-  onEditProvider,
-  onEditChange,
-  onEditSubmit,
-  onEditCancel,
-}: ProviderRowProps) {
-  const [apiKeyInput, setApiKeyInput] = useState("");
-  const apiKeyStatus = provider.has_api_key ? "API key stored" : "API key not set";
-  const apiKeyTone: "default" | "warning" = provider.has_api_key
-    ? "default"
-    : "warning";
-
-  const handleSubmitApiKey = () => {
-    const value = apiKeyInput.trim();
-    if (value.length === 0) return;
-    onUpdateApiKey(provider.id, value);
-    setApiKeyInput("");
-  };
-
-  if (isEditing) {
-    return (
-      <div className="settings-panel">
-        <div className="settings-row">
-          <div>
-            <h3>{`Editing ${provider.name}`}</h3>
-            <p>Update provider metadata. Provider ID is immutable. API key has its own Update Key flow when not editing.</p>
-          </div>
-        </div>
-        <SettingsRow
-          label="Provider ID"
-          description="System-generated UUID; cannot be changed."
-          control={<SettingsValue value={provider.id} tone="muted" />}
-        />
-        <ProviderForm
-          form={editForm}
-          mode="edit"
-          onChange={onEditChange}
-          onSubmit={onEditSubmit}
-          onCancel={onEditCancel}
-          isSubmitting={isEditPending}
-        />
-      </div>
-    );
-  }
-
-  return (
-    <div className="settings-panel">
-      <SettingsRow
-        label={provider.name}
-        description={
-          provider.enabled
-            ? undefined
-            : "This provider is disabled and will not be used."
-        }
-        dangerous={!provider.enabled}
-        control={
-          <ToggleSwitch
-            checked={provider.enabled}
-            onChange={() => onToggleEnabled(provider)}
-            aria-label={`Enable ${provider.name}`}
-          />
-        }
-      />
-      <SettingsRow
-        label="Provider ID"
-        control={<SettingsValue value={provider.id} tone="muted" />}
-      />
-      <SettingsRow
-        label="Kind"
-        control={<SettingsValue value={provider.provider_kind} tone="muted" />}
-      />
-      <SettingsRow
-        label="Base URL"
-        control={<SettingsValue value={provider.base_url} tone="muted" />}
-      />
-      <SettingsRow
-        label="API Key"
-        control={
-          <SettingsActionGroup direction="col">
-            <SettingsValue value={apiKeyStatus} tone={apiKeyTone} />
-            <SettingsActionGroup direction="row">
-              <input
-                type="password"
-                className="input"
-                aria-label={`Update API key for ${provider.name}`}
-                placeholder={
-                  provider.has_api_key ? "•••• (stored)" : "Enter API key"
-                }
-                value={apiKeyInput}
-                onChange={(e) => setApiKeyInput(e.currentTarget.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    handleSubmitApiKey();
-                  }
-                }}
-              />
-              <button
-                type="button"
-                className="btn btn--secondary btn--sm"
-                onClick={handleSubmitApiKey}
-              >
-                Update Key
-              </button>
-            </SettingsActionGroup>
-          </SettingsActionGroup>
-        }
-      />
-      <SettingsRow
-        label="Actions"
-        control={
-          <SettingsActionGroup direction="row">
-            <button
-              type="button"
-              className="btn btn--secondary btn--sm"
-              onClick={() => onEditProvider(provider)}
-            >
-              Edit
-            </button>
-            <button
-              type="button"
-              className="btn btn--secondary btn--sm"
-              onClick={() => onTestConnection(provider.id)}
-              disabled={isTestPending}
-            >
-              {isTestPending ? "Testing..." : "Test Connection"}
-            </button>
-            <button
-              type="button"
-              className="btn btn--danger btn--sm"
-              onClick={() => onDelete(provider)}
-            >
-              Delete
-            </button>
-          </SettingsActionGroup>
-        }
-      />
-      {testResult && (
-        <SettingsRow
-          label="Connection Test"
-          control={
-            <SettingsValue
-              value={
-                testResult.ok
-                  ? "✓ Connected"
-                  : `✗ Failed${testResult.error ? `: ${testResult.error}` : ""}`
-              }
-              tone={testResult.ok ? "default" : "danger"}
-            />
-          }
-        />
-      )}
-    </div>
-  );
-}
-
-// ── Main page ───────────────────────────────────────────────────────
-
+/**
+ * ProvidersPage orchestrates the provider/model catalog UI.
+ *
+ * Architecture (per spec §4 redesign):
+ *   - A single `useModels({ includeDisabled: true })` query at the page
+ *     level, grouped by `provider_id` into a Map. Each ProviderCard
+ *     receives its slice of models via props (1 query vs N-per-card).
+ *   - ProviderCard (view + edit modes) renders one provider and its
+ *     inline models. Provider edit mode is tracked at the page level so
+ *     only one card is editable at a time.
+ *   - ProviderCreationForm (toggleable) handles create-provider (+ the
+ *     optional sync-create-model partial-success flow). It emits its own
+ *     `provider.added` / `provider.add.failed` / `model.added` /
+ *     `model.add.failed` events for the sync-create flow.
+ *   - The page emits the remaining observability events (spec §8) for
+ *     provider delete/test, inline model create/update/tags/delete, and
+ *     the symmetric `.failed` events on client exceptions. ProviderCard
+ *     emits `provider.updated` / `provider.update.failed` directly
+ *     inside its edit-mode save handler (it has the patch context).
+ *
+ * Event details payloads (spec §8):
+ *   - Provider events: `{ id, ... }` (or `{ id, ok, error }` for test)
+ *   - Model events: `{ provider_id, model_id, ... }` (NOT `model_db_id`)
+ */
 export function ProvidersPage() {
-  const { data, isLoading, isError, isFetching } = useProviders();
-  const { createProvider, updateProvider, deleteProvider, testConnection } =
-    useProviderMutations();
+  const providersQuery = useProviders();
+  const modelsQuery = useModels({ includeDisabled: true });
+  const providerMutations = useProviderMutations();
+  const modelMutations = useModelMutations();
 
-  const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState<ProviderFormState>(EMPTY_FORM);
-  const [testResults, setTestResults] = useState<
-    Record<string, { ok: boolean; error: string | null } | null>
-  >({});
-  const [mutationError, setMutationError] = useState<string | null>(null);
-  // Inline edit state. `editingId` is null in view mode; setting it to a
-  // provider id swaps that row into the edit form (id is immutable and
-  // shown read-only in edit mode).
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState<ProviderFormState>(EMPTY_FORM);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
 
-  const providers = useMemo<ProviderDto[]>(
-    () => data?.providers ?? [],
-    [data?.providers],
-  );
-
-  const handleFormChange = useCallback((patch: Partial<ProviderFormState>) => {
-    setForm((prev) => ({ ...prev, ...patch }));
-  }, []);
-
-  const handleFormSubmit = useCallback(() => {
-    // Create payload (Spec §3.2): name + base_url + api_key + provider_kind.
-    // id is system-generated. Empty api_key is sent as null
-    // (Some(None) = "no key on create").
-    if (form.provider_kind === "") {
-      setMutationError("Select a provider kind before saving.");
-      return;
+  // Group models by provider_id once per render. A single useModels query
+  // feeds every ProviderCard — avoids N-per-card fetches.
+  const modelsByProvider = useMemo(() => {
+    const map = new Map<string, ModelCatalogEntryDto[]>();
+    for (const m of modelsQuery.data?.models ?? []) {
+      const list = map.get(m.provider_id) ?? [];
+      list.push(m);
+      map.set(m.provider_id, list);
     }
-    const payload: ProviderCreateRequestDto = {
-      name: form.name.trim(),
-      provider_kind: form.provider_kind,
-      base_url: form.base_url.trim(),
-      enabled: form.enabled,
-      api_key: form.api_key.length > 0 ? form.api_key : null,
-    };
-    setMutationError(null);
-    createProvider.mutate(payload, {
+    return map;
+  }, [modelsQuery.data]);
+
+  const handleProviderDelete = (provider: ProviderDto) => {
+    providerMutations.deleteProvider.mutate(provider.id, {
       onSuccess: () => {
         reportFrontendEventSafely({
           level: "INFO",
-          event_code: "provider.added",
-          message: "Provider added",
-          details: { name: payload.name },
+          event_code: "provider.deleted",
+          message: "Provider deleted",
+          details: { id: provider.id, name: provider.name },
         });
-        setForm(EMPTY_FORM);
-        setShowForm(false);
       },
-      onError: (err: unknown) => {
-        setMutationError((err as Error)?.message ?? String(err));
+      onError: (err: Error) => {
+        reportFrontendEventSafely({
+          level: "ERROR",
+          event_code: "provider.delete.failed",
+          message: "Provider delete failed",
+          details: { id: provider.id, name: provider.name, error: err.message },
+        });
       },
     });
-  }, [form, createProvider]);
+  };
 
-  const handleFormCancel = useCallback(() => {
-    setForm(EMPTY_FORM);
-    setShowForm(false);
-  }, []);
-
-  // ── Inline edit handlers ───────────────────────────────────────────
-  const handleStartEdit = useCallback((provider: ProviderDto) => {
-    setMutationError(null);
-    setEditForm({
-      name: provider.name,
-      base_url: provider.base_url,
-      api_key: "", // unused in edit mode (separate Update Key flow)
-      enabled: provider.enabled,
-      provider_kind: provider.provider_kind,
+  const handleTestConnection = (id: string) => {
+    providerMutations.testConnection.mutate(id, {
+      onSuccess: (response) => {
+        // RPC-returned ok:false is NOT a client exception — it still goes
+        // through onSuccess and emits `provider.tested` with ok:false
+        // (preserves the "test ran, here's the result" semantics). Only
+        // a client-side exception (RPC call itself failed) emits
+        // `provider.test.failed` via onError.
+        reportFrontendEventSafely({
+          level: "INFO",
+          event_code: "provider.tested",
+          message: "Provider connection test completed",
+          details: { id, ok: response.ok, error: response.error },
+        });
+      },
+      onError: (err: Error) => {
+        reportFrontendEventSafely({
+          level: "ERROR",
+          event_code: "provider.test.failed",
+          message: "Provider connection test failed (client exception)",
+          details: { id, error: err.message },
+        });
+      },
     });
-    setEditingId(provider.id);
-  }, []);
+  };
 
-  const handleEditChange = useCallback((patch: Partial<ProviderFormState>) => {
-    setEditForm((prev) => ({ ...prev, ...patch }));
-  }, []);
-
-  const handleEditSubmit = useCallback(() => {
-    if (editingId === null) return;
-    const id = editingId;
-    if (editForm.provider_kind === "") {
-      setMutationError("Select a provider kind before saving.");
-      return;
+  const handleModelCreate = async (payload: ModelCreateRequestDto): Promise<void> => {
+    try {
+      const entry = await modelMutations.createModel.mutateAsync(payload);
+      // Use the created entry's provider_id + model_id (canonical ids),
+      // not the db id — per spec §8 model event details payload.
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.added",
+        message: "Model added",
+        details: { provider_id: entry.provider_id, model_id: entry.model_id },
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.add.failed",
+        message: "Model creation failed",
+        details: {
+          provider_id: payload.provider_id,
+          model_id: payload.model_id,
+          error: err.message,
+        },
+      });
+      throw err;
     }
-    setMutationError(null);
-    // Three-state api_key contract: OMIT api_key/enabled from the patch
-    // so the backend treats them as "no change". Only name + base_url +
-    // provider_kind are editable in the inline form. Cast `as
-    // ProviderUpdateRequestDto` — the generated TS type marks the omitted
-    // fields as required (`| null`), but the wire protocol treats absent
-    // keys as `None`.
-    const payload = {
-      id,
-      name: editForm.name.trim(),
-      base_url: editForm.base_url.trim(),
-      provider_kind: editForm.provider_kind,
-    } as ProviderUpdateRequestDto;
-    updateProvider.mutate(payload, {
+  };
+
+  // The full model object is passed (not just the id) so the page can
+  // emit spec-§8-correct details `{ provider_id, model_id }` — those ids
+  // live on the catalog entry, not on the update patch.
+  // Returns a Promise so ProviderCard can await success before closing
+  // the inline form (prevents input loss on RPC failure).
+  const handleModelUpdate = async (
+    model: ModelCatalogEntryDto,
+    patch: ModelUpdateRequestDto,
+  ): Promise<void> => {
+    try {
+      await modelMutations.updateModel.mutateAsync({ ...patch, id: model.model_db_id });
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.updated",
+        message: "Model updated",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+        },
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.update.failed",
+        message: "Model update failed",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          error: err.message,
+        },
+      });
+      throw err;
+    }
+  };
+
+  const handleModelTagsUpdate = async (
+    model: ModelCatalogEntryDto,
+    tags: string[],
+  ): Promise<void> => {
+    try {
+      await modelMutations.tagsUpdate.mutateAsync({ modelId: model.model_db_id, tags });
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.tags.updated",
+        message: "Model tags updated",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          tags,
+        },
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.tags.update.failed",
+        message: "Model tags update failed",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          error: err.message,
+        },
+      });
+      throw err;
+    }
+  };
+
+  const handleModelDelete = (model: ModelCatalogEntryDto) => {
+    modelMutations.deleteModel.mutate(model.model_db_id, {
       onSuccess: () => {
-        setEditingId(null);
+        reportFrontendEventSafely({
+          level: "INFO",
+          event_code: "model.deleted",
+          message: "Model deleted",
+          details: {
+            provider_id: model.provider_id,
+            model_id: model.model_id,
+          },
+        });
       },
-      onError: (err: unknown) => {
-        setMutationError((err as Error)?.message ?? String(err));
+      onError: (err: Error) => {
+        reportFrontendEventSafely({
+          level: "ERROR",
+          event_code: "model.delete.failed",
+          message: "Model delete failed",
+          details: {
+            provider_id: model.provider_id,
+            model_id: model.model_id,
+            error: err.message,
+          },
+        });
       },
     });
-  }, [editForm, editingId, updateProvider]);
-
-  const handleEditCancel = useCallback(() => {
-    setEditingId(null);
-    setEditForm(EMPTY_FORM);
-  }, []);
-
-  const handleToggleEnabled = useCallback(
-    (provider: ProviderDto) => {
-      setMutationError(null);
-      // Omit name/base_url/api_key so the backend preserves them.
-      const payload = {
-        id: provider.id,
-        enabled: !provider.enabled,
-      } as ProviderUpdateRequestDto;
-      updateProvider.mutate(payload, {
-        onError: (err: unknown) => {
-          setMutationError((err as Error)?.message ?? String(err));
-        },
-      });
-    },
-    [updateProvider],
-  );
-
-  const handleUpdateApiKey = useCallback(
-    (id: string, apiKey: string) => {
-      setMutationError(null);
-      // Omit name/base_url/enabled so the backend preserves them. Sending
-      // api_key as a string = Some(Some("...")) = update the key.
-      const payload = {
-        id,
-        api_key: apiKey,
-      } as ProviderUpdateRequestDto;
-      updateProvider.mutate(payload, {
-        onError: (err: unknown) => {
-          setMutationError((err as Error)?.message ?? String(err));
-        },
-      });
-    },
-    [updateProvider],
-  );
-
-  const handleDelete = useCallback(
-    (provider: ProviderDto) => {
-      const confirmed = globalThis.confirm(
-        `Delete provider "${provider.name}" (${provider.id})? This cannot be undone.`,
-      );
-      if (!confirmed) return;
-      setMutationError(null);
-      deleteProvider.mutate(provider.id, {
-        onSuccess: () => {
-          reportFrontendEventSafely({
-            level: "INFO",
-            event_code: "provider.deleted",
-            message: "Provider deleted",
-            details: { id: provider.id, name: provider.name },
-          });
-          setTestResults((prev) => {
-            const next = { ...prev };
-            delete next[provider.id];
-            return next;
-          });
-        },
-        onError: (err: unknown) => {
-          setMutationError((err as Error)?.message ?? String(err));
-        },
-      });
-    },
-    [deleteProvider],
-  );
-
-  const handleTestConnection = useCallback(
-    (id: string) => {
-      // Clear previous result for an immediate visual reset.
-      setTestResults((prev) => ({ ...prev, [id]: null }));
-      testConnection.mutate(id, {
-        onSuccess: (response: ProviderTestConnectionResponseDto) => {
-          setTestResults((prev) => ({
-            ...prev,
-            [id]: { ok: response.ok, error: response.error },
-          }));
-          reportFrontendEventSafely({
-            level: "INFO",
-            event_code: "provider.tested",
-            message: "Provider connection test completed",
-            details: {
-              id,
-              ok: response.ok,
-              error: response.error,
-            },
-          });
-        },
-        onError: (err: unknown) => {
-          const msg = (err as Error)?.message ?? String(err);
-          setTestResults((prev) => ({
-            ...prev,
-            [id]: { ok: false, error: msg },
-          }));
-          reportFrontendEventSafely({
-            level: "INFO",
-            event_code: "provider.tested",
-            message: "Provider connection test failed",
-            details: { id, ok: false, error: msg },
-          });
-        },
-      });
-    },
-    [testConnection],
-  );
-
-  // Track which provider is currently being tested (for spinner state).
-  const testingId: string | null = testConnection.isPending
-    ? Object.keys(testResults).find((id) => testResults[id] === null) ?? null
-    : null;
-
-  // ── Loading state ──────────────────────────────────────────────────
-
-  if (isLoading && !data) {
-    return (
-      <div className="settings-page">
-        <PageState
-          kind="loading"
-          title="Providers"
-          message="Loading providers..."
-        />
-      </div>
-    );
-  }
-
-  // ── Error state ────────────────────────────────────────────────────
-
-  if (isError && !data) {
-    return (
-      <div className="settings-page">
-        <PageState
-          kind="error"
-          title="Providers unavailable"
-          message="Could not load providers."
-        />
-      </div>
-    );
-  }
-
-  // ── Render ─────────────────────────────────────────────────────────
+  };
 
   return (
-    <div className="settings-page" data-fetching={isFetching ? "true" : "false"}>
+    <div className="settings-page">
       <div className="settings-pane">
-        {mutationError && (
-          <section className="settings-section">
-            <div className="settings-panel">
-              <SettingsRow
-                label="Error"
-                control={
-                  <SettingsValue value={mutationError} tone="danger" />
-                }
-              />
-            </div>
-          </section>
-        )}
-        <section className="settings-section">
+        <div className="settings-section">
           <h2>Providers</h2>
-          <div className="settings-panel">
-            <SettingsRow
-              label="Add Provider"
-              description="Configure a new OpenAI-compatible provider."
-              control={
-                <button
-                  type="button"
-                  className="btn btn--primary btn--sm"
-                  onClick={() => setShowForm((v) => !v)}
-                  disabled={showForm}
-                >
-                  Add Provider
-                </button>
-              }
-            />
-          </div>
-          {showForm && (
-            <ProviderForm
-              form={form}
-              mode="create"
-              onChange={handleFormChange}
-              onSubmit={handleFormSubmit}
-              onCancel={handleFormCancel}
-              isSubmitting={createProvider.isPending}
-            />
-          )}
-        </section>
+          <button type="button" onClick={() => setShowCreateForm((v) => !v)}>
+            + 新建 Provider
+          </button>
+        </div>
 
-        {providers.length === 0 && !showForm ? (
-          <section className="settings-section">
-            <div className="settings-panel">
-              <p>No providers configured. Add one to get started.</p>
-            </div>
-          </section>
-        ) : (
-          <section className="settings-section">
-            <h2>Configured providers</h2>
-            {providers.map((provider) => (
-              <ProviderRow
-                key={provider.id}
-                provider={provider}
-                isTestPending={testingId === provider.id}
-                testResult={testResults[provider.id] ?? null}
-                onTestConnection={handleTestConnection}
-                onToggleEnabled={handleToggleEnabled}
-                onDelete={handleDelete}
-                onUpdateApiKey={handleUpdateApiKey}
-                isEditing={editingId === provider.id}
-                editForm={editForm}
-                isEditPending={updateProvider.isPending && editingId === provider.id}
-                onEditProvider={handleStartEdit}
-                onEditChange={handleEditChange}
-                onEditSubmit={handleEditSubmit}
-                onEditCancel={handleEditCancel}
-              />
-            ))}
-          </section>
+        {showCreateForm && (
+          <ProviderCreationForm onClose={() => setShowCreateForm(false)} />
         )}
-        <ModelsSection />
-        <ProfilesSection />
+
+        {providersQuery.isError && (
+          <div className="degraded-ribbon" role="alert">
+            <span className="degraded-ribbon__dot" />
+            Provider 列表加载失败，请刷新页面重试。
+          </div>
+        )}
+
+        {modelsQuery.isError && (
+          <div className="degraded-ribbon" role="alert">
+            <span className="degraded-ribbon__dot" />
+            Model 列表加载失败，Model 操作可能不可用。请刷新页面重试。
+          </div>
+        )}
+
+        {!providersQuery.isError && (providersQuery.data?.providers ?? []).map((provider) => (
+          <ProviderCard
+            key={provider.id}
+            provider={provider}
+            models={modelsByProvider.get(provider.id) ?? []}
+            isModelsLoading={modelsQuery.isLoading}
+            providerMutations={providerMutations}
+            onEdit={() => setEditingProviderId(provider.id)}
+            onTestConnection={handleTestConnection}
+            onDelete={handleProviderDelete}
+            onModelCreate={handleModelCreate}
+            onModelUpdate={handleModelUpdate}
+            onModelTagsUpdate={handleModelTagsUpdate}
+            onModelDelete={handleModelDelete}
+            isEditing={editingProviderId === provider.id}
+            onCancelEdit={() => setEditingProviderId(null)}
+          />
+        ))}
       </div>
     </div>
   );

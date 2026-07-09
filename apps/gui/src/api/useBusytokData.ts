@@ -42,8 +42,6 @@ import type {
   PromptSuggestTagsResponseDto,
   ProviderCreateRequestDto,
   ProviderUpdateRequestDto,
-  ProfileCreateRequestDto,
-  ProfileUpdateRequestDto,
   ModelCatalogEntryDto,
   ModelCreateRequestDto,
   ModelListRequestDto,
@@ -430,8 +428,8 @@ export interface UseModelsFilter {
   /**
    * When `false` (default), the query is disabled entirely (no fetch).
    * Callers that always want the query active can pass `true`; callers
-   * that need to skip fetches when the filter is empty (e.g. ProfilesSection
-   * has no selected provider) pass `false`.
+   * that need to skip fetches when the filter is empty (e.g. a caller with
+   * no selected provider) pass `false`.
    */
   enabled?: boolean;
 }
@@ -443,8 +441,8 @@ export function useModels(filter: UseModelsFilter = {}) {
     tags: filter.tags ?? [],
     include_disabled: filter.includeDisabled ?? false,
   };
-  // `enabled` defaults to true; ProfilesSection passes `!!providerId` so
-  // an unbound editing row does not trigger a fetch.
+  // `enabled` defaults to true; callers that want to skip fetches when the
+  // filter is empty pass `false`.
   const isEnabled = filter.enabled ?? true;
   return useQuery<ModelListResponseDto>({
     queryKey: queryKeys.modelsList(request),
@@ -485,35 +483,6 @@ export function useModelMutations() {
   });
 
   return { createModel, updateModel, deleteModel, tagsUpdate };
-}
-
-// ── Profiles (Phase 4) ───────────────────────────────────────────────
-
-/**
- * Profile mutations. All three invalidate `settingsSnapshot` on success
- * because profiles are READ via settings.snapshot (not a dedicated
- * profile.list RPC). This keeps the read+write paths consistent.
- */
-export function useProfileMutations() {
-  const client = useBusytokClient();
-  const queryClient = useQueryClient();
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: queryKeys.settingsSnapshot() });
-
-  const createProfile = useMutation({
-    mutationFn: (req: ProfileCreateRequestDto) => client.profileCreate(req),
-    onSuccess: invalidate,
-  });
-  const updateProfile = useMutation({
-    mutationFn: (req: ProfileUpdateRequestDto) => client.profileUpdate(req),
-    onSuccess: invalidate,
-  });
-  const deleteProfile = useMutation({
-    mutationFn: (id: string) => client.profileDelete(id),
-    onSuccess: invalidate,
-  });
-
-  return { createProfile, updateProfile, deleteProfile };
 }
 
 // ── Subagent runtime status ─────────────────────────────────────────

@@ -133,6 +133,115 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage providers and their models
+    Provider {
+        #[command(subcommand)]
+        subcommand: ProviderCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    /// List all providers
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new provider
+    Add {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value = "openai_compatible", value_parser = ["openai_compatible", "anthropic_compatible"])]
+        kind: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        tags: Option<String>,
+    },
+    /// Show provider details
+    Show { id: String },
+    /// Update a provider
+    Update {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long, value_parser = ["openai_compatible", "anthropic_compatible"])]
+        kind: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Delete a provider (cascades to models; may break bound subagents)
+    Delete {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Test connection to a provider
+    Test { id: String },
+    /// Manage models under a provider
+    Model {
+        #[command(subcommand)]
+        subcommand: ProviderModelCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderModelCommand {
+    /// List models for a provider (includes disabled models)
+    List {
+        provider_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a model to a provider
+    Add {
+        provider_id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        tags: Option<String>,
+        #[arg(long)]
+        context_window: Option<i64>,
+        #[arg(long)]
+        max_tokens: Option<i64>,
+        #[arg(long, default_value = "true")]
+        reasoning: bool,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    /// Update a model
+    Update {
+        provider_id: String,
+        model_id: String,
+        #[arg(long)]
+        tags: Option<String>,
+        #[arg(long)]
+        context_window: Option<i64>,
+        #[arg(long)]
+        max_tokens: Option<i64>,
+        #[arg(long)]
+        reasoning: Option<bool>,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    /// Delete a model (may break bound subagents)
+    Delete {
+        provider_id: String,
+        model_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -466,6 +575,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Subagent { .. } => "subagent",
         Command::Doctor => "doctor",
         Command::Models { .. } => "models",
+        Command::Provider { .. } => "provider",
     }
 }
 
@@ -666,6 +776,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             all,
             json,
         } => commands::models::handle_models(provider, tags, all, json).await,
+
+        Command::Provider { subcommand } => commands::provider::handle(subcommand).await,
 
         Command::Doctor => commands::handle_doctor().await,
     }
@@ -1231,5 +1343,217 @@ mod tests {
             result.is_err(),
             "should reject `--output yaml` for subagent task"
         );
+    }
+
+    // ── Provider subcommand parsing ────────────────────────────────────
+
+    #[test]
+    fn args_parses_provider_list() {
+        let args = Args::try_parse_from(["busytok", "provider", "list"]).unwrap();
+        match args.command {
+            Some(Command::Provider { subcommand }) => {
+                assert!(matches!(subcommand, ProviderCommand::List { json: false }));
+            }
+            other => panic!("expected Provider, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_provider_add_with_required_flags() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "provider",
+            "add",
+            "--url",
+            "https://api.deepseek.com/v1",
+            "--key",
+            "sk-test",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Provider {
+                subcommand:
+                    ProviderCommand::Add {
+                        url,
+                        key,
+                        kind,
+                        name,
+                        model,
+                        tags,
+                    },
+            }) => {
+                assert_eq!(url, "https://api.deepseek.com/v1");
+                assert_eq!(key, "sk-test");
+                assert_eq!(kind, "openai_compatible");
+                assert!(name.is_none());
+                assert!(model.is_none());
+                assert!(tags.is_none());
+            }
+            other => panic!("expected Provider Add, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_provider_add_with_all_flags() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "provider",
+            "add",
+            "--url",
+            "https://api.deepseek.com/v1",
+            "--key",
+            "sk-test",
+            "--kind",
+            "anthropic_compatible",
+            "--name",
+            "custom_name",
+            "--model",
+            "claude-3-opus",
+            "--tags",
+            "fast,reasoning",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Provider {
+                subcommand:
+                    ProviderCommand::Add {
+                        url,
+                        key,
+                        kind,
+                        name,
+                        model,
+                        tags,
+                    },
+            }) => {
+                assert_eq!(kind, "anthropic_compatible");
+                assert_eq!(name.as_deref(), Some("custom_name"));
+                assert_eq!(model.as_deref(), Some("claude-3-opus"));
+                assert_eq!(tags.as_deref(), Some("fast,reasoning"));
+                (url, key); // unused
+            }
+            other => panic!("expected Provider Add, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_provider_delete_with_yes_flag() {
+        let args =
+            Args::try_parse_from(["busytok", "provider", "delete", "prov-1", "--yes"]).unwrap();
+        match args.command {
+            Some(Command::Provider {
+                subcommand: ProviderCommand::Delete { id, yes },
+            }) => {
+                assert_eq!(id, "prov-1");
+                assert!(yes);
+            }
+            other => panic!("expected Provider Delete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_provider_delete_without_yes_flag() {
+        let args = Args::try_parse_from(["busytok", "provider", "delete", "prov-1"]).unwrap();
+        match args.command {
+            Some(Command::Provider {
+                subcommand: ProviderCommand::Delete { yes, .. },
+            }) => {
+                assert!(!yes);
+            }
+            other => panic!("expected Provider Delete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_provider_model_add() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "provider",
+            "model",
+            "add",
+            "prov-1",
+            "--name",
+            "deepseek-chat",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Provider {
+                subcommand:
+                    ProviderCommand::Model {
+                        subcommand:
+                            ProviderModelCommand::Add {
+                                provider_id,
+                                name,
+                                tags,
+                                context_window,
+                                max_tokens,
+                                reasoning,
+                                display_name,
+                            },
+                    },
+            }) => {
+                assert_eq!(provider_id, "prov-1");
+                assert_eq!(name, "deepseek-chat");
+                assert!(tags.is_none());
+                assert!(context_window.is_none());
+                assert!(max_tokens.is_none());
+                assert!(reasoning);
+                assert!(display_name.is_none());
+            }
+            other => panic!("expected Provider Model Add, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_provider_model_delete_with_yes() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "provider",
+            "model",
+            "delete",
+            "prov-1",
+            "deepseek-chat",
+            "--yes",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Provider {
+                subcommand:
+                    ProviderCommand::Model {
+                        subcommand:
+                            ProviderModelCommand::Delete {
+                                provider_id,
+                                model_id,
+                                yes,
+                            },
+                    },
+            }) => {
+                assert_eq!(provider_id, "prov-1");
+                assert_eq!(model_id, "deepseek-chat");
+                assert!(yes);
+            }
+            other => panic!("expected Provider Model Delete, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_name_returns_provider_for_provider_variant() {
+        let args = Args::try_parse_from(["busytok", "provider", "list"]).unwrap();
+        assert_eq!(command_name(args.command.as_ref().unwrap()), "provider");
+    }
+
+    #[test]
+    fn args_rejects_provider_add_with_invalid_kind() {
+        let result = Args::try_parse_from([
+            "busytok",
+            "provider",
+            "add",
+            "--url",
+            "https://api.deepseek.com",
+            "--key",
+            "sk-test",
+            "--kind",
+            "invalid_kind",
+        ]);
+        assert!(result.is_err());
     }
 }
