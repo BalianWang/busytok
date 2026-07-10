@@ -642,16 +642,18 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        // Pre-create .zshrc with some content.
-        let zshrc = tmp.path().join(".zshrc");
-        fs::write(&zshrc, "alias ls='ls --color'\n").unwrap();
+        // Pre-create the first rc file with some content. Use
+        // shell_rc_files()[0] so the test works on both macOS (.zshrc) and
+        // Linux (.bashrc).
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
+        fs::write(&rc_file, "alias ls='ls --color'\n").unwrap();
 
         let manager = ShimManager::new(&config_dir);
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
 
-        let contents = fs::read_to_string(&zshrc).unwrap();
+        let contents = fs::read_to_string(&rc_file).unwrap();
         assert!(contents.contains(PATH_BLOCK_BEGIN));
         assert!(contents.contains(PATH_BLOCK_END));
         assert!(contents.contains("export PATH="));
@@ -667,16 +669,16 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        let zshrc = tmp.path().join(".zshrc");
-        assert!(!zshrc.exists());
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
+        assert!(!rc_file.exists());
 
         let manager = ShimManager::new(&config_dir);
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
 
-        assert!(zshrc.exists());
-        let contents = fs::read_to_string(&zshrc).unwrap();
+        assert!(rc_file.exists());
+        let contents = fs::read_to_string(&rc_file).unwrap();
         assert!(contents.contains(PATH_BLOCK_BEGIN));
     }
 
@@ -689,8 +691,8 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        let zshrc = tmp.path().join(".zshrc");
-        fs::write(&zshrc, "existing content\n").unwrap();
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
+        fs::write(&rc_file, "existing content\n").unwrap();
 
         let manager = ShimManager::new(&config_dir);
 
@@ -698,7 +700,7 @@ mod tests {
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
-        let after_first = fs::read_to_string(&zshrc).unwrap();
+        let after_first = fs::read_to_string(&rc_file).unwrap();
         let count_first = after_first.matches(PATH_BLOCK_BEGIN).count();
         assert_eq!(count_first, 1);
 
@@ -706,7 +708,7 @@ mod tests {
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
-        let after_second = fs::read_to_string(&zshrc).unwrap();
+        let after_second = fs::read_to_string(&rc_file).unwrap();
         let count_second = after_second.matches(PATH_BLOCK_BEGIN).count();
         assert_eq!(count_second, 1, "block should not be duplicated");
     }
@@ -720,20 +722,20 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        let zshrc = tmp.path().join(".zshrc");
-        fs::write(&zshrc, "user content line\n").unwrap();
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
+        fs::write(&rc_file, "user content line\n").unwrap();
 
         let manager = ShimManager::new(&config_dir);
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
-        assert!(fs::read_to_string(&zshrc)
+        assert!(fs::read_to_string(&rc_file)
             .unwrap()
             .contains(PATH_BLOCK_BEGIN));
 
         manager.uninstall(&bin_dir).unwrap();
 
-        let contents = fs::read_to_string(&zshrc).unwrap();
+        let contents = fs::read_to_string(&rc_file).unwrap();
         assert!(!contents.contains(PATH_BLOCK_BEGIN));
         assert!(!contents.contains(PATH_BLOCK_END));
         assert!(contents.contains("user content line"));
@@ -748,14 +750,14 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        let zshrc = tmp.path().join(".zshrc");
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
         // Start with only the block.
-        fs::write(&zshrc, &format_path_block(&bin_dir)).unwrap();
+        fs::write(&rc_file, &format_path_block(&bin_dir)).unwrap();
 
         let manager = ShimManager::new(&config_dir);
         manager.uninstall(&bin_dir).unwrap();
 
-        let contents = fs::read_to_string(&zshrc).unwrap();
+        let contents = fs::read_to_string(&rc_file).unwrap();
         assert!(!contents.contains(PATH_BLOCK_BEGIN));
     }
 
@@ -768,14 +770,14 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        let zshrc = tmp.path().join(".zshrc");
-        fs::write(&zshrc, "user content\n").unwrap();
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
+        fs::write(&rc_file, "user content\n").unwrap();
 
         let manager = ShimManager::new(&config_dir);
         // Uninstall without prior install — should not corrupt the rc file.
         manager.uninstall(&bin_dir).unwrap();
 
-        let contents = fs::read_to_string(&zshrc).unwrap();
+        let contents = fs::read_to_string(&rc_file).unwrap();
         assert_eq!(contents, "user content\n");
     }
 
@@ -829,16 +831,16 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        // Pre-create .zshrc with content that has NO trailing newline.
-        let zshrc = tmp.path().join(".zshrc");
-        fs::write(&zshrc, "alias ls='ls --color'").unwrap(); // no \n
+        // Pre-create rc file with content that has NO trailing newline.
+        let rc_file = shell_rc_files().into_iter().next().unwrap();
+        fs::write(&rc_file, "alias ls='ls --color'").unwrap(); // no \n
 
         let manager = ShimManager::new(&config_dir);
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
 
-        let contents = fs::read_to_string(&zshrc).unwrap();
+        let contents = fs::read_to_string(&rc_file).unwrap();
         // The original content and the block must be separated by a newline.
         assert!(
             contents.contains("alias ls='ls --color'\n"),
@@ -848,31 +850,29 @@ mod tests {
         assert!(contents.contains(PATH_BLOCK_END));
     }
 
-    // ── P2-4: .bash_profile is also written ────────────────────────────
+    // ── P2-4: second rc file is also written ───────────────────────────
 
+    #[cfg(unix)]
     #[test]
     #[serial]
-    fn ensure_path_setup_writes_bash_profile_on_macos() {
+    fn ensure_path_setup_writes_second_rc_file() {
         let tmp = TempDir::new().unwrap();
         let _guard = isolate_home(tmp.path());
         let config_dir = tmp.path().join("config");
         let bin_dir = tmp.path().join("bin");
 
-        let bash_profile = tmp.path().join(".bash_profile");
-        assert!(!bash_profile.exists());
+        let files = shell_rc_files();
+        let second = files.get(1).unwrap();
+        assert!(!second.exists());
 
         let manager = ShimManager::new(&config_dir);
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
 
-        #[cfg(target_os = "macos")]
-        {
-            // On macOS, .bash_profile should also get the PATH block.
-            let contents = fs::read_to_string(&bash_profile).unwrap();
-            assert!(contents.contains(PATH_BLOCK_BEGIN));
-            assert!(contents.contains(PATH_BLOCK_END));
-        }
+        let contents = fs::read_to_string(second).unwrap();
+        assert!(contents.contains(PATH_BLOCK_BEGIN));
+        assert!(contents.contains(PATH_BLOCK_END));
     }
 
     // ── P2-6: partial failure in ensure_path_setup ─────────────────────
@@ -887,13 +887,13 @@ mod tests {
         let bin_dir = tmp.path().join("bin");
 
         // Pre-create both rc files with content.
-        let zshrc = tmp.path().join(".zshrc");
-        fs::write(&zshrc, "existing content\n").unwrap();
+        let files = shell_rc_files();
+        let mutable_file = files.first().unwrap();
+        let immutable_file = files.get(1).unwrap();
+        fs::write(mutable_file, "existing content\n").unwrap();
+        fs::write(immutable_file, "existing content\n").unwrap();
 
-        let bash_profile = tmp.path().join(".bash_profile");
-        fs::write(&bash_profile, "existing content\n").unwrap();
-
-        // Make .bash_profile immutable via `chflags uchg` (macOS user
+        // Make the second rc file immutable via `chflags uchg` (macOS user
         // immutable flag). This blocks rename(2) with EPERM — unlike
         // chmod 0444 which only blocks open(O_WRONLY) but NOT rename.
         // On non-macOS, skip the immutability assertion (no portable
@@ -903,7 +903,7 @@ mod tests {
             use std::process::Command;
             let chflags = Command::new("chflags")
                 .arg("uchg")
-                .arg(&bash_profile)
+                .arg(immutable_file)
                 .status();
             // chflags may fail if not file owner; skip assertion in that case.
             if !matches!(chflags, Ok(s) if s.success()) {
@@ -913,22 +913,22 @@ mod tests {
         }
 
         let manager = ShimManager::new(&config_dir);
-        // install() should succeed even though .bash_profile is immutable.
+        // install() should succeed even though the second rc file is immutable.
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
 
-        // .zshrc (mutable) should have the PATH block.
-        let zshrc_contents = fs::read_to_string(&zshrc).unwrap();
-        assert!(zshrc_contents.contains(PATH_BLOCK_BEGIN));
+        // The mutable rc file should have the PATH block.
+        let mutable_contents = fs::read_to_string(mutable_file).unwrap();
+        assert!(mutable_contents.contains(PATH_BLOCK_BEGIN));
 
-        // .bash_profile (immutable): verify it was NOT modified.
+        // The immutable rc file: verify it was NOT modified.
         #[cfg(target_os = "macos")]
         {
-            let bash_contents = fs::read_to_string(&bash_profile).unwrap();
+            let immutable_contents = fs::read_to_string(immutable_file).unwrap();
             assert_eq!(
-                bash_contents, "existing content\n",
-                "immutable .bash_profile should be unchanged"
+                immutable_contents, "existing content\n",
+                "immutable rc file should be unchanged"
             );
         }
 
@@ -937,7 +937,7 @@ mod tests {
         {
             let _ = std::process::Command::new("chflags")
                 .arg("nouchg")
-                .arg(&bash_profile)
+                .arg(immutable_file)
                 .status();
         }
     }
