@@ -12,16 +12,6 @@ Busytok does **not** proxy traffic, route models, inspect protocol payloads, ins
 
 ## Install (macOS)
 
-### Homebrew (recommended)
-
-```bash
-brew install --cask busytok
-```
-
-Auto-updates are handled by the app's built-in updater. You can also `brew upgrade --cask busytok` to pull the latest version via Homebrew.
-
-### Manual download
-
 Download the latest universal DMG from [Releases](https://github.com/BalianWang/busytok/releases/latest) and drag `Busytok.app` to `/Applications`.
 
 **Apple Silicon and Intel are both supported** by the universal binary.
