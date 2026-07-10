@@ -7,6 +7,7 @@
 
 mod activation_context;
 mod bootstrap;
+mod cli_auto_install;
 mod commands;
 mod desktop_host;
 mod desktop_lifecycle_settings;
@@ -136,6 +137,26 @@ pub(crate) fn bootstrap_failure_is_retryable(err: &str) -> bool {
 
 // ── Phase 5: sidecar runtime-dir persistence ──────────────────────────
 
+/// Walk up from `exe` to find the enclosing `.app` bundle directory.
+/// Returns `None` if no ancestor ends with `.app` (e.g. dev builds where
+/// the binary lives at `target/debug/busytok-gui`).
+///
+/// Shared by sidecar resolution, CLI auto-install, and the setup callback.
+pub(crate) fn find_enclosing_app_bundle(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cursor = exe.parent()?;
+    loop {
+        let is_app = cursor
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".app"))
+            .unwrap_or(false);
+        if is_app {
+            return Some(cursor.to_path_buf());
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
 /// Testable core: resolve the sidecar resource directory from a given exe
 /// path by walking up to find the enclosing `.app` bundle, then checking
 /// for `Contents/Resources/pi-sidecar/`. Returns None if no `.app` ancestor
@@ -144,19 +165,9 @@ pub(crate) fn bootstrap_failure_is_retryable(err: &str) -> bool {
 /// Extracted as a free function (not inlined in `resolve_packaged_sidecar_dir`)
 /// so tests can exercise the real algorithm without `current_exe()`.
 fn resolve_sidecar_dir_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut cursor = exe.parent()?;
-    loop {
-        if cursor
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.ends_with(".app"))
-            .unwrap_or(false)
-        {
-            let sidecar = cursor.join("Contents/Resources/pi-sidecar");
-            return sidecar.is_dir().then_some(sidecar);
-        }
-        cursor = cursor.parent()?;
-    }
+    let bundle = find_enclosing_app_bundle(exe)?;
+    let sidecar = bundle.join("Contents/Resources/pi-sidecar");
+    sidecar.is_dir().then_some(sidecar)
 }
 
 /// Production entry point: resolve the packaged sidecar dir via
@@ -315,6 +326,8 @@ pub fn run() {
             // the uninstall removes the task definition. If a stale marker lingers
             // after crash, the next service boot clears it (see ServiceApp::boot).
             let _ = busytok_config::service_marker::remove(paths.data_dir());
+            // Auto-uninstall the CLI shim so drag-to-trash leaves no PATH residue.
+            crate::cli_auto_install::uninstall_cli(paths.data_dir());
             #[cfg(target_os = "macos")]
             {
                 crate::service_lifecycle::macos_lifecycle_for_uninstall_self()?.uninstall()?;
@@ -345,6 +358,10 @@ pub fn run() {
         }
         std::process::exit(0);
     }
+
+    // ── 2b. Auto-install CLI shim (first launch or version upgrade) ─
+    // Best-effort: failures are logged but never block app startup.
+    cli_auto_install::ensure_cli_installed(paths.data_dir(), env!("CARGO_PKG_VERSION"));
 
     // ── 3. Detect launch reason (before control_endpoint) ─────────
     let launch_reason = desktop_runtime::detect_launch_reason();
@@ -481,19 +498,8 @@ pub fn run() {
                 // Resolve bundle layout by walking up from current_exe.
                 let exe = std::env::current_exe()
                     .context("resolving current executable")?;
-                let mut cursor = exe.parent();
-                let bundle_root = loop {
-                    let dir = cursor.context("could not locate enclosing .app bundle")?;
-                    if dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.ends_with(".app"))
-                        .unwrap_or(false)
-                    {
-                        break dir.to_path_buf();
-                    }
-                    cursor = dir.parent();
-                };
+                let bundle_root = crate::find_enclosing_app_bundle(&exe)
+                    .context("could not locate enclosing .app bundle")?;
                 let layout = BundleLayout::for_app_root(&bundle_root);
 
                 let paths_for_lc = busytok_config::BusytokPaths::new();
