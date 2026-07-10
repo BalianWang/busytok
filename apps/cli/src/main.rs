@@ -21,6 +21,11 @@ struct Args {
     /// Write structured JSON logs to this directory (overrides BUSYTOK_LOG_DIR).
     #[arg(long, env = "BUSYTOK_LOG_DIR")]
     log_dir: Option<std::path::PathBuf>,
+
+    /// Enable verbose logging (info level). Useful for debugging.
+    /// Without this flag, the CLI is quiet by default (warn level).
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -517,6 +522,12 @@ async fn main() {
     // Route --log-dir / BUSYTOK_LOG_DIR through env for the shared factory
     if let Some(dir) = &args.log_dir {
         std::env::set_var("BUSYTOK_LOG_DIR", dir);
+    }
+    // --verbose restores the info-level terminal output that was the
+    // pre-quiet default. Only set if RUST_LOG isn't already set so we
+    // don't clobber a more specific user configuration.
+    if args.verbose && std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
     }
     let _guards = init_logging(&paths.log_dir(), LogSource::Cli, &session_id);
 
@@ -1174,6 +1185,25 @@ mod tests {
             args.log_dir.as_deref(),
             Some(std::path::Path::new("/tmp/logs"))
         );
+    }
+
+    #[test]
+    fn args_verbose_defaults_to_false() {
+        let args = Args::try_parse_from(["busytok"]).unwrap();
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn args_parses_verbose_short_flag() {
+        let args = Args::try_parse_from(["busytok", "-v", "status"]).unwrap();
+        assert!(args.verbose);
+        assert!(matches!(args.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn args_parses_verbose_long_flag() {
+        let args = Args::try_parse_from(["busytok", "--verbose", "status"]).unwrap();
+        assert!(args.verbose);
     }
 
     #[test]
