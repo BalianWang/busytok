@@ -249,6 +249,7 @@ exec "$BUNDLE_PATH/Contents/MacOS/busytok" "$@"
     ///
     /// Best-effort: individual file failures are logged and skipped so that
     /// one unwritable rc file doesn't prevent the other from being updated.
+    #[cfg(unix)]
     fn ensure_path_setup(&self, bin_dir: &Path) {
         let block = format_path_block(bin_dir);
         for rc_file in shell_rc_files() {
@@ -297,12 +298,18 @@ exec "$BUNDLE_PATH/Contents/MacOS/busytok" "$@"
         }
     }
 
+    /// No-op on non-Unix (Windows has no shell rc files).
+    #[cfg(not(unix))]
+    #[allow(unused_variables)]
+    fn ensure_path_setup(&self, bin_dir: &Path) {}
+
     /// Remove the PATH setup block from all shell rc files.
     /// Removes ALL blocks (even if the bin_dir differs from the install-time
     /// value) to ensure clean teardown.
     ///
     /// Best-effort: individual file failures are logged and skipped so that
     /// one unwritable rc file doesn't prevent the other from being cleaned.
+    #[cfg(unix)]
     fn remove_path_setup(&self) {
         for rc_file in shell_rc_files() {
             let contents = match fs::read_to_string(&rc_file) {
@@ -339,6 +346,10 @@ exec "$BUNDLE_PATH/Contents/MacOS/busytok" "$@"
             );
         }
     }
+
+    /// No-op on non-Unix (Windows has no shell rc files).
+    #[cfg(not(unix))]
+    fn remove_path_setup(&self) {}
 }
 
 /// Escape a path for safe embedding in a bash double-quoted string.
@@ -622,6 +633,7 @@ mod tests {
         assert_eq!(result, "\n");
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn ensure_path_setup_appends_block_to_existing_rc_file() {
@@ -646,6 +658,7 @@ mod tests {
         assert!(contents.contains("alias ls='ls --color'"));
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn ensure_path_setup_creates_rc_file_if_missing() {
@@ -667,6 +680,7 @@ mod tests {
         assert!(contents.contains(PATH_BLOCK_BEGIN));
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn ensure_path_setup_is_idempotent() {
@@ -697,6 +711,7 @@ mod tests {
         assert_eq!(count_second, 1, "block should not be duplicated");
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn uninstall_removes_path_block_from_rc_files() {
@@ -724,6 +739,7 @@ mod tests {
         assert!(contents.contains("user content line"));
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn uninstall_cleans_up_when_rc_file_has_only_the_block() {
@@ -743,6 +759,7 @@ mod tests {
         assert!(!contents.contains(PATH_BLOCK_BEGIN));
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn remove_path_setup_is_safe_when_no_block_exists() {
@@ -803,6 +820,7 @@ mod tests {
 
     // ── P2-3: rc file without trailing newline ──────────────────────────
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn ensure_path_setup_handles_rc_file_without_trailing_newline() {
@@ -859,6 +877,7 @@ mod tests {
 
     // ── P2-6: partial failure in ensure_path_setup ─────────────────────
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn install_succeeds_when_one_rc_file_is_immutable() {
