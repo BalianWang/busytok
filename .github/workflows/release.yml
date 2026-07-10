@@ -230,3 +230,29 @@ jobs:
       - name: Cleanup Apple API key (always)
         if: always()
         run: rm -f /tmp/apple-api-key.p8
+
+  # Bump the Homebrew Cask formula after a successful release.
+  # Only active after the initial cask PR has been accepted upstream
+  # and the HOMEBREW_CASK_TOKEN secret has been configured.
+  # See: docs/superpowers/specs/2026-06-24-homebrew-cask-distribution-design.md
+  bump-homebrew-cask:
+    needs: publish-macos
+    runs-on: macos-latest
+    if: startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_CASK_ENABLED == 'true'
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract app version from Cargo.toml
+        run: |
+          APP_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/gui/src-tauri/Cargo.toml | head -1)
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+
+      - name: Bump homebrew-cask formula
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_CASK_TOKEN }}
+        run: |
+          brew tap homebrew/cask
+          brew bump-cask-pr busytok \
+            --version "$APP_VERSION" \
+            --commit-url "https://github.com/BalianWang/busytok/releases/tag/v$APP_VERSION"
