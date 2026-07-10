@@ -218,6 +218,7 @@ jobs:
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
           files: |
             target/universal-apple-darwin/release/bundle/dmg/*.dmg
             target/universal-apple-darwin/release/bundle/macos/Busytok.app.tar.gz
