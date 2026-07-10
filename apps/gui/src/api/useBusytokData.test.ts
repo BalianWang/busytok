@@ -256,7 +256,13 @@ describe("useBusytokData", () => {
     useModels({ providerId: "deepseek", tags: ["chat"], includeDisabled: true, enabled: true });
     const options = useQuerySpy.mock.calls[0][0];
     expect(options.queryKey).toEqual(
-      queryKeys.modelsList({ provider_id: "deepseek", tags: ["chat"], include_disabled: true }),
+      queryKeys.modelsList({
+        provider_id: "deepseek",
+        tags: ["chat"],
+        include_disabled: true,
+        sort: null,
+        reasoning: null,
+      }),
     );
     expect(options.enabled).toBe(true);
     expect(options.staleTime).toBe(30_000);
@@ -267,6 +273,8 @@ describe("useBusytokData", () => {
       provider_id: "deepseek",
       tags: ["chat"],
       include_disabled: true,
+      sort: null,
+      reasoning: null,
     });
   });
 
@@ -279,6 +287,8 @@ describe("useBusytokData", () => {
       provider_id: null,
       tags: [],
       include_disabled: false,
+      sort: null,
+      reasoning: null,
     });
   });
 

@@ -2965,7 +2965,7 @@ async fn cancel_task_invokes_executor_cancel() {
     // is in-process).
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     // Verify executor.cancel() was called with the correct args.
-    let calls = cancel_calls.lock().unwrap();
+    let calls = cancel_calls.lock().unwrap().clone();
     assert_eq!(
         calls.len(),
         1,

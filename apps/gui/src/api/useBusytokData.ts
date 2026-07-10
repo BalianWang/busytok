@@ -440,6 +440,8 @@ export function useModels(filter: UseModelsFilter = {}) {
     provider_id: filter.providerId ? filter.providerId : null,
     tags: filter.tags ?? [],
     include_disabled: filter.includeDisabled ?? false,
+    sort: null,
+    reasoning: null,
   };
   // `enabled` defaults to true; callers that want to skip fetches when the
   // filter is empty pass `false`.
