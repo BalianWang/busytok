@@ -507,6 +507,56 @@ pub fn task_counts_by_status(conn: &Connection) -> Result<(u32, u32)> {
     Ok((queued as u32, running as u32))
 }
 
+/// Reap orphaned `running` tasks: mark as `failed` any task whose
+/// `started_at_ms` is older than `now - max_age_ms`. Returns the reaped
+/// task ids (for logging / observability).
+///
+/// **Why this exists:** `dispatch_timeout` at the control-server layer
+/// drops the `execute_task` future without giving it a chance to persist
+/// `status='failed'` — the task row stays `running` forever. Because
+/// `pick_oldest_queued_task` excludes subagents that already have a
+/// running task, a single orphan blocks every subsequent `delegate` to
+/// that subagent. The reaper is the single recovery path that works
+/// regardless of how the orphan was produced (timeout / panic / crash).
+///
+/// `max_age_ms` should be `task_timeout + buffer` so legitimate in-flight
+/// tasks are never reaped. The caller (dispatcher tick) passes the
+/// largest configured `task_timeout_seconds` across profiles + buffer.
+pub fn reap_orphaned_running_tasks(conn: &Connection, now_ms: i64, max_age_ms: i64) -> Result<Vec<String>> {
+    let cutoff = now_ms - max_age_ms;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM subagent_tasks \
+         WHERE status = 'running' AND started_at_ms IS NOT NULL AND started_at_ms < ?1",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![cutoff], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Single UPDATE with a CTE-free IN-list. Re-bind each id positionally
+    // (rusqlite positional params are 1-indexed; ?1 = now_ms, ?2.. = ids).
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "UPDATE subagent_tasks SET status = 'failed', error = 'ORPHANED_REAPED', completed_at_ms = ?1 \
+         WHERE status = 'running' AND id IN ({placeholders})"
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_ms)];
+    for id in &ids {
+        params_vec.push(Box::new(id.clone()));
+    }
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let rows = conn.execute(&sql, params_refs.as_slice())?;
+    tracing::debug!(reaped = rows, "reaper marked orphaned tasks as failed");
+    Ok(ids)
+}
+
 /// Atomically pick the oldest "queued" task and flip it to "running".
 /// Enforces per-subagent FIFO (spec §6.4 line 737): only picks from
 /// subagents that have NO running task. This ensures same-subagent tasks

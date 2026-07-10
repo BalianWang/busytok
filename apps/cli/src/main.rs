@@ -103,6 +103,11 @@ enum Command {
         /// Model ID to bind a new subagent to (required with --bind-provider for new subagents)
         #[arg(long)]
         bind_model: Option<String>,
+        /// Wait for the task to reach a terminal state (completed/failed)
+        /// before returning. Polls `subagent.task_get` every 2s. Without
+        /// this flag, a `queued` result is printed immediately.
+        #[arg(long)]
+        wait: bool,
         /// The task prompt (positional)
         prompt: String,
     },
@@ -722,6 +727,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             output,
             bind_provider,
             bind_model,
+            wait,
             prompt,
         } => {
             commands_subagent::handle_delegate(
@@ -736,6 +742,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 prompt,
                 bind_provider,
                 bind_model,
+                wait,
             )
             .await
         }
@@ -873,6 +880,7 @@ mod tests {
             output: "text".to_string(),
             bind_provider: None,
             bind_model: None,
+            wait: false,
             prompt: "do thing".to_string(),
         };
         assert_eq!(command_name(&cmd), "delegate");
@@ -954,6 +962,49 @@ mod tests {
                 assert_eq!(bind_model.as_deref(), Some("model-1"));
             }
             other => panic!("expected Delegate with both --model and --bind-*, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_wait_flag() {
+        // --wait is a bool flag: present → true.
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--wait",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { wait, .. }) => {
+                assert!(wait, "--wait present → wait should be true");
+            }
+            other => panic!("expected Delegate with --wait, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_without_wait_flag_defaults_false() {
+        // Without --wait, the flag defaults to false.
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { wait, .. }) => {
+                assert!(!wait, "no --wait → wait should default to false");
+            }
+            other => panic!("expected Delegate without --wait, got: {other:?}"),
         }
     }
 

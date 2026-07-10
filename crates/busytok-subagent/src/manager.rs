@@ -736,6 +736,54 @@ impl SubagentManager {
         })
     }
 
+    /// Reap orphaned `running` tasks: mark as `failed` any task whose
+    /// `started_at_ms` is older than `max_profile_timeout + buffer`.
+    ///
+    /// Runs on the dispatcher's 30s reaper cadence. Recovers from
+    /// `dispatch_timeout` orphans (control-server timeout drops the
+    /// `execute_task` future without persisting `status='failed'`),
+    /// panics, and crashes — any `running` row whose age exceeds the
+    /// ceiling is flipped to `failed` with `error='ORPHANED_REAPED'`.
+    /// This unblocks `pick_oldest_queued_task` (which excludes
+    /// subagents with a running task) so queued delegates proceed.
+    fn reap_orphaned_tasks(&self) {
+        // max_age = max(profile timeouts, pi_sidecar.task_timeout) + 60s buffer.
+        // The buffer covers non-sidecar overhead (context build, DB writes)
+        // so legitimate in-flight tasks are never reaped.
+        let max_profile = self
+            .settings
+            .profiles
+            .values()
+            .map(|p| p.timeout_seconds)
+            .max()
+            .unwrap_or(300);
+        let sidecar_timeout = self.settings.pi_sidecar.task_timeout_seconds;
+        let max_timeout = max_profile.max(sidecar_timeout);
+        let max_age_ms = (max_timeout + 60) * 1000;
+        let now_ms = busytok_domain::now_ms();
+        let reaped = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_reap_orphaned_running_tasks(now_ms, max_age_ms as i64)
+                .unwrap_or_else(|e| {
+                    warn!(
+                        event_code = "subagent.reaper.failed",
+                        error = %e,
+                        "reaper scan failed"
+                    );
+                    Vec::new()
+                })
+        };
+        if !reaped.is_empty() {
+            warn!(
+                event_code = "subagent.reaper.reaped",
+                count = reaped.len(),
+                task_ids = ?reaped,
+                max_age_ms,
+                "reaped orphaned running tasks (likely dispatch_timeout orphans)"
+            );
+        }
+    }
+
     /// Spawn the background task dispatcher (§8.3 step 2 "queue only").
     /// Polls for queued tasks every 200ms; when the gate is not paused,
     /// picks the oldest queued task and executes it. Terminates when
@@ -752,9 +800,18 @@ impl SubagentManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            // Reaper runs on its own slower cadence (every 30s) — orphan
+            // detection doesn't need 200ms latency, and the scan touches
+            // every `running` row.
+            let mut reaper_ticker = tokio::time::interval(Duration::from_secs(30));
+            reaper_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {},
+                    _ = reaper_ticker.tick() => {
+                        manager.reap_orphaned_tasks();
+                        continue;
+                    }
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             info!(
