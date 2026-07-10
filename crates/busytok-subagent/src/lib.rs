@@ -16,6 +16,6 @@ pub mod sidecar;
 pub mod util;
 
 pub use error::{Result, SubagentError};
-pub use manager::{SubagentManager, TaskCompletionHook};
+pub use manager::{CancelOutcome, SubagentManager, TaskCompletionHook};
 pub use models::{DelegateRequest, DelegateResult, TaskErrorKind, TaskStatus};
 pub use pressure::{PressureAction, PressureGate, PressureResponder};

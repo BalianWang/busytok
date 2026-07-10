@@ -323,6 +323,17 @@ impl RuntimeControl for MethodDispatchErrorRuntime {
     ) -> anyhow::Result<busytok_protocol::dto::SubagentTaskDetailDto> {
         self.inner.subagent_task_get(req).await
     }
+    async fn subagent_task_cancel(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+        Ok(busytok_protocol::dto::SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: "queued".to_string(),
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
+    }
 
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await

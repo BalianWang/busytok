@@ -3590,6 +3590,7 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
             source_session_id: None,
             bound_provider_id: Some(bound_provider_id),
             bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -5271,6 +5272,7 @@ async fn write_usage_event_inserts_into_usage_events() {
             source_session_id: None,
             bound_provider_id: Some(bound_provider_id),
             bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -5316,6 +5318,7 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             source_session_id: None,
             bound_provider_id: Some(bound_provider_id),
             bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -5350,6 +5353,7 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             cache_write_tokens: None,
             cost_usd: None,
         },
+        created: true,
     };
     sup.write_subagent_usage_event(&result, &cwd).unwrap();
 
@@ -5390,6 +5394,7 @@ async fn write_usage_event_uses_active_generation_id() {
             source_session_id: None,
             bound_provider_id: Some(bound_provider_id),
             bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -5434,6 +5439,7 @@ async fn write_usage_event_produces_real_rollup_rows() {
             source_session_id: None,
             bound_provider_id: Some(bound_provider_id),
             bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -5500,6 +5506,7 @@ async fn write_usage_event_visible_in_overview_read_path() {
             source_session_id: None,
             bound_provider_id: Some(bound_provider_id),
             bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -5597,6 +5604,7 @@ async fn e2e_usage_events_agent_kind_is_codex() {
         source_session_id: None,
         bound_provider_id: Some(bound_provider_id),
         bound_model_id: Some(bound_model_id),
+        reuse_policy: None,
     })
     .await
     .unwrap();

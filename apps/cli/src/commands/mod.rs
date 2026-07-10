@@ -1833,6 +1833,12 @@ mod tests {
         ) -> Result<SubagentTaskDetailDto> {
             self.inner.subagent_task_get(req).await
         }
+        async fn subagent_task_cancel(
+            &self,
+            req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+        ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+            self.inner.subagent_task_cancel(req).await
+        }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
         }
@@ -2056,6 +2062,7 @@ mod tests {
                 source_session_id: None,
                 bound_provider_id: None,
                 bound_model_id: None,
+                reuse_policy: None,
             })
             .await;
         let _ = rt
@@ -2140,6 +2147,8 @@ mod tests {
                 provider_id: None,
                 tags: vec![],
                 include_disabled: false,
+                sort: None,
+                reasoning: None,
             })
             .await;
         let _ = rt

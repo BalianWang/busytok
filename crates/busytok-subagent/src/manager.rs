@@ -102,6 +102,15 @@ pub struct SubagentManager {
 /// so queued tasks' usage flows into `usage_events` + rollups.
 pub type TaskCompletionHook = Arc<dyn Fn(&DelegateResult, &str) + Send + Sync>;
 
+/// Outcome of a `cancel_task` call. `cancelled == false` when the task was
+/// already terminal (completed/failed/cancelled) or the cancel was a no-op.
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    pub previous_status: String,
+    pub new_status: String,
+    pub cancelled: bool,
+}
+
 /// Combined snapshot for `subagent.runtime_status` — all DB reads occur under
 /// a single `SubagentManager` lock acquisition to preserve single-read
 /// aggregate semantics (spec §4 line 213). The worker sample (collected
@@ -274,6 +283,52 @@ impl SubagentManager {
             }
         };
 
+        // Reuse-policy conflict detection (P1-4). Enforced after resolution so
+        // the resolver's own validation (bound fields required on create,
+        // canonical cwd) runs first.
+        match (&req.reuse_policy.as_deref(), created) {
+            (Some("create"), false) => {
+                return Err(SubagentError::InvalidArgument(format!(
+                    "subagent '{}' already exists; use --reuse-policy=reuse to reuse it",
+                    req.subagent_name
+                )));
+            }
+            (Some("reuse"), true) => {
+                return Err(SubagentError::InvalidArgument(format!(
+                    "subagent '{}' not found; use --reuse-policy=create to create it",
+                    req.subagent_name
+                )));
+            }
+            // Explicit reuse: proceed without binding conflict check. The
+            // user opted into reusing the existing subagent regardless of
+            // its current binding.
+            (Some("reuse"), false) => {}
+            // Default policy (None / Some("fail")) on the reuse path: when the
+            // request carries bound fields, verify they match the existing
+            // subagent's binding. A mismatch is a configuration error.
+            (_, false) => {
+                if let (Some(req_pid), Some(req_mid)) =
+                    (&req.bound_provider_id, &req.bound_model_id)
+                {
+                    if req_pid != &subagent.bound_provider_id || req_mid != &subagent.bound_model_id
+                    {
+                        return Err(SubagentError::InvalidArgument(format!(
+                            "subagent '{}' exists but is bound to provider={}/model={}, \
+                             which differs from the requested provider={}/model={}. \
+                             Use --reuse-policy=reuse to ignore this conflict.",
+                            req.subagent_name,
+                            subagent.bound_provider_id,
+                            subagent.bound_model_id,
+                            req_pid,
+                            req_mid
+                        )));
+                    }
+                }
+            }
+            // Create path with any policy other than "reuse" → proceed.
+            (_, true) => {}
+        }
+
         // 2. insert task row. §8.3 step 2 "queue only" (Round 4 race-free
         //    design) + spec §6.4 per-subagent serialization: check the gate
         //    AND whether this subagent already has a running task BEFORE insert.
@@ -362,6 +417,7 @@ impl SubagentManager {
                 model: req.model_override.clone(),
                 summary: None,
                 usage: TaskUsage::default(),
+                created,
             });
         }
 
@@ -407,6 +463,7 @@ impl SubagentManager {
         if result.model.is_none() {
             result.model = model;
         }
+        result.created = created;
         Ok(result)
     }
 
@@ -619,7 +676,9 @@ impl SubagentManager {
                 let error_kind = subagent_error_to_task_error_kind(&e);
                 {
                     let db = self.db.lock().expect("subagent db lock poisoned");
-                    db.subagent_set_task_status(&task.id, "failed", None, None)
+                    // Use the guarded variant so a late cancel is not
+                    // overwritten by this failure write.
+                    db.subagent_set_task_status_if_not_cancelled(&task.id, "failed", None, None)
                         .ok();
                     if let Some(kind) = error_kind {
                         if let Err(persist_err) =
@@ -646,13 +705,24 @@ impl SubagentManager {
         //    observable point.
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
-            db.subagent_set_task_status(
-                &task.id,
-                out.status.as_str(),
-                Some(out.summary.clone()),
-                None,
-            )
-            .map_err(SubagentError::Store)?;
+            // Use the guarded variant so a late cancel is not overwritten
+            // by the executor's terminal write (P1-5 review finding C1).
+            let updated = db
+                .subagent_set_task_status_if_not_cancelled(
+                    &task.id,
+                    out.status.as_str(),
+                    Some(out.summary.clone()),
+                    None,
+                )
+                .map_err(SubagentError::Store)?;
+            if !updated {
+                info!(
+                    event_code = "subagent.task_terminal_write_skipped",
+                    task_id = %task.id,
+                    attempted_status = out.status.as_str(),
+                    "terminal write skipped: task was already cancelled"
+                );
+            }
             // Task 5: persist classified error_kind on the task row.
             if let Some(kind) = &out.error_kind {
                 if let Err(e) = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str())) {
@@ -793,6 +863,9 @@ impl SubagentManager {
             model,
             summary: Some(out.summary),
             usage: out.usage.clone(),
+            // `created` is set by the caller (`delegate` or the dispatcher);
+            // default to `false` here (the dispatcher path always reuses).
+            created: false,
         })
     }
 
@@ -923,7 +996,7 @@ impl SubagentManager {
                             "dispatcher could not resolve subagent for queued task; marking failed"
                         );
                         let db = manager.db.lock().expect("subagent db lock poisoned");
-                        let _ = db.subagent_set_task_status(
+                        let _ = db.subagent_set_task_status_if_not_cancelled(
                             &task.id,
                             "failed",
                             None,
@@ -966,7 +1039,7 @@ impl SubagentManager {
                                 "dispatcher execute_task failed; marking task failed"
                             );
                             let db = manager.db.lock().expect("subagent db lock poisoned");
-                            let _ = db.subagent_set_task_status(
+                            let _ = db.subagent_set_task_status_if_not_cancelled(
                                 &task.id,
                                 "failed",
                                 None,
@@ -988,6 +1061,64 @@ impl SubagentManager {
     pub fn task_counts(&self) -> (u32, u32) {
         let db = self.db.lock().expect("subagent db lock poisoned");
         db.subagent_task_counts_by_status().unwrap_or((0, 0))
+    }
+
+    /// Cancel a task by id. Idempotent on terminal states: returns
+    /// `cancelled == false` when the task was already completed/failed/
+    /// cancelled. Returns an error when the task is not found.
+    pub async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<CancelOutcome> {
+        let now_ms = busytok_domain::now_ms();
+        let task = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_get_task(task_id)
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| SubagentError::NotFound(format!("task {task_id}")))?
+        };
+        let previous_status = task.status.clone();
+        if matches!(
+            previous_status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            return Ok(CancelOutcome {
+                previous_status: previous_status.clone(),
+                new_status: previous_status,
+                cancelled: false,
+            });
+        }
+        let updated = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_cancel_task_if_not_terminal(task_id, reason, now_ms)
+                .map_err(SubagentError::Store)?
+        };
+        if !updated {
+            // Lost a race — another writer flipped the task to a terminal
+            // state between our read and the conditional UPDATE. Re-read
+            // the actual current status so `new_status` is accurate.
+            let actual_status = {
+                let db = self.db.lock().expect("subagent db lock poisoned");
+                db.subagent_get_task(task_id)
+                    .map_err(SubagentError::Store)?
+                    .map(|t| t.status)
+                    .unwrap_or_else(|| previous_status.clone())
+            };
+            return Ok(CancelOutcome {
+                previous_status: previous_status.clone(),
+                new_status: actual_status,
+                cancelled: false,
+            });
+        }
+        info!(
+            event_code = "subagent.task_cancelled",
+            task_id = %task_id,
+            previous_status = %previous_status,
+            reason = ?reason,
+            "task cancelled"
+        );
+        Ok(CancelOutcome {
+            previous_status,
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
     }
 
     /// List subagents, optionally filtered by status / project / include-deleted.

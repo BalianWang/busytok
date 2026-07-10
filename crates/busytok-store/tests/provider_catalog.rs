@@ -89,7 +89,7 @@ fn model_crud_and_cascade_tags() {
     // Delete model cascades tags
     db.delete_model(&model.id).unwrap();
     let entries = db
-        .list_models_filtered(ModelCatalogFilter::default())
+        .list_models_filtered(ModelCatalogFilter::default(), None, None)
         .unwrap();
     assert!(entries.is_empty());
 }
@@ -124,11 +124,15 @@ fn list_models_filtered_by_multiple_tags_and_semantics() {
 
     // AND semantics: only model with both tags
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: None,
-            tags: vec!["fast".into(), "cheap".into()],
-            include_disabled: false,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: None,
+                tags: vec!["fast".into(), "cheap".into()],
+                include_disabled: false,
+            },
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].model_id, "gpt-4o");
@@ -192,22 +196,30 @@ fn include_disabled_filters_both_provider_and_model() {
 
     // include_disabled=false: only enabled provider + enabled model
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: None,
-            tags: vec![],
-            include_disabled: false,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: false,
+            },
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].model_id, "m-enabled");
 
     // include_disabled=true: all 3
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: None,
-            tags: vec![],
-            include_disabled: true,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(entries.len(), 3);
 }
@@ -376,11 +388,15 @@ fn model_update_lookup_by_provider_and_tags_setter() {
     db.set_model_tags(&model.id, &["fast".into(), "cheap".into()])
         .unwrap();
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: None,
-            tags: vec!["fast".into(), "cheap".into()],
-            include_disabled: false,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: None,
+                tags: vec!["fast".into(), "cheap".into()],
+                include_disabled: false,
+            },
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tags.len(), 2);
@@ -388,11 +404,15 @@ fn model_update_lookup_by_provider_and_tags_setter() {
     // set_model_tags: remove a tag
     db.set_model_tags(&model.id, &["fast".into()]).unwrap();
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: None,
-            tags: vec!["cheap".into()],
-            include_disabled: false,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: None,
+                tags: vec!["cheap".into()],
+                include_disabled: false,
+            },
+            None,
+            None,
+        )
         .unwrap();
     // "cheap" was removed, so AND-filter for ["cheap"] yields nothing
     assert!(entries.is_empty());
@@ -547,11 +567,15 @@ fn create_model_dedupes_duplicate_tags() {
         })
         .unwrap();
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: None,
-            tags: vec![],
-            include_disabled: true,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: None,
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            None,
+        )
         .unwrap();
     let entry = entries.iter().find(|e| e.model_db_id == model.id).unwrap();
     assert_eq!(entry.tags, vec!["chat".to_string(), "fast".to_string()]);
@@ -612,11 +636,15 @@ fn model_metadata_round_trip() {
 
     // list_models_filtered surfaces metadata in the joined row
     let entries = db
-        .list_models_filtered(ModelCatalogFilter {
-            provider_id: Some(provider.id.clone()),
-            tags: vec![],
-            include_disabled: true,
-        })
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(provider.id.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            None,
+        )
         .unwrap();
     let entry = entries.iter().find(|e| e.model_db_id == m.id).unwrap();
     assert_eq!(
@@ -656,4 +684,192 @@ fn update_provider_persists_provider_kind_patch() {
     // Verify round-trip via a fresh read.
     let fetched = db.get_provider_with_secret(&provider.id).unwrap().unwrap();
     assert_eq!(fetched.provider_kind, ProviderKind::AnthropicCompatible);
+}
+
+// ── sort / reasoning filter (P2-7) ──────────────────────────────────────────
+
+fn seed_sort_models(db: &Database) -> (String, Vec<String>) {
+    let provider = db
+        .create_provider(CreateProviderReq {
+            name: "SortProvider".into(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.test.com".into(),
+            enabled: true,
+            api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+    let pid = provider.id.clone();
+    let ids: Vec<String> = ["alpha", "beta", "gamma"]
+        .iter()
+        .map(|mid| {
+            let (cw, mt, reasoning) = match *mid {
+                "alpha" => (Some(128_000i64), Some(4_096i64), Some(true)),
+                "beta" => (Some(200_000i64), Some(8_192i64), Some(false)),
+                "gamma" => (None, None, None),
+                _ => unreachable!(),
+            };
+            let m = db
+                .create_model(CreateModelReq {
+                    provider_id: pid.clone(),
+                    model_id: mid.to_string(),
+                    enabled: true,
+                    tags: vec![],
+                    display_name: None,
+                    reasoning,
+                    context_window: cw,
+                    max_tokens: mt,
+                })
+                .unwrap();
+            m.id
+        })
+        .collect();
+    (pid, ids)
+}
+
+#[test]
+fn list_models_sort_by_context_window_desc() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, ids) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            Some("context_window_desc"),
+            None,
+        )
+        .unwrap();
+    // beta (200k) → alpha (128k) → gamma (NULL last)
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].model_id, "beta");
+    assert_eq!(entries[1].model_id, "alpha");
+    assert_eq!(entries[2].model_id, "gamma");
+    let _ = ids;
+}
+
+#[test]
+fn list_models_sort_by_max_tokens_desc() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            Some("max_tokens_desc"),
+            None,
+        )
+        .unwrap();
+    // beta (8192) → alpha (4096) → gamma (NULL last)
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].model_id, "beta");
+    assert_eq!(entries[1].model_id, "alpha");
+    assert_eq!(entries[2].model_id, "gamma");
+}
+
+#[test]
+fn list_models_sort_default_by_name() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    // Default sort: provider name, then model_id
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].model_id, "alpha");
+    assert_eq!(entries[1].model_id, "beta");
+    assert_eq!(entries[2].model_id, "gamma");
+}
+
+#[test]
+fn list_models_sort_unknown_value_falls_back_to_name() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            Some("bogus_sort"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].model_id, "alpha");
+}
+
+#[test]
+fn list_models_reasoning_filter_true() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            Some(true),
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].model_id, "alpha");
+    assert!(entries[0].reasoning);
+}
+
+#[test]
+fn list_models_reasoning_filter_false() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            Some(false),
+        )
+        .unwrap();
+    // "beta" has reasoning=false explicitly; "gamma" was seeded with
+    // reasoning=None but create_model defaults None→false (0) in storage.
+    // So the Some(false) filter matches both.
+    assert_eq!(entries.len(), 2);
+    for e in &entries {
+        assert!(!e.reasoning, "all returned models should be non-reasoning");
+    }
+}
+
+#[test]
+fn list_models_reasoning_filter_none_returns_all() {
+    let db = Database::open_in_memory().unwrap();
+    let (pid, _) = seed_sort_models(&db);
+    let entries = db
+        .list_models_filtered(
+            ModelCatalogFilter {
+                provider_id: Some(pid.clone()),
+                tags: vec![],
+                include_disabled: true,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(entries.len(), 3);
 }

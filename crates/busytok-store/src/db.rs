@@ -303,8 +303,10 @@ impl Database {
     pub fn list_models_filtered(
         &self,
         filter: busytok_domain::ModelCatalogFilter,
+        sort: Option<&str>,
+        reasoning: Option<bool>,
     ) -> anyhow::Result<Vec<busytok_domain::ModelCatalogEntry>> {
-        crate::provider_catalog::list_models_filtered(&self.conn, filter)
+        crate::provider_catalog::list_models_filtered(&self.conn, filter, sort, reasoning)
     }
     pub fn list_models_by_provider(
         &self,
@@ -2076,6 +2078,37 @@ impl Database {
         error: Option<String>,
     ) -> Result<()> {
         subagent_queries::set_task_status(self.conn(), id, status, result_summary, error)
+    }
+
+    /// Like `subagent_set_task_status` but refuses to overwrite a cancelled
+    /// task. Used by the executor's terminal-write path. Returns `true` if
+    /// the row was updated, `false` if the task was already cancelled.
+    pub fn subagent_set_task_status_if_not_cancelled(
+        &self,
+        id: &str,
+        status: &str,
+        result_summary: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool> {
+        subagent_queries::set_task_status_if_not_cancelled(
+            self.conn(),
+            id,
+            status,
+            result_summary,
+            error,
+        )
+    }
+    /// Conditionally cancel a task (idempotent on terminal states).
+    /// Returns `true` when the row was updated, `false` when the task was
+    /// already terminal or not found. See
+    /// [`subagent_queries::cancel_task_if_not_terminal`].
+    pub fn subagent_cancel_task_if_not_terminal(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        subagent_queries::cancel_task_if_not_terminal(self.conn(), task_id, reason, now)
     }
     /// Set the classified `error_kind` on a task row (Task 5).
     pub fn subagent_set_task_error_kind(&self, id: &str, error_kind: Option<&str>) -> Result<()> {

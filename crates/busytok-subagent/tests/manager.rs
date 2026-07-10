@@ -136,6 +136,7 @@ fn req_with_cwd(name: &str, prompt: &str, cwd: &str) -> DelegateRequest {
         source_session_id: None,
         bound_provider_id: Some(bound_provider_id()),
         bound_model_id: Some(bound_model_id()),
+        reuse_policy: None,
     }
 }
 
@@ -154,6 +155,7 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         source_session_id: None,
         bound_provider_id: Some(bound_provider_id()),
         bound_model_id: Some(bound_model_id()),
+        reuse_policy: None,
     }
 }
 
@@ -950,6 +952,7 @@ async fn delegate_builds_context_and_merges_memory_update() {
         source_session_id: None,
         bound_provider_id: Some(bound_provider_id()),
         bound_model_id: Some(bound_model_id()),
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await.unwrap();
     assert_eq!(result.status, TaskStatus::Completed);
@@ -1042,6 +1045,7 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
         source_session_id: None,
         bound_provider_id: Some(bound_provider_id()),
         bound_model_id: Some(bound_model_id()),
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await.unwrap();
     // Verify status is Cold, not Warm.
@@ -1102,6 +1106,7 @@ async fn delegate_populates_attempts_after_first_completed_task() {
         source_session_id: None,
         bound_provider_id: Some(bound_provider_id()),
         bound_model_id: Some(bound_model_id()),
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await.unwrap();
     assert_eq!(result.status.as_str(), "completed");
@@ -1743,6 +1748,7 @@ async fn execute_task_fails_when_bound_provider_disabled() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await;
     assert!(
@@ -1842,6 +1848,7 @@ async fn execute_task_fails_when_bound_provider_missing_api_key() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await;
     assert!(
@@ -1928,6 +1935,7 @@ async fn execute_task_fails_when_bound_model_not_found() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await;
     assert!(
@@ -2024,6 +2032,7 @@ async fn execute_task_fails_when_bound_model_disabled() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let result = manager.delegate(req).await;
     assert!(
@@ -2127,6 +2136,7 @@ async fn execute_task_fails_when_model_missing_context_window() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let err = manager.delegate(req).await.unwrap_err();
     assert!(
@@ -2217,6 +2227,7 @@ async fn execute_task_fails_when_model_missing_max_tokens() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let err = manager.delegate(req).await.unwrap_err();
     assert!(
@@ -2356,6 +2367,7 @@ async fn execute_task_fails_when_bound_provider_deleted() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     let err = manager.delegate(req).await.unwrap_err();
     assert!(
@@ -2489,4 +2501,255 @@ async fn delegate_accepts_normal_timeout() {
         .await
         .unwrap();
     assert_eq!(result.status, TaskStatus::Completed);
+}
+
+// ── reuse_policy conflict detection (P1-4) ─────────────────────────────────
+
+#[tokio::test]
+async fn reuse_policy_create_fails_when_subagent_exists() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // First delegate creates the subagent.
+    m.delegate(req("reviewer", "first")).await.unwrap();
+    // Second delegate with reuse_policy="create" should fail.
+    let err = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("create".into()),
+            ..req("reviewer", "second")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert!(format!("{err}").contains("already exists"));
+    assert!(format!("{err}").contains("--reuse-policy=reuse"));
+}
+
+#[tokio::test]
+async fn reuse_policy_create_succeeds_when_subagent_does_not_exist() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let r = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("create".into()),
+            ..req("new-sub", "do")
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_str(), "completed");
+    assert!(r.created, "created should be true for a new subagent");
+}
+
+#[tokio::test]
+async fn reuse_policy_reuse_fails_when_subagent_not_found() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let err = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("reuse".into()),
+            ..req("nonexistent", "do")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert!(format!("{err}").contains("not found"));
+    assert!(format!("{err}").contains("--reuse-policy=create"));
+}
+
+#[tokio::test]
+async fn reuse_policy_reuse_succeeds_when_subagent_exists() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // Create the subagent first.
+    let r1 = m.delegate(req("worker", "first")).await.unwrap();
+    // Reuse it with reuse_policy="reuse".
+    let r2 = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("reuse".into()),
+            ..req("worker", "second")
+        })
+        .await
+        .unwrap();
+    assert_eq!(r2.subagent_id, r1.subagent_id);
+    assert!(!r2.created, "created should be false when reusing");
+}
+
+#[tokio::test]
+async fn reuse_policy_default_fails_on_binding_mismatch() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // Create a subagent with the default bound provider/model.
+    m.delegate(req("mismatch-test", "first")).await.unwrap();
+    // Try to reuse with DIFFERENT bound fields (non-existent IDs).
+    let err = m
+        .delegate(DelegateRequest {
+            bound_provider_id: Some("wrong-provider".into()),
+            bound_model_id: Some("wrong-model".into()),
+            ..req("mismatch-test", "second")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    assert!(format!("{err}").contains("differs"));
+}
+
+#[tokio::test]
+async fn reuse_policy_default_succeeds_when_binding_matches() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let r1 = m.delegate(req("match-test", "first")).await.unwrap();
+    // Reuse with the SAME bound fields → should succeed.
+    let r2 = m
+        .delegate(DelegateRequest {
+            bound_provider_id: Some(bound_provider_id()),
+            bound_model_id: Some(bound_model_id()),
+            ..req("match-test", "second")
+        })
+        .await
+        .unwrap();
+    assert_eq!(r2.subagent_id, r1.subagent_id);
+    assert!(!r2.created);
+}
+
+// I1 fix: --reuse-policy=reuse explicitly bypasses the binding conflict
+// check, so a delegate with mismatched bound fields must SUCCEED (reusing the
+// existing subagent). execute_task reads the subagent's STORED binding, so the
+// mismatched request bound fields are never used for execution.
+#[tokio::test]
+async fn reuse_policy_reuse_succeeds_with_mismatched_bindings() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // Create a subagent bound to the seeded test provider/model (A/X).
+    m.delegate(req("reuse-mismatch", "first")).await.unwrap();
+    // Delegate with reuse_policy="reuse" and DIFFERENT bound fields (B/Y).
+    // The conflict check is bypassed; execute_task uses the stored A/X binding.
+    let r2 = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("reuse".into()),
+            bound_provider_id: Some("other-provider".into()),
+            bound_model_id: Some("other-model".into()),
+            ..req("reuse-mismatch", "second")
+        })
+        .await
+        .expect("reuse policy must bypass the binding conflict check");
+    assert_eq!(r2.status.as_str(), "completed");
+    assert!(
+        !r2.created,
+        "created should be false when reusing an existing subagent"
+    );
+}
+
+// I1 fix companion: the default/fail policy runs the binding conflict check,
+// so a delegate with mismatched bound fields must FAIL with a conflict error.
+#[tokio::test]
+async fn reuse_policy_fail_errors_with_mismatched_bindings() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // Create a subagent bound to the seeded test provider/model (A/X).
+    m.delegate(req("fail-mismatch", "first")).await.unwrap();
+    // Delegate with reuse_policy="fail" and DIFFERENT bound fields (B/Y).
+    // The conflict check runs and must reject the mismatch.
+    let err = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("fail".into()),
+            bound_provider_id: Some("other-provider".into()),
+            bound_model_id: Some("other-model".into()),
+            ..req("fail-mismatch", "second")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("differs"),
+        "expected 'differs' in conflict error, got: {msg}"
+    );
+    assert!(
+        msg.contains("--reuse-policy=reuse"),
+        "expected hint to use --reuse-policy=reuse, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn delegate_result_created_is_true_for_new_subagent() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let r = m.delegate(req("fresh-sub", "do")).await.unwrap();
+    assert!(r.created, "created should be true for a new subagent");
+}
+
+#[tokio::test]
+async fn delegate_result_created_is_false_for_reused_subagent() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    m.delegate(req("reused-sub", "first")).await.unwrap();
+    let r2 = m.delegate(req("reused-sub", "second")).await.unwrap();
+    assert!(!r2.created, "created should be false when reusing");
+}
+
+// ── cancel_task (P1-5) ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cancel_task_cancels_queued_task() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // Delegate a task to create a task row.
+    let r = m.delegate(req("cancel-queued", "do")).await.unwrap();
+    // The task should already be completed (mock executor is synchronous).
+    // Cancel should return cancelled=false since it's terminal.
+    let outcome = m.cancel_task(&r.task_id, None).await.unwrap();
+    assert!(
+        !outcome.cancelled,
+        "completed task should not be cancellable"
+    );
+    assert_eq!(outcome.previous_status, "completed");
+}
+
+#[tokio::test]
+async fn cancel_task_returns_not_found_for_missing_task() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let err = m
+        .cancel_task("nonexistent-task-id", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::NotFound(_)));
+    assert!(format!("{err}").contains("task"));
+}
+
+#[tokio::test]
+async fn cancel_task_cancels_running_task() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+    let r = m.delegate(req("cancel-running", "do")).await.unwrap();
+    // Manually set the task to running via DB.
+    {
+        let g = db.lock().unwrap();
+        g.subagent_set_task_status(&r.task_id, "running", None, None)
+            .unwrap();
+    }
+    let outcome = m
+        .cancel_task(&r.task_id, Some("user-requested"))
+        .await
+        .unwrap();
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.previous_status, "running");
+    assert_eq!(outcome.new_status, "cancelled");
+}
+
+#[tokio::test]
+async fn cancel_task_skips_already_terminal_task() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let r = m.delegate(req("cancel-terminal", "do")).await.unwrap();
+    // Task is already completed. Cancel should be a no-op.
+    let outcome = m.cancel_task(&r.task_id, None).await.unwrap();
+    assert!(!outcome.cancelled);
+    assert_eq!(outcome.previous_status, "completed");
+    assert_eq!(outcome.new_status, "completed");
 }

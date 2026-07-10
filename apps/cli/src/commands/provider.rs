@@ -481,6 +481,8 @@ async fn handle_model_list(provider_id: String, json: bool) -> Result<()> {
         provider_id: Some(provider_id),
         tags: vec![],
         include_disabled: true,
+        sort: None,
+        reasoning: None,
     };
     let mut client = connect_client().await?;
     let resp = client
@@ -588,6 +590,8 @@ async fn handle_model_update(
         provider_id: Some(provider_id.clone()),
         tags: vec![],
         include_disabled: true,
+        sort: None,
+        reasoning: None,
     };
     let mut client = connect_client().await?;
     let list_resp = client
@@ -674,6 +678,8 @@ async fn handle_model_delete(provider_id: String, model_id: String, yes: bool) -
         provider_id: Some(provider_id.clone()),
         tags: vec![],
         include_disabled: true,
+        sort: None,
+        reasoning: None,
     };
     let mut client = connect_client().await?;
     let list_resp = client
@@ -1160,6 +1166,12 @@ mod tests {
             req: SubagentTaskGetRequestDto,
         ) -> anyhow::Result<SubagentTaskDetailDto> {
             self.inner.subagent_task_get(req).await
+        }
+        async fn subagent_task_cancel(
+            &self,
+            req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+        ) -> anyhow::Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+            self.inner.subagent_task_cancel(req).await
         }
         async fn pi_sidecar_locator_update(
             &self,

@@ -450,6 +450,56 @@ pub fn set_task_status(
     .with_context(|| format!("set task {} status {}", id, status))
 }
 
+/// Like `set_task_status` but refuses to overwrite a task that has already
+/// been cancelled. Used by the executor's terminal-write path so that a
+/// late cancel is not silently reverted to `completed`/`failed`.
+///
+/// Returns `true` if the row was updated, `false` if the task was already
+/// `cancelled` (the write was skipped).
+pub fn set_task_status_if_not_cancelled(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    result_summary: Option<String>,
+    error: Option<String>,
+) -> Result<bool> {
+    let now = busytok_domain::now_ms();
+    let completed_at: Option<i64> =
+        (status == "completed" || status == "failed" || status == "cancelled").then_some(now);
+    let rows = conn
+        .execute(
+            "UPDATE subagent_tasks SET status = ?2, result_summary = COALESCE(?3, result_summary), \
+                error = COALESCE(?4, error), completed_at_ms = COALESCE(?5, completed_at_ms) \
+             WHERE id = ?1 AND status != 'cancelled'",
+            params![id, status, result_summary, error, completed_at],
+        )
+        .with_context(|| format!("set task {} status (if not cancelled) {}", id, status))?;
+    Ok(rows > 0)
+}
+
+/// Conditionally cancel a task: flip `status → 'cancelled'` ONLY if the
+/// task is NOT already in a terminal state (`completed` / `failed` /
+/// `cancelled`). Returns `true` when a row was updated (the task was
+/// queued or running), `false` when the task was already terminal or not
+/// found. The `error` field is set to `reason` when provided, else
+/// `"CANCELLED"`.
+pub fn cancel_task_if_not_terminal(
+    conn: &Connection,
+    task_id: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> Result<bool> {
+    let error = reason.unwrap_or("CANCELLED");
+    let rows = conn
+        .execute(
+            "UPDATE subagent_tasks SET status = 'cancelled', error = ?1, completed_at_ms = ?2 \
+             WHERE id = ?3 AND status NOT IN ('completed', 'failed', 'cancelled')",
+            params![error, now, task_id],
+        )
+        .with_context(|| format!("cancel task {}", task_id))?;
+    Ok(rows > 0)
+}
+
 /// Set the classified `error_kind` on a task row (Task 5). Called by
 /// `SubagentManager::execute_task` after `executor.execute()` returns a
 /// failed/timeout `ExecutorOutput` with `error_kind: Some(...)`. The

@@ -172,6 +172,7 @@ fn req(name: &str, prompt: &str, provider_id: &str, model_id: &str) -> DelegateR
         source_session_id: None,
         bound_provider_id: Some(provider_id.to_string()),
         bound_model_id: Some(model_id.to_string()),
+        reuse_policy: None,
     }
 }
 

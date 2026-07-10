@@ -364,6 +364,148 @@ fn set_task_status_running_does_not_set_completed_at() {
     assert!(got.completed_at_ms.is_none());
 }
 
+// ── cancel_task_if_not_terminal (P1-5) ─────────────────────────────────────
+
+#[test]
+fn cancel_task_if_not_terminal_cancels_queued_task() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    // Default status is "queued" — should be cancellable.
+    let cancelled = subagent_queries::cancel_task_if_not_terminal(
+        db.conn(),
+        "t-1",
+        Some("user-requested"),
+        12345,
+    )
+    .unwrap();
+    assert!(cancelled);
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "cancelled");
+    assert_eq!(got.error.as_deref(), Some("user-requested"));
+    assert_eq!(got.completed_at_ms, Some(12345));
+}
+
+#[test]
+fn cancel_task_if_not_terminal_cancels_running_task() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    // Move to running first.
+    subagent_queries::set_task_status(db.conn(), "t-1", "running", None, None).unwrap();
+    let cancelled =
+        subagent_queries::cancel_task_if_not_terminal(db.conn(), "t-1", None, 99999).unwrap();
+    assert!(cancelled);
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "cancelled");
+    // None reason → default "CANCELLED"
+    assert_eq!(got.error.as_deref(), Some("CANCELLED"));
+    assert_eq!(got.completed_at_ms, Some(99999));
+}
+
+#[test]
+fn cancel_task_if_not_terminal_skips_completed_task() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    subagent_queries::set_task_status(db.conn(), "t-1", "completed", Some("done".into()), None)
+        .unwrap();
+    let cancelled =
+        subagent_queries::cancel_task_if_not_terminal(db.conn(), "t-1", None, 5000).unwrap();
+    assert!(!cancelled);
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "completed");
+}
+
+#[test]
+fn cancel_task_if_not_terminal_skips_failed_task() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    subagent_queries::set_task_status(db.conn(), "t-1", "failed", None, Some("boom".into()))
+        .unwrap();
+    let cancelled =
+        subagent_queries::cancel_task_if_not_terminal(db.conn(), "t-1", None, 5000).unwrap();
+    assert!(!cancelled);
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "failed");
+}
+
+#[test]
+fn cancel_task_if_not_terminal_skips_already_cancelled() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    subagent_queries::set_task_status(db.conn(), "t-1", "cancelled", None, Some("first".into()))
+        .unwrap();
+    let cancelled =
+        subagent_queries::cancel_task_if_not_terminal(db.conn(), "t-1", Some("second"), 5000)
+            .unwrap();
+    assert!(!cancelled);
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "cancelled");
+    // Original error preserved
+    assert_eq!(got.error.as_deref(), Some("first"));
+}
+
+#[test]
+fn cancel_task_if_not_terminal_returns_false_for_missing_task() {
+    let db = db();
+    let cancelled =
+        subagent_queries::cancel_task_if_not_terminal(db.conn(), "no-such-task", None, 5000)
+            .unwrap();
+    assert!(!cancelled);
+}
+
+// ── set_task_status_if_not_cancelled (C1 guard) ───────────────────────────
+
+#[test]
+fn set_task_status_if_not_cancelled_preserves_cancelled_status() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    // Move to cancelled first.
+    subagent_queries::set_task_status(
+        db.conn(),
+        "t-1",
+        "cancelled",
+        None,
+        Some("user-cancelled".into()),
+    )
+    .unwrap();
+    // Attempt to write "completed" via the guard — must be skipped because
+    // the WHERE clause excludes rows already in 'cancelled' status.
+    let wrote = db
+        .subagent_set_task_status_if_not_cancelled("t-1", "completed", Some("done".into()), None)
+        .unwrap();
+    assert!(
+        !wrote,
+        "write must be skipped for an already-cancelled task"
+    );
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "cancelled");
+    // Original error preserved (no row was touched).
+    assert_eq!(got.error.as_deref(), Some("user-cancelled"));
+}
+
+#[test]
+fn set_task_status_if_not_cancelled_writes_when_not_cancelled() {
+    let db = db();
+    seed_subagent(&db, "sa-1", "r");
+    seed_task(&db, "t-1", "sa-1", "go");
+    // Move to running first (non-terminal, non-cancelled).
+    subagent_queries::set_task_status(db.conn(), "t-1", "running", None, None).unwrap();
+    // Write "completed" via the guard — must succeed.
+    let wrote = db
+        .subagent_set_task_status_if_not_cancelled("t-1", "completed", Some("done".into()), None)
+        .unwrap();
+    assert!(wrote, "write must succeed for a non-cancelled task");
+    let got = db.subagent_get_task("t-1").unwrap().unwrap();
+    assert_eq!(got.status, "completed");
+    assert_eq!(got.result_summary.as_deref(), Some("done"));
+    assert!(got.completed_at_ms.is_some());
+}
+
 // ── set_task_error_kind ─────────────────────────────────────────────────────
 
 #[test]

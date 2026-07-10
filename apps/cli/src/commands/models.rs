@@ -18,11 +18,15 @@ pub async fn handle_models(
     tags: Vec<String>,
     all: bool,
     json: bool,
+    sort: Option<String>,
+    reasoning: bool,
 ) -> Result<()> {
     let req = ModelListRequestDto {
         provider_id: provider,
         tags,
         include_disabled: all,
+        sort,
+        reasoning: if reasoning { Some(true) } else { None },
     };
     let mut client = connect_client().await?;
     let response = client
@@ -184,6 +188,8 @@ mod tests {
             provider_id: Some("p1".to_string()),
             tags: vec!["chat".to_string(), "fast".to_string()],
             include_disabled: true,
+            sort: None,
+            reasoning: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["provider_id"], "p1");
@@ -197,6 +203,8 @@ mod tests {
             provider_id: None,
             tags: vec![],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         // provider_id has skip_serializing_if = "Option::is_none".
@@ -211,6 +219,8 @@ mod tests {
             provider_id: Some("p-7".to_string()),
             tags: vec!["a".to_string()],
             include_disabled: true,
+            sort: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ModelListRequestDto = serde_json::from_str(&json).unwrap();
@@ -251,7 +261,7 @@ mod tests {
     async fn handle_models_bails_when_socket_unreachable() {
         // No server: connect_client surfaces a friendly connect error.
         std::env::set_var("BUSYTOK_SOCKET", "/nonexistent/busytok-models-test.sock");
-        let result = handle_models(None, vec![], false, false).await;
+        let result = handle_models(None, vec![], false, false, None, false).await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("connecting to Busytok service") || err.contains("Open Busytok.app"),
@@ -268,7 +278,7 @@ mod tests {
         let runtime: Arc<dyn RuntimeControl> = Arc::new(inner);
         let (harness, socket) = spawn_server(runtime).await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_models(None, vec![], false, false).await;
+        let result = handle_models(None, vec![], false, false, None, false).await;
         drop(harness);
         let err = result.unwrap_err().to_string();
         assert!(
@@ -482,6 +492,12 @@ mod tests {
         ) -> Result<SubagentTaskDetailDto> {
             self.inner.subagent_task_get(req).await
         }
+        async fn subagent_task_cancel(
+            &self,
+            req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+        ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+            self.inner.subagent_task_cancel(req).await
+        }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
         }
@@ -579,7 +595,7 @@ mod tests {
     async fn handle_models_table_output_succeeds() {
         let (harness, socket) = spawn_models_server(sample_models()).await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_models(None, vec![], false, false).await;
+        let result = handle_models(None, vec![], false, false, None, false).await;
         drop(harness);
         assert!(result.is_ok(), "table output: {:?}", result.err());
     }
@@ -589,7 +605,7 @@ mod tests {
     async fn handle_models_json_output_succeeds() {
         let (harness, socket) = spawn_models_server(sample_models()).await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_models(None, vec![], false, true).await;
+        let result = handle_models(None, vec![], false, true, None, false).await;
         drop(harness);
         assert!(result.is_ok(), "json output: {:?}", result.err());
     }
@@ -601,7 +617,7 @@ mod tests {
         // the canned response), but the request should still build & send.
         let (harness, socket) = spawn_models_server(sample_models()).await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_models(None, vec![], true, false).await;
+        let result = handle_models(None, vec![], true, false, None, false).await;
         drop(harness);
         assert!(result.is_ok(), "table output --all: {:?}", result.err());
     }
@@ -616,6 +632,8 @@ mod tests {
             vec!["chat".to_string()],
             false,
             false,
+            None,
+            false,
         )
         .await;
         drop(harness);
@@ -627,7 +645,7 @@ mod tests {
     async fn handle_models_empty_list_prints_no_models_found() {
         let (harness, socket) = spawn_models_server(vec![]).await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_models(None, vec![], false, false).await;
+        let result = handle_models(None, vec![], false, false, None, false).await;
         drop(harness);
         assert!(result.is_ok(), "empty list: {:?}", result.err());
     }
@@ -794,6 +812,7 @@ mod tests {
                 source_session_id: None,
                 bound_provider_id: None,
                 bound_model_id: None,
+                reuse_policy: None,
             })
             .await;
         let _ = rt

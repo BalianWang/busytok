@@ -1293,10 +1293,15 @@ pub struct SubagentDelegateRequestDto {
     pub cwd: String,
     pub profile: String,
     pub intent: Option<String>,
+    /// Inline prompt text. When `prompt_artifact_ref` is set, this should be
+    /// empty (the service uses the artifact instead). At least one of
+    /// `prompt` (non-empty) or `prompt_artifact_ref` (Some) must be provided.
+    #[serde(default)]
     pub prompt: String,
     /// Spec §4.3: when set, references a stored artifact (relative path within
     /// the artifact store root) instead of the inline `prompt`. Mutually
     /// exclusive with `prompt` — exactly one must be non-empty/Some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_artifact_ref: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub model_override: Option<String>,
@@ -1310,6 +1315,13 @@ pub struct SubagentDelegateRequestDto {
     pub bound_provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_model_id: Option<String>,
+    /// Reuse policy for name-based resolution:
+    /// - `create`: only create a new subagent; fail if one with the same name exists
+    /// - `reuse`: only reuse an existing subagent; fail if not found
+    /// - `fail` (default): create-or-reuse, but fail if `--bind-*` is given
+    ///   and the existing subagent's binding differs from the request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1341,6 +1353,35 @@ pub struct SubagentTasksRequestDto {
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct SubagentTaskGetRequestDto {
     pub task_id: String,
+}
+
+/// `subagent.task_cancel` request — cancel a task by id.
+/// For queued tasks: immediate cancellation (status → cancelled).
+/// For running tasks: best-effort cooperative cancel (status → cancelled;
+/// the running executor's terminal status write is guarded against
+/// overwriting a cancelled status).
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SubagentTaskCancelRequestDto {
+    pub task_id: String,
+    /// Optional human-readable reason for the cancellation (logged, stored
+    /// in the task's `error` field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `subagent.task_cancel` response — reports the outcome.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+pub struct SubagentTaskCancelResponseDto {
+    pub id: String,
+    /// Status before the cancel attempt.
+    pub previous_status: String,
+    /// Status after the cancel attempt. `"cancelled"` if the cancel
+    /// succeeded, or the original terminal status if the task was
+    /// already done.
+    pub new_status: String,
+    /// True if the cancel actually changed the status to `cancelled`.
+    /// False if the task was already terminal (completed/failed/cancelled).
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1377,6 +1418,10 @@ pub struct SubagentDelegateResponseDto {
     pub model: Option<String>,
     pub summary: Option<String>,
     pub usage: SubagentUsageDto,
+    /// Whether a new subagent was created (true) or an existing one was
+    /// reused (false). Lets the caller verify the reuse-policy outcome.
+    #[serde(default)]
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -1439,6 +1484,21 @@ pub struct SubagentTaskDetailDto {
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
+    /// Effective provider used for this task's execution (derived from the
+    /// subagent's bound_provider_id at read time). `None` if the parent
+    /// subagent row is gone (hard-deleted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_provider_id: Option<String>,
+    /// Effective model used for this task's execution. Derived as
+    /// `model_override.unwrap_or(bound_model_id)` — reflects the actual
+    /// routing decision. `None` if the parent subagent row is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model_id: Option<String>,
+    /// How the effective model was chosen: `"override"` (task-level
+    /// model_override) or `"bound"` (subagent's stored binding). `None`
+    /// when the parent subagent row is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -1707,6 +1767,16 @@ pub struct ModelListRequestDto {
     pub tags: Vec<String>,
     #[serde(default)]
     pub include_disabled: bool,
+    /// Sort order for results:
+    /// - `name` (default): alphabetical by provider name, then model_id
+    /// - `context_window_desc`: largest context window first
+    /// - `max_tokens_desc`: largest max_tokens first
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+    /// Filter by reasoning capability: `Some(true)` → only reasoning models,
+    /// `Some(false)` → only non-reasoning, `None` → no filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -2019,6 +2089,7 @@ mod tests {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         };
         let json = serde_json::to_value(&none_dto).unwrap();
         assert!(json.get("bound_provider_id").is_none());
@@ -2720,6 +2791,9 @@ mod tests {
             created_at_ms: 1_000,
             started_at_ms: Some(1_100),
             completed_at_ms: Some(2_000),
+            effective_provider_id: None,
+            effective_model_id: None,
+            binding_source: None,
         };
         let json = serde_json::to_value(&dto).unwrap();
         assert_eq!(json["id"], "task-1");
@@ -2814,6 +2888,9 @@ mod tests {
             created_at_ms: 5_000,
             started_at_ms: Some(5_100),
             completed_at_ms: Some(6_000),
+            effective_provider_id: None,
+            effective_model_id: None,
+            binding_source: None,
         };
         let json = serde_json::to_value(&degraded).unwrap();
         // None serializes as explicit null — consistent with the TS contract

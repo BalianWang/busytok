@@ -241,6 +241,7 @@ fn req(name: &str, prompt: &str) -> DelegateRequest {
         source_session_id: None,
         bound_provider_id: Some(TEST_PROVIDER_ID.to_string()),
         bound_model_id: Some("test-model".to_string()),
+        reuse_policy: None,
     }
 }
 
