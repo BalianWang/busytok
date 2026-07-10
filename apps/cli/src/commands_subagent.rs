@@ -5,9 +5,10 @@ use std::io::BufRead;
 use anyhow::{bail, Context, Result};
 use busytok_control::ControlClient;
 use busytok_protocol::dto::{
-    ModelCatalogEntryDto, ModelListRequestDto, ModelListResponseDto, SubagentDelegateRequestDto,
-    SubagentDeleteRequestDto, SubagentListRequestDto, SubagentResolveRequestDto,
-    SubagentTaskGetRequestDto, SubagentTasksRequestDto,
+    ModelCatalogEntryDto, ModelListRequestDto, ModelListResponseDto, ProviderDto,
+    ProviderListResponseDto, SubagentDelegateRequestDto, SubagentDeleteRequestDto,
+    SubagentListRequestDto, SubagentResolveRequestDto, SubagentTaskGetRequestDto,
+    SubagentTasksRequestDto,
 };
 use busytok_protocol::{ControlRequest, ControlResponse};
 
@@ -30,6 +31,7 @@ pub async fn handle_delegate(
     prompt: String,
     bind_provider: Option<String>,
     bind_model: Option<String>,
+    wait: bool,
 ) -> Result<()> {
     // Phase 1: pure shape validation that needs no RPC. Do this BEFORE
     // `connect()` so obvious CLI misuse (e.g. `--bind-provider` without
@@ -82,7 +84,57 @@ pub async fn handle_delegate(
         .await
         .context("subagent.delegate RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_delegate(&data, &output)
+
+    // --wait: poll `subagent.task_get` until the task reaches a terminal
+    // state (completed/failed/cancelled), then print the full task detail.
+    // Without --wait, the initial delegate response (possibly `queued`)
+    // is printed immediately. The --wait path uses `print_task_detail`
+    // (not `print_delegate`) because `subagent.task_get` returns a
+    // `SubagentTaskDetailDto` (fields: `id`, `result_summary`,
+    // `subagent_name: Option`), not a `SubagentDelegateResponseDto`
+    // (fields: `task_id`, `summary`, `subagent_name: String`). Using the
+    // wrong printer would render `task: ?` and `(no summary)` and emit a
+    // different JSON schema than `subagent task --task-id` — inconsistent
+    // for programmatic callers like Codex.
+    if wait {
+        let task_id = data
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .context("delegate response missing task_id for --wait")?
+            .to_string();
+        let final_data = wait_for_task(&mut client, &task_id).await?;
+        print_task_detail(&final_data, &output)
+    } else {
+        print_delegate(&data, &output)
+    }
+}
+
+/// Poll `subagent.task_get` every 2s until the task reaches a terminal
+/// state (`completed`, `failed`, or `cancelled`). Returns the final task
+/// detail DTO as a `serde_json::Value` (shaped like a delegate response for
+/// printing). All three are terminal per `set_task_status` (which stamps
+/// `completed_at_ms` for each); omitting `cancelled` would spin forever
+/// if a task is ever cancelled.
+async fn wait_for_task(client: &mut ControlClient, task_id: &str) -> Result<serde_json::Value> {
+    let poll_interval = std::time::Duration::from_secs(2);
+    loop {
+        let req = SubagentTaskGetRequestDto {
+            task_id: task_id.to_string(),
+        };
+        let resp = client
+            .call(ControlRequest::new(
+                "subagent.task_get",
+                serde_json::to_value(&req)?,
+            ))
+            .await
+            .with_context(|| format!("subagent.task_get RPC failed for {task_id}"))?;
+        let data = unwrap_ok(resp)?;
+        let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "completed" || status == "failed" || status == "cancelled" {
+            return Ok(data);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 pub async fn handle_list(
@@ -233,6 +285,11 @@ fn unwrap_ok(resp: ControlResponse) -> Result<serde_json::Value> {
 /// - Ok(Some((provider, model))) when the bound fields are fully resolved
 /// - Ok(None) for the valid reuse-path passthrough case `(None, None)`
 /// - Err(...) for asymmetric or ambiguous input
+///
+/// `--bind-provider` accepts either a UUID (passed through directly) or a
+/// provider name (resolved to UUID via `provider.list`). This lets Codex /
+/// Claude Code use the human-friendly name from `provider list` instead of
+/// parsing the UUID from `models --json`.
 async fn resolve_bound_fields(
     client: &mut ControlClient,
     bind_provider: Option<String>,
@@ -240,8 +297,13 @@ async fn resolve_bound_fields(
 ) -> Result<Option<(String, String)>> {
     match (bind_provider, bind_model) {
         (Some(p), Some(m)) => {
-            // Both given — pass through directly.
-            Ok(Some((p, m)))
+            // If it's a valid UUID, pass through directly (no RPC).
+            if uuid::Uuid::parse_str(&p).is_ok() {
+                return Ok(Some((p, m)));
+            }
+            // Not a UUID — resolve by provider name via `provider.list`.
+            let pid = resolve_provider_by_name(client, &p).await?;
+            Ok(Some((pid, m)))
         }
         (None, None) => {
             // Important: do NOT reject this case in the CLI. It is valid for
@@ -296,6 +358,47 @@ async fn resolve_bound_fields(
                     )
                 }
             }
+        }
+    }
+}
+
+/// Resolve a provider name to its UUID via the `provider.list` RPC.
+/// Only enabled providers are considered (disabled providers cannot be
+/// bound, per spec). Returns an error if the name is not found or if
+/// multiple enabled providers share the same name.
+async fn resolve_provider_by_name(client: &mut ControlClient, name: &str) -> Result<String> {
+    let resp = client
+        .call(ControlRequest::new(
+            "provider.list",
+            serde_json::Value::Null,
+        ))
+        .await?;
+    let value = unwrap_ok(resp)?;
+    let providers: Vec<ProviderDto> =
+        serde_json::from_value::<ProviderListResponseDto>(value)?.providers;
+    let matches: Vec<_> = providers
+        .iter()
+        .filter(|p| p.enabled && p.name == name)
+        .collect();
+    match matches.len() {
+        0 => anyhow::bail!(
+            "provider '{}' not found (or disabled). Run `busytok provider list` to see available providers.",
+            name
+        ),
+        1 => {
+            let pid = matches[0].id.clone();
+            eprintln!("  (resolved provider '{name}' → {pid})");
+            Ok(pid)
+        }
+        _ => {
+            let ids: Vec<_> = matches.iter().map(|p| p.id.as_str()).collect();
+            anyhow::bail!(
+                "provider name '{}' is ambiguous (matched {} providers: {:?}).\n\
+                 Use --bind-provider <UUID> to disambiguate.",
+                name,
+                matches.len(),
+                ids
+            )
         }
     }
 }
@@ -790,7 +893,8 @@ mod tests {
     use async_trait::async_trait;
     use busytok_control::{dispatch::RuntimeControl, server::ControlServer, TestRuntimeControl};
     use serial_test::serial;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Hold a running `ControlServer` for the lifetime of the test.
@@ -837,11 +941,25 @@ mod tests {
         /// `resolve_bound_fields` auto-resolution tests). When `None`,
         /// `model_list` delegates to the inner runtime.
         model_list_response: Option<ModelListResponseDto>,
+        /// Optional canned response for `provider_list` (used by
+        /// `resolve_bound_fields` name-lookup tests). When `None`,
+        /// `provider_list` delegates to the inner runtime. Behind a
+        /// `Mutex` so tests can stage it after the server is spawned.
+        provider_list_response: Mutex<Option<ProviderListResponseDto>>,
         /// Captures the most recent `SubagentDelegateRequestDto` received by
         /// `subagent_delegate`, so tests can assert the outgoing DTO carries
         /// the expected bound fields. Wrapped in `Mutex` because the trait
         /// method takes `&self` (not `&mut self`).
         last_delegate_request: Mutex<Option<SubagentDelegateRequestDto>>,
+        /// When non-empty, `subagent_task_get` pops the next status from the
+        /// front and returns a `SubagentTaskDetailDto` with that status. When
+        /// empty, falls through to the inner runtime. Used to test the
+        /// `--wait` polling path without a real task lifecycle.
+        task_get_status_sequence: Mutex<VecDeque<String>>,
+        /// Counts `subagent_task_get` calls so tests can assert the `--wait`
+        /// path polled the expected number of times (and that the no-wait
+        /// path did not poll at all).
+        task_get_call_count: AtomicUsize,
     }
 
     impl SubagentRuntime {
@@ -888,7 +1006,10 @@ mod tests {
                 delete_should_fail: AtomicBool::new(false),
                 task_get_should_fail: AtomicBool::new(false),
                 model_list_response: None,
+                provider_list_response: Mutex::new(None),
                 last_delegate_request: Mutex::new(None),
+                task_get_status_sequence: Mutex::new(VecDeque::new()),
+                task_get_call_count: AtomicUsize::new(0),
             }
         }
     }
@@ -1101,13 +1222,33 @@ mod tests {
                     ),
                 ));
             }
+            self.task_get_call_count.fetch_add(1, Ordering::SeqCst);
+            // When a status sequence is staged, pop the next status and
+            // return a synthetic DTO. When empty, fall through to the
+            // inner runtime (preserves existing task_get tests).
+            let staged = { self.task_get_status_sequence.lock().unwrap().pop_front() };
+            if let Some(status) = staged {
+                return Ok(SubagentTaskDetailDto {
+                    id: req.task_id.clone(),
+                    subagent_id: "sa-1".to_string(),
+                    subagent_name: Some("dev-subagent".to_string()),
+                    profile: "default".to_string(),
+                    status,
+                    ..Default::default()
+                });
+            }
             self.inner.subagent_task_get(req).await
         }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
         }
         async fn provider_list(&self) -> Result<ProviderListResponseDto> {
-            self.inner.provider_list().await
+            let staged = self.provider_list_response.lock().unwrap().clone();
+            if let Some(resp) = staged {
+                Ok(resp)
+            } else {
+                self.inner.provider_list().await
+            }
         }
         async fn provider_update(&self, req: ProviderUpdateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_update(req).await
@@ -1195,6 +1336,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             None,
+            false,
         )
         .await;
         drop(harness);
@@ -1222,6 +1364,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             None,
+            false,
         )
         .await;
         drop(harness);
@@ -1272,19 +1415,17 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn resolve_bound_fields_some_some_returns_ok_some() {
-        // (Some, Some) passes through directly — no RPC.
+        // (Some, Some) with a valid UUID passes through directly — no RPC.
         let (harness, socket) = spawn_subagent_server().await;
         let mut client = ControlClient::connect(&socket).await.unwrap();
-        let result = resolve_bound_fields(
-            &mut client,
-            Some("prov-1".to_string()),
-            Some("model-1".to_string()),
-        )
-        .await;
+        let uuid = "5e3a4034-0000-0000-0000-000000000000".to_string();
+        let result =
+            resolve_bound_fields(&mut client, Some(uuid.clone()), Some("model-1".to_string()))
+                .await;
         drop(harness);
         assert!(result.is_ok(), "err: {:?}", result.err());
         let (p, m) = result.unwrap().unwrap();
-        assert_eq!(p, "prov-1");
+        assert_eq!(p, uuid);
         assert_eq!(m, "model-1");
     }
 
@@ -1398,12 +1539,12 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn handle_delegate_with_bind_provider_and_bind_model_succeeds() {
-        // (Some, Some) on handle_delegate — the bound fields are passed
-        // straight through to the DTO without any model.list RPC. Verify
-        // the outgoing DTO actually carries them (not just that the call
-        // returns Ok).
+        // (Some, Some) on handle_delegate — a valid UUID provider ID is
+        // passed straight through to the DTO without any provider.list or
+        // model.list RPC. Verify the outgoing DTO carries the UUID as-is.
         let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let provider_uuid = "5e3a4034-0000-0000-0000-000000000000".to_string();
         let result = handle_delegate(
             "dev-subagent".to_string(),
             None,
@@ -1414,8 +1555,9 @@ mod tests {
             None,
             "text".to_string(),
             "do the thing".to_string(),
-            Some("prov-1".to_string()),
+            Some(provider_uuid.clone()),
             Some("model-1".to_string()),
+            false,
         )
         .await;
         assert!(
@@ -1428,7 +1570,7 @@ mod tests {
             "subagent_delegate should have captured the request DTO — \
              if None, the RPC never reached the runtime",
         );
-        assert_eq!(captured.bound_provider_id, Some("prov-1".to_string()));
+        assert_eq!(captured.bound_provider_id, Some(provider_uuid));
         assert_eq!(captured.bound_model_id, Some("model-1".to_string()));
         // model_override is the task-level override (separate from bound fields);
         // passing None must leave it None.
@@ -1455,6 +1597,7 @@ mod tests {
             "do the thing".to_string(),
             None,
             None,
+            false,
         )
         .await;
         assert!(
@@ -1490,6 +1633,7 @@ mod tests {
             "do the thing".to_string(),
             Some("prov-1".to_string()),
             None,
+            false,
         )
         .await;
         drop(harness);
@@ -1519,12 +1663,461 @@ mod tests {
             "do the thing".to_string(),
             Some("prov-1".to_string()),
             None,
+            false,
         )
         .await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("--bind-model is required"),
             "expected asymmetric bind error BEFORE connect, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_wait_polls_until_completed() {
+        // --wait: stage a status sequence [queued, completed]. The first
+        // task_get returns "queued" (non-terminal → sleep → poll again),
+        // the second returns "completed" (terminal → return). Asserts the
+        // handler returns Ok and that task_get was polled exactly twice.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("queued".to_string());
+            seq.push_back("completed".to_string());
+        }
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "json".to_string(),
+            "do the thing".to_string(),
+            None,
+            None,
+            true,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate --wait (completed): {:?}",
+            result.err()
+        );
+        let calls = runtime.task_get_call_count.load(Ordering::SeqCst);
+        assert_eq!(
+            calls, 2,
+            "expected 2 task_get polls (queued → completed), got {calls}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_wait_polls_until_failed() {
+        // --wait: stage [running, failed]. The first poll returns "running"
+        // (non-terminal → sleep → poll again), the second returns "failed"
+        // (terminal → return). The handler returns Ok (it surfaces the
+        // failed status, not an error).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("running".to_string());
+            seq.push_back("failed".to_string());
+        }
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "json".to_string(),
+            "do the thing".to_string(),
+            None,
+            None,
+            true,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate --wait (failed): {:?}",
+            result.err()
+        );
+        let calls = runtime.task_get_call_count.load(Ordering::SeqCst);
+        assert_eq!(
+            calls, 2,
+            "expected 2 task_get polls (running → failed), got {calls}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_wait_polls_until_cancelled() {
+        // --wait: stage [running, cancelled]. `cancelled` is a terminal
+        // status (set_task_status stamps completed_at_ms for it). The loop
+        // must detect it and return — not spin forever.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("running".to_string());
+            seq.push_back("cancelled".to_string());
+        }
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "json".to_string(),
+            "do the thing".to_string(),
+            None,
+            None,
+            true,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate --wait (cancelled): {:?}",
+            result.err()
+        );
+        let calls = runtime.task_get_call_count.load(Ordering::SeqCst);
+        assert_eq!(
+            calls, 2,
+            "expected 2 task_get polls (running → cancelled), got {calls}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_without_wait_does_not_poll_task_get() {
+        // Without --wait, the delegate response is printed immediately and
+        // subagent.task_get is never called. Stage a sequence and verify
+        // the call count stays at 0.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("queued".to_string());
+            seq.push_back("completed".to_string());
+        }
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            None,
+            None,
+            false,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate (no wait): {:?}",
+            result.err()
+        );
+        let calls = runtime.task_get_call_count.load(Ordering::SeqCst);
+        assert_eq!(
+            calls, 0,
+            "task_get should not be polled without --wait, got {calls} calls"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn wait_for_task_returns_task_detail_dto_shape() {
+        // Review finding P1: the --wait path must use `print_task_detail`
+        // (which reads `id` / `result_summary`) not `print_delegate` (which
+        // reads `task_id` / `summary`). This test verifies the data shape
+        // returned by `wait_for_task` is a `SubagentTaskDetailDto` (has `id`,
+        // `result_summary`, `subagent_name: Option`) not a delegate response
+        // (has `task_id`, `summary`, `subagent_name: String`). Combined with
+        // the `print_task_detail_text_*` tests, this verifies the full
+        // --wait text output renders `id:` (not `task: ?`) and
+        // `result_summary:` (not `(no summary)`).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("completed".to_string());
+        }
+        let mut client = connect().await.unwrap();
+        let data = wait_for_task(&mut client, "task-xyz").await.unwrap();
+        drop(harness);
+        // Task detail DTO fields:
+        assert_eq!(data.get("id").and_then(|v| v.as_str()), Some("task-xyz"));
+        assert_eq!(
+            data.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+        // `subagent_name` is Option<String> in TaskDetailDto (present but null
+        // when the mock uses Default::default).
+        assert!(data.get("subagent_name").is_some());
+        // Delegate response fields must NOT be present (would indicate wrong DTO):
+        assert!(
+            data.get("task_id").is_none(),
+            "task detail must not contain `task_id` (delegate response field)"
+        );
+        assert!(
+            data.get("summary").is_none(),
+            "task detail must not contain `summary` (delegate response field)"
+        );
+        // `result_summary` is the task detail field (null from Default::default).
+        assert!(data.get("result_summary").is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_name_resolves_to_uuid() {
+        // --bind-provider <name>: resolve the provider name to its UUID via
+        // provider.list, then pass the UUID through to the delegate DTO.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            // Stage a provider list with one enabled provider named "Deepseek".
+            let provider = ProviderDto {
+                id: "5e3a4034-0000-0000-0000-000000000001".to_string(),
+                name: "Deepseek".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.deepseek.com".to_string(),
+                enabled: true,
+                has_api_key: true,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            };
+            *runtime.provider_list_response.lock().unwrap() = Some(ProviderListResponseDto {
+                providers: vec![provider],
+            });
+        }
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("Deepseek".to_string()), // name, not UUID
+            Some("deepseek-v4-pro".to_string()),
+            false,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate with provider name: {:?}",
+            result.err()
+        );
+        let captured = runtime
+            .last_delegate_request
+            .lock()
+            .unwrap()
+            .take()
+            .expect("delegate request should have been captured");
+        assert_eq!(
+            captured.bound_provider_id,
+            Some("5e3a4034-0000-0000-0000-000000000001".to_string()),
+            "provider name should be resolved to UUID in the delegate DTO"
+        );
+        assert_eq!(captured.bound_model_id, Some("deepseek-v4-pro".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_uuid_passes_through_directly() {
+        // --bind-provider <UUID>: a valid UUID is passed through directly
+        // without calling provider.list. Verify the DTO carries the UUID
+        // as-is and that provider_list was never staged (inner returns []).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let uuid = "5e3a4034-0000-0000-0000-000000000002".to_string();
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some(uuid.clone()),
+            Some("deepseek-v4-pro".to_string()),
+            false,
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_delegate with provider UUID: {:?}",
+            result.err()
+        );
+        let captured = runtime
+            .last_delegate_request
+            .lock()
+            .unwrap()
+            .take()
+            .expect("delegate request should have been captured");
+        assert_eq!(
+            captured.bound_provider_id,
+            Some(uuid),
+            "provider UUID should pass through unchanged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_unknown_name_errors() {
+        // --bind-provider <unknown-name>: provider.list returns no match.
+        // The handler should error before any delegate RPC fires.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        *runtime.provider_list_response.lock().unwrap() = Some(ProviderListResponseDto {
+            providers: vec![ProviderDto {
+                id: "5e3a4034-0000-0000-0000-000000000003".to_string(),
+                name: "OpenAI".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com".to_string(),
+                enabled: true,
+                has_api_key: true,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            }],
+        });
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("Nonexistent".to_string()),
+            Some("gpt-5".to_string()),
+            false,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "expected provider-not-found error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_disabled_name_errors() {
+        // --bind-provider <name> matching a disabled provider: should
+        // error (disabled providers cannot be bound per spec).
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        *runtime.provider_list_response.lock().unwrap() = Some(ProviderListResponseDto {
+            providers: vec![ProviderDto {
+                id: "5e3a4034-0000-0000-0000-000000000004".to_string(),
+                name: "Disabled-Prov".to_string(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.example.com".to_string(),
+                enabled: false,
+                has_api_key: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            }],
+        });
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("Disabled-Prov".to_string()),
+            Some("model-x".to_string()),
+            false,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found") || err.contains("disabled"),
+            "expected disabled-provider error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_with_bind_provider_ambiguous_name_errors() {
+        // --bind-provider <name> matching two enabled providers: should
+        // error with an ambiguity message listing both UUIDs.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        *runtime.provider_list_response.lock().unwrap() = Some(ProviderListResponseDto {
+            providers: vec![
+                ProviderDto {
+                    id: "5e3a4034-0000-0000-0000-000000000005".to_string(),
+                    name: "Dup".to_string(),
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    base_url: "https://a.example.com".to_string(),
+                    enabled: true,
+                    has_api_key: true,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+                ProviderDto {
+                    id: "5e3a4034-0000-0000-0000-000000000006".to_string(),
+                    name: "Dup".to_string(),
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    base_url: "https://b.example.com".to_string(),
+                    enabled: true,
+                    has_api_key: true,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            ],
+        });
+        let result = handle_delegate(
+            "dev-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            "do the thing".to_string(),
+            Some("Dup".to_string()),
+            Some("model-x".to_string()),
+            false,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("ambiguous"),
+            "expected ambiguity error, got: {err}"
         );
     }
 

@@ -300,3 +300,28 @@ fn sample_includes_queued_and_running_task_counts() {
     assert_eq!(sample.queued_task_count, 5);
     assert_eq!(sample.running_task_count, 2);
 }
+
+#[test]
+fn sample_system_available_mb_is_nonzero_on_real_host() {
+    // Regression test: sysinfo's available_memory() returns 0 on macOS (known
+    // sysinfo bug — the host_statistics64 computation breaks silently). Without
+    // the total-used fallback in ResourceMonitor::available_bytes(), this test
+    // fails on macOS: system_available_mb == 0, the pressure gate spuriously
+    // triggers, and because the recovery path requires available >= threshold,
+    // the gate never resumes — deadlocking delegate until restart.
+    let policy = busytok_config::SubagentResourcePolicyConfig::default();
+    let mut monitor = ResourceMonitor::new(policy, 800, 1200);
+    let sample = monitor.sample(None, 0, 0, 0);
+    assert!(
+        sample.system_available_mb > 0.0,
+        "system_available_mb must be > 0 on a real host (macOS fallback); got {}",
+        sample.system_available_mb
+    );
+    // memory_used_pct must also use the fallback (not 100%).
+    let pct = monitor.memory_used_pct().expect("pct on real host");
+    assert!(
+        pct < 100,
+        "memory_used_pct must be < 100 on a host with available memory; got {}",
+        pct
+    );
+}

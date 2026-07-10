@@ -31,8 +31,14 @@ fn default_false() -> bool {
 
 /// Atomically write `contents` to `path` via temp-file + rename.
 ///
-/// Shared by `BusytokSettings::save` and the GUI-side local lifecycle
-/// settings store so atomic-write logic doesn't diverge.
+/// If the target file already exists, its permissions are preserved on the
+/// replacement (the temp file is `fchmod`'d to match before rename). This
+/// matters for user-owned files like shell rc files where a user may have
+/// set restrictive permissions (e.g. `chmod 600 ~/.zshrc`).
+///
+/// Shared by `BusytokSettings::save`, the GUI-side local lifecycle settings
+/// store, and the CLI shim PATH setup/teardown so atomic-write logic doesn't
+/// diverge.
 pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
@@ -52,6 +58,29 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 
     std::fs::write(&tmp_path, contents)
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+
+    // Preserve the target file's permissions if it already exists, so the
+    // rename doesn't silently relax them to the umask default.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            if let Err(e) =
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))
+            {
+                // Best-effort: if fchmod fails, clean up and bail rather
+                // than replacing the file with relaxed permissions.
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to set permissions on temp file {}",
+                        tmp_path.display()
+                    )
+                });
+            }
+        }
+    }
 
     if let Err(err) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -902,5 +931,45 @@ timeout_seconds = 120
 
         atomic_write(&path, "new content").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+    }
+
+    /// `atomic_write` preserves the target file's permissions when replacing.
+    /// Without this, a user's `chmod 600 ~/.zshrc` would be silently relaxed
+    /// to the umask default (typically 0644) after an atomic replace.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rc_file");
+        std::fs::write(&path, "old content\n").unwrap();
+
+        // Set restrictive permissions (0600 — owner read/write only).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        atomic_write(&path, "new content\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "permissions should be preserved after atomic_write"
+        );
+    }
+
+    /// `atomic_write` on a non-existent file uses umask defaults (no target
+    /// to copy permissions from).
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_new_file_uses_umask_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("new_file");
+
+        atomic_write(&path, "content").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        // Just verify it's writable by owner (umask typically gives 0644 or 0666).
+        assert!(mode & 0o200 != 0, "new file should be owner-writable");
     }
 }

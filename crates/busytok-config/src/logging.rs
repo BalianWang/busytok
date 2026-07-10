@@ -54,6 +54,18 @@ pub enum LogSource {
     Cli,
 }
 
+/// Return the default `RUST_LOG` filter level for a given source.
+///
+/// CLI defaults to `warn` (quiet — only show warnings/errors, like
+/// `gh`/`docker`/`kubectl`). Service and GUI default to `info`.
+/// `RUST_LOG` env var always takes precedence over this default.
+fn default_log_level(source: LogSource) -> &'static str {
+    match source {
+        LogSource::Cli => "warn",
+        _ => "info",
+    }
+}
+
 /// Holds guards that must outlive the process to keep non-blocking
 /// writers alive. Drop to flush on shutdown.
 pub struct LoggingGuards {
@@ -76,6 +88,9 @@ pub struct LoggingGuards {
 pub fn init_logging(log_dir: &Path, source: LogSource, session_id: &str) -> Option<LoggingGuards> {
     prune_old_logs(log_dir, 7);
 
+    // Registry-level filter: always defaults to `info` so file logging
+    // captures full diagnostics. The terminal layer gets its own per-layer
+    // filter below to quiet CLI stderr.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // CLI: terminal-only by default; enables file layer when
@@ -92,10 +107,18 @@ pub fn init_logging(log_dir: &Path, source: LogSource, session_id: &str) -> Opti
         None
     };
 
-    // Terminal layer (shared by Service and Gui).
+    // Terminal layer (shared by Service, GUI, and CLI+BUSYTOK_LOG_DIR).
+    // CLI gets a per-layer filter defaulting to `warn` so the terminal is
+    // quiet; file logging still gets `info` from the registry-level filter.
+    // `RUST_LOG` overrides both (via `try_from_default_env`).
+    // Service/GUI: no per-layer filter — terminal follows registry default.
     let term_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_target(true);
+        .with_target(true)
+        .with_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_log_level(source))),
+        );
 
     let main_name = match source {
         LogSource::Service => "service.log",
@@ -166,9 +189,14 @@ pub fn init_logging(log_dir: &Path, source: LogSource, session_id: &str) -> Opti
 }
 
 fn init_cli_logging(env_filter: EnvFilter, _session_id: &str) -> Option<LoggingGuards> {
+    // Terminal layer: quiet by default (warn), RUST_LOG overrides.
+    // env_filter (registry) stays at "info" so if BUSYTOK_LOG_DIR is later
+    // enabled, file logging captures full diagnostics. But this path has no
+    // file layer, so the per-layer filter is the effective terminal level.
     let term_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_target(true);
+        .with_target(true)
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")));
 
     match tracing_subscriber::registry()
         .with(env_filter)
@@ -244,5 +272,20 @@ mod tests {
     fn prune_handles_nonexistent_dir() {
         let dir = std::path::Path::new("/nonexistent/prune/test/dir");
         prune_old_logs(dir, 7);
+    }
+
+    #[test]
+    fn default_log_level_cli_is_warn() {
+        assert_eq!(default_log_level(LogSource::Cli), "warn");
+    }
+
+    #[test]
+    fn default_log_level_service_is_info() {
+        assert_eq!(default_log_level(LogSource::Service), "info");
+    }
+
+    #[test]
+    fn default_log_level_gui_is_info() {
+        assert_eq!(default_log_level(LogSource::Gui), "info");
     }
 }

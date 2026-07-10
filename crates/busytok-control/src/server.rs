@@ -15,8 +15,41 @@ use busytok_protocol::dto::*;
 use tokio::sync::watch;
 use tracing::{debug, error, info, Instrument};
 
-/// Default per-request dispatch timeout (30 s).
+/// Default per-request dispatch timeout (30 s) for fast RPCs.
 const REQUEST_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Buffer added on top of `subagent.delegate`'s `timeout_seconds` to cover
+/// non-sidecar overhead (context build, memory snapshot, DB writes).
+const DELEGATE_TIMEOUT_BUFFER: Duration = Duration::from_secs(60);
+
+/// Default dispatch timeout for `subagent.delegate` when the request carries
+/// no `timeout_seconds` (the task uses the profile default, typically 120 s).
+/// 30 min covers any reasonable sidecar task while bounding runaway hangs.
+const DELEGATE_DISPATCH_DEFAULT: Duration = Duration::from_secs(1800);
+
+/// Compute the dispatch timeout for a request.
+///
+/// Fast RPCs use the fixed `REQUEST_DISPATCH_TIMEOUT` (30 s).  `subagent.delegate`
+/// is synchronous — it waits for sidecar completion — so its dispatch timeout must
+/// cover the sidecar execution window, otherwise the 30 s ceiling truncates
+/// long-running tasks before they finish (returning `dispatch_timeout` to the
+/// CLI while the sidecar keeps running orphaned).  We derive the timeout from the
+/// request's `timeout_seconds` + buffer, falling back to a large default.  This
+/// removes the fixed 30 s ceiling on delegate while keeping a backstop so a
+/// runaway task cannot hang the connection forever.
+fn dispatch_timeout_for(request: &ControlRequest) -> Duration {
+    if request.method == "subagent.delegate" {
+        let task_timeout = request
+            .params
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_secs)
+            .unwrap_or(DELEGATE_DISPATCH_DEFAULT);
+        task_timeout + DELEGATE_TIMEOUT_BUFFER
+    } else {
+        REQUEST_DISPATCH_TIMEOUT
+    }
+}
 
 use crate::dispatch::{control_response_from_error, ControlDispatcher, RuntimeControl};
 use crate::protocol::{read_frame, write_frame, HELLO, HELLO_ACK};
@@ -403,8 +436,9 @@ where
         );
 
         let started = Instant::now();
+        let dispatch_timeout = dispatch_timeout_for(&request);
         let response = tokio::time::timeout(
-            REQUEST_DISPATCH_TIMEOUT,
+            dispatch_timeout,
             dispatcher.dispatch(request).instrument(dispatch_span),
         )
         .await
@@ -426,6 +460,7 @@ where
             session_id = %session_id,
             correlation_id = %correlation_id,
             elapsed_ms,
+            dispatch_timeout_ms = dispatch_timeout.as_millis() as u64,
             status,
             error_code,
             payload_bytes = response_json.len(),
@@ -506,5 +541,97 @@ fn event_payload_json(event: &AppEvent) -> serde_json::Value {
             })
         }
         other => serde_json::to_value(other).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn req(method: &str, params: serde_json::Value) -> ControlRequest {
+        ControlRequest::new(method, params)
+    }
+
+    #[test]
+    fn fast_rpc_uses_30s_default() {
+        // Non-delegate methods must keep the 30s ceiling.
+        let r = req("service.health", serde_json::json!({}));
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(30));
+
+        let r = req("subagent.list", serde_json::json!({}));
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(30));
+
+        let r = req("subagent.tasks", serde_json::json!({}));
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn delegate_without_timeout_uses_large_default_plus_buffer() {
+        // No `timeout_seconds` → default (1800s) + buffer (60s) = 1860s.
+        let r = req(
+            "subagent.delegate",
+            serde_json::json!({"subagent_name": "dev", "prompt": "do it"}),
+        );
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(1860));
+    }
+
+    #[test]
+    fn delegate_with_timeout_uses_request_timeout_plus_buffer() {
+        // timeout_seconds=600 → 600s + 60s buffer = 660s.
+        let r = req(
+            "subagent.delegate",
+            serde_json::json!({"subagent_name": "dev", "prompt": "do it", "timeout_seconds": 600}),
+        );
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(660));
+    }
+
+    #[test]
+    fn delegate_with_zero_timeout_gives_60s_floor() {
+        // timeout_seconds=0 is falsy-ish but as_u64 returns Some(0), so
+        // dispatch timeout = 0 + 60s = 60s. This is still > 30s and a
+        // reasonable floor for a synchronous delegate.
+        let r = req(
+            "subagent.delegate",
+            serde_json::json!({"subagent_name": "dev", "prompt": "do it", "timeout_seconds": 0}),
+        );
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn delegate_exceeds_old_30s_ceiling() {
+        // Regression: before this fix, delegate was capped at 30s and
+        // long-running tasks returned `dispatch_timeout` to the CLI.
+        // Verify the new timeout is strictly greater than the old ceiling.
+        let r = req(
+            "subagent.delegate",
+            serde_json::json!({"subagent_name": "dev", "prompt": "do it"}),
+        );
+        assert!(
+            dispatch_timeout_for(&r) > Duration::from_secs(30),
+            "delegate dispatch timeout must exceed the old 30s ceiling"
+        );
+    }
+
+    #[test]
+    fn delegate_with_null_timeout_falls_back_to_default() {
+        // `timeout_seconds: null` → as_u64 returns None → default.
+        let r = req(
+            "subagent.delegate",
+            serde_json::json!({"subagent_name": "dev", "prompt": "do it", "timeout_seconds": null}),
+        );
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(1860));
+    }
+
+    #[test]
+    fn delegate_with_string_timeout_ignores_it() {
+        // If timeout_seconds is a string (malformed), as_u64 returns None → default.
+        // We do not attempt to coerce — the DTO deserialize in dispatch.rs
+        // will reject the request anyway.
+        let r = req(
+            "subagent.delegate",
+            serde_json::json!({"subagent_name": "dev", "prompt": "do it", "timeout_seconds": "120"}),
+        );
+        assert_eq!(dispatch_timeout_for(&r), Duration::from_secs(1860));
     }
 }

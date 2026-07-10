@@ -2399,3 +2399,94 @@ async fn hard_delete_by_name_without_cwd_returns_invalid_argument() {
         "expected 'cwd is required' in error, got: {msg}"
     );
 }
+
+// --- P1 fix: u64→i64 timeout truncation rejection --------------------------
+
+/// `delegate()` must reject `timeout_seconds` values that exceed `i64::MAX`.
+/// Without this check, `as i64` truncation wraps the value to negative,
+/// corrupting the reaper SQL cutoff and causing healthy tasks to be reaped.
+/// Verifies the exact value from the review finding: `9223372036854775808`
+/// (= 2^63 = i64::MAX + 1) wraps to `i64::MIN` under `as i64`.
+#[tokio::test]
+async fn delegate_rejects_oversized_timeout_exceeding_i64_max() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let err = m
+        .delegate(DelegateRequest {
+            timeout_seconds: Some(9_223_372_036_854_775_808u64), // 2^63
+            ..req("oversized", "do")
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SubagentError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("exceeds i64::MAX"),
+        "expected 'exceeds i64::MAX' in error, got: {msg}"
+    );
+}
+
+/// `delegate()` must reject `timeout_seconds` values that fit in `i64` but
+/// would overflow the reaper's `timeout_seconds * 1000 + REAPER_BUFFER_MS`
+/// SQL arithmetic. `i64::MAX` itself is the worst case: `i64::MAX * 1000`
+/// overflows `i64`.
+#[tokio::test]
+async fn delegate_rejects_timeout_that_overflows_reaper_arithmetic() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let err = m
+        .delegate(DelegateRequest {
+            timeout_seconds: Some(i64::MAX as u64), // fits i64 but * 1000 overflows
+            ..req("overflow", "do")
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SubagentError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("overflow"),
+        "expected 'overflow' in error, got: {msg}"
+    );
+}
+
+/// `delegate()` must accept the boundary value: the largest `timeout_seconds`
+/// where `timeout * 1000 + REAPER_BUFFER_MS` does NOT overflow `i64`. This is
+/// `(i64::MAX - 60_000) / 1000` seconds. The task should be created and
+/// complete successfully.
+#[tokio::test]
+async fn delegate_accepts_boundary_timeout_at_max_safe_value() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // (i64::MAX - 60_000) / 1000 — the exact boundary.
+    let boundary = ((i64::MAX - 60_000i64) / 1000i64) as u64;
+    let result = m
+        .delegate(DelegateRequest {
+            timeout_seconds: Some(boundary),
+            ..req("boundary", "do")
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.status, TaskStatus::Completed);
+}
+
+/// `delegate()` must accept a normal, realistic timeout (e.g. 600s). This is
+/// a sanity check that the validation doesn't over-reject legitimate values.
+#[tokio::test]
+async fn delegate_accepts_normal_timeout() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    let result = m
+        .delegate(DelegateRequest {
+            timeout_seconds: Some(600),
+            ..req("normal-timeout", "do")
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.status, TaskStatus::Completed);
+}

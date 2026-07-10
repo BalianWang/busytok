@@ -22,6 +22,57 @@ use crate::resolver::{resolve_by_id, resolve_by_name, row_to_model, Resolved};
 
 type SharedDb = Arc<Mutex<busytok_store::Database>>;
 
+/// Buffer (ms) added to the per-task timeout when computing the reaper
+/// cutoff: `COALESCE(timeout_seconds, default) * 1000 + REAPER_BUFFER_MS`.
+/// Covers non-sidecar overhead (context build, DB writes) so legitimate
+/// in-flight tasks are never reaped. Must match the buffer bound in the
+/// reaper SQL (`subagent_queries::reap_orphaned_running_tasks`).
+const REAPER_BUFFER_MS: i64 = 60_000;
+
+/// Maximum `timeout_seconds` value that will NOT overflow the reaper's
+/// `timeout_seconds * 1000 + REAPER_BUFFER_MS` arithmetic in SQLite's
+/// 64-bit integer domain. Values above this are rejected at delegate time
+/// and capped at the reaper fallback path.
+const MAX_SAFE_TIMEOUT_SECONDS: i64 = (i64::MAX - REAPER_BUFFER_MS) / 1000;
+
+/// Convert a delegate-request `timeout_seconds` override (`u64` from
+/// CLI/DTO) to the `i64` representation stored in
+/// `subagent_tasks.timeout_seconds`.
+///
+/// Rejects values that exceed `i64::MAX` or would overflow the reaper's
+/// `timeout_seconds * 1000 + REAPER_BUFFER_MS` cutoff arithmetic. This
+/// prevents `as i64` truncation from wrapping oversized `u64` values
+/// (e.g. `--timeout 9223372036854775808` → `i64::MIN`) to negative, which
+/// would make the reaper SQL
+/// `started_at_ms < (?1 - (COALESCE(timeout_seconds, ?2) * 1000 + ?3))`
+/// evaluate true for healthy tasks, immediately reaping them.
+fn validate_timeout_seconds(timeout: u64) -> Result<i64> {
+    let secs = i64::try_from(timeout).map_err(|_| {
+        SubagentError::InvalidArgument(format!(
+            "timeout_seconds {timeout} exceeds i64::MAX ({}); use a smaller value",
+            i64::MAX
+        ))
+    })?;
+    secs.checked_mul(1000)
+        .and_then(|v| v.checked_add(REAPER_BUFFER_MS))
+        .ok_or_else(|| {
+            SubagentError::InvalidArgument(format!(
+                "timeout_seconds {timeout} would overflow the reaper cutoff arithmetic \
+                 (timeout * 1000 + {REAPER_BUFFER_MS}); use a value <= {MAX_SAFE_TIMEOUT_SECONDS}"
+            ))
+        })?;
+    Ok(secs)
+}
+
+/// Convert a config-sourced `timeout_seconds` (`u64`) to `i64` for the
+/// reaper SQL parameter. Caps to `MAX_SAFE_TIMEOUT_SECONDS` if the value
+/// would overflow, ensuring the reaper never crashes on bad config.
+/// Config values are trusted but defensively capped — a huge config
+/// value would otherwise overflow the SQL `* 1000` arithmetic.
+fn cap_timeout_for_reaper(timeout: u64) -> i64 {
+    validate_timeout_seconds(timeout).unwrap_or(MAX_SAFE_TIMEOUT_SECONDS)
+}
+
 pub struct SubagentManager {
     db: SharedDb,
     settings: SubagentSettings,
@@ -184,6 +235,15 @@ impl SubagentManager {
             }
         };
 
+        // Validate timeout_seconds BEFORE any DB write: `as i64` truncation of
+        // oversized u64 values (e.g. `--timeout 9223372036854775808`) would
+        // wrap to negative, corrupting the reaper SQL cutoff and causing
+        // healthy tasks to be reaped. Reject early with InvalidArgument.
+        let timeout_seconds = req
+            .timeout_seconds
+            .map(validate_timeout_seconds)
+            .transpose()?;
+
         // 1. resolve subagent (create if needed). `resolve_by_name` canonicalizes
         //    cwd and validates the name; errors propagate with a reject log.
         let Resolved { subagent, created } = {
@@ -261,7 +321,7 @@ impl SubagentManager {
                 completed_at_ms: None,
                 // Task 7 Round 3 Finding 1 fix: persist execution params so the
                 // dispatcher reads them from the row (single source of truth).
-                timeout_seconds: req.timeout_seconds.map(|t| t as i64),
+                timeout_seconds,
                 model_override: req.model_override.clone(),
                 error_kind: None,
             })
@@ -334,7 +394,7 @@ impl SubagentManager {
             created_at_ms: now,
             started_at_ms: Some(now),
             completed_at_ms: None,
-            timeout_seconds: req.timeout_seconds.map(|t| t as i64),
+            timeout_seconds,
             model_override: req.model_override.clone(),
             error_kind: None,
         };
@@ -736,6 +796,60 @@ impl SubagentManager {
         })
     }
 
+    /// Reap orphaned `running` tasks: mark as `failed` any task whose
+    /// `started_at_ms` is older than `max_profile_timeout + buffer`.
+    ///
+    /// Runs on the dispatcher's 30s reaper cadence. Recovers from
+    /// `dispatch_timeout` orphans (control-server timeout drops the
+    /// `execute_task` future without persisting `status='failed'`),
+    /// panics, and crashes — any `running` row whose age exceeds the
+    /// ceiling is flipped to `failed` with `error='ORPHANED_REAPED'`.
+    /// This unblocks `pick_oldest_queued_task` (which excludes
+    /// subagents with a running task) so queued delegates proceed.
+    fn reap_orphaned_tasks(&self) {
+        // default_timeout = max(profile timeouts, pi_sidecar.task_timeout).
+        // Used as the fallback when a task row has no `timeout_seconds`
+        // (NULL). Per-task timeout overrides are honored in SQL via
+        // COALESCE(timeout_seconds, default_timeout_seconds).
+        let max_profile = self
+            .settings
+            .profiles
+            .values()
+            .map(|p| p.timeout_seconds)
+            .max()
+            .unwrap_or(300);
+        let sidecar_timeout = self.settings.pi_sidecar.task_timeout_seconds;
+        let default_timeout = max_profile.max(sidecar_timeout);
+        let buffer_ms = REAPER_BUFFER_MS;
+        let now_ms = busytok_domain::now_ms();
+        let reaped = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_reap_orphaned_running_tasks(
+                now_ms,
+                cap_timeout_for_reaper(default_timeout),
+                buffer_ms,
+            )
+            .unwrap_or_else(|e| {
+                warn!(
+                    event_code = "subagent.reaper.failed",
+                    error = %e,
+                    "reaper scan failed"
+                );
+                Vec::new()
+            })
+        };
+        if !reaped.is_empty() {
+            warn!(
+                event_code = "subagent.reaper.reaped",
+                count = reaped.len(),
+                task_ids = ?reaped,
+                default_timeout_seconds = default_timeout,
+                buffer_ms,
+                "reaped orphaned running tasks (likely dispatch_timeout orphans)"
+            );
+        }
+    }
+
     /// Spawn the background task dispatcher (§8.3 step 2 "queue only").
     /// Polls for queued tasks every 200ms; when the gate is not paused,
     /// picks the oldest queued task and executes it. Terminates when
@@ -752,9 +866,18 @@ impl SubagentManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            // Reaper runs on its own slower cadence (every 30s) — orphan
+            // detection doesn't need 200ms latency, and the scan touches
+            // every `running` row.
+            let mut reaper_ticker = tokio::time::interval(Duration::from_secs(30));
+            reaper_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {},
+                    _ = reaper_ticker.tick() => {
+                        manager.reap_orphaned_tasks();
+                        continue;
+                    }
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             info!(
@@ -1322,6 +1445,56 @@ mod tests {
         let summary = task_row_to_summary(row);
         assert_eq!(summary.status, TaskStatus::Completed);
         assert_eq!(summary.result_summary.as_deref(), Some("done"));
+    }
+
+    // --- P1 fix: u64→i64 timeout truncation unit tests ---
+
+    #[test]
+    fn validate_timeout_seconds_rejects_value_exceeding_i64_max() {
+        let err = validate_timeout_seconds(9_223_372_036_854_775_808u64).unwrap_err();
+        assert!(matches!(err, SubagentError::InvalidArgument(_)));
+        assert!(format!("{err}").contains("exceeds i64::MAX"));
+    }
+
+    #[test]
+    fn validate_timeout_seconds_rejects_value_that_overflows_reaper_arithmetic() {
+        // i64::MAX fits in i64 but i64::MAX * 1000 overflows.
+        let err = validate_timeout_seconds(i64::MAX as u64).unwrap_err();
+        assert!(matches!(err, SubagentError::InvalidArgument(_)));
+        assert!(format!("{err}").contains("overflow"));
+    }
+
+    #[test]
+    fn validate_timeout_seconds_accepts_boundary_value() {
+        let boundary = (i64::MAX - REAPER_BUFFER_MS) / 1000;
+        assert_eq!(validate_timeout_seconds(boundary as u64).unwrap(), boundary);
+    }
+
+    #[test]
+    fn validate_timeout_seconds_accepts_normal_values() {
+        assert_eq!(validate_timeout_seconds(0).unwrap(), 0);
+        assert_eq!(validate_timeout_seconds(300).unwrap(), 300);
+        assert_eq!(validate_timeout_seconds(86400).unwrap(), 86400);
+    }
+
+    #[test]
+    fn cap_timeout_for_reaper_caps_oversized_config() {
+        // Value > i64::MAX → capped to MAX_SAFE_TIMEOUT_SECONDS.
+        assert_eq!(
+            cap_timeout_for_reaper(9_223_372_036_854_775_808u64),
+            MAX_SAFE_TIMEOUT_SECONDS
+        );
+        // i64::MAX (fits i64 but overflows * 1000) → capped.
+        assert_eq!(
+            cap_timeout_for_reaper(i64::MAX as u64),
+            MAX_SAFE_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn cap_timeout_for_reaper_passes_through_normal_config() {
+        assert_eq!(cap_timeout_for_reaper(300), 300);
+        assert_eq!(cap_timeout_for_reaper(0), 0);
     }
 
     /// Install a thread-local tracing subscriber so the `warn!` arguments in

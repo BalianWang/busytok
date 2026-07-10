@@ -164,7 +164,7 @@ impl ResourceMonitor {
             })
             .unwrap_or((None, None));
 
-        let system_available_mb = bytes_to_mb(self.system.available_memory());
+        let system_available_mb = bytes_to_mb(self.available_bytes());
 
         ResourceSample {
             service_rss_mb,
@@ -175,6 +175,28 @@ impl ResourceMonitor {
             queued_task_count,
             running_task_count,
         }
+    }
+
+    /// System available memory in bytes, with a macOS fallback.
+    ///
+    /// sysinfo's `available_memory()` returns 0 on some macOS versions (the
+    /// computation via `host_statistics64` breaks silently). Without a
+    /// fallback, the pressure gate spuriously triggers and — because the
+    /// recovery path requires `available >= threshold` — never resumes,
+    /// deadlocking `delegate` until the service is restarted.
+    ///
+    /// When `available_memory()` is 0 but `total_memory()` / `used_memory()`
+    /// are valid, fall back to `total - used` (≈ free + inactive + speculative,
+    /// the same categories `available` is meant to compute). Both are reliable
+    /// on macOS where `available` is not.
+    fn available_bytes(&self) -> u64 {
+        let available = self.system.available_memory();
+        if available > 0 {
+            return available;
+        }
+        self.system
+            .total_memory()
+            .saturating_sub(self.system.used_memory())
     }
 
     /// The configured sampling interval (spec §8.2). Read by the supervision
@@ -220,13 +242,14 @@ impl ResourceMonitor {
     /// tick): `used_pct = 100 - (available / total * 100)`. Returns `None`
     /// only if `total_memory() == 0` (shouldn't happen on a real host).
     /// Clamped to `[0, 100]` to guard against sysinfo reporting
-    /// `available > total` (swap pressure edge case).
+    /// `available > total` (swap pressure edge case). Uses `available_bytes()`
+    /// (with the macOS fallback) so the UI doesn't show 100% on macOS.
     pub fn memory_used_pct(&self) -> Option<u32> {
         let total = bytes_to_mb(self.system.total_memory());
         if total <= 0.0 {
             return None;
         }
-        let available_mb = bytes_to_mb(self.system.available_memory());
+        let available_mb = bytes_to_mb(self.available_bytes());
         let pct = 100.0 - (available_mb / total * 100.0);
         let pct = pct.clamp(0.0, 100.0);
         Some(pct.round() as u32)

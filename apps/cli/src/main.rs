@@ -21,6 +21,11 @@ struct Args {
     /// Write structured JSON logs to this directory (overrides BUSYTOK_LOG_DIR).
     #[arg(long, env = "BUSYTOK_LOG_DIR")]
     log_dir: Option<std::path::PathBuf>,
+
+    /// Enable verbose logging (info level). Useful for debugging.
+    /// Without this flag, the CLI is quiet by default (warn level).
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -103,6 +108,11 @@ enum Command {
         /// Model ID to bind a new subagent to (required with --bind-provider for new subagents)
         #[arg(long)]
         bind_model: Option<String>,
+        /// Wait for the task to reach a terminal state (completed/failed)
+        /// before returning. Polls `subagent.task_get` every 2s. Without
+        /// this flag, a `queued` result is printed immediately.
+        #[arg(long)]
+        wait: bool,
         /// The task prompt (positional)
         prompt: String,
     },
@@ -513,6 +523,12 @@ async fn main() {
     if let Some(dir) = &args.log_dir {
         std::env::set_var("BUSYTOK_LOG_DIR", dir);
     }
+    // --verbose restores the info-level terminal output that was the
+    // pre-quiet default. Only set if RUST_LOG isn't already set so we
+    // don't clobber a more specific user configuration.
+    if args.verbose && std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
     let _guards = init_logging(&paths.log_dir(), LogSource::Cli, &session_id);
 
     let _root = tracing::info_span!(
@@ -722,6 +738,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             output,
             bind_provider,
             bind_model,
+            wait,
             prompt,
         } => {
             commands_subagent::handle_delegate(
@@ -736,6 +753,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 prompt,
                 bind_provider,
                 bind_model,
+                wait,
             )
             .await
         }
@@ -873,6 +891,7 @@ mod tests {
             output: "text".to_string(),
             bind_provider: None,
             bind_model: None,
+            wait: false,
             prompt: "do thing".to_string(),
         };
         assert_eq!(command_name(&cmd), "delegate");
@@ -954,6 +973,49 @@ mod tests {
                 assert_eq!(bind_model.as_deref(), Some("model-1"));
             }
             other => panic!("expected Delegate with both --model and --bind-*, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_wait_flag() {
+        // --wait is a bool flag: present → true.
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--wait",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { wait, .. }) => {
+                assert!(wait, "--wait present → wait should be true");
+            }
+            other => panic!("expected Delegate with --wait, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_without_wait_flag_defaults_false() {
+        // Without --wait, the flag defaults to false.
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { wait, .. }) => {
+                assert!(!wait, "no --wait → wait should default to false");
+            }
+            other => panic!("expected Delegate without --wait, got: {other:?}"),
         }
     }
 
@@ -1123,6 +1185,25 @@ mod tests {
             args.log_dir.as_deref(),
             Some(std::path::Path::new("/tmp/logs"))
         );
+    }
+
+    #[test]
+    fn args_verbose_defaults_to_false() {
+        let args = Args::try_parse_from(["busytok"]).unwrap();
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn args_parses_verbose_short_flag() {
+        let args = Args::try_parse_from(["busytok", "-v", "status"]).unwrap();
+        assert!(args.verbose);
+        assert!(matches!(args.command, Some(Command::Status)));
+    }
+
+    #[test]
+    fn args_parses_verbose_long_flag() {
+        let args = Args::try_parse_from(["busytok", "--verbose", "status"]).unwrap();
+        assert!(args.verbose);
     }
 
     #[test]
