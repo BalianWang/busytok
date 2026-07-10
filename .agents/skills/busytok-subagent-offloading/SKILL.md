@@ -42,9 +42,10 @@ busytok delegate \
   --output json \
   --prompt-file "<PROMPT_FILE>" \
   --wait \
-  --wait-timeout 120 \
-  "Review the scoped patch. Return ranked findings with file, line, impact, and evidence."
+  --wait-timeout 120
 ```
+
+`<PROMPT_FILE>` should contain the full instructions, e.g. "Review the scoped patch. Return ranked findings with file, line, impact, and evidence."
 
 Profiles: `pi/review-cheap` (review), `pi/search-cheap` (search), `pi/plan-cheap` (planning).
 

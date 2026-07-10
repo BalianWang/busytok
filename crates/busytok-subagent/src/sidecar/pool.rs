@@ -434,6 +434,14 @@ impl WorkerPool {
         }
     }
 
+    /// Get an existing worker WITHOUT creating one. Returns `None` if no
+    /// supervisor exists for `provider_id` (used by best-effort cancel —
+    /// we don't want to spawn a sidecar just to cancel a session).
+    pub fn get_worker(&self, provider_id: &str) -> Option<Arc<PiSidecarSupervisor>> {
+        let workers = self.workers.lock().expect("workers map lock poisoned");
+        workers.get(provider_id).cloned()
+    }
+
     /// Look up which provider's supervisor owns a given adapter session
     /// (C7 fix: `evict_session` needs this to route `prepare_hibernate` /
     /// `close` RPCs to the correct supervisor in a multi-provider pool).

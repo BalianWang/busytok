@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use anyhow::Context;
 use busytok_config::{init_logging, BusytokPaths, LogSource};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod commands;
 mod commands_subagent;
@@ -615,6 +615,28 @@ async fn main() {
             "command completed"
         ),
         Err(e) => {
+            // Check for a structured exit-code error (e.g. --wait-timeout
+            // returns 124). Log `cli.complete` with the error so the
+            // tracing guard flushes before exit.
+            if let Some(exit_err) = e
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<commands_subagent::ExitCodeError>())
+            {
+                warn!(
+                    event_code = "cli.complete",
+                    command = cmd_name,
+                    exit_code = exit_err.code,
+                    error = %e,
+                    "command exited with non-standard exit code"
+                );
+                // Flush tracing guard before exit — std::process::exit does
+                // NOT run Drop impls, so the non-blocking file writer's
+                // WorkerGuard must be explicitly dropped to flush pending
+                // log events (including the `cli.complete` warn above).
+                drop(_root);
+                drop(_guards);
+                std::process::exit(exit_err.code);
+            }
             error!(
                 event_code = "cli.complete",
                 command = cmd_name,

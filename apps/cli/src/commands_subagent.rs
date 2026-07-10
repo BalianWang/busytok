@@ -21,7 +21,24 @@ async fn connect() -> Result<ControlClient> {
 
 /// Exit code for `--wait-timeout` expiry. Matches the Unix `timeout` command
 /// convention (124 = command timed out), making it automatable.
-const EXIT_WAIT_TIMED_OUT: i32 = 124;
+pub const EXIT_WAIT_TIMED_OUT: i32 = 124;
+
+/// Error type carrying a process exit code. Used by `--wait-timeout` to
+/// signal timeout to `main()` via the normal `Result` return path, so
+/// `cli.complete` logging and tracing guard flush still happen.
+#[derive(Debug)]
+pub struct ExitCodeError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for ExitCodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (exit {})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for ExitCodeError {}
 
 /// Resolve the prompt from one of four mutually-exclusive sources:
 /// positional `<prompt>`, `--prompt-file <path>`, `--stdin`, or
@@ -193,10 +210,14 @@ pub async fn handle_delegate(
             WaitOutcome::Completed(data) => print_task_detail(&data, &output),
             WaitOutcome::TimedOut(last_data) => {
                 // Print the last-known task state as JSON so callers can
-                // inspect the intermediate status. Then exit with code 124
-                // so automation can detect the timeout.
+                // inspect the intermediate status. Then return an error
+                // carrying exit code 124 so `main()` can log `cli.complete`
+                // and flush the tracing guard before exiting.
                 print_task_detail(&last_data, &output)?;
-                std::process::exit(EXIT_WAIT_TIMED_OUT);
+                return Err(anyhow::Error::new(ExitCodeError {
+                    code: EXIT_WAIT_TIMED_OUT,
+                    message: "wait-timeout expired".to_string(),
+                }));
             }
         }
     } else {
@@ -3776,6 +3797,55 @@ mod tests {
                 panic!("expected WaitOutcome::TimedOut, got Completed");
             }
         }
+    }
+
+    /// Verify that `handle_delegate` returns an `ExitCodeError` with
+    /// code=124 when `--wait-timeout` expires, so `main()` can log
+    /// `cli.complete` and flush the tracing guard before exiting.
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_wait_timeout_returns_exit_code_error_124() {
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        // Stage non-terminal "queued" so the poll never reaches terminal.
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("queued".to_string());
+        }
+        // The runtime's default delegate_response has task_id: "task-xyz".
+
+        let result = handle_delegate(
+            "test-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            Some("do thing".to_string()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            true,    // wait
+            Some(1), // wait_timeout = 1s
+            Some(1), // poll_interval = 1s
+            None,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err();
+        let exit_err = err
+            .downcast_ref::<ExitCodeError>()
+            .expect("expected ExitCodeError on wait-timeout");
+        assert_eq!(exit_err.code, EXIT_WAIT_TIMED_OUT);
+        assert!(
+            exit_err.message.contains("wait-timeout"),
+            "message should mention wait-timeout, got: {}",
+            exit_err.message
+        );
     }
 
     // ── handle_task_cancel ───────────────────────────────────────────

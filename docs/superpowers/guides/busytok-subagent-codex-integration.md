@@ -2,25 +2,30 @@
 
 ## Overview
 
-Busytok exposes a JSON-over-stdout CLI that lets AI coding agents (Codex,
-Claude Code) delegate subtasks to remote LLMs via Busytok subagents. This
-document describes the full programmatic flow: discover available models →
-select one → delegate a task → retrieve the result.
+Busytok exposes a JSON-over-stdout CLI that lets coding agents such as Codex
+and Claude Code offload subtasks to Busytok subagents. The robust automation
+flow is:
 
-**CLI convention:** structured JSON goes to **stdout**; log messages go to
-**stderr**. Always redirect `stderr` to `/dev/null` when parsing JSON output.
+1. Verify the service is ready
+2. Read the live model catalog
+3. Select a model with an explicit policy
+4. Delegate with explicit binding or reuse semantics
+5. Wait, poll, or cancel using task-level state
+
+Structured JSON is written to stdout. Diagnostics are written to stderr.
+Parse stdout only. Do not merge streams with `2>&1`, and do not discard
+stderr by default in automation.
 
 ## Prerequisites
 
-The Busytok desktop app must be installed and running (macOS). Verify:
+The Busytok desktop app must be installed and the service must be running:
 
 ```bash
-busytok status 2>/dev/null
-# {"db_healthy":true,"ready":true,"scan_state":"completed"}
+busytok status
 ```
 
-At least one provider with an API key and at least one model must be
-configured. Use the GUI (Settings → Providers) or the CLI:
+At least one provider with an API key and at least one enabled model must be
+configured. Providers can be added in the GUI or by CLI:
 
 ```bash
 busytok provider add \
@@ -31,16 +36,21 @@ busytok provider add \
   --model "my-model"
 ```
 
-## Step 1 — Discover Available Models
+## Step 1 — Discover the Live Catalog
 
-Get the full model catalog in JSON. Each entry includes the provider UUID
-needed for delegation:
+Read the enabled model catalog in JSON:
 
 ```bash
-busytok models --json 2>/dev/null
+busytok models --json
 ```
 
-Example output:
+For coding-oriented work, a common starting filter is:
+
+```bash
+busytok models --tag Coding --reasoning --sort context_window_desc --json
+```
+
+Example entry:
 
 ```json
 [
@@ -61,258 +71,306 @@ Example output:
 ]
 ```
 
-### Filter by tag
+Fields used for delegation:
 
-Use `--tag` to narrow the list (AND semantics):
+- `provider_id` → `--bind-provider`
+- `model_id` → `--bind-model`
 
-```bash
-busytok models --tag Coding --json 2>/dev/null
-```
+Useful selection inputs:
 
-### Extract the fields needed for delegation
+- `tags`
+- `reasoning`
+- `context_window`
+- `max_tokens`
 
-From each model entry, extract:
-- `provider_id` → `--bind-provider` argument
-- `model_id` → `--bind-model` argument
+Do not assume catalog order means “best”, “latest”, or “recommended”.
+Agents should define their own deterministic selection policy. If no matching
+candidate exists, stop and surface a configuration or routing failure instead
+of blindly selecting `.[0]`.
 
-## Step 2 — Select a Model
+## Step 2 — Select a Model Deliberately
 
-Choose a model based on task requirements. Example heuristics:
+Example heuristics:
 
 | Task type | Prefer |
 |-----------|--------|
-| Coding, code review | `tags` contains "Coding", `reasoning: true` |
-| Writing, summarization | `tags` contains "Writing" |
-| Fast, simple queries | Smaller `context_window`, `reasoning: false` |
-| Complex analysis | Larger `context_window`, `reasoning: true` |
+| Code review, debugging, patch generation | `tags` contains `Coding`, `reasoning = true` |
+| Repo search, lightweight extraction | smaller `max_tokens`, `reasoning = false` acceptable |
+| Deep synthesis across large diffs | larger `context_window`, `reasoning = true` |
+| Writing or summarization | `tags` contains `Writing` |
 
-Pick the first matching model, or implement a scoring function over the JSON.
+Automation should usually pass both `provider_id` and `model_id`, even if
+`--bind-model` alone would currently resolve uniquely.
 
-## Step 3 — Delegate the Task
+## Step 3 — Delegate a Task
 
-Use the `delegate` subcommand with bound provider/model. The `--bind-*`
-flags are required when creating a new subagent.
+### Prompt Channels
+
+Exactly one prompt source must be provided:
+
+- positional prompt
+- `--prompt-file <PATH>`
+- `--stdin`
+- `--artifact-ref <REF>`
+
+For large or untrusted multi-line content, prefer `--prompt-file` or
+`--artifact-ref`.
+
+### New Binding
+
+For a new logical subagent, use a stable role-oriented name and an explicit
+reuse policy:
 
 ```bash
 busytok delegate \
-  --subagent "<NAME>" \
-  --profile "pi/search-cheap" \
-  --bind-provider "<PROVIDER_ID>" \
-  --bind-model "<MODEL_ID>" \
+  --subagent "reviewer-deepseek-v4-pro-001" \
+  --profile "pi/review-cheap" \
+  --bind-provider "5e3a4034-f1fd-4d50-a092-54022adbfa3e" \
+  --bind-model "deepseek-v4-pro" \
+  --reuse-policy create \
   --output json \
-  "<YOUR PROMPT>" 2>/dev/null
+  --prompt-file "/tmp/review-prompt.txt"
 ```
 
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--subagent` | yes | Name for the logical subagent (reused across calls) |
-| `--profile` | yes | `pi/search-cheap` (read-only), `pi/review-cheap`, or `pi/plan-cheap` |
-| `--bind-provider` | for new subagents | Provider UUID from Step 1 |
-| `--bind-model` | for new subagents | Model ID from Step 1 |
-| `--cwd` | no | Working directory (default `.`) |
-| `--timeout` | no | Task timeout in seconds |
-| `--output` | no | `json` or `text` (default `text`) |
+Common profiles:
 
-### Handling the response
+- `pi/review-cheap`
+- `pi/search-cheap`
+- `pi/plan-cheap`
 
-Two possible outcomes:
+Important flags:
 
-**A. Immediate completion:**
+| Flag | Purpose |
+|------|---------|
+| `--subagent` | Logical subagent identity |
+| `--profile` | Workload profile |
+| `--bind-provider` | Provider UUID from catalog |
+| `--bind-model` | Model ID from catalog |
+| `--reuse-policy create|reuse|fail` | Name reuse behavior |
+| `--model` | One-task override; not the same as `--bind-model` |
+| `--timeout` | Task runtime timeout in seconds |
+| `--output json` | Machine-readable output |
 
-```json
-{
-  "status": "completed",
-  "task_id": "task_xxx",
-  "subagent_id": "xxx",
-  "subagent_name": "my-task",
-  "model": "deepseek-v4-pro",
-  "summary": "The subagent's response text...",
-  "usage": {
-    "model": "deepseek-v4-pro",
-    "provider": "5e3a4034-...",
-    "input_tokens": 4562,
-    "output_tokens": 120,
-    "cost_usd": 0.0
-  }
-}
+### Reuse Semantics
+
+Reusing a `--subagent` name does not rebind it.
+
+- Use `--reuse-policy create` when you are creating a new routing identity
+- Use `--reuse-policy reuse` only when you intentionally want the existing
+  binding
+- Use `--reuse-policy fail` when name collisions should be surfaced
+
+If you want a different provider/model routing decision, create a fresh
+subagent name instead of reusing the old one.
+
+## Step 4 — Choose a Completion Strategy
+
+### Strategy A: Wait in One Command
+
+For short, bounded work, prefer `--wait` with a client-side deadline:
+
+```bash
+busytok delegate \
+  --subagent "reviewer-deepseek-v4-pro-001" \
+  --profile "pi/review-cheap" \
+  --bind-provider "5e3a4034-f1fd-4d50-a092-54022adbfa3e" \
+  --bind-model "deepseek-v4-pro" \
+  --reuse-policy create \
+  --output json \
+  --wait \
+  --wait-timeout 120 \
+  --prompt-file "/tmp/review-prompt.txt"
 ```
 
-**B. Queued (gate paused or subagent busy):**
+Behavior:
+
+- terminal completion returns full task detail JSON
+- wait timeout returns the last known task JSON and exits with code `124`
+
+### Strategy B: Submit Asynchronously and Poll
+
+For longer orchestration, read the initial delegate response and poll by
+task id:
+
+```bash
+busytok subagent task --task-id "<TASK_ID>" --output json
+```
+
+Example initial delegate response:
 
 ```json
 {
   "status": "queued",
   "task_id": "task_xxx",
-  "subagent_id": "xxx",
+  "subagent_id": "subagent_xxx",
+  "subagent_name": "reviewer-deepseek-v4-pro-001",
   "summary": null,
-  "model": null
+  "model": null,
+  "created": true
 }
 ```
 
-If `status` is `"queued"`, proceed to Step 4 to poll for the result.
-
-### Reusing an existing subagent
-
-Once a subagent is created (first call), subsequent calls with the same
-`--subagent` name reuse it — `--bind-provider` and `--bind-model` are no
-longer required:
-
-```bash
-# First call — creates the subagent
-busytok delegate --subagent "code-reviewer" --profile "pi/search-cheap" \
-  --bind-provider "<ID>" --bind-model "deepseek-v4-pro" \
-  --output json "Review this code..." 2>/dev/null
-
-# Subsequent calls — reuse, no bind flags needed
-busytok delegate --subagent "code-reviewer" --profile "pi/search-cheap" \
-  --output json "Review this other code..." 2>/dev/null
-```
-
-## Step 4 — Poll for Result (if queued)
-
-When `status` is `"queued"`, poll with `subagent task`:
-
-```bash
-busytok subagent task --task-id "task_xxx" --output json 2>/dev/null
-```
-
-Example polling loop (bash):
-
-```bash
-TASK_ID="task_xxx"
-while true; do
-  RESULT=$(busytok subagent task --task-id "$TASK_ID" --output json 2>/dev/null)
-  STATUS=$(echo "$RESULT" | jq -r '.status')
-  if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ]; then
-    echo "$RESULT"
-    break
-  fi
-  sleep 2
-done
-```
-
-Response shape:
+Example task detail response:
 
 ```json
 {
   "id": "task_xxx",
-  "subagent_id": "xxx",
-  "subagent_name": "my-task",
-  "profile": "pi/search-cheap",
+  "subagent_id": "subagent_xxx",
+  "subagent_name": "reviewer-deepseek-v4-pro-001",
+  "profile": "pi/review-cheap",
   "status": "completed",
-  "result_summary": "The subagent's response text...",
+  "result_summary": "Ranked findings...",
   "error": null,
   "error_kind": null,
-  "timeout_seconds": 120,
-  "model_override": "deepseek-v4-pro",
+  "model_override": null,
+  "effective_provider_id": "5e3a4034-f1fd-4d50-a092-54022adbfa3e",
+  "effective_model_id": "deepseek-v4-pro",
+  "binding_source": "bound",
   "created_at_ms": 1783300000000,
   "started_at_ms": 1783300000100,
   "completed_at_ms": 1783300005000
 }
 ```
 
-## Step 5 — List Existing Subagents
+## Step 5 — Cancel Abandoned Work
 
-See all subagents and their bound provider/model:
+If the caller-owned deadline expires and the task is no longer useful,
+cancel it explicitly:
 
 ```bash
-busytok subagent list 2>/dev/null
+busytok subagent cancel \
+  --task-id "<TASK_ID>" \
+  --reason "caller deadline exceeded" \
+  --output json
 ```
 
+Example response:
+
+```json
+{
+  "id": "task_xxx",
+  "previous_status": "running",
+  "new_status": "cancelled",
+  "cancelled": true
+}
 ```
-SUBAGENT_ID                            NAME           BINDING                              STATUS
-03daa136-c22d-4af0-b7e6-5d5e21c1d14c   verify-test    5e3a4034.../deepseek-v4-pro          cold
+
+This is best-effort for real execution. Agents should still treat
+`cancelled = true` as the task lifecycle outcome.
+
+## Step 6 — Interpret Status Correctly
+
+Machine callers should determine outcome from task status, not only process
+exit code.
+
+- `completed` → success
+- `queued` / `running` → still in progress
+- `failed` → surface `error`, `error_kind`, and summary
+- `cancelled` → treat as non-success and surface the cancellation context
+
+Output shape differences:
+
+- `delegate --output json` returns `task_id` and `summary`
+- `subagent task --output json` returns `id` and `result_summary`
+- `delegate --wait` returns the task-detail shape, not the initial delegate shape
+
+## Step 7 — Inspect Existing Subagents
+
+List subagents:
+
+```bash
+busytok subagent list --output json
+```
+
+Resolve a single subagent:
+
+```bash
+busytok subagent show "reviewer-deepseek-v4-pro-001" --output json
+```
+
+List recent tasks for a subagent:
+
+```bash
+busytok subagent tasks "reviewer-deepseek-v4-pro-001" --output json
 ```
 
 ## Complete Example (Bash)
 
 ```bash
 #!/bin/bash
-# Full automated flow: discover → select → delegate → get result
+set -euo pipefail
 
-# Step 1: find a coding model
-MODEL=$(busytok models --tag Coding --json 2>/dev/null | jq -r '.[0]')
-if [ -z "$MODEL" ] || [ "$MODEL" = "null" ]; then
-  echo "No Coding models found, falling back to first available"
-  MODEL=$(busytok models --json 2>/dev/null | jq -r '.[0]')
+CATALOG=$(busytok models --tag Coding --reasoning --sort context_window_desc --json)
+COUNT=$(echo "$CATALOG" | jq 'length')
+if [ "$COUNT" -eq 0 ]; then
+  echo "No enabled Coding reasoning models available" >&2
+  exit 1
 fi
 
+MODEL=$(echo "$CATALOG" | jq '.[0]')
 PROVIDER_ID=$(echo "$MODEL" | jq -r '.provider_id')
 MODEL_ID=$(echo "$MODEL" | jq -r '.model_id')
-echo "Selected: provider=$PROVIDER_ID model=$MODEL_ID"
 
-# Step 2: delegate
+PROMPT_FILE=$(mktemp)
+cat >"$PROMPT_FILE" <<'EOF'
+Review the scoped patch.
+Return ranked findings with file, line, impact, and evidence.
+EOF
+
+set +e
 RESP=$(busytok delegate \
-  --subagent "auto-demo" \
-  --profile "pi/search-cheap" \
+  --subagent "reviewer-${MODEL_ID}-$(date +%s)" \
+  --profile "pi/review-cheap" \
   --bind-provider "$PROVIDER_ID" \
   --bind-model "$MODEL_ID" \
+  --reuse-policy create \
   --output json \
-  "用一句话介绍中国的长城" 2>/dev/null)
+  --wait \
+  --wait-timeout 120 \
+  --prompt-file "$PROMPT_FILE")
+RC=$?
+set -e
+
+if [ "$RC" -eq 124 ]; then
+  TASK_ID=$(echo "$RESP" | jq -r '.id')
+  echo "Timed out waiting; last known state:"
+  echo "$RESP" | jq .
+  busytok subagent cancel --task-id "$TASK_ID" --reason "caller deadline exceeded" --output json | jq .
+  exit 124
+fi
 
 STATUS=$(echo "$RESP" | jq -r '.status')
-TASK_ID=$(echo "$RESP" | jq -r '.task_id')
-
-echo "Delegate status: $STATUS (task: $TASK_ID)"
-
-# Step 3: get result (poll if queued)
-if [ "$STATUS" = "completed" ]; then
-  echo "Summary: $(echo "$RESP" | jq -r '.summary')"
-elif [ "$STATUS" = "queued" ]; then
-  echo "Task queued, polling..."
-  for i in $(seq 1 30); do
-    sleep 2
-    TASK=$(busytok subagent task --task-id "$TASK_ID" --output json 2>/dev/null)
-    TS=$(echo "$TASK" | jq -r '.status')
-    if [ "$TS" = "completed" ] || [ "$TS" = "failed" ]; then
-      echo "Status: $TS"
-      echo "Summary: $(echo "$TASK" | jq -r '.result_summary')"
-      break
-    fi
-    echo "  ... still $TS"
-  done
+if [ "$STATUS" != "completed" ]; then
+  echo "$RESP" | jq .
+  exit 1
 fi
+
+echo "$RESP" | jq -r '.result_summary'
 ```
 
 ## Troubleshooting
 
-### Task returns `status: "queued"` on every delegate
+### No matching model in `busytok models`
 
-The Busytok pressure gate is paused. This happens when a previous task got
-stuck in `running` status (e.g., due to a network timeout). Fix by
-restarting the Busytok service:
+The catalog is configuration, not policy. If your filter returns zero rows,
+surface that as a routing/configuration failure instead of silently falling
+back to the first entry.
 
-```bash
-launchctl kickstart -k gui/$(id -u)/com.busytok.service
-sleep 3
-```
+### Reused subagent has the wrong binding
 
-### Delegate returns `dispatch_timeout` error
+You reused a logical name. Use `--reuse-policy fail` to surface collisions,
+or create a fresh subagent name for a new provider/model route.
 
-The LLM response took >30 seconds. The task may still complete — check with
-`subagent task --task-id <id>`. For longer tasks, increase `--timeout`:
+### Prompt is large or multi-line
 
-```bash
-busytok delegate ... --timeout 300
-```
+Use `--prompt-file`, `--stdin`, or `--artifact-ref` instead of shell
+interpolation.
 
-### `provider list` shows empty table (display bug)
+### Wait exited `124`
 
-This is a known rendering bug (v0.0.10). Use `--json` instead:
+That is a client-side wait timeout, not necessarily a remote task failure.
+Inspect the returned JSON and decide whether to keep polling or cancel.
 
-```bash
-busytok provider list --json 2>/dev/null
-```
+### JSON parsing is unreliable
 
-### `--bind-provider` requires a UUID, not a name
-
-Provider IDs are UUIDs. Always extract them from `models --json` or
-`provider list --json` output — never hardcode.
-
-### Log lines interfere with JSON parsing
-
-All log output goes to stderr. Always redirect when parsing:
-
-```bash
-busytok <command> --json 2>/dev/null | jq .
-```
+Read stdout only. Do not merge stderr into stdout.

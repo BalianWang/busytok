@@ -21,6 +21,7 @@ import {
   ERROR_CODE_AUTH_FAILURE,
   ERROR_CODE_RATE_LIMIT,
   ERROR_CODE_NETWORK,
+  ERROR_CODE_TURN_CANCELLED,
   type ProviderKind,
 } from './types.js';
 import { SidecarError } from './errors.js';
@@ -190,6 +191,12 @@ export class PiSdkSession {
    */
   readonly resolvedModel: string;
   private closed = false;
+  /**
+   * Set by `abort()` (called via `session.cancel` RPC) so `sendTurn()` can
+   * distinguish a user-initiated cancel from a timeout. Without this, the
+   * AbortError from `sdk.abort()` is classified as TASK_TIMEOUT (-32003).
+   */
+  private cancelled = false;
 
   constructor(
     sdk: SdkSession,
@@ -213,6 +220,9 @@ export class PiSdkSession {
     if (this.closed) {
       throw new SidecarError('session is closed', -32001);
     }
+    // Reset the cancel flag for this turn — a prior `abort()` must not
+    // poison a reused session (the session stays in the pool after cancel).
+    this.cancelled = false;
     this.last_used_at_ms = Date.now();
 
     const timeoutMs = options.timeout_ms;
@@ -232,6 +242,13 @@ export class PiSdkSession {
     try {
       await Promise.race([this.sdk.prompt(promptText), timeoutPromise]);
     } catch (err) {
+      // Distinguish user-initiated cancel (via `session.cancel` RPC) from
+      // timeout. Both call `sdk.abort()`, which causes `prompt()` to reject
+      // with an AbortError. The `cancelled` flag is set by `abort()` BEFORE
+      // the SDK resolves the rejection, so it's reliably `true` here.
+      if (this.cancelled) {
+        throw new SidecarError('turn cancelled by user', ERROR_CODE_TURN_CANCELLED);
+      }
       throw classifyError(err, timedOut);
     } finally {
       if (timer) clearTimeout(timer);
@@ -255,6 +272,26 @@ export class PiSdkSession {
         cost_usd: stats.cost,
       },
     };
+  }
+
+  /**
+   * Abort an in-flight `sendTurn()` call. Sets the `cancelled` flag so
+   * `sendTurn()` can classify the rejection as TURN_CANCELLED (not
+   * TASK_TIMEOUT), then calls `sdk.abort()` which aborts the underlying
+   * HTTP request to the LLM provider — stopping token generation.
+   *
+   * Called by the `session.cancel` RPC handler. Best-effort: if `abort()`
+   * throws, the error is swallowed (the cancel RPC still succeeds — the
+   * caller already flipped the DB status to `cancelled`).
+   */
+  async abort(): Promise<void> {
+    this.cancelled = true;
+    try {
+      await this.sdk.abort();
+    } catch {
+      // Best-effort — the SDK may have already settled or the session
+      // may be in a bad state. The cancel RPC still returns success.
+    }
   }
 
   /** Dispose the underlying SDK session. Safe to call once. */

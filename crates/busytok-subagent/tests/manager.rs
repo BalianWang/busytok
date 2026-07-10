@@ -19,6 +19,72 @@ use busytok_subagent::models::{
 use busytok_subagent::pressure::{PressureAction, PressureGate};
 use busytok_subagent::SubagentError;
 
+/// A mock executor that blocks forever, simulating a long-running sidecar
+/// call. Used to test cooperative cancel of in-flight executor calls — the
+/// only exit is the cancel signal dropping the executor future via
+/// `tokio::select!` in `execute_task`.
+struct BlockingExecutor;
+
+impl BlockingExecutor {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for BlockingExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        // Block forever until the cancel signal drops the future (via
+        // `tokio::select!` in `execute_task`). This simulates a long-running
+        // sidecar turn_auto call that never completes on its own.
+        std::future::pending::<()>().await;
+        unreachable!("BlockingExecutor should never complete — cancel drops the future");
+    }
+}
+
+/// Executor that counts how many times `execute()` is called. Used to verify
+/// that cancelled tasks are never executed — whether filtered by
+/// `pick_oldest_queued_task` (status='cancelled' not picked) or skipped by
+/// the dispatcher's pre-execute re-check (status flipped between pick and
+/// execute).
+struct CountingExecutor {
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl CountingExecutor {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn call_count(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for CountingExecutor {
+    async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ExecutorOutput {
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: format!("[counted] prompt: {}", input.prompt),
+            usage: TaskUsage {
+                model: Some(input.model.clone()),
+                provider: Some("counting".to_string()),
+                input_tokens: Some(input.prompt.len() as i64),
+                output_tokens: Some(0),
+                ..Default::default()
+            },
+            memory_update: MemoryUpdate::default(),
+            error_kind: None,
+        })
+    }
+}
+
 /// Install a thread-local tracing subscriber so `tracing!` macro arguments
 /// (event_code, reason, etc.) are evaluated and counted by line coverage.
 /// Returns a guard that restores the previous default on drop. Each
@@ -2752,4 +2818,282 @@ async fn cancel_task_skips_already_terminal_task() {
     assert!(!outcome.cancelled);
     assert_eq!(outcome.previous_status, "completed");
     assert_eq!(outcome.new_status, "completed");
+}
+
+// ── cooperative cancel of in-flight executor (P1-5) ────────────────────────
+
+#[tokio::test]
+async fn cancel_task_aborts_in_flight_executor() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let executor = BlockingExecutor::new();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(executor) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    // Spawn delegate — it will hang on the BlockingExecutor inside
+    // execute_task's `tokio::select!` (cancel signal registered, executor
+    // future pending). The cooperative cancel signal is the only way out.
+    let m2 = std::sync::Arc::clone(&m);
+    let delegate_task =
+        tokio::spawn(async move { m2.delegate(req("cancel-in-flight", "do slow thing")).await });
+
+    // Give delegate time to insert the task as 'running' and reach the
+    // select! (which registers the cancel signal). All DB work up to the
+    // select! is synchronous, so 200ms is ample.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Resolve the task id: find the subagent by name, then its latest task.
+    let task_id = {
+        let g = db.lock().unwrap();
+        let subagents = g.subagent_list_filtered(None, None, false).unwrap();
+        let sa = subagents
+            .iter()
+            .find(|s| s.name == "cancel-in-flight")
+            .expect("subagent cancel-in-flight should exist");
+        let tasks = g.subagent_list_tasks(&sa.id, 10).unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "exactly one task expected for cancel-in-flight"
+        );
+        assert_eq!(tasks[0].status, "running", "task should be running");
+        tasks[0].id.clone()
+    };
+
+    // Cancel the in-flight task — this sends the cooperative cancel signal.
+    let outcome = m.cancel_task(&task_id, Some("test abort")).await.unwrap();
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.previous_status, "running");
+    assert_eq!(outcome.new_status, "cancelled");
+
+    // delegate() should now return with Cancelled status. The cancel branch
+    // in execute_task returns early without a terminal DB write (the status
+    // was already flipped to "cancelled" by cancel_task).
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), delegate_task)
+        .await
+        .expect("delegate did not return within 2s after cancel");
+    let result = result.unwrap(); // join: delegate task did not panic
+    let result = result.unwrap(); // delegate() returned Ok
+    assert_eq!(result.status, TaskStatus::Cancelled);
+    assert_eq!(result.task_id, task_id);
+}
+
+/// Executor that records `cancel()` calls. Used to verify that
+/// `cancel_task` invokes the execution-protocol cancel (sends
+/// `session.cancel` RPC to the sidecar in production).
+struct CancelTrackingExecutor {
+    cancel_calls: CancelCallLog,
+}
+
+type CancelCallLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+impl CancelTrackingExecutor {
+    fn new() -> (Self, CancelCallLog) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                cancel_calls: std::sync::Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskExecutor for CancelTrackingExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        // Block forever — the only exit is the cancel signal dropping the future.
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
+
+    async fn cancel(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
+        self.cancel_calls
+            .lock()
+            .unwrap()
+            .push((subagent_id.to_string(), provider_id.to_string()));
+        Ok(())
+    }
+}
+
+/// Verify that `cancel_task` calls `executor.cancel()` with the correct
+/// `subagent_id` and `provider_id` — the execution-protocol cancel that
+/// sends `session.cancel` RPC to the sidecar (stopping token generation
+/// at the LLM provider).
+#[tokio::test]
+async fn cancel_task_invokes_executor_cancel() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let (executor, cancel_calls) = CancelTrackingExecutor::new();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(executor) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+    // Spawn delegate — it will hang on the BlockingExecutor (pending forever).
+    let m2 = std::sync::Arc::clone(&m);
+    let delegate_task =
+        tokio::spawn(async move { m2.delegate(req("cancel-tracking", "do slow thing")).await });
+    // Give delegate time to insert the task and reach the executor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Find the task id and the subagent's UUID (the value executor.cancel()
+    // should receive as `subagent_id`).
+    let (task_id, expected_subagent_id) = {
+        let g = db.lock().unwrap();
+        let subagents = g.subagent_list_filtered(None, None, false).unwrap();
+        let sa = subagents
+            .iter()
+            .find(|s| s.name == "cancel-tracking")
+            .expect("subagent should exist");
+        let tasks = g.subagent_list_tasks(&sa.id, 10).unwrap();
+        assert_eq!(tasks[0].status, "running");
+        (tasks[0].id.clone(), sa.id.clone())
+    };
+    // Cancel — this should fire executor.cancel() in a spawned task.
+    let outcome = m
+        .cancel_task(&task_id, Some("test executor cancel"))
+        .await
+        .unwrap();
+    assert!(outcome.cancelled);
+    // Wait for the spawned cancel task to complete (fire-and-forget with
+    // 5s timeout — should finish instantly since CancelTrackingExecutor
+    // is in-process).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Verify executor.cancel() was called with the correct args.
+    let calls = cancel_calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "executor.cancel() should be called exactly once"
+    );
+    assert_eq!(
+        calls[0].0, expected_subagent_id,
+        "cancel subagent_id should match the task's subagent UUID"
+    );
+    assert_eq!(
+        calls[0].1,
+        bound_provider_id(),
+        "cancel provider_id should match the bound provider"
+    );
+    // Clean up: drop the delegate task (it will be cancelled by the signal).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), delegate_task).await;
+}
+
+/// `cancel_task` flips a queued task to "cancelled" in the DB. No cancel
+/// signal is registered for queued tasks (the executor isn't running), so
+/// `cancel_task` just flips the DB status — the `if let Some(tx)` signal-send
+/// branch is a no-op. The dispatcher's `pick_oldest_queued_task` filters by
+/// `status='queued'`, so a cancelled task is never picked.
+#[tokio::test]
+async fn cancel_task_flips_queued_task_to_cancelled() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    );
+    let r = m.delegate(req("cancel-queued", "do")).await.unwrap();
+    // MockTaskExecutor completes synchronously, so the task is now
+    // "completed". Simulate a queued task (as if the dispatcher hasn't
+    // picked it up yet) by flipping the status back to "queued".
+    {
+        let g = db.lock().unwrap();
+        g.subagent_set_task_status(&r.task_id, "queued", None, None)
+            .unwrap();
+    }
+    let outcome = m.cancel_task(&r.task_id, None).await.unwrap();
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.previous_status, "queued");
+    assert_eq!(outcome.new_status, "cancelled");
+    let task = {
+        let g = db.lock().unwrap();
+        g.subagent_get_task(&r.task_id).unwrap().unwrap()
+    };
+    assert_eq!(task.status, "cancelled");
+}
+
+/// Dispatcher-level test: a cancelled queued task must never reach the
+/// executor. Spawns the real dispatcher with a `CountingExecutor` and verifies
+/// `execute()` call count stays 0 after multiple poll cycles. This exercises
+/// the `pick_oldest_queued_task` SQL filter (status='cancelled' is never
+/// picked). The dispatcher's pre-execute re-check and `execute_task`'s
+/// pre-execute cancel check are defense-in-depth for the race between pick
+/// and execute — they are not directly exercised by this test because the
+/// task is cancelled before the dispatcher starts.
+#[tokio::test]
+async fn dispatcher_skips_cancelled_queued_task() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let executor = std::sync::Arc::new(CountingExecutor::new());
+    let manager = std::sync::Arc::new(SubagentManager::new(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        executor.clone() as std::sync::Arc<dyn TaskExecutor>,
+    ));
+    // Seed a subagent + queued task directly (bypassing delegate() so the
+    // task starts as "queued", not "completed").
+    {
+        use busytok_store::repository::{SubagentLogicalSubagentRow, SubagentTaskRow};
+        let g = db.lock().unwrap();
+        g.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(
+            "sub-cancel-skip",
+            "cancel-skip-sub",
+        ))
+        .unwrap();
+        g.subagent_insert_task(&SubagentTaskRow {
+            id: "task-cancel-skip".into(),
+            subagent_id: "sub-cancel-skip".into(),
+            source_harness: None,
+            source_session_id: None,
+            intent: None,
+            profile: "pi/search-cheap".into(),
+            prompt: Some("queued then cancelled".into()),
+            prompt_artifact_ref: None,
+            output_schema_name: None,
+            output_schema_version: 1,
+            status: "queued".into(),
+            result_summary: None,
+            result_json: None,
+            error: None,
+            created_at_ms: busytok_domain::now_ms(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            timeout_seconds: None,
+            model_override: None,
+            error_kind: None,
+        })
+        .unwrap();
+    }
+    // Cancel the queued task BEFORE starting the dispatcher.
+    let outcome = manager
+        .cancel_task("task-cancel-skip", Some("test pre-execute skip"))
+        .await
+        .unwrap();
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.previous_status, "queued");
+    // Start the dispatcher. It polls every 200ms; over 600ms (3 ticks) the
+    // cancelled task must never be picked or executed.
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(rx);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    tx.send(true).unwrap();
+    let _ = handle.await;
+    assert_eq!(
+        executor.call_count(),
+        0,
+        "executor must NOT be called for a cancelled task"
+    );
+    let task = {
+        let g = db.lock().unwrap();
+        g.subagent_get_task("task-cancel-skip").unwrap().unwrap()
+    };
+    assert_eq!(task.status, "cancelled");
 }
