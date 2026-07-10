@@ -167,7 +167,7 @@ describe("ProviderCard delete via ConfirmDialog", () => {
     render(<ProviderCard {...defaultProps()} />);
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
     expect(screen.getByText("删除 Provider")).toBeDefined();
-    expect(screen.getByText(/确定删除此 provider/)).toBeDefined();
+    expect(screen.getByText(/确定删除 provider「deepseek_openai」/)).toBeDefined();
   });
 
   it("calls onDelete when dialog confirm clicked", () => {
@@ -194,7 +194,7 @@ describe("ProviderCard delete via ConfirmDialog", () => {
     // Click the model row's 删除 (last one before dialog opens).
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(screen.getByText("删除 Model")).toBeDefined();
-    expect(screen.getByText(/确定删除此 model/)).toBeDefined();
+    expect(screen.getByText(/确定删除 model「deepseek-chat」/)).toBeDefined();
   });
 
   it("calls onModelDelete when dialog confirm clicked", () => {
@@ -370,10 +370,11 @@ describe("ProviderCard model edit", () => {
       }),
     );
     const call = onModelUpdate.mock.calls[0][1] as ModelUpdateRequestDto;
-    expect(call.context_window).toBeUndefined();
-    expect(call.max_tokens).toBeUndefined();
-    expect(call.reasoning).toBeUndefined();
-    expect(call.enabled).toBeUndefined();
+    // Unchanged fields are null (wire-compatible with serde None), not undefined.
+    expect(call.context_window).toBeNull();
+    expect(call.max_tokens).toBeNull();
+    expect(call.reasoning).toBeNull();
+    expect(call.enabled).toBeNull();
   });
 
   it("calls onModelTagsUpdate when tags changed on save", () => {
@@ -586,5 +587,87 @@ describe("ProviderCard edit mode", () => {
     );
     expect((screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /^取消$/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("sets aria-invalid and shows field-error when base URL is invalid on blur (P2 #7)", () => {
+    renderCardInEditMode();
+    const urlInput = screen.getByDisplayValue("https://api.deepseek.com/v1");
+    fireEvent.change(urlInput, { target: { value: "not-a-url" } });
+    fireEvent.blur(urlInput);
+    // aria-invalid reflects the error state.
+    expect((urlInput as HTMLInputElement).getAttribute("aria-invalid")).toBe("true");
+    // Error message renders in a role=alert div.
+    expect(screen.getByRole("alert").textContent).toContain("http://");
+  });
+
+  it("clears aria-invalid and field-error when base URL is corrected on blur", () => {
+    renderCardInEditMode();
+    const urlInput = screen.getByDisplayValue("https://api.deepseek.com/v1");
+    // First make it invalid.
+    fireEvent.change(urlInput, { target: { value: "bad" } });
+    fireEvent.blur(urlInput);
+    expect(screen.getByRole("alert")).toBeDefined();
+    // Now fix it.
+    fireEvent.change(urlInput, { target: { value: "https://api.openai.com/v1" } });
+    fireEvent.blur(urlInput);
+    expect((urlInput as HTMLInputElement).getAttribute("aria-invalid")).toBe("false");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("clears providerSaveError when re-entering edit mode (P2 #9)", () => {
+    // 1. Mount in edit mode, trigger a save failure → error shows.
+    const updateProvider = vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void }) => {
+      opts?.onError?.(new Error("update rpc failed"));
+    });
+    const { rerender } = render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations: {
+            createProvider: { mutate: vi.fn(), isPending: false },
+            updateProvider: { mutate: updateProvider, isPending: false },
+            deleteProvider: { mutate: vi.fn(), isPending: false },
+            testConnection: { mutate: vi.fn(), isPending: false },
+          } as never,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(screen.getByText(/update rpc failed/)).toBeDefined();
+    // 2. Exit edit mode (parent sets isEditing=false).
+    rerender(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations: {
+            createProvider: { mutate: vi.fn(), isPending: false },
+            updateProvider: { mutate: updateProvider, isPending: false },
+            deleteProvider: { mutate: vi.fn(), isPending: false },
+            testConnection: { mutate: vi.fn(), isPending: false },
+          } as never,
+          isEditing: false,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    // 3. Re-enter edit mode → prevEditing pattern should clear the error.
+    rerender(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations: {
+            createProvider: { mutate: vi.fn(), isPending: false },
+            updateProvider: { mutate: updateProvider, isPending: false },
+            deleteProvider: { mutate: vi.fn(), isPending: false },
+            testConnection: { mutate: vi.fn(), isPending: false },
+          } as never,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    expect(screen.queryByText(/update rpc failed/)).toBeNull();
   });
 });

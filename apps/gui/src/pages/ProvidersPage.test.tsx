@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, fireEvent } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
   ModelCatalogEntryDto,
@@ -65,6 +65,7 @@ const mockMutations = (): ProviderMutationsResult => ({
     mutate: vi.fn((_id: string, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     }),
+    mutateAsync: vi.fn().mockResolvedValue(undefined),
     isPending: false,
   },
   testConnection: {
@@ -111,6 +112,7 @@ const mockModelMutations = (): ModelMutationsResult => ({
     mutate: vi.fn((_id: string, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     }),
+    mutateAsync: vi.fn().mockResolvedValue(undefined),
     isPending: false,
   },
   tagsUpdate: {
@@ -213,27 +215,28 @@ describe("ProvidersPage (rewritten)", () => {
     expect(screen.getByText("beta-model")).toBeTruthy();
   });
 
-  it("emits provider.deleted event on successful delete", () => {
+  it("emits provider.deleted event on successful delete", async () => {
     renderPage({ providers: [makeProvider()] });
     // Click delete in the card → ConfirmDialog opens → click dialog confirm.
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
     const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_code: "provider.deleted",
-        details: expect.objectContaining({ id: "prov-1" }),
-      }),
-    );
+    await waitFor(() => {
+      expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_code: "provider.deleted",
+          details: expect.objectContaining({ id: "prov-1" }),
+        }),
+      );
+    });
   });
 
-  it("emits provider.delete.failed event on failed delete", () => {
+  it("emits provider.delete.failed event on failed delete and keeps dialog open with error", async () => {
     vi.mocked(useProviderMutations).mockReturnValue({
       ...mockMutations(),
       deleteProvider: {
-        mutate: vi.fn((_id: string, opts?: { onError?: (e: Error) => void }) => {
-          opts?.onError?.(new Error("delete rpc failed"));
-        }),
+        mutate: vi.fn(),
+        mutateAsync: vi.fn().mockRejectedValue(new Error("delete rpc failed")),
         isPending: false,
       },
     } as never);
@@ -242,13 +245,18 @@ describe("ProvidersPage (rewritten)", () => {
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
     const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_code: "provider.delete.failed",
-        level: "ERROR",
-        details: expect.objectContaining({ id: "prov-1" }),
-      }),
-    );
+    await waitFor(() => {
+      expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_code: "provider.delete.failed",
+          level: "ERROR",
+          details: expect.objectContaining({ id: "prov-1" }),
+        }),
+      );
+    });
+    // P1 #2: dialog must stay open and surface the error (no silent close).
+    expect(screen.getByText("删除 Provider")).toBeDefined();
+    expect(screen.getByText(/delete rpc failed/)).toBeDefined();
   });
 
   it("emits provider.tested event on successful test connection", () => {
@@ -331,7 +339,7 @@ describe("ProvidersPage (rewritten)", () => {
     );
   });
 
-  it("emits model.deleted event on successful model delete", () => {
+  it("emits model.deleted event on successful model delete", async () => {
     renderPage({
       providers: [makeProvider()],
       models: [makeModel()],
@@ -343,24 +351,25 @@ describe("ProvidersPage (rewritten)", () => {
     // Dialog confirm is now the last delete button.
     deleteButtons = screen.getAllByRole("button", { name: /删除/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_code: "model.deleted",
-        details: expect.objectContaining({
-          provider_id: "prov-1",
-          model_id: "deepseek-chat",
+    await waitFor(() => {
+      expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_code: "model.deleted",
+          details: expect.objectContaining({
+            provider_id: "prov-1",
+            model_id: "deepseek-chat",
+          }),
         }),
-      }),
-    );
+      );
+    });
   });
 
-  it("emits model.delete.failed event on failed model delete", () => {
+  it("emits model.delete.failed event on failed model delete and keeps dialog open with error", async () => {
     vi.mocked(useModelMutations).mockReturnValue({
       ...mockModelMutations(),
       deleteModel: {
-        mutate: vi.fn((_id: string, opts?: { onError?: (e: Error) => void }) => {
-          opts?.onError?.(new Error("model delete rpc failed"));
-        }),
+        mutate: vi.fn(),
+        mutateAsync: vi.fn().mockRejectedValue(new Error("model delete rpc failed")),
         isPending: false,
       },
     } as never);
@@ -373,16 +382,21 @@ describe("ProvidersPage (rewritten)", () => {
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     deleteButtons = screen.getAllByRole("button", { name: /删除/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event_code: "model.delete.failed",
-        level: "ERROR",
-        details: expect.objectContaining({
-          provider_id: "prov-1",
-          model_id: "deepseek-chat",
+    await waitFor(() => {
+      expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_code: "model.delete.failed",
+          level: "ERROR",
+          details: expect.objectContaining({
+            provider_id: "prov-1",
+            model_id: "deepseek-chat",
+          }),
         }),
-      }),
-    );
+      );
+    });
+    // P1 #2: dialog must stay open and surface the error (no silent close).
+    expect(screen.getByText("删除 Model")).toBeDefined();
+    expect(screen.getByText(/model delete rpc failed/)).toBeDefined();
   });
 
   it("emits model.updated event on successful model update", async () => {

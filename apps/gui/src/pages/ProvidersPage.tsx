@@ -62,25 +62,31 @@ export function ProvidersPage() {
     return map;
   }, [modelsQuery.data]);
 
-  const handleProviderDelete = (provider: ProviderDto) => {
-    providerMutations.deleteProvider.mutate(provider.id, {
-      onSuccess: () => {
-        reportFrontendEventSafely({
-          level: "INFO",
-          event_code: "provider.deleted",
-          message: "Provider deleted",
-          details: { id: provider.id, name: provider.name },
-        });
-      },
-      onError: (err: Error) => {
-        reportFrontendEventSafely({
-          level: "ERROR",
-          event_code: "provider.delete.failed",
-          message: "Provider delete failed",
-          details: { id: provider.id, name: provider.name, error: err.message },
-        });
-      },
-    });
+  const handleProviderDelete = async (provider: ProviderDto): Promise<void> => {
+    try {
+      await providerMutations.deleteProvider.mutateAsync(provider.id);
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "provider.deleted",
+        message: "Provider deleted",
+        details: { id: provider.id, name: provider.name },
+      });
+      // P2 #8: clear stale test result for deleted provider.
+      setTestResults((prev) => {
+        if (!(provider.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[provider.id];
+        return next;
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "provider.delete.failed",
+        message: "Provider delete failed",
+        details: { id: provider.id, name: provider.name, error: err.message },
+      });
+      throw err;
+    }
   };
 
   const handleTestConnection = (id: string) => {
@@ -211,32 +217,31 @@ export function ProvidersPage() {
     }
   };
 
-  const handleModelDelete = (model: ModelCatalogEntryDto) => {
-    modelMutations.deleteModel.mutate(model.model_db_id, {
-      onSuccess: () => {
-        reportFrontendEventSafely({
-          level: "INFO",
-          event_code: "model.deleted",
-          message: "Model deleted",
-          details: {
-            provider_id: model.provider_id,
-            model_id: model.model_id,
-          },
-        });
-      },
-      onError: (err: Error) => {
-        reportFrontendEventSafely({
-          level: "ERROR",
-          event_code: "model.delete.failed",
-          message: "Model delete failed",
-          details: {
-            provider_id: model.provider_id,
-            model_id: model.model_id,
-            error: err.message,
-          },
-        });
-      },
-    });
+  const handleModelDelete = async (model: ModelCatalogEntryDto): Promise<void> => {
+    try {
+      await modelMutations.deleteModel.mutateAsync(model.model_db_id);
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.deleted",
+        message: "Model deleted",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+        },
+      });
+    } catch (err: any) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.delete.failed",
+        message: "Model delete failed",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          error: err.message,
+        },
+      });
+      throw err;
+    }
   };
 
   return (
@@ -274,7 +279,16 @@ export function ProvidersPage() {
             models={modelsByProvider.get(provider.id) ?? []}
             isModelsLoading={modelsQuery.isLoading}
             providerMutations={providerMutations}
-            onEdit={() => setEditingProviderId(provider.id)}
+            onEdit={() => {
+              setEditingProviderId(provider.id);
+              // P2 #8: clear stale test result when entering edit mode.
+              setTestResults((prev) => {
+                if (!(provider.id in prev)) return prev;
+                const next = { ...prev };
+                delete next[provider.id];
+                return next;
+              });
+            }}
             onTestConnection={handleTestConnection}
             onDelete={handleProviderDelete}
             onModelCreate={handleModelCreate}
