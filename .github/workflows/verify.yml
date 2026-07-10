@@ -64,6 +64,31 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: cargo test --workspace
 
+      # Catch packaging regressions (broken scripts, missing deps) at PR
+      # time instead of at release time. Runs in <2s — no build involved.
+      - name: Packaging script smoke check (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          # 1. Bash syntax check on all packaging scripts
+          for script in packaging/macos/scripts/*.sh; do
+            bash -n "$script"
+          done
+          # 2. Verify critical packaging dependencies exist
+          test -f packaging/macos/assets/dmg-background.png
+          test -f packaging/macos/launchd/com.busytok.service.plist.template
+          test -f packaging/macos/entitlements/app.plist
+          test -f packaging/macos/entitlements/service.plist
+          test -f packaging/macos/entitlements/sidecar-node.plist
+          test -f crates/busytok-subagent/src/sidecar/protocol.rs
+          test -f scripts/generate_updater_manifest.sh
+          test -f scripts/generate_versions_manifest.sh
+          # 3. Verify _release_vars.sh sources cleanly and defines required vars
+          source packaging/macos/scripts/_release_vars.sh
+          test -n "$BUNDLE_ROOT"
+          test -n "$SIDECAR_NODE_VERSION"
+          echo "Packaging script smoke check passed."
+
       - name: Install cargo-audit
         if: matrix.os == 'ubuntu-latest'
         uses: taiki-e/install-action@v2
