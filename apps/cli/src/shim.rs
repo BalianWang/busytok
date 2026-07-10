@@ -278,18 +278,9 @@ exec "$BUNDLE_PATH/Contents/MacOS/busytok" "$@"
                 new_contents.push('\n');
             }
             new_contents.push_str(&block);
-            if let Some(parent) = rc_file.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    tracing::warn!(
-                        event_code = "shim.path_setup.mkdir_failed",
-                        file = %rc_file.display(),
-                        error = %e,
-                        "failed to create parent dir for rc file; skipping"
-                    );
-                    continue;
-                }
-            }
-            if let Err(e) = fs::write(&rc_file, &new_contents) {
+            // Atomically replace the rc file (temp-file + rename) so a crash
+            // or disk-full mid-write can't truncate the user's dotfile.
+            if let Err(e) = busytok_config::atomic_write(&rc_file, &new_contents) {
                 tracing::warn!(
                     event_code = "shim.path_setup.write_failed",
                     file = %rc_file.display(),
@@ -331,7 +322,9 @@ exec "$BUNDLE_PATH/Contents/MacOS/busytok" "$@"
                 continue;
             }
             let new_contents = strip_path_block(&contents);
-            if let Err(e) = fs::write(&rc_file, &new_contents) {
+            // Atomically replace the rc file (temp-file + rename) so a crash
+            // or disk-full mid-write can't truncate the user's dotfile.
+            if let Err(e) = busytok_config::atomic_write(&rc_file, &new_contents) {
                 tracing::warn!(
                     event_code = "shim.path_teardown.write_failed",
                     file = %rc_file.display(),
@@ -868,7 +861,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn install_succeeds_when_one_rc_file_is_unwritable() {
+    fn install_succeeds_when_one_rc_file_is_immutable() {
         let tmp = TempDir::new().unwrap();
         let _guard = isolate_home(tmp.path());
         let config_dir = tmp.path().join("config");
@@ -881,45 +874,52 @@ mod tests {
         let bash_profile = tmp.path().join(".bash_profile");
         fs::write(&bash_profile, "existing content\n").unwrap();
 
-        // Make .bash_profile read-only (chmod 0444) to simulate an
-        // unwritable rc file. This is more realistic than the previous
-        // idempotency-only test.
-        #[cfg(unix)]
+        // Make .bash_profile immutable via `chflags uchg` (macOS user
+        // immutable flag). This blocks rename(2) with EPERM — unlike
+        // chmod 0444 which only blocks open(O_WRONLY) but NOT rename.
+        // On non-macOS, skip the immutability assertion (no portable
+        // equivalent without root).
+        #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&bash_profile).unwrap().permissions();
-            perms.set_mode(0o444);
-            fs::set_permissions(&bash_profile, perms).unwrap();
+            use std::process::Command;
+            let chflags = Command::new("chflags")
+                .arg("uchg")
+                .arg(&bash_profile)
+                .status();
+            // chflags may fail if not file owner; skip assertion in that case.
+            if !matches!(chflags, Ok(s) if s.success()) {
+                eprintln!("chflags uchg failed; skipping immutability test");
+                return;
+            }
         }
 
         let manager = ShimManager::new(&config_dir);
-        // install() should succeed even though .bash_profile is unwritable.
+        // install() should succeed even though .bash_profile is immutable.
         manager
             .install(&bin_dir, &make_fake_bundle(tmp.path(), "Busytok.app"))
             .unwrap();
 
-        // .zshrc (writable) should have the PATH block.
+        // .zshrc (mutable) should have the PATH block.
         let zshrc_contents = fs::read_to_string(&zshrc).unwrap();
         assert!(zshrc_contents.contains(PATH_BLOCK_BEGIN));
 
-        // .bash_profile (read-only): verify it was NOT modified.
-        // When running as root, chmod 0444 doesn't prevent writes, so
-        // only assert if the block is absent (write was correctly blocked).
-        let bash_contents = fs::read_to_string(&bash_profile).unwrap();
-        if !bash_contents.contains(PATH_BLOCK_BEGIN) {
+        // .bash_profile (immutable): verify it was NOT modified.
+        #[cfg(target_os = "macos")]
+        {
+            let bash_contents = fs::read_to_string(&bash_profile).unwrap();
             assert_eq!(
                 bash_contents, "existing content\n",
-                "read-only .bash_profile should be unchanged"
+                "immutable .bash_profile should be unchanged"
             );
         }
 
-        // Restore permissions so TempDir cleanup works.
-        #[cfg(unix)]
+        // Remove the immutable flag so TempDir cleanup works.
+        #[cfg(target_os = "macos")]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&bash_profile).unwrap().permissions();
-            perms.set_mode(0o644);
-            let _ = fs::set_permissions(&bash_profile, perms);
+            let _ = std::process::Command::new("chflags")
+                .arg("nouchg")
+                .arg(&bash_profile)
+                .status();
         }
     }
 
