@@ -345,6 +345,14 @@ mod tests {
         paths.ensure_dirs_exist().expect("ensure dirs");
         let data_dir = paths.data_dir().to_path_buf();
 
+        // Keep this lifecycle test hermetic: default discovery would scan the
+        // developer/CI user's real Claude and Codex logs, making the 10s
+        // shutdown assertion depend on host data volume.
+        let mut settings = busytok_config::BusytokSettings::default();
+        settings.discovery.claude_code_default_paths = false;
+        settings.discovery.codex_default_paths = false;
+        settings.save(&paths).expect("save test settings");
+
         let app = ServiceApp::boot(paths, Instant::now()).await.expect("boot");
 
         // Clone the server Arc BEFORE run() takes ownership of app.

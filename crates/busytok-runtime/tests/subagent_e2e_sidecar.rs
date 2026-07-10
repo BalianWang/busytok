@@ -249,6 +249,7 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -422,6 +423,7 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -553,6 +555,7 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -598,6 +601,7 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -704,6 +708,7 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
             source_session_id: None,
             bound_provider_id: Some(TEST_PROVIDER_SEED.id.to_string()),
             bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
+            reuse_policy: None,
         })
         .await;
 
@@ -773,6 +778,7 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -795,6 +801,7 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -1532,6 +1539,7 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .expect("first delegate must complete (response sent before crash)");
@@ -1579,6 +1587,7 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         })
         .await
         .expect("second delegate must succeed after auto-restart");
@@ -1677,6 +1686,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .expect("first delegate must complete");
@@ -1723,6 +1733,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         })
         .await
         .expect("second delegate must complete after restart");
@@ -1769,6 +1780,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         })
         .await
         .expect("third delegate must complete after second restart");
@@ -1921,6 +1933,7 @@ async fn sidecar_e2e_stress_100_subagents_rss_does_not_grow_linearly() {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -2042,6 +2055,7 @@ async fn sidecar_e2e_idle_rss_does_not_leak_after_delegate_shutdown() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -2158,6 +2172,7 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
         source_session_id: None,
         bound_provider_id: Some(TEST_PROVIDER_SEED.id.to_string()),
         bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
+        reuse_policy: None,
     };
     // §8.3 step 2 "queue only": delegate() accepts the task and returns
     // DelegateResult { status: Queued } — NOT an error. The background
@@ -2261,6 +2276,7 @@ async fn pressure_response_force_kills_on_rss_limit_exceeded() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await;
 
@@ -2349,6 +2365,7 @@ async fn pressure_response_pauses_on_memory_pressure() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await;
 
@@ -2422,6 +2439,7 @@ async fn pressure_response_graceful_restarts_on_soft_limit_exceeded() {
             source_session_id: None,
             bound_provider_id: Some("test-provider".to_string()),
             bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
         })
         .await;
 

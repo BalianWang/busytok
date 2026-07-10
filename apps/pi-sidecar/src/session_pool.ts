@@ -105,6 +105,27 @@ export class SessionPool {
     return this.sessions.get(adapter_session_id);
   }
 
+  /**
+   * Abort an in-flight turn for `logical_subagent_id`. Looks up the hot
+   * session by subagent id and calls `session.abort()`, which aborts the
+   * underlying SDK HTTP request to the LLM provider — stopping token
+   * generation. The session stays in the pool (not closed) and can be
+   * reused for subsequent turns.
+   *
+   * Called by the `session.cancel` RPC handler. Returns `true` if a hot
+   * session was found and abort was called, `false` if no hot session
+   * exists for the subagent (the turn may have already completed or the
+   * subagent was never seen by this sidecar).
+   */
+  async abortSession(logical_subagent_id: string): Promise<boolean> {
+    const adapter_session_id = this.subagentMap.get(logical_subagent_id);
+    if (adapter_session_id === undefined) return false;
+    const session = this.sessions.get(adapter_session_id);
+    if (!session) return false;
+    await session.abort();
+    return true;
+  }
+
   /** Close (remove) a session from the pool. Disposes the SDK session. */
   close(adapter_session_id: string): void {
     const session = this.sessions.get(adapter_session_id);

@@ -4,6 +4,16 @@
  * apps/cli/src/commands/provider.rs.
  */
 
+/**
+ * Safely extract a human-readable message from an unknown catch value.
+ * Returns the fallback when the value is not an Error or has no message.
+ */
+export function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error) return error;
+  return fallback;
+}
+
 /** Split a comma-separated tag string into a clean string[]. */
 export function parseTags(input: string): string[] {
   return input

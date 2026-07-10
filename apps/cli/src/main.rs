@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use anyhow::Context;
 use busytok_config::{init_logging, BusytokPaths, LogSource};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod commands;
 mod commands_subagent;
@@ -108,13 +108,40 @@ enum Command {
         /// Model ID to bind a new subagent to (required with --bind-provider for new subagents)
         #[arg(long)]
         bind_model: Option<String>,
-        /// Wait for the task to reach a terminal state (completed/failed)
+        /// Wait for the task to reach a terminal state (completed/failed/cancelled)
         /// before returning. Polls `subagent.task_get` every 2s. Without
         /// this flag, a `queued` result is printed immediately.
         #[arg(long)]
         wait: bool,
-        /// The task prompt (positional)
-        prompt: String,
+        /// Read the prompt from a file instead of the positional argument.
+        /// Mutually exclusive with <prompt>, --stdin, and --artifact-ref.
+        #[arg(long)]
+        prompt_file: Option<String>,
+        /// Read the prompt from stdin. Mutually exclusive with <prompt>,
+        /// --prompt-file, and --artifact-ref.
+        #[arg(long = "stdin")]
+        stdin_prompt: bool,
+        /// Reference to a stored artifact to use as the prompt. Mutually
+        /// exclusive with <prompt>, --prompt-file, and --stdin.
+        #[arg(long)]
+        artifact_ref: Option<String>,
+        /// Client-side deadline for --wait, in seconds. If the task has not
+        /// reached a terminal state by this time, the last-known task JSON
+        /// is printed and the process exits with code 124.
+        #[arg(long)]
+        wait_timeout: Option<u64>,
+        /// Interval between --wait polls, in seconds (default: 2).
+        #[arg(long)]
+        poll_interval: Option<u64>,
+        /// Binding reuse policy when a subagent with the same name already
+        /// exists: "create" (always create new), "reuse" (reuse existing),
+        /// "fail" (fail on conflict). Defaults to "fail" when --bind-* flags
+        /// are given and the existing binding differs.
+        #[arg(long, value_parser = ["create", "reuse", "fail"])]
+        reuse_policy: Option<String>,
+        /// The task prompt (positional). Mutually exclusive with --prompt-file,
+        /// --stdin, and --artifact-ref. Exactly one of the four must be given.
+        prompt: Option<String>,
     },
 
     /// Inspect and manage subagents
@@ -142,6 +169,12 @@ enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Sort key: "name" (default, by provider then model), "context_window_desc", "max_tokens_desc"
+        #[arg(long, value_parser = ["name", "context_window_desc", "max_tokens_desc"])]
+        sort: Option<String>,
+        /// Filter to reasoning-capable models only
+        #[arg(long)]
+        reasoning: bool,
     },
 
     /// Manage providers and their models
@@ -265,6 +298,8 @@ enum SubagentCommand {
         project: Option<String>,
         #[arg(long)]
         include_deleted: bool,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
     },
 
     /// Resolve by <name> (within --cwd) or by --id <uuid>.
@@ -277,6 +312,8 @@ enum SubagentCommand {
         id: Option<String>,
         #[arg(long, default_value = ".")]
         cwd: String,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
     },
 
     /// List recent tasks for a subagent
@@ -289,6 +326,8 @@ enum SubagentCommand {
         cwd: String,
         #[arg(long, default_value_t = 20)]
         limit: i64,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
     },
 
     /// Hibernate a subagent (move to cold tier)
@@ -299,6 +338,8 @@ enum SubagentCommand {
         id: Option<String>,
         #[arg(long, default_value = ".")]
         cwd: String,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
     },
 
     /// Delete a subagent (use --hard for permanent removal)
@@ -313,12 +354,25 @@ enum SubagentCommand {
         hard: bool,
         #[arg(long)]
         yes: bool,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
     },
 
     /// Look up a single task by its task_id
     Task {
         #[arg(long)]
         task_id: String,
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        output: String,
+    },
+
+    /// Cancel a task by its task_id (queued → cancelled; running → cooperative cancel)
+    Cancel {
+        #[arg(long)]
+        task_id: String,
+        /// Optional human-readable reason for the cancel (recorded in the task log)
+        #[arg(long)]
+        reason: Option<String>,
         #[arg(long, default_value = "text", value_parser = ["json", "text"])]
         output: String,
     },
@@ -561,6 +615,28 @@ async fn main() {
             "command completed"
         ),
         Err(e) => {
+            // Check for a structured exit-code error (e.g. --wait-timeout
+            // returns 124). Log `cli.complete` with the error so the
+            // tracing guard flushes before exit.
+            if let Some(exit_err) = e
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<commands_subagent::ExitCodeError>())
+            {
+                warn!(
+                    event_code = "cli.complete",
+                    command = cmd_name,
+                    exit_code = exit_err.code,
+                    error = %e,
+                    "command exited with non-standard exit code"
+                );
+                // Flush tracing guard before exit — std::process::exit does
+                // NOT run Drop impls, so the non-blocking file writer's
+                // WorkerGuard must be explicitly dropped to flush pending
+                // log events (including the `cli.complete` warn above).
+                drop(_root);
+                drop(_guards);
+                std::process::exit(exit_err.code);
+            }
             error!(
                 event_code = "cli.complete",
                 command = cmd_name,
@@ -739,6 +815,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
             bind_provider,
             bind_model,
             wait,
+            prompt_file,
+            stdin_prompt,
+            artifact_ref,
+            wait_timeout,
+            poll_interval,
+            reuse_policy,
             prompt,
         } => {
             commands_subagent::handle_delegate(
@@ -751,9 +833,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 timeout,
                 output,
                 prompt,
+                prompt_file,
+                stdin_prompt,
+                artifact_ref,
                 bind_provider,
                 bind_model,
                 wait,
+                wait_timeout,
+                poll_interval,
+                reuse_policy,
             )
             .await
         }
@@ -763,29 +851,43 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 status,
                 project,
                 include_deleted,
-            } => commands_subagent::handle_list(status, project, include_deleted).await,
-            SubagentCommand::Show { name, id, cwd } => {
-                commands_subagent::handle_show(name, id, cwd).await
-            }
+                output,
+            } => commands_subagent::handle_list(status, project, include_deleted, output).await,
+            SubagentCommand::Show {
+                name,
+                id,
+                cwd,
+                output,
+            } => commands_subagent::handle_show(name, id, cwd, output).await,
             SubagentCommand::Tasks {
                 name,
                 id,
                 cwd,
                 limit,
-            } => commands_subagent::handle_tasks(name, id, cwd, limit).await,
-            SubagentCommand::Hibernate { name, id, cwd } => {
-                commands_subagent::handle_hibernate(name, id, cwd).await
-            }
+                output,
+            } => commands_subagent::handle_tasks(name, id, cwd, limit, output).await,
+            SubagentCommand::Hibernate {
+                name,
+                id,
+                cwd,
+                output,
+            } => commands_subagent::handle_hibernate(name, id, cwd, output).await,
             SubagentCommand::Delete {
                 name,
                 id,
                 cwd,
                 hard,
                 yes,
-            } => commands_subagent::handle_delete(name, id, cwd, hard, yes).await,
+                output,
+            } => commands_subagent::handle_delete(name, id, cwd, hard, yes, output).await,
             SubagentCommand::Task { task_id, output } => {
                 commands_subagent::handle_task_get(task_id, output).await
             }
+            SubagentCommand::Cancel {
+                task_id,
+                reason,
+                output,
+            } => commands_subagent::handle_task_cancel(task_id, reason, output).await,
         },
 
         Command::Models {
@@ -793,7 +895,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             tags,
             all,
             json,
-        } => commands::models::handle_models(provider, tags, all, json).await,
+            sort,
+            reasoning,
+        } => commands::models::handle_models(provider, tags, all, json, sort, reasoning).await,
 
         Command::Provider { subcommand } => commands::provider::handle(subcommand).await,
 
@@ -892,7 +996,13 @@ mod tests {
             bind_provider: None,
             bind_model: None,
             wait: false,
-            prompt: "do thing".to_string(),
+            prompt_file: None,
+            stdin_prompt: false,
+            artifact_ref: None,
+            wait_timeout: None,
+            poll_interval: None,
+            reuse_policy: None,
+            prompt: Some("do thing".to_string()),
         };
         assert_eq!(command_name(&cmd), "delegate");
     }
@@ -904,6 +1014,7 @@ mod tests {
                 status: None,
                 project: None,
                 include_deleted: false,
+                output: "text".to_string(),
             },
         };
         assert_eq!(command_name(&cmd), "subagent");
@@ -1031,6 +1142,8 @@ mod tests {
             tags: vec![],
             all: false,
             json: false,
+            sort: None,
+            reasoning: false,
         };
         assert_eq!(command_name(&cmd), "models");
     }
@@ -1227,11 +1340,15 @@ mod tests {
                 tags,
                 all,
                 json,
+                sort,
+                reasoning,
             }) => {
                 assert!(provider.is_none());
                 assert!(tags.is_empty());
                 assert!(!all);
                 assert!(!json);
+                assert!(sort.is_none());
+                assert!(!reasoning);
             }
             other => panic!("expected Models, got: {other:?}"),
         }
@@ -1250,6 +1367,9 @@ mod tests {
             "fast",
             "--all",
             "--json",
+            "--sort",
+            "context_window_desc",
+            "--reasoning",
         ])
         .unwrap();
         match args.command {
@@ -1258,11 +1378,15 @@ mod tests {
                 tags,
                 all,
                 json,
+                sort,
+                reasoning,
             }) => {
                 assert_eq!(provider.as_deref(), Some("p1"));
                 assert_eq!(tags, vec!["chat".to_string(), "fast".to_string()]);
                 assert!(all);
                 assert!(json);
+                assert_eq!(sort.as_deref(), Some("context_window_desc"));
+                assert!(reasoning);
             }
             other => panic!("expected Models with flags, got: {other:?}"),
         }
@@ -1636,5 +1760,300 @@ mod tests {
             "invalid_kind",
         ]);
         assert!(result.is_err());
+    }
+
+    // ── Delegate new flags (P0/P1) ────────────────────────────────────
+
+    #[test]
+    fn args_parses_delegate_with_prompt_file_flag() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--prompt-file",
+            "/tmp/prompt.txt",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate {
+                prompt_file,
+                prompt,
+                stdin_prompt,
+                artifact_ref,
+                ..
+            }) => {
+                assert_eq!(prompt_file.as_deref(), Some("/tmp/prompt.txt"));
+                assert!(prompt.is_none());
+                assert!(!stdin_prompt);
+                assert!(artifact_ref.is_none());
+            }
+            other => panic!("expected Delegate with --prompt-file, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_stdin_flag() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--stdin",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { stdin_prompt, .. }) => {
+                assert!(
+                    stdin_prompt,
+                    "--stdin present → stdin_prompt should be true"
+                );
+            }
+            other => panic!("expected Delegate with --stdin, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_artifact_ref_flag() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--artifact-ref",
+            "artifact:abc-123",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { artifact_ref, .. }) => {
+                assert_eq!(artifact_ref.as_deref(), Some("artifact:abc-123"));
+            }
+            other => panic!("expected Delegate with --artifact-ref, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_wait_timeout_and_poll_interval() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--wait",
+            "--wait-timeout",
+            "120",
+            "--poll-interval",
+            "5",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate {
+                wait,
+                wait_timeout,
+                poll_interval,
+                ..
+            }) => {
+                assert!(wait);
+                assert_eq!(wait_timeout, Some(120));
+                assert_eq!(poll_interval, Some(5));
+            }
+            other => panic!("expected Delegate with --wait-timeout, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_delegate_with_reuse_policy_create() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--reuse-policy",
+            "create",
+            "do the thing",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { reuse_policy, .. }) => {
+                assert_eq!(reuse_policy.as_deref(), Some("create"));
+            }
+            other => panic!("expected Delegate with --reuse-policy create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_rejects_delegate_with_invalid_reuse_policy() {
+        let result = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+            "--reuse-policy",
+            "invalid",
+            "do the thing",
+        ]);
+        assert!(
+            result.is_err(),
+            "should reject invalid --reuse-policy value"
+        );
+    }
+
+    #[test]
+    fn args_parses_delegate_prompt_as_optional_when_absent() {
+        // No positional prompt, no --prompt-file/--stdin/--artifact-ref.
+        // clap should still parse (validation is done in resolve_prompt).
+        let args = Args::try_parse_from([
+            "busytok",
+            "delegate",
+            "--subagent",
+            "worker",
+            "--profile",
+            "default",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Delegate { prompt, .. }) => {
+                assert!(prompt.is_none(), "prompt should be None when absent");
+            }
+            other => panic!("expected Delegate without prompt, got: {other:?}"),
+        }
+    }
+
+    // ── Subagent Cancel subcommand ────────────────────────────────────
+
+    #[test]
+    fn args_parses_subagent_cancel_with_task_id() {
+        let args =
+            Args::try_parse_from(["busytok", "subagent", "cancel", "--task-id", "task-1"]).unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand:
+                    SubagentCommand::Cancel {
+                        task_id,
+                        reason,
+                        output,
+                    },
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert!(reason.is_none());
+                assert_eq!(output, "text");
+            }
+            other => panic!("expected Subagent::Cancel, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_subagent_cancel_with_reason_and_json_output() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "subagent",
+            "cancel",
+            "--task-id",
+            "task-1",
+            "--reason",
+            "user aborted",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand:
+                    SubagentCommand::Cancel {
+                        task_id,
+                        reason,
+                        output,
+                    },
+            }) => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(reason.as_deref(), Some("user aborted"));
+                assert_eq!(output, "json");
+            }
+            other => panic!("expected Subagent::Cancel with reason, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_rejects_subagent_cancel_without_task_id() {
+        let result = Args::try_parse_from(["busytok", "subagent", "cancel"]);
+        assert!(
+            result.is_err(),
+            "should reject `subagent cancel` without --task-id"
+        );
+    }
+
+    // ── Subagent read commands with --output ─────────────────────────
+
+    #[test]
+    fn args_parses_subagent_list_with_output_json() {
+        let args =
+            Args::try_parse_from(["busytok", "subagent", "list", "--output", "json"]).unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand: SubagentCommand::List { output, .. },
+            }) => {
+                assert_eq!(output, "json");
+            }
+            other => panic!("expected Subagent::List with json, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_subagent_show_with_output_json() {
+        let args = Args::try_parse_from([
+            "busytok", "subagent", "show", "my-agent", "--output", "json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Subagent {
+                subcommand: SubagentCommand::Show { output, .. },
+            }) => {
+                assert_eq!(output, "json");
+            }
+            other => panic!("expected Subagent::Show with json, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_parses_models_with_sort_and_reasoning() {
+        let args = Args::try_parse_from([
+            "busytok",
+            "models",
+            "--sort",
+            "context_window_desc",
+            "--reasoning",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Models {
+                sort, reasoning, ..
+            }) => {
+                assert_eq!(sort.as_deref(), Some("context_window_desc"));
+                assert!(reasoning);
+            }
+            other => panic!("expected Models with sort+reasoning, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_rejects_models_with_invalid_sort_value() {
+        let result = Args::try_parse_from(["busytok", "models", "--sort", "price"]);
+        assert!(
+            result.is_err(),
+            "should reject invalid --sort value for models"
+        );
     }
 }

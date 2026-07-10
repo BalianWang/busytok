@@ -380,6 +380,7 @@ async fn arc_blanket_impl_delegates_all_runtime_control_methods() {
             source_session_id: None,
             bound_provider_id: None,
             bound_model_id: None,
+            reuse_policy: None,
         })
         .await
         .unwrap();
@@ -1082,6 +1083,17 @@ impl RuntimeControl for SettingsValidationRuntime {
     ) -> anyhow::Result<SubagentTaskDetailDto> {
         self.inner.subagent_task_get(req).await
     }
+    async fn subagent_task_cancel(
+        &self,
+        req: SubagentTaskCancelRequestDto,
+    ) -> anyhow::Result<SubagentTaskCancelResponseDto> {
+        Ok(SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: "queued".to_string(),
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
+    }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await
     }
@@ -1615,6 +1627,17 @@ impl RuntimeControl for RuntimeWithLatestSeq {
         req: SubagentTaskGetRequestDto,
     ) -> anyhow::Result<SubagentTaskDetailDto> {
         self.inner.subagent_task_get(req).await
+    }
+    async fn subagent_task_cancel(
+        &self,
+        req: SubagentTaskCancelRequestDto,
+    ) -> anyhow::Result<SubagentTaskCancelResponseDto> {
+        Ok(SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: "queued".to_string(),
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
     }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await

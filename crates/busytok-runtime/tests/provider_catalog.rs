@@ -251,6 +251,8 @@ async fn model_create_and_list_round_trip() {
             provider_id: None,
             tags: vec![],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -421,6 +423,8 @@ async fn model_update_toggles_enabled() {
             provider_id: None,
             tags: vec![],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -437,6 +441,8 @@ async fn model_update_toggles_enabled() {
             provider_id: None,
             tags: vec![],
             include_disabled: true,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -541,6 +547,8 @@ async fn model_tags_update_replaces_tags() {
             provider_id: None,
             tags: vec![],
             include_disabled: true,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -616,6 +624,8 @@ async fn model_list_filters_by_provider() {
             provider_id: Some(p1.id.clone()),
             tags: vec![],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -677,6 +687,8 @@ async fn model_list_filters_by_tag_and_semantics() {
             provider_id: None,
             tags: vec!["fast".into()],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -688,6 +700,8 @@ async fn model_list_filters_by_tag_and_semantics() {
             provider_id: None,
             tags: vec!["fast".into(), "cheap".into()],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         })
         .await
         .unwrap();

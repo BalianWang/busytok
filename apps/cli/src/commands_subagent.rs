@@ -1,14 +1,14 @@
 //! Handlers for `busytok delegate` and `busytok subagent …`.
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use anyhow::{bail, Context, Result};
 use busytok_control::ControlClient;
 use busytok_protocol::dto::{
     ModelCatalogEntryDto, ModelListRequestDto, ModelListResponseDto, ProviderDto,
     ProviderListResponseDto, SubagentDelegateRequestDto, SubagentDeleteRequestDto,
-    SubagentListRequestDto, SubagentResolveRequestDto, SubagentTaskGetRequestDto,
-    SubagentTasksRequestDto,
+    SubagentListRequestDto, SubagentResolveRequestDto, SubagentTaskCancelRequestDto,
+    SubagentTaskGetRequestDto, SubagentTasksRequestDto,
 };
 use busytok_protocol::{ControlRequest, ControlResponse};
 
@@ -17,6 +17,90 @@ async fn connect() -> Result<ControlClient> {
     crate::commands::connect_client().await.with_context(|| {
         "busytok-service is not running; subagent commands require the service. Start it and retry."
     })
+}
+
+/// Exit code for `--wait-timeout` expiry. Matches the Unix `timeout` command
+/// convention (124 = command timed out), making it automatable.
+pub const EXIT_WAIT_TIMED_OUT: i32 = 124;
+
+/// Error type carrying a process exit code. Used by `--wait-timeout` to
+/// signal timeout to `main()` via the normal `Result` return path, so
+/// `cli.complete` logging and tracing guard flush still happen.
+#[derive(Debug)]
+pub struct ExitCodeError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for ExitCodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (exit {})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for ExitCodeError {}
+
+/// Resolve the prompt from one of four mutually-exclusive sources:
+/// positional `<prompt>`, `--prompt-file <path>`, `--stdin`, or
+/// `--artifact-ref <ref>`. Returns `(prompt, prompt_artifact_ref)`.
+///
+/// When `--artifact-ref` is used, `prompt` is empty and `prompt_artifact_ref`
+/// is Some — the service uses the artifact instead of inline text.
+/// For the other three, `prompt` is non-empty and `prompt_artifact_ref`
+/// is None.
+///
+/// Validates exactly one source is provided. Empty files/stdin are rejected.
+fn resolve_prompt(
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+    stdin_prompt: bool,
+    artifact_ref: Option<String>,
+) -> Result<(String, Option<String>)> {
+    let source_count = [
+        prompt.is_some(),
+        prompt_file.is_some(),
+        stdin_prompt,
+        artifact_ref.is_some(),
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+    if source_count > 1 {
+        bail!(
+            "Only one of <prompt>, --prompt-file, --stdin, or --artifact-ref may be used at a time"
+        );
+    }
+    if source_count == 0 {
+        bail!("A prompt is required: provide <prompt>, --prompt-file <path>, --stdin, or --artifact-ref <ref>");
+    }
+    if let Some(ref_path) = artifact_ref {
+        return Ok((String::new(), Some(ref_path)));
+    }
+    if let Some(path) = prompt_file {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read --prompt-file '{}'", path))?;
+        if content.trim().is_empty() {
+            bail!("--prompt-file '{}' is empty", path);
+        }
+        return Ok((content, None));
+    }
+    if stdin_prompt {
+        let mut content = String::new();
+        std::io::stdin()
+            .lock()
+            .read_to_string(&mut content)
+            .context("failed to read prompt from stdin")?;
+        if content.trim().is_empty() {
+            bail!("stdin prompt is empty");
+        }
+        return Ok((content, None));
+    }
+    // Safe unwrap: source_count >= 1 and it's not any of the other three.
+    let p = prompt.unwrap();
+    if p.trim().is_empty() {
+        bail!("prompt is empty");
+    }
+    Ok((p, None))
 }
 
 pub async fn handle_delegate(
@@ -28,12 +112,24 @@ pub async fn handle_delegate(
     model: Option<String>,
     timeout: Option<u64>,
     output: String,
-    prompt: String,
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+    stdin_prompt: bool,
+    artifact_ref: Option<String>,
     bind_provider: Option<String>,
     bind_model: Option<String>,
     wait: bool,
+    wait_timeout: Option<u64>,
+    poll_interval: Option<u64>,
+    reuse_policy: Option<String>,
 ) -> Result<()> {
-    // Phase 1: pure shape validation that needs no RPC. Do this BEFORE
+    // Phase 1a: resolve the prompt from one of the four mutually-exclusive
+    // sources. Do this BEFORE connect() so file/stdin errors surface
+    // immediately, even when the service is down.
+    let (prompt, prompt_artifact_ref) =
+        resolve_prompt(prompt, prompt_file, stdin_prompt, artifact_ref)?;
+
+    // Phase 1b: pure shape validation that needs no RPC. Do this BEFORE
     // `connect()` so obvious CLI misuse (e.g. `--bind-provider` without
     // `--bind-model`) fails fast with the right error even when the service
     // is down. `(None, None)` is a valid reuse-path passthrough and must
@@ -68,13 +164,14 @@ pub async fn handle_delegate(
         profile,
         intent,
         prompt,
-        prompt_artifact_ref: None,
+        prompt_artifact_ref,
         timeout_seconds: timeout,
         model_override: model,
         source_harness: Some("cli".to_string()),
         source_session_id: None,
         bound_provider_id,
         bound_model_id,
+        reuse_policy,
     };
     let resp = client
         .call(ControlRequest::new(
@@ -102,38 +199,90 @@ pub async fn handle_delegate(
             .and_then(|v| v.as_str())
             .context("delegate response missing task_id for --wait")?
             .to_string();
-        let final_data = wait_for_task(&mut client, &task_id).await?;
-        print_task_detail(&final_data, &output)
+        match wait_for_task(
+            &mut client,
+            &task_id,
+            wait_timeout,
+            poll_interval.unwrap_or(2),
+        )
+        .await?
+        {
+            WaitOutcome::Completed(data) => print_task_detail(&data, &output),
+            WaitOutcome::TimedOut(last_data) => {
+                // Print the last-known task state as JSON so callers can
+                // inspect the intermediate status. Then return an error
+                // carrying exit code 124 so `main()` can log `cli.complete`
+                // and flush the tracing guard before exiting.
+                print_task_detail(&last_data, &output)?;
+                return Err(anyhow::Error::new(ExitCodeError {
+                    code: EXIT_WAIT_TIMED_OUT,
+                    message: "wait-timeout expired".to_string(),
+                }));
+            }
+        }
     } else {
         print_delegate(&data, &output)
     }
 }
 
-/// Poll `subagent.task_get` every 2s until the task reaches a terminal
-/// state (`completed`, `failed`, or `cancelled`). Returns the final task
-/// detail DTO as a `serde_json::Value` (shaped like a delegate response for
-/// printing). All three are terminal per `set_task_status` (which stamps
+/// Outcome of `wait_for_task`: either the task reached a terminal state,
+/// or the client-side timeout expired.
+enum WaitOutcome {
+    Completed(serde_json::Value),
+    TimedOut(serde_json::Value),
+}
+
+/// Poll `subagent.task_get` until the task reaches a terminal state
+/// (`completed`, `failed`, or `cancelled`) or the client-side timeout
+/// expires. Returns the final task detail DTO as a `serde_json::Value`.
+///
+/// All three statuses are terminal per `set_task_status` (which stamps
 /// `completed_at_ms` for each); omitting `cancelled` would spin forever
 /// if a task is ever cancelled.
-async fn wait_for_task(client: &mut ControlClient, task_id: &str) -> Result<serde_json::Value> {
-    let poll_interval = std::time::Duration::from_secs(2);
-    loop {
-        let req = SubagentTaskGetRequestDto {
-            task_id: task_id.to_string(),
-        };
-        let resp = client
-            .call(ControlRequest::new(
-                "subagent.task_get",
-                serde_json::to_value(&req)?,
-            ))
-            .await
-            .with_context(|| format!("subagent.task_get RPC failed for {task_id}"))?;
-        let data = unwrap_ok(resp)?;
-        let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status == "completed" || status == "failed" || status == "cancelled" {
-            return Ok(data);
+///
+/// When `wait_timeout` is set, the function returns `WaitOutcome::TimedOut`
+/// with the last-known task state instead of spinning indefinitely.
+async fn wait_for_task(
+    client: &mut ControlClient,
+    task_id: &str,
+    wait_timeout: Option<u64>,
+    poll_interval_secs: u64,
+) -> Result<WaitOutcome> {
+    let poll_interval = std::time::Duration::from_secs(poll_interval_secs.max(1));
+    let deadline =
+        wait_timeout.map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+
+    let mut last_data: Option<serde_json::Value> = None;
+    let poll = async {
+        loop {
+            let req = SubagentTaskGetRequestDto {
+                task_id: task_id.to_string(),
+            };
+            let resp = client
+                .call(ControlRequest::new(
+                    "subagent.task_get",
+                    serde_json::to_value(&req)?,
+                ))
+                .await
+                .with_context(|| format!("subagent.task_get RPC failed for {task_id}"))?;
+            let data = unwrap_ok(resp)?;
+            let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status == "completed" || status == "failed" || status == "cancelled" {
+                return Ok(WaitOutcome::Completed(data));
+            }
+            last_data = Some(data);
+            tokio::time::sleep(poll_interval).await;
         }
-        tokio::time::sleep(poll_interval).await;
+    };
+
+    match deadline {
+        Some(d) => match tokio::time::timeout_at(d, poll).await {
+            Ok(result) => result,
+            Err(_) => Ok(WaitOutcome::TimedOut(last_data.unwrap_or_else(
+                || serde_json::json!({"id": task_id, "status": "unknown"}),
+            ))),
+        },
+        None => poll.await,
     }
 }
 
@@ -141,6 +290,7 @@ pub async fn handle_list(
     status: Option<String>,
     project: Option<String>,
     include_deleted: bool,
+    output: String,
 ) -> Result<()> {
     let mut client = connect().await?;
     let req = SubagentListRequestDto {
@@ -156,10 +306,15 @@ pub async fn handle_list(
         .await
         .context("subagent.list RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_subagent_list(&data, "text")
+    print_subagent_list(&data, &output)
 }
 
-pub async fn handle_show(name: Option<String>, id: Option<String>, cwd: String) -> Result<()> {
+pub async fn handle_show(
+    name: Option<String>,
+    id: Option<String>,
+    cwd: String,
+    output: String,
+) -> Result<()> {
     let mut client = connect().await?;
     let req = SubagentResolveRequestDto {
         name,
@@ -174,7 +329,7 @@ pub async fn handle_show(name: Option<String>, id: Option<String>, cwd: String) 
         .await
         .context("subagent.show RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_detail(&data, "text")
+    print_detail(&data, &output)
 }
 
 pub async fn handle_tasks(
@@ -182,6 +337,7 @@ pub async fn handle_tasks(
     id: Option<String>,
     cwd: String,
     limit: i64,
+    output: String,
 ) -> Result<()> {
     let mut client = connect().await?;
     let req = SubagentTasksRequestDto {
@@ -198,10 +354,15 @@ pub async fn handle_tasks(
         .await
         .context("subagent.tasks RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_array(&data, "tasks", "text")
+    print_array(&data, "tasks", &output)
 }
 
-pub async fn handle_hibernate(name: Option<String>, id: Option<String>, cwd: String) -> Result<()> {
+pub async fn handle_hibernate(
+    name: Option<String>,
+    id: Option<String>,
+    cwd: String,
+    output: String,
+) -> Result<()> {
     let mut client = connect().await?;
     let req = SubagentResolveRequestDto {
         name,
@@ -216,7 +377,7 @@ pub async fn handle_hibernate(name: Option<String>, id: Option<String>, cwd: Str
         .await
         .context("subagent.hibernate RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_ack(&data, "text")
+    print_ack(&data, &output)
 }
 
 pub async fn handle_delete(
@@ -225,6 +386,7 @@ pub async fn handle_delete(
     cwd: String,
     hard: bool,
     yes: bool,
+    output: String,
 ) -> Result<()> {
     if hard && !yes {
         println!(
@@ -255,7 +417,7 @@ pub async fn handle_delete(
         .await
         .context("subagent.delete RPC failed")?;
     let data = unwrap_ok(resp)?;
-    print_ack(&data, "text")
+    print_ack(&data, &output)
 }
 
 pub async fn handle_task_get(task_id: String, output: String) -> Result<()> {
@@ -270,6 +432,24 @@ pub async fn handle_task_get(task_id: String, output: String) -> Result<()> {
         .context("subagent.task_get RPC failed")?;
     let data = unwrap_ok(resp)?;
     print_task_detail(&data, &output)
+}
+
+pub async fn handle_task_cancel(
+    task_id: String,
+    reason: Option<String>,
+    output: String,
+) -> Result<()> {
+    let mut client = connect().await?;
+    let req = SubagentTaskCancelRequestDto { task_id, reason };
+    let resp = client
+        .call(ControlRequest::new(
+            "subagent.task_cancel",
+            serde_json::to_value(&req)?,
+        ))
+        .await
+        .context("subagent.task_cancel RPC failed")?;
+    let data = unwrap_ok(resp)?;
+    print_task_cancel(&data, &output)
 }
 
 /// Extract the Ok payload or bail with the control error message.
@@ -325,6 +505,8 @@ async fn resolve_bound_fields(
                 provider_id: None,
                 tags: vec![],
                 include_disabled: false, // never bind to disabled provider/model
+                sort: None,
+                reasoning: None,
             };
             let resp = client
                 .call(ControlRequest::new(
@@ -410,6 +592,7 @@ fn print_delegate(value: &serde_json::Value, output: &str) -> Result<()> {
             .get("summary")
             .and_then(|s| s.as_str())
             .unwrap_or("(no summary)");
+        let created = v.get("created").and_then(|b| b.as_bool()).unwrap_or(false);
         println!(
             "task:     {}",
             v.get("task_id").and_then(|s| s.as_str()).unwrap_or("?")
@@ -424,6 +607,7 @@ fn print_delegate(value: &serde_json::Value, output: &str) -> Result<()> {
             "status:   {}",
             v.get("status").and_then(|s| s.as_str()).unwrap_or("?")
         );
+        println!("created:  {}", if created { "yes" } else { "reused" });
         println!("\n{summary}");
     })
 }
@@ -527,6 +711,28 @@ fn print_ack(value: &serde_json::Value, output: &str) -> Result<()> {
     })
 }
 
+/// Print a `SubagentTaskCancelResponseDto` (`{ id, previous_status,
+/// new_status, cancelled }`).
+fn print_task_cancel(value: &serde_json::Value, output: &str) -> Result<()> {
+    print_json_or(value, output, |v| {
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let prev = v
+            .get("previous_status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?");
+        let new = v.get("new_status").and_then(|s| s.as_str()).unwrap_or("?");
+        let cancelled = v
+            .get("cancelled")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        if cancelled {
+            println!("task {id}: {prev} → {new} (cancelled)");
+        } else {
+            println!("task {id}: already terminal ({new}), not cancelled");
+        }
+    })
+}
+
 /// Print a single task detail record (`SubagentTaskDetailDto`).
 ///
 /// This is a DEDICATED formatter — do NOT reuse `print_detail` (that is for
@@ -554,6 +760,9 @@ fn format_task_detail_text(v: &serde_json::Value) -> String {
     let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
     let profile = v.get("profile").and_then(|s| s.as_str()).unwrap_or("?");
     let model_override = or_dash(v.get("model_override").and_then(|s| s.as_str()));
+    let effective_provider_id = or_dash(v.get("effective_provider_id").and_then(|s| s.as_str()));
+    let effective_model_id = or_dash(v.get("effective_model_id").and_then(|s| s.as_str()));
+    let binding_source = or_dash(v.get("binding_source").and_then(|s| s.as_str()));
     let source_harness = or_dash(v.get("source_harness").and_then(|s| s.as_str()));
     let source_session_id = or_dash(v.get("source_session_id").and_then(|s| s.as_str()));
     let created_at_ms = v.get("created_at_ms").and_then(|n| n.as_i64()).unwrap_or(0);
@@ -569,20 +778,23 @@ fn format_task_detail_text(v: &serde_json::Value) -> String {
     let error = or_dash(v.get("error").and_then(|s| s.as_str()));
     let error_kind = or_dash(v.get("error_kind").and_then(|s| s.as_str()));
     format!(
-        "id:                {id}\n\
-         subagent_id:       {subagent_id}\n\
-         subagent_name:     {subagent_name}\n\
-         status:            {status}\n\
-         profile:           {profile}\n\
-         model_override:    {model_override}\n\
-         source_harness:    {source_harness}\n\
-         source_session_id: {source_session_id}\n\
-         created_at_ms:     {created_at_ms}\n\
-         started_at_ms:     {started_at_ms}\n\
-         completed_at_ms:   {completed_at_ms}\n\
-         result_summary:    {result_summary}\n\
-         error:             {error}\n\
-         error_kind:        {error_kind}\n"
+        "id:                    {id}\n\
+         subagent_id:           {subagent_id}\n\
+         subagent_name:         {subagent_name}\n\
+         status:                {status}\n\
+         profile:               {profile}\n\
+         model_override:        {model_override}\n\
+         effective_provider_id: {effective_provider_id}\n\
+         effective_model_id:    {effective_model_id}\n\
+         binding_source:        {binding_source}\n\
+         source_harness:        {source_harness}\n\
+         source_session_id:     {source_session_id}\n\
+         created_at_ms:         {created_at_ms}\n\
+         started_at_ms:         {started_at_ms}\n\
+         completed_at_ms:       {completed_at_ms}\n\
+         result_summary:        {result_summary}\n\
+         error:                 {error}\n\
+         error_kind:            {error_kind}\n"
     )
 }
 
@@ -978,6 +1190,7 @@ mod tests {
                     model: Some("gpt-5".to_string()),
                     summary: Some("did the thing".to_string()),
                     usage: SubagentUsageDto::default(),
+                    created: true,
                 },
                 list_response: SubagentListResponseDto {
                     subagents: vec![SubagentDetailDto {
@@ -1239,6 +1452,12 @@ mod tests {
             }
             self.inner.subagent_task_get(req).await
         }
+        async fn subagent_task_cancel(
+            &self,
+            req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+        ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+            self.inner.subagent_task_cancel(req).await
+        }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
         }
@@ -1333,10 +1552,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1361,10 +1586,16 @@ mod tests {
             Some("gpt-5".to_string()),
             Some(60),
             "json".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1554,10 +1785,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some(provider_uuid.clone()),
             Some("model-1".to_string()),
             false,
+            None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -1594,10 +1831,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             false,
+            None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -1630,10 +1873,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some("prov-1".to_string()),
             None,
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1660,10 +1909,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some("prov-1".to_string()),
             None,
             false,
+            None,
+            None,
+            None,
         )
         .await;
         let err = result.unwrap_err().to_string();
@@ -1696,10 +1951,16 @@ mod tests {
             None,
             None,
             "json".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             true,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1738,10 +1999,16 @@ mod tests {
             None,
             None,
             "json".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             true,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1779,10 +2046,16 @@ mod tests {
             None,
             None,
             "json".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             true,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1820,10 +2093,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             None,
             None,
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1858,7 +2137,13 @@ mod tests {
             seq.push_back("completed".to_string());
         }
         let mut client = connect().await.unwrap();
-        let data = wait_for_task(&mut client, "task-xyz").await.unwrap();
+        let data = match wait_for_task(&mut client, "task-xyz", None, 1)
+            .await
+            .unwrap()
+        {
+            WaitOutcome::Completed(d) => d,
+            WaitOutcome::TimedOut(_) => panic!("expected completed"),
+        };
         drop(harness);
         // Task detail DTO fields:
         assert_eq!(data.get("id").and_then(|v| v.as_str()), Some("task-xyz"));
@@ -1914,10 +2199,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some("Deepseek".to_string()), // name, not UUID
             Some("deepseek-v4-pro".to_string()),
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -1958,10 +2249,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some(uuid.clone()),
             Some("deepseek-v4-pro".to_string()),
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -2011,10 +2308,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some("Nonexistent".to_string()),
             Some("gpt-5".to_string()),
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -2053,10 +2356,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some("Disabled-Prov".to_string()),
             Some("model-x".to_string()),
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -2107,10 +2416,16 @@ mod tests {
             None,
             None,
             "text".to_string(),
-            "do the thing".to_string(),
+            Some("do the thing".to_string()),
+            None,
+            false,
+            None,
             Some("Dup".to_string()),
             Some("model-x".to_string()),
             false,
+            None,
+            None,
+            None,
         )
         .await;
         drop(harness);
@@ -2126,7 +2441,13 @@ mod tests {
     async fn handle_list_invokes_subagent_list_rpc() {
         let (harness, socket) = spawn_subagent_server().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_list(Some("hot".to_string()), Some("proj".to_string()), false).await;
+        let result = handle_list(
+            Some("hot".to_string()),
+            Some("proj".to_string()),
+            false,
+            "text".to_string(),
+        )
+        .await;
         drop(harness);
         assert!(result.is_ok(), "handle_list: {:?}", result.err());
     }
@@ -2136,7 +2457,13 @@ mod tests {
     async fn handle_show_invokes_subagent_show_rpc_by_name() {
         let (harness, socket) = spawn_subagent_server().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_show(Some("dev-subagent".to_string()), None, ".".to_string()).await;
+        let result = handle_show(
+            Some("dev-subagent".to_string()),
+            None,
+            ".".to_string(),
+            "text".to_string(),
+        )
+        .await;
         drop(harness);
         assert!(result.is_ok(), "handle_show by name: {:?}", result.err());
     }
@@ -2146,7 +2473,13 @@ mod tests {
     async fn handle_show_invokes_subagent_show_rpc_by_id() {
         let (harness, socket) = spawn_subagent_server().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_show(None, Some("sa-1".to_string()), ".".to_string()).await;
+        let result = handle_show(
+            None,
+            Some("sa-1".to_string()),
+            ".".to_string(),
+            "text".to_string(),
+        )
+        .await;
         drop(harness);
         assert!(result.is_ok(), "handle_show by id: {:?}", result.err());
     }
@@ -2156,7 +2489,14 @@ mod tests {
     async fn handle_tasks_invokes_subagent_tasks_rpc() {
         let (harness, socket) = spawn_subagent_server().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_tasks(Some("dev-subagent".to_string()), None, ".".to_string(), 5).await;
+        let result = handle_tasks(
+            Some("dev-subagent".to_string()),
+            None,
+            ".".to_string(),
+            5,
+            "text".to_string(),
+        )
+        .await;
         drop(harness);
         assert!(result.is_ok(), "handle_tasks: {:?}", result.err());
     }
@@ -2166,8 +2506,13 @@ mod tests {
     async fn handle_hibernate_invokes_subagent_hibernate_rpc() {
         let (harness, socket) = spawn_subagent_server().await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result =
-            handle_hibernate(Some("dev-subagent".to_string()), None, ".".to_string()).await;
+        let result = handle_hibernate(
+            Some("dev-subagent".to_string()),
+            None,
+            ".".to_string(),
+            "text".to_string(),
+        )
+        .await;
         drop(harness);
         assert!(result.is_ok(), "handle_hibernate: {:?}", result.err());
     }
@@ -2183,6 +2528,7 @@ mod tests {
             ".".to_string(),
             false,
             false,
+            "text".to_string(),
         )
         .await;
         drop(harness);
@@ -2202,6 +2548,7 @@ mod tests {
             ".".to_string(),
             true,
             true,
+            "text".to_string(),
         )
         .await;
         drop(harness);
@@ -2227,6 +2574,7 @@ mod tests {
             ".".to_string(),
             false,
             false,
+            "text".to_string(),
         )
         .await;
         drop(harness);
@@ -2243,7 +2591,7 @@ mod tests {
         // Point BUSYTOK_SOCKET at a path that cannot be connected to and
         // verify the subagent-specific error context is added.
         std::env::set_var("BUSYTOK_SOCKET", "/nonexistent/busytok-test-inline.sock");
-        let result = handle_list(None, None, false).await;
+        let result = handle_list(None, None, false, "text".to_string()).await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("busytok-service is not running"),
@@ -2260,7 +2608,7 @@ mod tests {
         let runtime: Arc<dyn RuntimeControl> = Arc::new(FailingListRuntime { inner });
         let (harness, socket) = spawn_server(runtime).await;
         std::env::set_var("BUSYTOK_SOCKET", &socket);
-        let result = handle_list(None, None, false).await;
+        let result = handle_list(None, None, false, "text".to_string()).await;
         drop(harness);
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2462,6 +2810,12 @@ mod tests {
             req: SubagentTaskGetRequestDto,
         ) -> Result<SubagentTaskDetailDto> {
             self.inner.subagent_task_get(req).await
+        }
+        async fn subagent_task_cancel(
+            &self,
+            req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+        ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+            self.inner.subagent_task_cancel(req).await
         }
         async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
             self.inner.provider_create(req).await
@@ -2706,6 +3060,8 @@ mod tests {
                 provider_id: None,
                 tags: vec![],
                 include_disabled: false,
+                sort: None,
+                reasoning: None,
             })
             .await;
         let _ = rt
@@ -2915,6 +3271,7 @@ mod tests {
                 source_session_id: None,
                 bound_provider_id: None,
                 bound_model_id: None,
+                reuse_policy: None,
             })
             .await;
         let _ = rt
@@ -2992,6 +3349,8 @@ mod tests {
                 provider_id: None,
                 tags: vec![],
                 include_disabled: false,
+                sort: None,
+                reasoning: None,
             })
             .await;
         let _ = rt
@@ -3072,21 +3431,24 @@ mod tests {
             "error_kind": null,
         });
         let s = format_task_detail_text(&v);
-        assert!(s.contains("id:                task-1"), "got: {s}");
-        assert!(s.contains("subagent_id:       sa-1"), "got: {s}");
-        assert!(s.contains("subagent_name:     dev"), "got: {s}");
-        assert!(s.contains("status:            completed"), "got: {s}");
-        assert!(s.contains("profile:           default"), "got: {s}");
-        assert!(s.contains("model_override:    gpt-5"), "got: {s}");
-        assert!(s.contains("source_harness:    cli"), "got: {s}");
-        assert!(s.contains("source_session_id: sess-1"), "got: {s}");
-        assert!(s.contains("created_at_ms:     1700000000"), "got: {s}");
-        assert!(s.contains("started_at_ms:     1700000001"), "got: {s}");
-        assert!(s.contains("completed_at_ms:   1700000002"), "got: {s}");
-        assert!(s.contains("result_summary:    did the thing"), "got: {s}");
+        assert!(s.contains("id:                    task-1"), "got: {s}");
+        assert!(s.contains("subagent_id:           sa-1"), "got: {s}");
+        assert!(s.contains("subagent_name:         dev"), "got: {s}");
+        assert!(s.contains("status:                completed"), "got: {s}");
+        assert!(s.contains("profile:               default"), "got: {s}");
+        assert!(s.contains("model_override:        gpt-5"), "got: {s}");
+        assert!(s.contains("source_harness:        cli"), "got: {s}");
+        assert!(s.contains("source_session_id:     sess-1"), "got: {s}");
+        assert!(s.contains("created_at_ms:         1700000000"), "got: {s}");
+        assert!(s.contains("started_at_ms:         1700000001"), "got: {s}");
+        assert!(s.contains("completed_at_ms:       1700000002"), "got: {s}");
+        assert!(
+            s.contains("result_summary:        did the thing"),
+            "got: {s}"
+        );
         // `error`/`error_kind` are null → or_dash renders `-`.
-        assert!(s.contains("error:             -"), "got: {s}");
-        assert!(s.contains("error_kind:        -"), "got: {s}");
+        assert!(s.contains("error:                 -"), "got: {s}");
+        assert!(s.contains("error_kind:            -"), "got: {s}");
         // Negative assertions: the text formatter intentionally omits
         // `prompt`, `prompt_artifact_ref`, and `timeout_seconds` even when
         // they are present in the payload.
@@ -3118,26 +3480,26 @@ mod tests {
         });
         let s = format_task_detail_text(&v);
         // Required string fields render their provided values.
-        assert!(s.contains("id:                task-2"), "got: {s}");
-        assert!(s.contains("subagent_id:       sa-2"), "got: {s}");
-        assert!(s.contains("status:            pending"), "got: {s}");
-        assert!(s.contains("profile:           default"), "got: {s}");
-        assert!(s.contains("created_at_ms:     1700000000"), "got: {s}");
+        assert!(s.contains("id:                    task-2"), "got: {s}");
+        assert!(s.contains("subagent_id:           sa-2"), "got: {s}");
+        assert!(s.contains("status:                pending"), "got: {s}");
+        assert!(s.contains("profile:               default"), "got: {s}");
+        assert!(s.contains("created_at_ms:         1700000000"), "got: {s}");
         // Optional string fields must render `-` (not `?`, not empty).
-        assert!(s.contains("subagent_name:     -"), "got: {s}");
-        assert!(s.contains("model_override:    -"), "got: {s}");
-        assert!(s.contains("source_harness:    -"), "got: {s}");
-        assert!(s.contains("source_session_id: -"), "got: {s}");
-        assert!(s.contains("result_summary:    -"), "got: {s}");
-        assert!(s.contains("error:             -"), "got: {s}");
-        assert!(s.contains("error_kind:        -"), "got: {s}");
+        assert!(s.contains("subagent_name:         -"), "got: {s}");
+        assert!(s.contains("model_override:        -"), "got: {s}");
+        assert!(s.contains("source_harness:        -"), "got: {s}");
+        assert!(s.contains("source_session_id:     -"), "got: {s}");
+        assert!(s.contains("result_summary:        -"), "got: {s}");
+        assert!(s.contains("error:                 -"), "got: {s}");
+        assert!(s.contains("error_kind:            -"), "got: {s}");
         // Optional i64 timestamps render `-` when absent.
-        assert!(s.contains("started_at_ms:     -"), "got: {s}");
-        assert!(s.contains("completed_at_ms:   -"), "got: {s}");
+        assert!(s.contains("started_at_ms:         -"), "got: {s}");
+        assert!(s.contains("completed_at_ms:       -"), "got: {s}");
         // Sanity: a regression that rendered `?` or empty for optionals
         // would fail the above — the literal `-` is asserted per-field.
         assert!(
-            !s.contains("subagent_name:     ?"),
+            !s.contains("subagent_name:         ?"),
             "optional field rendered `?` instead of `-`: {s}"
         );
     }
@@ -3148,20 +3510,20 @@ mod tests {
         let v = json!({});
         let s = format_task_detail_text(&v);
         // Required string fields fall back to `?`.
-        assert!(s.contains("id:                ?"), "got: {s}");
-        assert!(s.contains("subagent_id:       ?"), "got: {s}");
-        assert!(s.contains("status:            ?"), "got: {s}");
-        assert!(s.contains("profile:           ?"), "got: {s}");
+        assert!(s.contains("id:                    ?"), "got: {s}");
+        assert!(s.contains("subagent_id:           ?"), "got: {s}");
+        assert!(s.contains("status:                ?"), "got: {s}");
+        assert!(s.contains("profile:               ?"), "got: {s}");
         // Required i64 field falls back to 0.
-        assert!(s.contains("created_at_ms:     0"), "got: {s}");
+        assert!(s.contains("created_at_ms:         0"), "got: {s}");
         // Optional fields still render `-`.
-        assert!(s.contains("subagent_name:     -"), "got: {s}");
-        assert!(s.contains("model_override:    -"), "got: {s}");
-        assert!(s.contains("result_summary:    -"), "got: {s}");
-        assert!(s.contains("error:             -"), "got: {s}");
-        assert!(s.contains("error_kind:        -"), "got: {s}");
-        assert!(s.contains("started_at_ms:     -"), "got: {s}");
-        assert!(s.contains("completed_at_ms:   -"), "got: {s}");
+        assert!(s.contains("subagent_name:         -"), "got: {s}");
+        assert!(s.contains("model_override:        -"), "got: {s}");
+        assert!(s.contains("result_summary:        -"), "got: {s}");
+        assert!(s.contains("error:                 -"), "got: {s}");
+        assert!(s.contains("error_kind:            -"), "got: {s}");
+        assert!(s.contains("started_at_ms:         -"), "got: {s}");
+        assert!(s.contains("completed_at_ms:       -"), "got: {s}");
     }
 
     #[test]
@@ -3223,5 +3585,410 @@ mod tests {
             err.contains("task not found: missing-task"),
             "expected task-specific message, got: {err}"
         );
+    }
+
+    // ── resolve_prompt ────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_prompt_positional_arg_works() {
+        let (prompt, artifact) =
+            resolve_prompt(Some("hello world".to_string()), None, false, None).unwrap();
+        assert_eq!(prompt, "hello world");
+        assert!(artifact.is_none());
+    }
+
+    #[test]
+    fn resolve_prompt_prompt_file_reads_content() {
+        // Write a temp file with content, verify resolve_prompt reads it.
+        let dir = std::env::temp_dir();
+        let path = dir.join("busytok-resolve-prompt-test.txt");
+        std::fs::write(&path, "file prompt content").unwrap();
+        let (prompt, artifact) =
+            resolve_prompt(None, Some(path.to_string_lossy().to_string()), false, None).unwrap();
+        assert_eq!(prompt, "file prompt content");
+        assert!(artifact.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_prompt_prompt_file_with_unicode() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("busytok-resolve-prompt-unicode.txt");
+        std::fs::write(&path, "你好世界 🌍 émojis").unwrap();
+        let (prompt, _) =
+            resolve_prompt(None, Some(path.to_string_lossy().to_string()), false, None).unwrap();
+        assert_eq!(prompt, "你好世界 🌍 émojis");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_prompt_prompt_file_multiline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("busytok-resolve-prompt-multiline.txt");
+        std::fs::write(&path, "line one\nline two\nline three").unwrap();
+        let (prompt, _) =
+            resolve_prompt(None, Some(path.to_string_lossy().to_string()), false, None).unwrap();
+        assert_eq!(prompt, "line one\nline two\nline three");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_prompt_empty_file_errors() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("busytok-resolve-prompt-empty.txt");
+        std::fs::write(&path, "   \n\n  ").unwrap();
+        let err = resolve_prompt(None, Some(path.to_string_lossy().to_string()), false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "expected empty error, got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_prompt_nonexistent_file_errors() {
+        let err = resolve_prompt(
+            None,
+            Some("/nonexistent/busytok-prompt-file.txt".to_string()),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("failed to read") || err.contains("prompt-file"),
+            "expected read error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_artifact_ref_returns_empty_prompt() {
+        let (prompt, artifact) =
+            resolve_prompt(None, None, false, Some("artifact:123".to_string())).unwrap();
+        assert!(prompt.is_empty());
+        assert_eq!(artifact, Some("artifact:123".to_string()));
+    }
+
+    #[test]
+    fn resolve_prompt_no_source_errors() {
+        let err = resolve_prompt(None, None, false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("prompt is required"),
+            "expected required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_multiple_sources_errors() {
+        // positional + prompt_file
+        let err = resolve_prompt(
+            Some("p".to_string()),
+            Some("/tmp/x".to_string()),
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Only one"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_multiple_sources_positional_and_stdin_errors() {
+        let err = resolve_prompt(Some("p".to_string()), None, true, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Only one"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_multiple_sources_artifact_and_file_errors() {
+        let err = resolve_prompt(
+            None,
+            Some("/tmp/x".to_string()),
+            false,
+            Some("ref".to_string()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Only one"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_empty_positional_errors() {
+        let err = resolve_prompt(Some("   ".to_string()), None, false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "expected empty error, got: {err}");
+    }
+
+    #[test]
+    fn resolve_prompt_multiple_sources_positional_and_artifact_errors() {
+        let err = resolve_prompt(Some("p".to_string()), None, false, Some("ref".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Only one"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_multiple_sources_prompt_file_and_stdin_errors() {
+        let err = resolve_prompt(None, Some("/tmp/x".to_string()), true, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Only one"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_multiple_sources_stdin_and_artifact_errors() {
+        let err = resolve_prompt(None, None, true, Some("ref".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Only one"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    // ── wait_for_task (timeout) ──────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn wait_for_task_returns_timed_out_when_deadline_exceeds() {
+        // Stage a non-terminal status ("queued") that never reaches terminal.
+        // With a 1s wait_timeout and 1s poll interval, the deadline should
+        // expire and return WaitOutcome::TimedOut with the last-known state.
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        {
+            // Only stage one non-terminal status — the next poll would also
+            // return "queued" via the inner runtime's default.
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("queued".to_string());
+        }
+        let mut client = connect().await.unwrap();
+        let outcome = wait_for_task(&mut client, "task-timeout-test", Some(1), 1)
+            .await
+            .unwrap();
+        drop(harness);
+        match outcome {
+            WaitOutcome::TimedOut(data) => {
+                // The last-known state should have the task_id and "queued" or "unknown" status
+                assert!(
+                    data.get("id").is_some(),
+                    "timed-out data should have id field"
+                );
+            }
+            WaitOutcome::Completed(_) => {
+                panic!("expected WaitOutcome::TimedOut, got Completed");
+            }
+        }
+    }
+
+    /// Verify that `handle_delegate` returns an `ExitCodeError` with
+    /// code=124 when `--wait-timeout` expires, so `main()` can log
+    /// `cli.complete` and flush the tracing guard before exiting.
+    #[tokio::test]
+    #[serial]
+    async fn handle_delegate_wait_timeout_returns_exit_code_error_124() {
+        let (harness, runtime, socket) = spawn_subagent_server_with_runtime().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        // Stage non-terminal "queued" so the poll never reaches terminal.
+        {
+            let mut seq = runtime.task_get_status_sequence.lock().unwrap();
+            seq.push_back("queued".to_string());
+        }
+        // The runtime's default delegate_response has task_id: "task-xyz".
+
+        let result = handle_delegate(
+            "test-subagent".to_string(),
+            None,
+            ".".to_string(),
+            "default".to_string(),
+            None,
+            None,
+            None,
+            "text".to_string(),
+            Some("do thing".to_string()),
+            None,
+            false,
+            None,
+            None,
+            None,
+            true,    // wait
+            Some(1), // wait_timeout = 1s
+            Some(1), // poll_interval = 1s
+            None,
+        )
+        .await;
+        drop(harness);
+        let err = result.unwrap_err();
+        let exit_err = err
+            .downcast_ref::<ExitCodeError>()
+            .expect("expected ExitCodeError on wait-timeout");
+        assert_eq!(exit_err.code, EXIT_WAIT_TIMED_OUT);
+        assert!(
+            exit_err.message.contains("wait-timeout"),
+            "message should mention wait-timeout, got: {}",
+            exit_err.message
+        );
+    }
+
+    // ── handle_task_cancel ───────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_cancel_invokes_subagent_task_cancel_rpc_and_prints_text() {
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_cancel(
+            "task-1".to_string(),
+            Some("user requested".to_string()),
+            "text".to_string(),
+        )
+        .await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_task_cancel text: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_cancel_invokes_subagent_task_cancel_rpc_with_json_output() {
+        let (harness, socket) = spawn_subagent_server().await;
+        std::env::set_var("BUSYTOK_SOCKET", &socket);
+        let result = handle_task_cancel("task-1".to_string(), None, "json".to_string()).await;
+        drop(harness);
+        assert!(
+            result.is_ok(),
+            "handle_task_cancel json: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_task_cancel_propagates_rpc_error_when_runtime_fails() {
+        // Use a runtime whose subagent_task_get always fails — the cancel
+        // handler should propagate the error through unwrap_ok.
+        // Actually the cancel RPC delegates to TestRuntimeControl which returns
+        // a canned response. To test error propagation, we can point at a
+        // nonexistent socket.
+        std::env::set_var(
+            "BUSYTOK_SOCKET",
+            "/nonexistent/busytok-cancel-error-test.sock",
+        );
+        let result = handle_task_cancel("missing-task".to_string(), None, "text".to_string()).await;
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("busytok-service is not running"),
+            "expected connect error, got: {err}"
+        );
+    }
+
+    // ── format_task_detail_text (effective fields) ──────────────────
+
+    #[test]
+    fn format_task_detail_text_shows_effective_fields_when_present() {
+        let v = json!({
+            "id": "task-1",
+            "subagent_id": "sa-1",
+            "subagent_name": "dev-subagent",
+            "status": "completed",
+            "profile": "default",
+            "model_override": "gpt-4",
+            "effective_provider_id": "prov-uuid-123",
+            "effective_model_id": "gpt-4",
+            "binding_source": "override",
+            "source_harness": "cli",
+            "source_session_id": null,
+            "created_at_ms": 1000,
+            "started_at_ms": 1001,
+            "completed_at_ms": 2000,
+            "result_summary": "done",
+            "error": null,
+            "error_kind": null,
+        });
+        let text = format_task_detail_text(&v);
+        assert!(
+            text.contains("effective_provider_id: prov-uuid-123"),
+            "text should show effective_provider_id: {text}"
+        );
+        assert!(
+            text.contains("effective_model_id:    gpt-4"),
+            "text should show effective_model_id: {text}"
+        );
+        assert!(
+            text.contains("binding_source:        override"),
+            "text should show binding_source: {text}"
+        );
+    }
+
+    #[test]
+    fn format_task_detail_text_shows_dashes_for_absent_effective_fields() {
+        let v = json!({
+            "id": "task-1",
+            "subagent_id": "sa-1",
+            "status": "queued",
+            "profile": "default",
+            "created_at_ms": 1000,
+        });
+        let text = format_task_detail_text(&v);
+        assert!(
+            text.contains("effective_provider_id: -"),
+            "absent effective_provider_id should render as dash: {text}"
+        );
+        assert!(
+            text.contains("effective_model_id:    -"),
+            "absent effective_model_id should render as dash: {text}"
+        );
+        assert!(
+            text.contains("binding_source:        -"),
+            "absent binding_source should render as dash: {text}"
+        );
+    }
+
+    // ── print_task_cancel ───────────────────────────────────────────
+
+    #[test]
+    fn print_task_cancel_text_output_shows_cancelled() {
+        let v = json!({
+            "id": "task-1",
+            "previous_status": "queued",
+            "new_status": "cancelled",
+            "cancelled": true,
+        });
+        // print_task_cancel prints to stdout; just verify it doesn't panic.
+        let result = print_task_cancel(&v, "text");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_task_cancel_text_output_shows_already_terminal() {
+        let v = json!({
+            "id": "task-2",
+            "previous_status": "completed",
+            "new_status": "completed",
+            "cancelled": false,
+        });
+        let result = print_task_cancel(&v, "text");
+        assert!(result.is_ok());
     }
 }

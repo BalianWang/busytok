@@ -429,6 +429,12 @@ impl RuntimeControl for ConfigurableRuntime {
     ) -> anyhow::Result<SubagentTaskDetailDto> {
         self.inner.subagent_task_get(req).await
     }
+    async fn subagent_task_cancel(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+    ) -> anyhow::Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+        self.inner.subagent_task_cancel(req).await
+    }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         self.inner.provider_create(req).await
     }

@@ -313,9 +313,28 @@ pub fn get_model_by_provider_and_model_id(
 pub fn list_models_filtered(
     conn: &Connection,
     filter: ModelCatalogFilter,
+    sort: Option<&str>,
+    reasoning: Option<bool>,
 ) -> Result<Vec<ModelCatalogEntry>> {
     let include_disabled = if filter.include_disabled { 1 } else { 0 };
     let provider_id = filter.provider_id.as_deref();
+    // Reasoning filter: Some(true) → only reasoning models, Some(false) → only
+    // non-reasoning, None → no filter.
+    let reasoning_clause = match reasoning {
+        Some(true) => " AND m.reasoning = 1",
+        Some(false) => " AND m.reasoning = 0",
+        None => "",
+    };
+    // Sort order: default ("name") keeps the historical ORDER BY. The NULLS
+    // handling (`IS NULL` boolean) forces NULL values to sort last regardless
+    // of SQLite's default NULL ordering.
+    let order_clause = match sort.unwrap_or("name") {
+        "context_window_desc" => {
+            "ORDER BY m.context_window IS NULL, m.context_window DESC, p.name, m.model_id"
+        }
+        "max_tokens_desc" => "ORDER BY m.max_tokens IS NULL, m.max_tokens DESC, p.name, m.model_id",
+        _ => "ORDER BY p.name, m.model_id",
+    };
 
     // Dynamic tag placeholders: rusqlite cannot bind Vec to IN()
     let tag_count = filter.tags.len() as i64;
@@ -339,9 +358,10 @@ pub fn list_models_filtered(
          LEFT JOIN model_tags mt ON mt.model_id = m.id
          WHERE (?1 = 1 OR (p.enabled = 1 AND m.enabled = 1))
            AND (?2 IS NULL OR m.provider_id = ?2)
+           {reasoning_clause}
          GROUP BY m.id
          {tag_clause}
-         ORDER BY p.name, m.model_id"
+         {order_clause}"
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -401,6 +421,8 @@ pub fn list_models_by_provider(
             tags: vec![],
             include_disabled: true, // by-provider view shows all models
         },
+        None,
+        None,
     )
 }
 

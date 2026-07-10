@@ -1233,6 +1233,26 @@ impl SidecarHandle {
             .await
     }
 
+    /// Cancel an in-flight `turn_auto` for the given subagent. The sidecar
+    /// looks up the hot session by `logical_subagent_id` and calls
+    /// `abort()` on the SDK session, which aborts the underlying HTTP
+    /// request to the LLM provider — stopping token generation.
+    ///
+    /// Best-effort: the sidecar returns `{ cancelled: bool }`. If no hot
+    /// session exists, `cancelled` is `false` (the turn may have already
+    /// completed or the subagent was never seen by this sidecar).
+    pub async fn cancel_session(
+        &self,
+        logical_subagent_id: &str,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.supervisor
+            .call_rpc(
+                "session.cancel",
+                serde_json::json!({ "logical_subagent_id": logical_subagent_id }),
+            )
+            .await
+    }
+
     /// §8.3 step 4: prepare ALL hot sessions for hibernate before graceful
     /// restart. Calls `session.prepare_hibernate` with `{"all": true}`.
     /// Returns the sidecar's response (a map of session_id → {memory_delta, stats}).

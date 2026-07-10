@@ -63,6 +63,25 @@ pub struct ExecutorOutput {
 #[async_trait::async_trait]
 pub trait TaskExecutor: Send + Sync {
     async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput>;
+
+    /// Cancel an in-flight `execute()` call for the given subagent. This is
+    /// the execution-protocol counterpart to `SubagentManager::cancel_task`:
+    /// the manager flips the DB status to `cancelled` and sends a local cancel
+    /// signal (dropping the executor future), while this method actually
+    /// aborts the underlying model call — stopping token generation at the
+    /// provider.
+    ///
+    /// **Best-effort:** the caller MUST NOT assume the cancel succeeded.
+    /// If the sidecar is unreachable, the session is not found, or the turn
+    /// has already completed, this method returns `Ok(())` without error.
+    /// The DB status is already `cancelled` regardless of this call's outcome.
+    ///
+    /// Default impl: no-op (mock executors don't have a real model call to
+    /// cancel). `SidecarTaskExecutor` overrides this to send a
+    /// `session.cancel` RPC to the sidecar process.
+    async fn cancel(&self, _subagent_id: &str, _provider_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Deterministic in-process mock executor. Used by Plan 1 tests and by Plan 2

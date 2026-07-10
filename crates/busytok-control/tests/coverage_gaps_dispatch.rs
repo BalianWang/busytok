@@ -357,6 +357,17 @@ impl RuntimeControl for SuccessRuntime {
     ) -> anyhow::Result<SubagentTaskDetailDto> {
         self.inner.subagent_task_get(req).await
     }
+    async fn subagent_task_cancel(
+        &self,
+        req: SubagentTaskCancelRequestDto,
+    ) -> anyhow::Result<SubagentTaskCancelResponseDto> {
+        Ok(SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: "queued".to_string(),
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
+    }
 
     // ── Provider overrides (return Ok to cover dispatch success paths) ──
     async fn provider_create(&self, _req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
@@ -871,6 +882,17 @@ impl RuntimeControl for AllErrorRuntime {
     ) -> anyhow::Result<SubagentTaskDetailDto> {
         Err(anyhow::anyhow!("runtime error"))
     }
+    async fn subagent_task_cancel(
+        &self,
+        req: SubagentTaskCancelRequestDto,
+    ) -> anyhow::Result<SubagentTaskCancelResponseDto> {
+        Ok(SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: "queued".to_string(),
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
+    }
 
     async fn provider_create(&self, _req: ProviderCreateRequestDto) -> anyhow::Result<ProviderDto> {
         Err(anyhow::anyhow!("runtime error"))
@@ -1206,6 +1228,8 @@ async fn arc_blanket_impl_delegates_model_profile_and_sidecar_methods() {
             provider_id: None,
             tags: vec![],
             include_disabled: false,
+            sort: None,
+            reasoning: None,
         })
         .await;
     let _ = rt

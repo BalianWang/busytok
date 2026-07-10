@@ -253,10 +253,22 @@ describe("createBusytokClient", () => {
   it("requests model list", async () => {
     const invoke = vi.fn().mockResolvedValue({ models: [] });
     const client = createBusytokClient({ invoke });
-    await client.modelList({ provider_id: "deepseek", tags: ["chat"], include_disabled: false });
+    await client.modelList({
+      provider_id: "deepseek",
+      tags: ["chat"],
+      include_disabled: false,
+      sort: null,
+      reasoning: null,
+    });
     expect(invoke).toHaveBeenCalledWith("invoke_busytok", expect.objectContaining({
       method: "model.list",
-      params: { provider_id: "deepseek", tags: ["chat"], include_disabled: false },
+      params: {
+        provider_id: "deepseek",
+        tags: ["chat"],
+        include_disabled: false,
+        sort: null,
+        reasoning: null,
+      },
     }));
   });
 

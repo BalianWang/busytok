@@ -5,6 +5,7 @@ import { shutdownHandler } from '../src/handlers/shutdown.js';
 import { turnAutoHandlerWithPool } from '../src/handlers/turn_auto.js';
 import { prepareHibernateHandlerWithPool } from '../src/handlers/prepare_hibernate.js';
 import { closeHandlerWithPool } from '../src/handlers/close.js';
+import { cancelHandlerWithPool } from '../src/handlers/cancel.js';
 import { SessionPool } from '../src/session_pool.js';
 import { PiSdkSession, type SdkSession, type SessionFactory } from '../src/pi_session.js';
 import type { HandlerContext } from '../src/rpc.js';
@@ -193,6 +194,51 @@ describe('close handler', () => {
       await handler({ adapter_session_id: 'nope' }, noopCtx);
     } catch (e) {
       expect((e as { code: number }).code).toBe(-32001);
+    }
+  });
+});
+
+describe('cancel handler', () => {
+  it('aborts an existing session and returns cancelled: true', async () => {
+    const pool = new SessionPool(3);
+    let abortCalled = false;
+    const spySdk: SdkSession = {
+      sessionId: 'sess-cancel',
+      prompt: async () => {},
+      getLastAssistantText: () => '',
+      getSessionStats: () => ({
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        cost: 0,
+      }),
+      abort: async () => { abortCalled = true; },
+      dispose: () => {},
+    };
+    const factory: SessionFactory = async (subagent: string) =>
+      new PiSdkSession(spySdk, subagent, 'sess-cancel', 'test-provider', 'test-model');
+    await pool.ensure('sub-cancel', OPTS, factory);
+    const handler = cancelHandlerWithPool(pool);
+    const result = await handler({ logical_subagent_id: 'sub-cancel' }, noopCtx) as { cancelled: boolean };
+    expect(result.cancelled).toBe(true);
+    expect(abortCalled).toBe(true);
+    // Session stays in the pool (not closed) — it can be reused.
+    expect(pool.size()).toBe(1);
+  });
+
+  it('returns cancelled: false when no session exists for the subagent', async () => {
+    const pool = new SessionPool(3);
+    const handler = cancelHandlerWithPool(pool);
+    const result = await handler({ logical_subagent_id: 'nonexistent' }, noopCtx) as { cancelled: boolean };
+    expect(result.cancelled).toBe(false);
+  });
+
+  it('throws -32602 on missing logical_subagent_id', async () => {
+    const pool = new SessionPool(3);
+    const handler = cancelHandlerWithPool(pool);
+    await expect(handler({}, noopCtx)).rejects.toThrow();
+    try {
+      await handler({}, noopCtx);
+    } catch (e) {
+      expect((e as { code: number }).code).toBe(-32602);
     }
   });
 });

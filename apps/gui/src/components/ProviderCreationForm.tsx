@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type {
   ModelCreateRequestDto,
   ProviderCreateRequestDto,
@@ -12,6 +12,7 @@ import {
   parseTags,
   validateBaseUrl,
 } from "../pages/providerFormUtils";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ProviderCreationFormProps {
   onClose: () => void;
@@ -49,21 +50,34 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
   const [modelTags, setModelTags] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
   const [state, setState] = useState<SubmitState>({ kind: "idle" });
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const urlInputRef = useRef<HTMLInputElement>(null);
 
   const existingNames = useMemo(
     () => new Set((providersQuery.data?.providers ?? []).map((p) => p.name)),
     [providersQuery.data],
   );
 
-  // Save is enabled only when the form is in a submittable state (idle or
-  // provider-failed) and the required fields are valid. In `partial-success`
-  // the provider already exists — re-submitting would create a duplicate.
+  // Save is enabled when the form is in a submittable state (idle or
+  // provider-failed) and the required API key is present. URL validation
+  // happens on blur (progressive feedback) and on submit (focus management).
+  // In `partial-success` the provider already exists — re-submitting would
+  // create a duplicate. Also disabled while a mutation is in-flight (f4).
+  const isMutationPending = createProvider.isPending || createModel.isPending;
   const canSubmit =
-    validateBaseUrl(baseUrl) === null &&
     apiKey.trim().length > 0 &&
-    (state.kind === "idle" || state.kind === "provider-failed");
+    (state.kind === "idle" || state.kind === "provider-failed") &&
+    !isMutationPending;
 
   const handleBlurUrl = () => setUrlError(validateBaseUrl(baseUrl));
+
+  // Dirty-form: any field has user input → confirm before discarding.
+  const isDirty = baseUrl.trim() !== "" || apiKey.trim() !== "" ||
+    modelName.trim() !== "" || modelTags.trim() !== "";
+  const handleCancel = () => {
+    if (isDirty && !isMutationPending) setShowCancelConfirm(true);
+    else onClose();
+  };
 
   const buildProviderPayload = (): ProviderCreateRequestDto => {
     const name = deriveUniqueProviderName(baseUrl, kind, existingNames);
@@ -148,6 +162,7 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
     const urlErr = validateBaseUrl(baseUrl);
     if (urlErr) {
       setUrlError(urlErr);
+      urlInputRef.current?.focus();
       return;
     }
     if (!apiKey.trim()) return;
@@ -179,82 +194,107 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
       <div className="provider-card__header">
         <strong>新建 Provider</strong>
       </div>
-      <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
-        <label>
-          Base URL
+      <div className="provider-card__body">
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-url">Base URL</label>
           <input
+            id="new-prov-url"
+            ref={urlInputRef}
+            className="field-input"
             type="text"
             placeholder="Base URL (https://...)"
             value={baseUrl}
+            aria-invalid={urlError !== null}
+            aria-describedby={urlError ? "new-prov-url-error" : undefined}
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={handleBlurUrl}
           />
-        </label>
+        </div>
         {urlError && (
-          <div style={{ color: "var(--color-status-danger)", fontSize: "0.85rem" }}>{urlError}</div>
+          <div id="new-prov-url-error" className="field-error" role="alert">{urlError}</div>
         )}
-        <label>
-          API Key
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-key">API Key</label>
           <input
+            id="new-prov-key"
+            className="field-input"
             type="password"
+            autoComplete="off"
             placeholder="API Key"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
           />
-        </label>
-        <label>
-          Kind
-          <select value={kind} onChange={(e) => setKind(e.target.value as ProviderKind)}>
+        </div>
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-kind">Kind</label>
+          <select
+            id="new-prov-kind"
+            className="field-select"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as ProviderKind)}
+          >
             <option value="openai_compatible">openai_compatible</option>
             <option value="anthropic_compatible">anthropic_compatible</option>
           </select>
-        </label>
+        </div>
         <hr />
         <div>同步创建 Model</div>
-        <label>
-          Model Name
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-model-name">Model Name</label>
           <input
+            id="new-prov-model-name"
+            className="field-input"
             type="text"
             placeholder="model name (optional)"
             value={modelName}
             onChange={(e) => setModelName(e.target.value)}
           />
-        </label>
-        <label>
-          Model Tags
+        </div>
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-model-tags">Model Tags</label>
           <input
+            id="new-prov-model-tags"
+            className="field-input"
             type="text"
             placeholder="tags (comma-separated, optional)"
             value={modelTags}
             onChange={(e) => setModelTags(e.target.value)}
           />
-        </label>
+        </div>
 
         {state.kind === "partial-success" && (
-          <div className="provider-card__error-banner">
+          <div className="provider-card__error-banner" role="alert">
             Provider 已创建，但 Model 创建失败：{state.modelError}
           </div>
         )}
         {state.kind === "provider-failed" && (
-          <div className="provider-card__error-banner">
+          <div className="provider-card__error-banner" role="alert">
             Provider 创建失败：{state.error}
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 8 }}>
-          <button type="button" onClick={handleSubmit} disabled={!canSubmit}>
+        <div className="provider-card__actions">
+          <button type="button" className="btn btn--primary" onClick={handleSubmit} disabled={!canSubmit}>
             保存
           </button>
           {state.kind === "partial-success" && (
-            <button type="button" onClick={handleRetryModel}>
+            <button type="button" className="btn btn--secondary" onClick={handleRetryModel} disabled={isMutationPending}>
               重试 Model
             </button>
           )}
-          <button type="button" onClick={onClose}>
+          <button type="button" className="btn btn--secondary" onClick={handleCancel} disabled={isMutationPending}>
             取消
           </button>
         </div>
       </div>
+      <ConfirmDialog
+        open={showCancelConfirm}
+        title="放弃修改"
+        body="表单有未保存的内容，确定放弃？"
+        confirmLabel="放弃"
+        onConfirm={() => { setShowCancelConfirm(false); onClose(); }}
+        onCancel={() => setShowCancelConfirm(false)}
+      />
     </div>
   );
 }

@@ -144,6 +144,12 @@ pub struct DelegateRequest {
     /// together. Ignored when reusing an existing subagent.
     pub bound_provider_id: Option<String>,
     pub bound_model_id: Option<String>,
+    /// Reuse policy for name-based resolution:
+    /// - `create`: only create a new subagent; fail if one with the same name exists
+    /// - `reuse`: only reuse an existing subagent; fail if not found
+    /// - `fail` (default / None): create-or-reuse, but fail if `--bind-*` is
+    ///   given and the existing subagent's binding differs from the request.
+    pub reuse_policy: Option<String>,
 }
 
 /// Resolution params for single-subagent operations (show/tasks/hibernate/delete).
@@ -181,6 +187,10 @@ pub struct DelegateResult {
     pub model: Option<String>,
     pub summary: Option<String>,
     pub usage: TaskUsage,
+    /// Whether a new subagent was created (true) or an existing one was
+    /// reused (false). Surfaced on the response DTO so callers can verify
+    /// the reuse-policy outcome.
+    pub created: bool,
 }
 
 /// Classification of task failures (Task 1 / Phase 3). Used by Task 3's

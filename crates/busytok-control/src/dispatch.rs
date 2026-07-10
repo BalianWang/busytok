@@ -203,6 +203,10 @@ pub trait RuntimeControl: Send + Sync {
         &self,
         req: busytok_protocol::dto::SubagentTaskGetRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentTaskDetailDto>;
+    async fn subagent_task_cancel(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto>;
 
     // Providers (Phase 1: Credential Foundation)
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto>;
@@ -541,6 +545,12 @@ impl ControlDispatcher {
                 let req: SubagentTaskGetRequestDto = serde_json::from_value(request.params)
                     .map_err(|e| anyhow::anyhow!("invalid params for subagent.task_get: {e}"))?;
                 let dto = self.runtime.subagent_task_get(req).await?;
+                ControlResponse::ok(serde_json::to_value(dto)?)
+            }
+            "subagent.task_cancel" => {
+                let req: SubagentTaskCancelRequestDto = serde_json::from_value(request.params)
+                    .map_err(|e| anyhow::anyhow!("invalid params for subagent.task_cancel: {e}"))?;
+                let dto = self.runtime.subagent_task_cancel(req).await?;
                 ControlResponse::ok(serde_json::to_value(dto)?)
             }
 
@@ -1278,6 +1288,17 @@ impl RuntimeControl for TestRuntimeControl {
     ) -> Result<busytok_protocol::dto::SubagentTaskDetailDto> {
         Ok(Default::default())
     }
+    async fn subagent_task_cancel(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+        Ok(busytok_protocol::dto::SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: "queued".to_string(),
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
+    }
 
     // ── Providers (Phase 1: Credential Foundation) ───────────────────
 
@@ -1545,6 +1566,12 @@ impl<T: RuntimeControl> RuntimeControl for Arc<T> {
         req: busytok_protocol::dto::SubagentTaskGetRequestDto,
     ) -> Result<busytok_protocol::dto::SubagentTaskDetailDto> {
         (**self).subagent_task_get(req).await
+    }
+    async fn subagent_task_cancel(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+    ) -> Result<busytok_protocol::dto::SubagentTaskCancelResponseDto> {
+        (**self).subagent_task_cancel(req).await
     }
     async fn provider_create(&self, req: ProviderCreateRequestDto) -> Result<ProviderDto> {
         (**self).provider_create(req).await

@@ -1,5 +1,6 @@
 //! The public logical-subagent manager.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +22,26 @@ use crate::pressure::PressureGate;
 use crate::resolver::{resolve_by_id, resolve_by_name, row_to_model, Resolved};
 
 type SharedDb = Arc<Mutex<busytok_store::Database>>;
+
+/// RAII guard that removes a task's cancel signal from the `cancel_signals`
+/// registry when dropped. This covers all exit paths from `execute_task`:
+/// normal return, early return (cancel), and future drop (task abort).
+/// Without this, a dropped `execute_task` future leaks the `oneshot::Sender`
+/// in the registry forever, and subsequent `cancel_task` calls would find a
+/// stale sender that can never signal a non-existent executor.
+struct CancelSignalGuard<'a> {
+    signals: &'a Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    task_id: String,
+}
+
+impl Drop for CancelSignalGuard<'_> {
+    fn drop(&mut self) {
+        self.signals
+            .lock()
+            .expect("cancel_signals lock poisoned")
+            .remove(&self.task_id);
+    }
+}
 
 /// Buffer (ms) added to the per-task timeout when computing the reaper
 /// cutoff: `COALESCE(timeout_seconds, default) * 1000 + REAPER_BUFFER_MS`.
@@ -95,12 +116,27 @@ pub struct SubagentManager {
     /// Set ONCE by `BusytokSupervisor::assemble_with_sidecar` after the
     /// generation manager is constructed.
     task_completion_hook: Mutex<Option<TaskCompletionHook>>,
+    /// Per-task cooperative cancel signal registry. When a task starts
+    /// executing, a `oneshot::Sender` is registered here; `cancel_task`
+    /// signals it so `execute_task` can abort the in-flight executor call
+    /// via `tokio::select!`. The entry is removed after execution
+    /// completes (success, failure, or cancel).
+    cancel_signals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Hook invoked by the background dispatcher after a queued task completes
 /// successfully. The runtime registers one that calls `bridge_subagent_usage`
 /// so queued tasks' usage flows into `usage_events` + rollups.
 pub type TaskCompletionHook = Arc<dyn Fn(&DelegateResult, &str) + Send + Sync>;
+
+/// Outcome of a `cancel_task` call. `cancelled == false` when the task was
+/// already terminal (completed/failed/cancelled) or the cancel was a no-op.
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    pub previous_status: String,
+    pub new_status: String,
+    pub cancelled: bool,
+}
 
 /// Combined snapshot for `subagent.runtime_status` — all DB reads occur under
 /// a single `SubagentManager` lock acquisition to preserve single-read
@@ -156,6 +192,7 @@ impl SubagentManager {
             memory_updater,
             pressure_gate,
             task_completion_hook: Mutex::new(None),
+            cancel_signals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -274,6 +311,52 @@ impl SubagentManager {
             }
         };
 
+        // Reuse-policy conflict detection (P1-4). Enforced after resolution so
+        // the resolver's own validation (bound fields required on create,
+        // canonical cwd) runs first.
+        match (&req.reuse_policy.as_deref(), created) {
+            (Some("create"), false) => {
+                return Err(SubagentError::InvalidArgument(format!(
+                    "subagent '{}' already exists; use --reuse-policy=reuse to reuse it",
+                    req.subagent_name
+                )));
+            }
+            (Some("reuse"), true) => {
+                return Err(SubagentError::InvalidArgument(format!(
+                    "subagent '{}' not found; use --reuse-policy=create to create it",
+                    req.subagent_name
+                )));
+            }
+            // Explicit reuse: proceed without binding conflict check. The
+            // user opted into reusing the existing subagent regardless of
+            // its current binding.
+            (Some("reuse"), false) => {}
+            // Default policy (None / Some("fail")) on the reuse path: when the
+            // request carries bound fields, verify they match the existing
+            // subagent's binding. A mismatch is a configuration error.
+            (_, false) => {
+                if let (Some(req_pid), Some(req_mid)) =
+                    (&req.bound_provider_id, &req.bound_model_id)
+                {
+                    if req_pid != &subagent.bound_provider_id || req_mid != &subagent.bound_model_id
+                    {
+                        return Err(SubagentError::InvalidArgument(format!(
+                            "subagent '{}' exists but is bound to provider={}/model={}, \
+                             which differs from the requested provider={}/model={}. \
+                             Use --reuse-policy=reuse to ignore this conflict.",
+                            req.subagent_name,
+                            subagent.bound_provider_id,
+                            subagent.bound_model_id,
+                            req_pid,
+                            req_mid
+                        )));
+                    }
+                }
+            }
+            // Create path with any policy other than "reuse" → proceed.
+            (_, true) => {}
+        }
+
         // 2. insert task row. §8.3 step 2 "queue only" (Round 4 race-free
         //    design) + spec §6.4 per-subagent serialization: check the gate
         //    AND whether this subagent already has a running task BEFORE insert.
@@ -362,6 +445,7 @@ impl SubagentManager {
                 model: req.model_override.clone(),
                 summary: None,
                 usage: TaskUsage::default(),
+                created,
             });
         }
 
@@ -407,6 +491,7 @@ impl SubagentManager {
         if result.model.is_none() {
             result.model = model;
         }
+        result.created = created;
         Ok(result)
     }
 
@@ -435,6 +520,63 @@ impl SubagentManager {
             .model_override
             .clone()
             .unwrap_or_else(|| subagent.bound_model_id.clone());
+        // `model` is used in DelegateResult returns (including early cancel
+        // returns below). Declared here so all return paths can reference it.
+        let model: Option<String> = Some(effective_model_id.clone());
+
+        // Register the cooperative cancel signal at the very start so
+        // `cancel_task` can abort execution even during the synchronous
+        // setup phase below (provider resolution, context building).
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut signals = self
+                .cancel_signals
+                .lock()
+                .expect("cancel_signals lock poisoned");
+            signals.insert(task.id.clone(), cancel_tx);
+        }
+        // RAII guard: removes the signal entry from the registry on drop
+        // — covers normal return, early return (cancel), and future drop
+        // (task abort). Without this, a dropped execute_task future leaks
+        // the Sender in the registry forever (M4 fix).
+        let _signal_guard = CancelSignalGuard {
+            signals: &self.cancel_signals,
+            task_id: task.id.clone(),
+        };
+        // Pre-execute cancel check: `cancel_task` may have flipped the
+        // status to "cancelled" in the window between `delegate()`'s task
+        // insert and this point (or the dispatcher's pick and this point).
+        // Skip the executor call entirely — no tokens consumed (M1 fix).
+        {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            let already_cancelled = db
+                .subagent_get_task(&task.id)
+                .ok()
+                .flatten()
+                .map(|t| t.status == "cancelled")
+                .unwrap_or(false);
+            if already_cancelled {
+                info!(
+                    event_code = "subagent.task_cancelled_before_execute",
+                    task_id = %task.id,
+                    "task was cancelled before execution started; skipping"
+                );
+                return Ok(DelegateResult {
+                    task_id: task.id.clone(),
+                    subagent_id: subagent.id.clone(),
+                    subagent_name: subagent.name.clone(),
+                    adapter: self.adapter.clone(),
+                    adapter_session_id: None,
+                    session_reused: false,
+                    status: TaskStatus::Cancelled,
+                    profile: task.profile.clone(),
+                    model,
+                    summary: Some("cancelled by user".to_string()),
+                    created: false,
+                    usage: TaskUsage::default(),
+                });
+            }
+        }
         // Spec §4.3 validation chain — fail fast on bound provider/model
         // issues. Reads happen under the DB lock; the resolved values are
         // used below to populate `ExecutorInput`'s provider config + model
@@ -481,11 +623,6 @@ impl SubagentManager {
             }
             (provider, model)
         };
-        // `model` (the local variable used by the rest of execute_task) is the
-        // resolved model id (a String, not Option<String>). The rest of the
-        // body uses `effective_model_id` in its place; this shim keeps the
-        // existing body compiling without further edits.
-        let model: Option<String> = Some(effective_model_id.clone());
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -598,15 +735,59 @@ impl SubagentManager {
                 profile_cfg.cloned(),
             )
         };
-        let out = match self.executor.execute(&input).await.map_err(|e| {
-            match e.downcast::<SubagentError>() {
+        let out = {
+            // The cancel signal was registered at the top of execute_task;
+            // `_signal_guard` removes it from the registry on drop (all exit
+            // paths). No explicit remove needed in the select! branches.
+            //
+            // Dropping the executor future stops the CLIENT from awaiting
+            // the `turn_auto` RPC response. The execution-protocol cancel
+            // (`session.cancel` RPC via `executor.cancel()`, fired by
+            // `cancel_task`) aborts the in-flight HTTP request in the
+            // sidecar, stopping token generation. However, partial usage
+            // from the aborted call is NOT captured — the cancel return
+            // path uses `TaskUsage::default()`. This is the accepted
+            // tradeoff: the sidecar abort may not return partial usage.
+            let exec_fut = self.executor.execute(&input);
+            let result = tokio::select! {
+                biased;
+                _ = cancel_rx => {
+                    warn!(
+                        event_code = "subagent.task_cancelled_in_flight",
+                        task_id = %task.id,
+                        "executor aborted by cooperative cancel signal"
+                    );
+                    // The task status is already `cancelled` in the DB
+                    // (set by `cancel_task`). Skip the terminal write
+                    // (it would be guarded anyway) and return early.
+                    return Ok(DelegateResult {
+                        task_id: task.id.clone(),
+                        subagent_id: subagent.id.clone(),
+                        subagent_name: subagent.name.clone(),
+                        adapter: self.adapter.clone(),
+                        adapter_session_id: None,
+                        session_reused: false,
+                        status: TaskStatus::Cancelled,
+                        profile: task.profile.clone(),
+                        model,
+                        summary: Some("cancelled by user".to_string()),
+                        created: false,
+                        usage: TaskUsage::default(),
+                    });
+                }
+                exec_result = exec_fut => {
+                    exec_result
+                }
+            };
+            result.map_err(|e| match e.downcast::<SubagentError>() {
                 Ok(se) => se,
                 Err(other) => {
                     warn!(event_code = "subagent.delegate.executor_failed", error = %other);
                     SubagentError::Store(other)
                 }
-            }
-        }) {
+            })
+        };
+        let out = match out {
             Ok(out) => out,
             Err(e) => {
                 // Persist failure state before propagating. The executor
@@ -619,7 +800,9 @@ impl SubagentManager {
                 let error_kind = subagent_error_to_task_error_kind(&e);
                 {
                     let db = self.db.lock().expect("subagent db lock poisoned");
-                    db.subagent_set_task_status(&task.id, "failed", None, None)
+                    // Use the guarded variant so a late cancel is not
+                    // overwritten by this failure write.
+                    db.subagent_set_task_status_if_not_cancelled(&task.id, "failed", None, None)
                         .ok();
                     if let Some(kind) = error_kind {
                         if let Err(persist_err) =
@@ -646,13 +829,24 @@ impl SubagentManager {
         //    observable point.
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
-            db.subagent_set_task_status(
-                &task.id,
-                out.status.as_str(),
-                Some(out.summary.clone()),
-                None,
-            )
-            .map_err(SubagentError::Store)?;
+            // Use the guarded variant so a late cancel is not overwritten
+            // by the executor's terminal write (P1-5 review finding C1).
+            let updated = db
+                .subagent_set_task_status_if_not_cancelled(
+                    &task.id,
+                    out.status.as_str(),
+                    Some(out.summary.clone()),
+                    None,
+                )
+                .map_err(SubagentError::Store)?;
+            if !updated {
+                info!(
+                    event_code = "subagent.task_terminal_write_skipped",
+                    task_id = %task.id,
+                    attempted_status = out.status.as_str(),
+                    "terminal write skipped: task was already cancelled"
+                );
+            }
             // Task 5: persist classified error_kind on the task row.
             if let Some(kind) = &out.error_kind {
                 if let Err(e) = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str())) {
@@ -781,6 +975,34 @@ impl SubagentManager {
             }
         }
 
+        // M2 fix: After persisting usage/memory/binding (tokens were consumed,
+        // learnings saved), check if the task was cancelled concurrently.
+        // If so, return `Cancelled` for consistency with the DB status, but
+        // preserve the REAL usage data so the audit trail is accurate.
+        // Without this, `delegate()` would return `Completed` while the DB
+        // says `cancelled` — an inconsistent return value.
+        let final_status = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_get_task(&task.id)
+                .ok()
+                .flatten()
+                .map(|t| {
+                    if t.status == "cancelled" {
+                        TaskStatus::Cancelled
+                    } else {
+                        out.status
+                    }
+                })
+                .unwrap_or(out.status)
+        };
+        if final_status == TaskStatus::Cancelled {
+            warn!(
+                event_code = "subagent.task_cancelled_after_complete",
+                task_id = %task.id,
+                "executor completed but task was cancelled concurrently; usage persisted, returning Cancelled"
+            );
+        }
+
         Ok(DelegateResult {
             task_id: task.id.clone(),
             subagent_id: subagent.id.clone(),
@@ -788,11 +1010,14 @@ impl SubagentManager {
             adapter: self.adapter.clone(),
             adapter_session_id: out.adapter_session_id.clone(),
             session_reused: out.session_reused,
-            status: out.status,
+            status: final_status,
             profile: task.profile.clone(),
             model,
             summary: Some(out.summary),
             usage: out.usage.clone(),
+            // `created` is set by the caller (`delegate` or the dispatcher);
+            // default to `false` here (the dispatcher path always reuses).
+            created: false,
         })
     }
 
@@ -923,7 +1148,7 @@ impl SubagentManager {
                             "dispatcher could not resolve subagent for queued task; marking failed"
                         );
                         let db = manager.db.lock().expect("subagent db lock poisoned");
-                        let _ = db.subagent_set_task_status(
+                        let _ = db.subagent_set_task_status_if_not_cancelled(
                             &task.id,
                             "failed",
                             None,
@@ -935,8 +1160,27 @@ impl SubagentManager {
                         event_code = "subagent.queue.execute",
                         task_id = %task.id,
                         subagent_id = %subagent.id,
-                        "dispatcher executing queued task"
+                        "dispatcher picked queued task for execution"
                     );
+                    // Pre-execute cancel re-check: the task may have been
+                    // cancelled between `pick` and now. Re-read the status
+                    // to avoid starting execution on a cancelled task.
+                    let cancelled_before_execute = {
+                        let db = manager.db.lock().expect("subagent db lock poisoned");
+                        db.subagent_get_task(&task.id)
+                            .ok()
+                            .flatten()
+                            .map(|t| t.status == "cancelled")
+                            .unwrap_or(true)
+                    };
+                    if cancelled_before_execute {
+                        info!(
+                            event_code = "subagent.queue.skip_cancelled",
+                            task_id = %task.id,
+                            "skipping execution: task was cancelled while queued"
+                        );
+                        continue;
+                    }
                     match manager.execute_task(&task, &subagent).await {
                         Ok(result) => {
                             // P1 #2 fix: invoke the post-task completion hook
@@ -966,7 +1210,7 @@ impl SubagentManager {
                                 "dispatcher execute_task failed; marking task failed"
                             );
                             let db = manager.db.lock().expect("subagent db lock poisoned");
-                            let _ = db.subagent_set_task_status(
+                            let _ = db.subagent_set_task_status_if_not_cancelled(
                                 &task.id,
                                 "failed",
                                 None,
@@ -988,6 +1232,131 @@ impl SubagentManager {
     pub fn task_counts(&self) -> (u32, u32) {
         let db = self.db.lock().expect("subagent db lock poisoned");
         db.subagent_task_counts_by_status().unwrap_or((0, 0))
+    }
+
+    /// Cancel a task by id. Idempotent on terminal states: returns
+    /// `cancelled == false` when the task was already completed/failed/
+    /// cancelled. Returns an error when the task is not found.
+    pub async fn cancel_task(&self, task_id: &str, reason: Option<&str>) -> Result<CancelOutcome> {
+        let now_ms = busytok_domain::now_ms();
+        let task = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_get_task(task_id)
+                .map_err(SubagentError::Store)?
+                .ok_or_else(|| SubagentError::NotFound(format!("task {task_id}")))?
+        };
+        let previous_status = task.status.clone();
+        if matches!(
+            previous_status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            return Ok(CancelOutcome {
+                previous_status: previous_status.clone(),
+                new_status: previous_status,
+                cancelled: false,
+            });
+        }
+        let updated = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_cancel_task_if_not_terminal(task_id, reason, now_ms)
+                .map_err(SubagentError::Store)?
+        };
+        if !updated {
+            // Lost a race — another writer flipped the task to a terminal
+            // state between our read and the conditional UPDATE. Re-read
+            // the actual current status so `new_status` is accurate.
+            let actual_status = {
+                let db = self.db.lock().expect("subagent db lock poisoned");
+                db.subagent_get_task(task_id)
+                    .map_err(SubagentError::Store)?
+                    .map(|t| t.status)
+                    .unwrap_or_else(|| previous_status.clone())
+            };
+            return Ok(CancelOutcome {
+                previous_status: previous_status.clone(),
+                new_status: actual_status,
+                cancelled: false,
+            });
+        }
+        info!(
+            event_code = "subagent.task_cancelled",
+            task_id = %task_id,
+            previous_status = %previous_status,
+            reason = ?reason,
+            "task cancelled"
+        );
+        // Signal the in-flight executor to abort (cooperative cancel).
+        // If the task is queued (not yet executing), no signal is
+        // registered and this is a no-op — the dispatcher's pre-execute
+        // re-check will catch the cancelled status.
+        if let Some(tx) = {
+            let mut signals = self
+                .cancel_signals
+                .lock()
+                .expect("cancel_signals lock poisoned");
+            signals.remove(task_id)
+        } {
+            let _ = tx.send(());
+            info!(
+                event_code = "subagent.task_cancel_signal_sent",
+                task_id = %task_id,
+                "cooperative cancel signal sent to in-flight executor"
+            );
+        }
+        // Execution-protocol cancel: send `session.cancel` RPC to the sidecar
+        // so it aborts the in-flight HTTP request to the LLM provider —
+        // stopping token generation. This is the execution-layer counterpart
+        // to the local signal above. The local signal drops the executor
+        // future (so the Rust side stops waiting); the sidecar cancel
+        // actually stops the model call.
+        //
+        // Fire-and-forget with a 5s timeout: we don't want to block
+        // `cancel_task` on a potentially slow RPC. The DB status is already
+        // `cancelled` regardless of this call's outcome. Failures are logged
+        // but don't change the cancel result.
+        let subagent_id = task.subagent_id.clone();
+        let provider_id = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            db.subagent_get_logical(&task.subagent_id)
+                .ok()
+                .flatten()
+                .map(|s| s.bound_provider_id)
+                .unwrap_or_default()
+        };
+        if !provider_id.is_empty() {
+            let executor = std::sync::Arc::clone(&self.executor);
+            let tid = task_id.to_string();
+            tokio::spawn(async move {
+                let cancel_fut = executor.cancel(&subagent_id, &provider_id);
+                match tokio::time::timeout(std::time::Duration::from_secs(5), cancel_fut).await {
+                    Ok(Ok(())) => info!(
+                        event_code = "subagent.sidecar_cancel_acknowledged",
+                        task_id = %tid,
+                        subagent_id = %subagent_id,
+                        provider_id = %provider_id,
+                        "sidecar acknowledged cancel — underlying model call aborted"
+                    ),
+                    Ok(Err(e)) => warn!(
+                        event_code = "subagent.sidecar_cancel_failed",
+                        task_id = %tid,
+                        subagent_id = %subagent_id,
+                        error = %e,
+                        "sidecar cancel failed — underlying model call may continue"
+                    ),
+                    Err(_) => warn!(
+                        event_code = "subagent.sidecar_cancel_timeout",
+                        task_id = %tid,
+                        subagent_id = %subagent_id,
+                        "sidecar cancel timed out (5s) — underlying model call may continue"
+                    ),
+                }
+            });
+        }
+        Ok(CancelOutcome {
+            previous_status,
+            new_status: "cancelled".to_string(),
+            cancelled: true,
+        })
     }
 
     /// List subagents, optionally filtered by status / project / include-deleted.

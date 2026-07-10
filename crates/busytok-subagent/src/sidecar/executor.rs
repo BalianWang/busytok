@@ -62,11 +62,53 @@ impl SidecarTaskExecutor {
     pub fn pool(&self) -> &Arc<WorkerPool> {
         &self.pool
     }
+
+    /// Best-effort cancel: send `session.cancel` RPC to the sidecar process
+    /// that owns the subagent's hot session. The sidecar calls `abort()` on
+    /// the SDK session, which aborts the in-flight HTTP request to the LLM
+    /// provider — stopping token generation.
+    ///
+    /// If no worker exists for `provider_id` (sidecar was never started or
+    /// was killed), returns `Ok(())` — there's nothing to cancel. If the
+    /// sidecar is unreachable or the RPC fails, the error is returned so
+    /// the caller can log it. The cancel outcome in the DB is NOT affected
+    /// by this call's result — the DB status is already `cancelled`.
+    async fn cancel_turn(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
+        let Some(supervisor) = self.pool.get_worker(provider_id) else {
+            // No worker — sidecar was never started or was killed.
+            // Nothing to cancel.
+            return Ok(());
+        };
+        // Don't spawn a sidecar just to cancel — if the process died, its
+        // hot sessions died with it and there's nothing to abort.
+        if !supervisor.try_is_running() {
+            return Ok(());
+        }
+        let handle = supervisor
+            .ensure_started()
+            .await
+            .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during cancel: {e}"))?;
+        handle
+            .cancel_session(subagent_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("session.cancel RPC failed: {e}"))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl TaskExecutor for SidecarTaskExecutor {
     async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        Self::execute_impl(self, input).await
+    }
+
+    async fn cancel(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
+        self.cancel_turn(subagent_id, provider_id).await
+    }
+}
+
+impl SidecarTaskExecutor {
+    async fn execute_impl(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
         // Task 5: provider_id is now String (always present, validated upstream
         // by `SubagentManager::execute_task`). No "profile not bound" branch.
         let provider_id = input.provider_id.clone();

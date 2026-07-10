@@ -61,6 +61,7 @@ fn delegate_request_requires_subagent_and_prompt() {
         source_session_id: None,
         bound_provider_id: None,
         bound_model_id: None,
+        reuse_policy: None,
     };
     assert_eq!(req.subagent_name, "reviewer");
     assert!(LogicalSubagent::is_valid_name(&req.subagent_name));

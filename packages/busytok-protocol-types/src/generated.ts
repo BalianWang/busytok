@@ -290,11 +290,22 @@ export type EventSubscriptionBatchDto = { events: Array<RuntimeEventDto>, };
 
 export type SubagentUsageDto = { model: string | null, provider: string | null, input_tokens: number | null, output_tokens: number | null, cache_read_tokens: number | null, cache_write_tokens: number | null, cost_usd: number | null, };
 
-export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string, subagent_name: string, adapter: string, adapter_session_id: string | null, session_reused: boolean, status: string, profile: string, model: string | null, summary: string | null, usage: SubagentUsageDto, };
+export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string, subagent_name: string, adapter: string, adapter_session_id: string | null, session_reused: boolean, status: string, profile: string, model: string | null, summary: string | null, usage: SubagentUsageDto, 
+/**
+ * Whether a new subagent was created (true) or an existing one was
+ * reused (false). Lets the caller verify the reuse-policy outcome.
+ */
+created: boolean, };
 
 export type SubagentResolveRequestDto = { name: string | null, id: string | null, cwd: string | null, };
 
-export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: string | null, cwd: string, profile: string, intent: string | null, prompt: string, 
+export type SubagentDelegateRequestDto = { subagent_name: string, subagent_id: string | null, cwd: string, profile: string, intent: string | null, 
+/**
+ * Inline prompt text. When `prompt_artifact_ref` is set, this should be
+ * empty (the service uses the artifact instead). At least one of
+ * `prompt` (non-empty) or `prompt_artifact_ref` (Some) must be provided.
+ */
+prompt: string, 
 /**
  * Spec §4.3: when set, references a stored artifact (relative path within
  * the artifact store root) instead of the inline `prompt`. Mutually
@@ -307,7 +318,15 @@ prompt_artifact_ref: string | null, timeout_seconds: number | null, model_overri
  * subagent (by `subagent_id` or matched `subagent_name` + `cwd`) — the
  * subagent's stored bound fields are used instead.
  */
-bound_provider_id: string | null, bound_model_id: string | null, };
+bound_provider_id: string | null, bound_model_id: string | null, 
+/**
+ * Reuse policy for name-based resolution:
+ * - `create`: only create a new subagent; fail if one with the same name exists
+ * - `reuse`: only reuse an existing subagent; fail if not found
+ * - `fail` (default): create-or-reuse, but fail if `--bind-*` is given
+ *   and the existing subagent's binding differs from the request
+ */
+reuse_policy: string | null, };
 
 export type SubagentListRequestDto = { 
 /**
@@ -326,7 +345,25 @@ export type SubagentListResponseDto = { subagents: Array<SubagentDetailDto>, };
 
 export type SubagentTaskSummaryDto = { id: string, subagent_id: string, profile: string, status: string, prompt: string | null, result_summary: string | null, error: string | null, created_at_ms: number, completed_at_ms: number | null, };
 
-export type SubagentTaskDetailDto = { id: string, subagent_id: string, subagent_name: string | null, source_harness: string | null, source_session_id: string | null, profile: string, status: string, prompt: string | null, prompt_artifact_ref: string | null, result_summary: string | null, error: string | null, error_kind: string | null, model_override: string | null, timeout_seconds: number | null, created_at_ms: number, started_at_ms: number | null, completed_at_ms: number | null, };
+export type SubagentTaskDetailDto = { id: string, subagent_id: string, subagent_name: string | null, source_harness: string | null, source_session_id: string | null, profile: string, status: string, prompt: string | null, prompt_artifact_ref: string | null, result_summary: string | null, error: string | null, error_kind: string | null, model_override: string | null, timeout_seconds: number | null, created_at_ms: number, started_at_ms: number | null, completed_at_ms: number | null, 
+/**
+ * Effective provider used for this task's execution (derived from the
+ * subagent's bound_provider_id at read time). `None` if the parent
+ * subagent row is gone (hard-deleted).
+ */
+effective_provider_id: string | null, 
+/**
+ * Effective model used for this task's execution. Derived as
+ * `model_override.unwrap_or(bound_model_id)` — reflects the actual
+ * routing decision. `None` if the parent subagent row is gone.
+ */
+effective_model_id: string | null, 
+/**
+ * How the effective model was chosen: `"override"` (task-level
+ * model_override) or `"bound"` (subagent's stored binding). `None`
+ * when the parent subagent row is gone.
+ */
+binding_source: string | null, };
 
 export type SubagentTasksRequestDto = { name: string | null, id: string | null, cwd: string | null, limit: number | null, };
 
@@ -427,7 +464,19 @@ export type ModelUpdateRequestDto = { id: string, enabled: boolean | null, displ
 
 export type ModelDeleteRequestDto = { id: string, };
 
-export type ModelListRequestDto = { provider_id: string | null, tags: Array<string>, include_disabled: boolean, };
+export type ModelListRequestDto = { provider_id: string | null, tags: Array<string>, include_disabled: boolean, 
+/**
+ * Sort order for results:
+ * - `name` (default): alphabetical by provider name, then model_id
+ * - `context_window_desc`: largest context window first
+ * - `max_tokens_desc`: largest max_tokens first
+ */
+sort: string | null, 
+/**
+ * Filter by reasoning capability: `Some(true)` → only reasoning models,
+ * `Some(false)` → only non-reasoning, `None` → no filter.
+ */
+reasoning: boolean | null, };
 
 export type ModelListResponseDto = { models: Array<ModelCatalogEntryDto>, };
 

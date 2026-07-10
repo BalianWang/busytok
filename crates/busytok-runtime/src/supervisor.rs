@@ -2861,6 +2861,7 @@ fn delegate_request_from_dto(
         // path, the manager enforces "both or neither".
         bound_provider_id: d.bound_provider_id,
         bound_model_id: d.bound_model_id,
+        reuse_policy: d.reuse_policy,
     }
 }
 
@@ -2915,14 +2916,31 @@ fn subagent_task_summary(
 /// Spec §3.4: map a `SubagentTaskRow` (full DB row) to the detail DTO
 /// returned by `subagent.task_get`. The DTO omits `intent`,
 /// `output_schema_name`, `output_schema_version`, and `result_json` from
-/// the row (consistent with `SubagentTaskSummaryDto`). `subagent_name` is
-/// resolved separately by the caller via `db.subagent_get_logical(...)`
-/// and is `None` when the parent subagent row is gone (graceful
-/// degradation — see `subagent.task_get` handler).
+/// the row (consistent with `SubagentTaskSummaryDto`). When `subagent` is
+/// `Some`, the effective provider/model/binding_source are derived from the
+/// parent subagent's bound fields; when `None` (hard-deleted parent), they
+/// are left as `None`.
 fn subagent_task_detail(
     task: busytok_store::repository::SubagentTaskRow,
-    subagent_name: Option<String>,
+    subagent: Option<&busytok_store::repository::SubagentLogicalSubagentRow>,
 ) -> SubagentTaskDetailDto {
+    let subagent_name = subagent.map(|s| s.name.clone());
+    let (effective_provider_id, effective_model_id, binding_source) = match subagent {
+        Some(s) => {
+            let provider_id = Some(s.bound_provider_id.clone());
+            let model_id = task
+                .model_override
+                .clone()
+                .or_else(|| Some(s.bound_model_id.clone()));
+            let source = if task.model_override.is_some() {
+                Some("override")
+            } else {
+                Some("bound")
+            };
+            (provider_id, model_id, source.map(|s| s.to_string()))
+        }
+        None => (None, None, None),
+    };
     SubagentTaskDetailDto {
         id: task.id,
         subagent_id: task.subagent_id,
@@ -2941,6 +2959,9 @@ fn subagent_task_detail(
         created_at_ms: task.created_at_ms,
         started_at_ms: task.started_at_ms,
         completed_at_ms: task.completed_at_ms,
+        effective_provider_id,
+        effective_model_id,
+        binding_source,
     }
 }
 
@@ -5449,6 +5470,7 @@ impl RuntimeControl for BusytokSupervisor {
                 cache_write_tokens: r.usage.cache_write_tokens,
                 cost_usd: r.usage.cost_usd,
             },
+            created: r.created,
         })
     }
 
@@ -5732,7 +5754,7 @@ impl RuntimeControl for BusytokSupervisor {
         // does NOT expose a `get_task(task_id)` method, and adding a one-off
         // read-only lookup there isn't worth it for a single read path.
         let task_id = req.task_id.clone();
-        let (task, subagent_name) = {
+        let (task, subagent) = {
             let db = self.db.lock().unwrap();
             let task = db.subagent_get_task(&task_id).map_err(|e| {
                 tracing::error!(
@@ -5761,26 +5783,24 @@ impl RuntimeControl for BusytokSupervisor {
                     )));
                 }
             };
-            // Resolve `subagent_name` from the parent logical subagent row.
+            // Resolve the parent logical subagent row to derive
+            // `subagent_name` + effective provider/model/binding_source.
             // Degrade gracefully when the parent is gone (e.g. hard-deleted
-            // while a task row remains): `subagent_name: None`, do NOT fail
+            // while a task row remains): `subagent: None`, do NOT fail
             // the whole read.
-            let subagent_name = db
-                .subagent_get_logical(&task.subagent_id)
-                .map_err(|e| {
-                    tracing::error!(
-                        event_code = "subagent.task_get.subagent_read_failed",
-                        error = %e,
-                        "subagent_get_logical failed"
-                    );
-                    anyhow::Error::new(MethodDispatchError::from_read_error(
-                        "subagent.task_get_failed",
-                        format!("subagent lookup failed: {task_id}"),
-                        serde_json::Value::Null,
-                    ))
-                })?
-                .map(|s| s.name);
-            (task, subagent_name)
+            let subagent = db.subagent_get_logical(&task.subagent_id).map_err(|e| {
+                tracing::error!(
+                    event_code = "subagent.task_get.subagent_read_failed",
+                    error = %e,
+                    "subagent_get_logical failed"
+                );
+                anyhow::Error::new(MethodDispatchError::from_read_error(
+                    "subagent.task_get_failed",
+                    format!("subagent lookup failed: {task_id}"),
+                    serde_json::Value::Null,
+                ))
+            })?;
+            (task, subagent)
         };
 
         tracing::debug!(
@@ -5789,7 +5809,24 @@ impl RuntimeControl for BusytokSupervisor {
             subagent_id = %task.subagent_id,
             "task lookup succeeded"
         );
-        Ok(subagent_task_detail(task, subagent_name))
+        Ok(subagent_task_detail(task, subagent.as_ref()))
+    }
+
+    async fn subagent_task_cancel(
+        &self,
+        req: busytok_protocol::dto::SubagentTaskCancelRequestDto,
+    ) -> Result<SubagentTaskCancelResponseDto> {
+        let outcome = self
+            .subagent_manager()
+            .cancel_task(&req.task_id, req.reason.as_deref())
+            .await
+            .map_err(map_subagent_error)?;
+        Ok(SubagentTaskCancelResponseDto {
+            id: req.task_id,
+            previous_status: outcome.previous_status,
+            new_status: outcome.new_status,
+            cancelled: outcome.cancelled,
+        })
     }
 
     // ── Providers (Phase 1: Credential Foundation) ──────────────────
@@ -5990,11 +6027,15 @@ impl RuntimeControl for BusytokSupervisor {
         // returns the full joined row.
         let entries = {
             let db = self.db.lock().unwrap();
-            db.list_models_filtered(busytok_domain::ModelCatalogFilter {
-                provider_id: Some(model.provider_id.clone()),
-                tags: vec![],
-                include_disabled: true,
-            })
+            db.list_models_filtered(
+                busytok_domain::ModelCatalogFilter {
+                    provider_id: Some(model.provider_id.clone()),
+                    tags: vec![],
+                    include_disabled: true,
+                },
+                None,
+                None,
+            )
             .map_err(|e| {
                 tracing::error!(event_code = "model.sql_read_failed", provider_id = %model.provider_id, model_db_id = %model.id, error = %e, "list_models_filtered re-fetch after create failed");
                 e
@@ -6012,11 +6053,15 @@ impl RuntimeControl for BusytokSupervisor {
         // uses AND semantics (a model must have ALL selected tags).
         let entries = {
             let db = self.db.lock().unwrap();
-            db.list_models_filtered(busytok_domain::ModelCatalogFilter {
-                provider_id: req.provider_id,
-                tags: req.tags,
-                include_disabled: req.include_disabled,
-            })
+            db.list_models_filtered(
+                busytok_domain::ModelCatalogFilter {
+                    provider_id: req.provider_id,
+                    tags: req.tags,
+                    include_disabled: req.include_disabled,
+                },
+                req.sort.as_deref(),
+                req.reasoning,
+            )
             .map_err(|e| {
                 tracing::error!(event_code = "model.sql_read_failed", error = %e, "list_models_filtered failed");
                 e
@@ -6408,11 +6453,15 @@ impl BusytokSupervisor {
                     // Probe model comes from the SQL models table (enabled only).
                     let probe_model = {
                         let db = self.db.lock().unwrap();
-                        db.list_models_filtered(busytok_domain::ModelCatalogFilter {
-                            provider_id: Some(provider_id.to_string()),
-                            tags: vec![],
-                            include_disabled: false,
-                        })
+                        db.list_models_filtered(
+                            busytok_domain::ModelCatalogFilter {
+                                provider_id: Some(provider_id.to_string()),
+                                tags: vec![],
+                                include_disabled: false,
+                            },
+                            None,
+                            None,
+                        )
                         .map_err(|e| {
                             tracing::error!(event_code = "model.sql_read_failed", provider_id = %provider_id, error = %e, "list_models_filtered for probe failed");
                             e
@@ -7458,6 +7507,7 @@ mod tests {
             source_session_id: Some("sess-1".to_string()),
             bound_provider_id: Some("prov-1".to_string()),
             bound_model_id: Some("gpt-5".to_string()),
+            reuse_policy: Some("create".to_string()),
         };
         let req = delegate_request_from_dto(dto);
         assert_eq!(req.subagent_name, "sa");
@@ -7473,6 +7523,7 @@ mod tests {
         assert_eq!(req.source_session_id.as_deref(), Some("sess-1"));
         assert_eq!(req.bound_provider_id.as_deref(), Some("prov-1"));
         assert_eq!(req.bound_model_id.as_deref(), Some("gpt-5"));
+        assert_eq!(req.reuse_policy.as_deref(), Some("create"));
     }
 
     #[test]
