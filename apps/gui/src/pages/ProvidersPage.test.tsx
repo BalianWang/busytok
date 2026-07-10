@@ -215,8 +215,10 @@ describe("ProvidersPage (rewritten)", () => {
 
   it("emits provider.deleted event on successful delete", () => {
     renderPage({ providers: [makeProvider()] });
-    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    // Click delete in the card → ConfirmDialog opens → click dialog confirm.
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
+    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "provider.deleted",
@@ -236,8 +238,10 @@ describe("ProvidersPage (rewritten)", () => {
       },
     } as never);
     renderPage({ providers: [makeProvider()] });
-    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
+    // Click delete in the card → ConfirmDialog opens → click dialog confirm.
     fireEvent.click(screen.getByRole("button", { name: /删除/i }));
+    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "provider.delete.failed",
@@ -332,9 +336,12 @@ describe("ProvidersPage (rewritten)", () => {
       providers: [makeProvider()],
       models: [makeModel()],
     });
-    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
-    // Last delete button is the model row's
+    // Click model row's delete → ConfirmDialog opens → click dialog confirm.
+    let deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    // Last delete button before dialog is the model row's.
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+    // Dialog confirm is now the last delete button.
+    deleteButtons = screen.getAllByRole("button", { name: /删除/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -361,8 +368,10 @@ describe("ProvidersPage (rewritten)", () => {
       providers: [makeProvider()],
       models: [makeModel()],
     });
-    vi.spyOn(globalThis, "confirm").mockReturnValue(true);
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    // Click model row's delete → ConfirmDialog opens → click dialog confirm.
+    let deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+    deleteButtons = screen.getAllByRole("button", { name: /删除/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -530,5 +539,32 @@ describe("ProvidersPage (rewritten)", () => {
       </QueryClientProvider>,
     );
     expect(screen.getByText(/Model 列表加载失败/i)).toBeTruthy();
+  });
+
+  it("renders H1 heading for the provider catalog (f7)", () => {
+    renderPage();
+    expect(screen.getByRole("heading", { level: 1, name: /providers/i })).toBeTruthy();
+  });
+
+  it("surfaces test-connection success result in the card UI (f3)", () => {
+    renderPage({ providers: [makeProvider()] });
+    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
+    expect(screen.getByText("连接成功")).toBeTruthy();
+  });
+
+  it("surfaces test-connection failure result in the card UI (f3)", () => {
+    vi.mocked(useProviderMutations).mockReturnValue({
+      ...mockMutations(),
+      testConnection: {
+        mutate: vi.fn((_id: string, opts?: { onSuccess?: (r: unknown) => void }) => {
+          opts?.onSuccess?.({ ok: false, error: "connection refused", models_detected: null });
+        }),
+        isPending: false,
+      },
+    } as never);
+    renderPage({ providers: [makeProvider()] });
+    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
+    expect(screen.getByText(/连接失败/)).toBeTruthy();
+    expect(screen.getByText(/connection refused/)).toBeTruthy();
   });
 });

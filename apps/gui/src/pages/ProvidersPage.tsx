@@ -11,7 +11,7 @@ import {
   useProviderMutations,
   useProviders,
 } from "../api/useBusytokData";
-import { ProviderCard } from "../components/ProviderCard";
+import { ProviderCard, type TestConnectionResult } from "../components/ProviderCard";
 import { ProviderCreationForm } from "../components/ProviderCreationForm";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 
@@ -47,6 +47,8 @@ export function ProvidersPage() {
 
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
+  // f3: surface test-connection results to the UI (keyed by provider id).
+  const [testResults, setTestResults] = useState<Record<string, TestConnectionResult>>({});
 
   // Group models by provider_id once per render. A single useModels query
   // feeds every ProviderCard — avoids N-per-card fetches.
@@ -95,6 +97,11 @@ export function ProvidersPage() {
           message: "Provider connection test completed",
           details: { id, ok: response.ok, error: response.error },
         });
+        // f3: surface result to the card UI.
+        setTestResults((prev) => ({
+          ...prev,
+          [id]: { ok: response.ok, error: response.error },
+        }));
       },
       onError: (err: Error) => {
         reportFrontendEventSafely({
@@ -103,6 +110,11 @@ export function ProvidersPage() {
           message: "Provider connection test failed (client exception)",
           details: { id, error: err.message },
         });
+        // f3: surface client-side exception as a failure result.
+        setTestResults((prev) => ({
+          ...prev,
+          [id]: { ok: false, error: err.message },
+        }));
       },
     });
   };
@@ -229,10 +241,10 @@ export function ProvidersPage() {
 
   return (
     <div className="settings-page">
-      <div className="settings-pane">
-        <div className="settings-section">
-          <h2>Providers</h2>
-          <button type="button" onClick={() => setShowCreateForm((v) => !v)}>
+      <div className="provider-catalog">
+        <div className="provider-catalog__header">
+          <h1>Providers</h1>
+          <button type="button" className="btn btn--primary" onClick={() => setShowCreateForm((v) => !v)}>
             + 新建 Provider
           </button>
         </div>
@@ -271,6 +283,7 @@ export function ProvidersPage() {
             onModelDelete={handleModelDelete}
             isEditing={editingProviderId === provider.id}
             onCancelEdit={() => setEditingProviderId(null)}
+            testResult={testResults[provider.id]}
           />
         ))}
       </div>

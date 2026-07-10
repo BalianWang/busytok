@@ -58,10 +58,13 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
   // Save is enabled only when the form is in a submittable state (idle or
   // provider-failed) and the required fields are valid. In `partial-success`
   // the provider already exists — re-submitting would create a duplicate.
+  // Also disabled while a mutation is in-flight (f4).
+  const isMutationPending = createProvider.isPending || createModel.isPending;
   const canSubmit =
     validateBaseUrl(baseUrl) === null &&
     apiKey.trim().length > 0 &&
-    (state.kind === "idle" || state.kind === "provider-failed");
+    (state.kind === "idle" || state.kind === "provider-failed") &&
+    !isMutationPending;
 
   const handleBlurUrl = () => setUrlError(validateBaseUrl(baseUrl));
 
@@ -179,78 +182,92 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
       <div className="provider-card__header">
         <strong>新建 Provider</strong>
       </div>
-      <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
-        <label>
-          Base URL
+      <div className="provider-card__body">
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-url">Base URL</label>
           <input
+            id="new-prov-url"
+            className="field-input"
             type="text"
             placeholder="Base URL (https://...)"
             value={baseUrl}
+            aria-invalid={urlError !== null}
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={handleBlurUrl}
           />
-        </label>
+        </div>
         {urlError && (
-          <div style={{ color: "var(--color-status-danger)", fontSize: "0.85rem" }}>{urlError}</div>
+          <div className="field-error" role="alert">{urlError}</div>
         )}
-        <label>
-          API Key
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-key">API Key</label>
           <input
+            id="new-prov-key"
+            className="field-input"
             type="password"
             placeholder="API Key"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
           />
-        </label>
-        <label>
-          Kind
-          <select value={kind} onChange={(e) => setKind(e.target.value as ProviderKind)}>
+        </div>
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-kind">Kind</label>
+          <select
+            id="new-prov-kind"
+            className="field-select"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as ProviderKind)}
+          >
             <option value="openai_compatible">openai_compatible</option>
             <option value="anthropic_compatible">anthropic_compatible</option>
           </select>
-        </label>
+        </div>
         <hr />
         <div>同步创建 Model</div>
-        <label>
-          Model Name
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-model-name">Model Name</label>
           <input
+            id="new-prov-model-name"
+            className="field-input"
             type="text"
             placeholder="model name (optional)"
             value={modelName}
             onChange={(e) => setModelName(e.target.value)}
           />
-        </label>
-        <label>
-          Model Tags
+        </div>
+        <div className="field-group">
+          <label className="field-label" htmlFor="new-prov-model-tags">Model Tags</label>
           <input
+            id="new-prov-model-tags"
+            className="field-input"
             type="text"
             placeholder="tags (comma-separated, optional)"
             value={modelTags}
             onChange={(e) => setModelTags(e.target.value)}
           />
-        </label>
+        </div>
 
         {state.kind === "partial-success" && (
-          <div className="provider-card__error-banner">
+          <div className="provider-card__error-banner" role="alert">
             Provider 已创建，但 Model 创建失败：{state.modelError}
           </div>
         )}
         {state.kind === "provider-failed" && (
-          <div className="provider-card__error-banner">
+          <div className="provider-card__error-banner" role="alert">
             Provider 创建失败：{state.error}
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 8 }}>
-          <button type="button" onClick={handleSubmit} disabled={!canSubmit}>
+        <div className="provider-card__actions">
+          <button type="button" className="btn btn--primary" onClick={handleSubmit} disabled={!canSubmit}>
             保存
           </button>
           {state.kind === "partial-success" && (
-            <button type="button" onClick={handleRetryModel}>
+            <button type="button" className="btn btn--secondary" onClick={handleRetryModel} disabled={isMutationPending}>
               重试 Model
             </button>
           )}
-          <button type="button" onClick={onClose}>
+          <button type="button" className="btn btn--secondary" onClick={onClose} disabled={isMutationPending}>
             取消
           </button>
         </div>
