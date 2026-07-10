@@ -1446,7 +1446,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: 14px 16px;
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--color-border-subtle);
 }
 .provider-card__name {
@@ -1455,7 +1455,7 @@
   color: var(--color-text);
 }
 .provider-card__info {
-  padding: 8px 16px;
+  padding: var(--space-2) var(--space-4);
   font-size: 0.85rem;
   color: var(--color-text-muted);
 }
@@ -1469,28 +1469,28 @@
   word-break: break-all;
 }
 .provider-card__models {
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
 }
 .provider-card__models--disabled {
   opacity: 0.5;
   pointer-events: none;
 }
 .provider-card__notice {
-  padding: 6px 16px;
+  padding: var(--space-1) var(--space-4);
   font-size: 0.8rem;
   color: var(--color-status-warning);
   background: var(--color-status-warning-soft);
 }
 .provider-card__error-banner {
-  padding: 8px 16px;
+  padding: var(--space-2) var(--space-4);
   font-size: 0.85rem;
   color: var(--color-status-danger);
   background: var(--color-status-danger-soft);
   border-radius: var(--radius-sm);
-  margin: 8px 16px;
+  margin: var(--space-2) var(--space-4);
 }
 .provider-card__test-result {
-  padding: 6px 16px;
+  padding: var(--space-1) var(--space-4);
   font-size: 0.85rem;
 }
 .provider-card__test-result--ok {
@@ -1500,7 +1500,7 @@
   color: var(--color-status-danger);
 }
 .provider-card__body {
-  padding: 16px;
+  padding: var(--space-4);
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -1525,8 +1525,8 @@
 .model-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   transition: background 0.1s ease;
 }
@@ -1541,7 +1541,7 @@
 }
 .model-row__tags {
   display: inline-flex;
-  gap: 4px;
+  gap: var(--space-1);
   flex-wrap: wrap;
 }
 .model-row__edit-form {
@@ -1554,7 +1554,7 @@
 .chip {
   display: inline-flex;
   align-items: center;
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
   border-radius: var(--radius-sm);
   font-size: 0.75rem;
   background: var(--color-surface-subtle);
@@ -1571,7 +1571,7 @@
 .field-group {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
 }
 .field-label {
   font-size: 13px;
@@ -1584,7 +1584,7 @@
   border-radius: var(--radius-sm);
   background: var(--color-surface);
   color: var(--color-text);
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   font-size: 13px;
   min-width: 0;
 }

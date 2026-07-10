@@ -370,4 +370,140 @@ describe("ProviderCreationForm", () => {
       expect.anything(),
     );
   });
+
+  // ─── aria-describedby association for URL error ─────────────────────
+  it("links URL input to error element via aria-describedby when error is present", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    fireEvent.change(urlInput, { target: { value: "bad-url" } });
+    fireEvent.blur(urlInput);
+    const describedBy = urlInput.getAttribute("aria-describedby");
+    expect(describedBy).toBe("new-prov-url-error");
+    const errorEl = document.getElementById("new-prov-url-error");
+    expect(errorEl).toBeTruthy();
+    expect(errorEl!.getAttribute("role")).toBe("alert");
+  });
+
+  it("does not set aria-describedby when there is no URL error", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    expect(urlInput.getAttribute("aria-describedby")).toBeNull();
+  });
+
+  // ─── Focus management on submit validation failure ─────────────────
+  it("moves focus to URL input when submit is attempted with invalid URL", () => {
+    renderForm();
+    // Enter a valid API key so the only validation failure is the URL.
+    fireEvent.change(screen.getByPlaceholderText(/api key/i), { target: { value: "sk-test" } });
+    // Enter an invalid URL but don't blur (so blur validation hasn't fired).
+    fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "bad" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Focus should move to the URL input.
+    expect(document.activeElement).toBe(screen.getByPlaceholderText(/base url/i));
+  });
+
+  // ─── autoComplete=off on API key input ─────────────────────────────
+  it("sets autoComplete=off on the API key input", () => {
+    renderForm();
+    const apiKeyInput = screen.getByPlaceholderText(/api key/i);
+    expect(apiKeyInput.getAttribute("autocomplete")).toBe("off");
+  });
+
+  // ─── Dirty form protection ─────────────────────────────────────────
+  it("shows confirm dialog when canceling with unsaved changes", () => {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useProviderMutations).mockReturnValue({
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never);
+    vi.mocked(useModelMutations).mockReturnValue({
+      createModel: { mutate: vi.fn(), isPending: false },
+      updateModel: { mutate: vi.fn(), isPending: false },
+      deleteModel: { mutate: vi.fn(), isPending: false },
+      tagsUpdate: { mutate: vi.fn(), isPending: false },
+    } as never);
+    render(
+      <QueryClientProvider client={qc}>
+        <ProviderCreationForm onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    // Type something → dirty.
+    fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes immediately when canceling with no input", () => {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useProviderMutations).mockReturnValue({
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never);
+    vi.mocked(useModelMutations).mockReturnValue({
+      createModel: { mutate: vi.fn(), isPending: false },
+      updateModel: { mutate: vi.fn(), isPending: false },
+      deleteModel: { mutate: vi.fn(), isPending: false },
+      tagsUpdate: { mutate: vi.fn(), isPending: false },
+    } as never);
+    render(
+      <QueryClientProvider client={qc}>
+        <ProviderCreationForm onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    // No input → cancel should close immediately.
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(screen.queryByText("放弃修改")).toBeNull();
+  });
+
+  it("discards and closes when confirm dialog confirmed", () => {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useProviderMutations).mockReturnValue({
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never);
+    vi.mocked(useModelMutations).mockReturnValue({
+      createModel: { mutate: vi.fn(), isPending: false },
+      updateModel: { mutate: vi.fn(), isPending: false },
+      deleteModel: { mutate: vi.fn(), isPending: false },
+      tagsUpdate: { mutate: vi.fn(), isPending: false },
+    } as never);
+    render(
+      <QueryClientProvider client={qc}>
+        <ProviderCreationForm onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
 });

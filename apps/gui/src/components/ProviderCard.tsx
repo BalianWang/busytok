@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   ModelCatalogEntryDto,
   ModelCreateRequestDto,
@@ -8,7 +8,7 @@ import type {
   ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
 import type { useProviderMutations } from "../api/useBusytokData";
-import { parseTags, validateBaseUrl } from "../pages/providerFormUtils";
+import { errorMessage, parseTags, validateBaseUrl } from "../pages/providerFormUtils";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -66,7 +66,9 @@ interface ProviderEditDraft {
 type ConfirmState =
   | { kind: "none" }
   | { kind: "provider-delete" }
-  | { kind: "model-delete"; model: ModelCatalogEntryDto };
+  | { kind: "model-delete"; model: ModelCatalogEntryDto }
+  | { kind: "cancel-provider-edit" }
+  | { kind: "cancel-model-edit" };
 
 function toEditDraft(m: ModelCatalogEntryDto): ModelEditDraft {
   return {
@@ -107,6 +109,15 @@ export function ProviderCard({
   const [deleteInFlight, setDeleteInFlight] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [modelFormInFlight, setModelFormInFlight] = useState(false);
+  // Brief success notice shown in view mode after provider save succeeds.
+  // Consistent with test-connection result feedback. Auto-dismisses after 3s.
+  const [providerSaveSuccess, setProviderSaveSuccess] = useState(false);
+
+  useEffect(() => {
+    if (!providerSaveSuccess) return;
+    const timer = setTimeout(() => setProviderSaveSuccess(false), 3000);
+    return () => clearTimeout(timer);
+  }, [providerSaveSuccess]);
 
   // Synchronously initialize/clear provider edit draft when isEditing changes.
   // Uses the React-recommended "adjusting state during render" pattern to
@@ -124,6 +135,7 @@ export function ProviderCard({
       });
       setProviderSaveError(null);
       setEditUrlError(null);
+      setProviderSaveSuccess(false);
     } else {
       setProviderEditDraft(null);
       setProviderSaveError(null);
@@ -136,6 +148,27 @@ export function ProviderCard({
     providerMutations.updateProvider.isPending || providerMutations.deleteProvider.isPending;
   const isAnyMutationInFlight =
     isProviderMutationPending || modelFormInFlight || deleteInFlight;
+
+  // Dirty-form checks: detect unsaved changes before allowing cancel.
+  const isProviderEditDirty = providerEditDraft !== null && (
+    providerEditDraft.name !== provider.name ||
+    providerEditDraft.base_url !== provider.base_url ||
+    providerEditDraft.api_key !== "" ||
+    providerEditDraft.provider_kind !== provider.provider_kind
+  );
+  const isModelEditDirty = editDraft !== null && editingModelDbId !== null && (() => {
+    const model = models.find((m) => m.model_db_id === editingModelDbId);
+    if (!model) return false;
+    const orig = toEditDraft(model);
+    return (
+      editDraft.display_name !== orig.display_name ||
+      editDraft.tags !== orig.tags ||
+      editDraft.context_window !== orig.context_window ||
+      editDraft.max_tokens !== orig.max_tokens ||
+      editDraft.reasoning !== orig.reasoning ||
+      editDraft.enabled !== orig.enabled
+    );
+  })();
 
   const handleSaveProviderEdit = () => {
     if (!providerEditDraft) return;
@@ -159,6 +192,7 @@ export function ProviderCard({
           message: "Provider updated",
           details: { id: provider.id, name: providerEditDraft.name },
         });
+        setProviderSaveSuccess(true);
         onCancelEdit?.();
       },
       onError: (err: Error) => {
@@ -183,7 +217,41 @@ export function ProviderCard({
     setConfirmState({ kind: "model-delete", model });
   };
 
-  const handleConfirmDelete = async () => {
+  // Cancel buttons: check dirty state before discarding.
+  // Also clear stale deleteError so it doesn't leak into cancel-confirm dialogs.
+  const handleProviderEditCancel = () => {
+    if (isProviderEditDirty) {
+      setDeleteError(null);
+      setConfirmState({ kind: "cancel-provider-edit" });
+    } else {
+      onCancelEdit?.();
+    }
+  };
+
+  const handleModelEditCancel = () => {
+    if (isModelEditDirty) {
+      setDeleteError(null);
+      setConfirmState({ kind: "cancel-model-edit" });
+    } else {
+      cancelModelEdit();
+      setModelFormError(null);
+    }
+  };
+
+  const handleConfirm = async () => {
+    // Cancel-confirm cases: synchronous, no loading/error needed.
+    if (confirmState.kind === "cancel-provider-edit") {
+      setConfirmState({ kind: "none" });
+      onCancelEdit?.();
+      return;
+    }
+    if (confirmState.kind === "cancel-model-edit") {
+      setConfirmState({ kind: "none" });
+      cancelModelEdit();
+      setModelFormError(null);
+      return;
+    }
+    // Delete cases: async with loading/error.
     setDeleteError(null);
     setDeleteInFlight(true);
     try {
@@ -193,8 +261,8 @@ export function ProviderCard({
         await onModelDelete(confirmState.model);
       }
       setConfirmState({ kind: "none" });
-    } catch (err: any) {
-      setDeleteError(err.message ?? "删除失败");
+    } catch (err) {
+      setDeleteError(errorMessage(err, "删除失败"));
     } finally {
       setDeleteInFlight(false);
     }
@@ -218,8 +286,8 @@ export function ProviderCard({
       setNewModelDraft({ modelId: "", tags: "" });
       setShowCreateModel(false);
       setModelFormError(null);
-    } catch (err: any) {
-      setModelFormError(err.message ?? "创建失败");
+    } catch (err) {
+      setModelFormError(errorMessage(err, "创建失败"));
     } finally {
       setModelFormInFlight(false);
     }
@@ -277,8 +345,8 @@ export function ProviderCard({
       }
       cancelModelEdit();
       setModelFormError(null);
-    } catch (err: any) {
-      setModelFormError(err.message ?? "保存失败");
+    } catch (err) {
+      setModelFormError(errorMessage(err, "保存失败"));
     } finally {
       setModelFormInFlight(false);
     }
@@ -296,6 +364,14 @@ export function ProviderCard({
       body: `确定删除 model「${confirmState.model.model_id}」？`,
       detail: "注意：已绑定此 model 的 subagents 将在下次 delegate 时失败。",
       confirmLabel: "删除",
+    } : confirmState.kind === "cancel-provider-edit" ? {
+      title: "放弃修改",
+      body: "Provider 有未保存的修改，确定放弃？",
+      confirmLabel: "放弃",
+    } : confirmState.kind === "cancel-model-edit" ? {
+      title: "放弃修改",
+      body: "Model 有未保存的修改，确定放弃？",
+      confirmLabel: "放弃",
     } : null;
 
   // ─── Edit mode render ────────────────────────────────────────────────
@@ -330,7 +406,7 @@ export function ProviderCard({
           </div>
           <div className="provider-card__actions provider-card__actions--end">
             <button type="button" className="btn btn--primary" onClick={handleSaveProviderEdit} disabled={isProviderMutationPending || editUrlError !== null}>保存</button>
-            <button type="button" className="btn btn--secondary" onClick={onCancelEdit} disabled={isProviderMutationPending}>取消</button>
+            <button type="button" className="btn btn--secondary" onClick={handleProviderEditCancel} disabled={isProviderMutationPending}>取消</button>
           </div>
         </div>
         <div className="provider-card__body">
@@ -342,11 +418,12 @@ export function ProviderCard({
               type="text"
               value={draft.base_url}
               aria-invalid={editUrlError !== null}
+              aria-describedby={editUrlError ? `prov-url-error-${provider.id}` : undefined}
               onChange={(e) => setProviderEditDraft({ ...draft, base_url: e.target.value })}
               onBlur={() => setEditUrlError(validateBaseUrl(draft.base_url))}
             />
             {editUrlError && (
-              <div className="field-error" role="alert">{editUrlError}</div>
+              <div id={`prov-url-error-${provider.id}`} className="field-error" role="alert">{editUrlError}</div>
             )}
           </div>
           <div className="field-group">
@@ -355,6 +432,7 @@ export function ProviderCard({
               id={`prov-key-${provider.id}`}
               className="field-input"
               type="password"
+              autoComplete="off"
               placeholder="new api key (optional)"
               value={draft.api_key}
               onChange={(e) => setProviderEditDraft({ ...draft, api_key: e.target.value })}
@@ -384,6 +462,19 @@ export function ProviderCard({
             </div>
           ))}
         </div>
+        {confirmDialog && (
+          <ConfirmDialog
+            open
+            title={confirmDialog.title}
+            body={confirmDialog.body}
+            detail={confirmDialog.detail}
+            confirmLabel={confirmDialog.confirmLabel}
+            loading={deleteInFlight}
+            error={confirmState.kind === "provider-delete" || confirmState.kind === "model-delete" ? deleteError : null}
+            onConfirm={handleConfirm}
+            onCancel={() => setConfirmState({ kind: "none" })}
+          />
+        )}
       </div>
     );
   }
@@ -411,6 +502,11 @@ export function ProviderCard({
           role={testResult.ok ? "status" : "alert"}
         >
           {testResult.ok ? "连接成功" : `连接失败：${testResult.error ?? "未知错误"}`}
+        </div>
+      )}
+      {providerSaveSuccess && (
+        <div className="provider-card__test-result provider-card__test-result--ok" role="status">
+          保存成功
         </div>
       )}
       <div className="provider-card__models">
@@ -519,7 +615,7 @@ export function ProviderCard({
                   </label>
                   <div className="provider-card__actions">
                     <button type="button" className="btn btn--primary" onClick={() => handleEditSubmit(m)} disabled={isAnyMutationInFlight}>保存</button>
-                    <button type="button" className="btn btn--secondary" onClick={() => { cancelModelEdit(); setModelFormError(null); }}>取消</button>
+                    <button type="button" className="btn btn--secondary" onClick={handleModelEditCancel} disabled={isAnyMutationInFlight}>取消</button>
                   </div>
                   {modelFormError && (
                     <div className="field-error" role="alert">{modelFormError}</div>
@@ -555,7 +651,7 @@ export function ProviderCard({
           confirmLabel={confirmDialog.confirmLabel}
           loading={deleteInFlight}
           error={deleteError}
-          onConfirm={handleConfirmDelete}
+          onConfirm={handleConfirm}
           onCancel={() => setConfirmState({ kind: "none" })}
         />
       )}

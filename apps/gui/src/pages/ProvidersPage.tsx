@@ -14,6 +14,7 @@ import {
 import { ProviderCard, type TestConnectionResult } from "../components/ProviderCard";
 import { ProviderCreationForm } from "../components/ProviderCreationForm";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
+import { errorMessage } from "./providerFormUtils";
 
 /**
  * ProvidersPage orchestrates the provider/model catalog UI.
@@ -78,12 +79,12 @@ export function ProvidersPage() {
         delete next[provider.id];
         return next;
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "provider.delete.failed",
         message: "Provider delete failed",
-        details: { id: provider.id, name: provider.name, error: err.message },
+        details: { id: provider.id, name: provider.name, error: errorMessage(err, "unknown error") },
       });
       throw err;
     }
@@ -136,7 +137,7 @@ export function ProvidersPage() {
         message: "Model added",
         details: { provider_id: entry.provider_id, model_id: entry.model_id },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.add.failed",
@@ -144,7 +145,7 @@ export function ProvidersPage() {
         details: {
           provider_id: payload.provider_id,
           model_id: payload.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;
@@ -171,7 +172,7 @@ export function ProvidersPage() {
           model_id: model.model_id,
         },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.update.failed",
@@ -179,7 +180,7 @@ export function ProvidersPage() {
         details: {
           provider_id: model.provider_id,
           model_id: model.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;
@@ -202,7 +203,7 @@ export function ProvidersPage() {
           tags,
         },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.tags.update.failed",
@@ -210,7 +211,7 @@ export function ProvidersPage() {
         details: {
           provider_id: model.provider_id,
           model_id: model.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;
@@ -229,7 +230,7 @@ export function ProvidersPage() {
           model_id: model.model_id,
         },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.delete.failed",
@@ -237,7 +238,7 @@ export function ProvidersPage() {
         details: {
           provider_id: model.provider_id,
           model_id: model.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;

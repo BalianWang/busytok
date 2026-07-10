@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type {
   ModelCreateRequestDto,
   ProviderCreateRequestDto,
@@ -12,6 +12,7 @@ import {
   parseTags,
   validateBaseUrl,
 } from "../pages/providerFormUtils";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ProviderCreationFormProps {
   onClose: () => void;
@@ -49,24 +50,34 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
   const [modelTags, setModelTags] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
   const [state, setState] = useState<SubmitState>({ kind: "idle" });
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const urlInputRef = useRef<HTMLInputElement>(null);
 
   const existingNames = useMemo(
     () => new Set((providersQuery.data?.providers ?? []).map((p) => p.name)),
     [providersQuery.data],
   );
 
-  // Save is enabled only when the form is in a submittable state (idle or
-  // provider-failed) and the required fields are valid. In `partial-success`
-  // the provider already exists — re-submitting would create a duplicate.
-  // Also disabled while a mutation is in-flight (f4).
+  // Save is enabled when the form is in a submittable state (idle or
+  // provider-failed) and the required API key is present. URL validation
+  // happens on blur (progressive feedback) and on submit (focus management).
+  // In `partial-success` the provider already exists — re-submitting would
+  // create a duplicate. Also disabled while a mutation is in-flight (f4).
   const isMutationPending = createProvider.isPending || createModel.isPending;
   const canSubmit =
-    validateBaseUrl(baseUrl) === null &&
     apiKey.trim().length > 0 &&
     (state.kind === "idle" || state.kind === "provider-failed") &&
     !isMutationPending;
 
   const handleBlurUrl = () => setUrlError(validateBaseUrl(baseUrl));
+
+  // Dirty-form: any field has user input → confirm before discarding.
+  const isDirty = baseUrl.trim() !== "" || apiKey.trim() !== "" ||
+    modelName.trim() !== "" || modelTags.trim() !== "";
+  const handleCancel = () => {
+    if (isDirty && !isMutationPending) setShowCancelConfirm(true);
+    else onClose();
+  };
 
   const buildProviderPayload = (): ProviderCreateRequestDto => {
     const name = deriveUniqueProviderName(baseUrl, kind, existingNames);
@@ -151,6 +162,7 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
     const urlErr = validateBaseUrl(baseUrl);
     if (urlErr) {
       setUrlError(urlErr);
+      urlInputRef.current?.focus();
       return;
     }
     if (!apiKey.trim()) return;
@@ -187,17 +199,19 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
           <label className="field-label" htmlFor="new-prov-url">Base URL</label>
           <input
             id="new-prov-url"
+            ref={urlInputRef}
             className="field-input"
             type="text"
             placeholder="Base URL (https://...)"
             value={baseUrl}
             aria-invalid={urlError !== null}
+            aria-describedby={urlError ? "new-prov-url-error" : undefined}
             onChange={(e) => setBaseUrl(e.target.value)}
             onBlur={handleBlurUrl}
           />
         </div>
         {urlError && (
-          <div className="field-error" role="alert">{urlError}</div>
+          <div id="new-prov-url-error" className="field-error" role="alert">{urlError}</div>
         )}
         <div className="field-group">
           <label className="field-label" htmlFor="new-prov-key">API Key</label>
@@ -205,6 +219,7 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
             id="new-prov-key"
             className="field-input"
             type="password"
+            autoComplete="off"
             placeholder="API Key"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
@@ -267,11 +282,19 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
               重试 Model
             </button>
           )}
-          <button type="button" className="btn btn--secondary" onClick={onClose} disabled={isMutationPending}>
+          <button type="button" className="btn btn--secondary" onClick={handleCancel} disabled={isMutationPending}>
             取消
           </button>
         </div>
       </div>
+      <ConfirmDialog
+        open={showCancelConfirm}
+        title="放弃修改"
+        body="表单有未保存的内容，确定放弃？"
+        confirmLabel="放弃"
+        onConfirm={() => { setShowCancelConfirm(false); onClose(); }}
+        onCancel={() => setShowCancelConfirm(false)}
+      />
     </div>
   );
 }

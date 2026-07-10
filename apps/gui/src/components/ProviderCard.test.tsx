@@ -671,3 +671,325 @@ describe("ProviderCard edit mode", () => {
     expect(screen.queryByText(/update rpc failed/)).toBeNull();
   });
 });
+
+// ─── Save success feedback ───────────────────────────────────────────────
+describe("ProviderCard save success feedback", () => {
+  it("shows 保存成功 banner in view mode after successful save", () => {
+    const updateProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
+    const onCancelEdit = vi.fn();
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: updateProvider, isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    const { rerender } = render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit,
+        })}
+      />,
+    );
+    // Make a change (dirty the form), then save.
+    fireEvent.change(screen.getByDisplayValue("https://api.deepseek.com/v1"), {
+      target: { value: "https://api.deepseek.com/v2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Parent would set isEditing=false after onCancelEdit.
+    rerender(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel({})],
+          providerMutations,
+          isEditing: false,
+          onCancelEdit,
+        })}
+      />,
+    );
+    expect(screen.getByText("保存成功")).toBeDefined();
+  });
+
+  it("clears 保存成功 banner when re-entering edit mode", () => {
+    const updateProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: updateProvider, isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    const { rerender } = render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    fireEvent.change(screen.getByDisplayValue("https://api.deepseek.com/v1"), {
+      target: { value: "https://api.deepseek.com/v2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Exit edit mode → success banner shows.
+    rerender(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: false,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    expect(screen.getByText("保存成功")).toBeDefined();
+    // Re-enter edit mode → banner cleared.
+    rerender(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    expect(screen.queryByText("保存成功")).toBeNull();
+  });
+});
+
+// ─── Dirty form protection ───────────────────────────────────────────────
+describe("ProviderCard dirty form protection", () => {
+  it("shows confirm dialog when canceling provider edit with unsaved changes", () => {
+    const onCancelEdit = vi.fn();
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit,
+        })}
+      />,
+    );
+    // Change the name → dirty.
+    fireEvent.change(screen.getByDisplayValue("deepseek_openai"), {
+      target: { value: "new_name" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    // Confirm dialog should be open.
+    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(onCancelEdit).not.toHaveBeenCalled();
+  });
+
+  it("exits edit mode immediately when canceling with no changes", () => {
+    const onCancelEdit = vi.fn();
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit,
+        })}
+      />,
+    );
+    // No changes → cancel should exit immediately.
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(onCancelEdit).toHaveBeenCalledOnce();
+    expect(screen.queryByText("放弃修改")).toBeNull();
+  });
+
+  it("discards changes and exits when confirm dialog confirmed (provider edit)", () => {
+    const onCancelEdit = vi.fn();
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit,
+        })}
+      />,
+    );
+    fireEvent.change(screen.getByDisplayValue("deepseek_openai"), {
+      target: { value: "new_name" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    // Confirm discard.
+    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
+    expect(onCancelEdit).toHaveBeenCalledOnce();
+  });
+
+  it("shows confirm dialog when canceling model edit with unsaved changes", () => {
+    render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
+    // Enter model edit.
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // Change display name → dirty.
+    fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
+      target: { value: "New Name" },
+    });
+    // Click cancel (the model edit cancel button).
+    const cancelButtons = screen.getAllByRole("button", { name: /^取消$/i });
+    fireEvent.click(cancelButtons[cancelButtons.length - 1]);
+    // Confirm dialog should be open.
+    expect(screen.getByText("放弃修改")).toBeDefined();
+    // Model edit form should still be visible (not yet discarded).
+    expect(screen.getByDisplayValue("New Name")).toBeDefined();
+  });
+
+  it("exits model edit immediately when canceling with no changes", () => {
+    render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    // No changes → cancel should exit immediately.
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(screen.queryByText("放弃修改")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /reasoning/i })).toBeNull();
+  });
+
+  it("discards model edit changes and exits when confirm dialog confirmed", () => {
+    render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
+      target: { value: "Changed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    // Confirm discard.
+    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
+    expect(screen.queryByText("放弃修改")).toBeNull();
+    expect(screen.queryByDisplayValue("Changed")).toBeNull();
+  });
+
+  it("does not show stale deleteError in cancel-confirm dialog", async () => {
+    // 1. Trigger a model delete that fails → deleteError is set.
+    const onModelDelete = vi.fn().mockRejectedValue(new Error("delete rpc failed"));
+    render(
+      <ProviderCard {...defaultProps({ models: [makeModel()], onModelDelete })} />,
+    );
+    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+    // Confirm delete → onModelDelete rejects → deleteError shows in dialog.
+    const dialogDeleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(dialogDeleteButtons[dialogDeleteButtons.length - 1]);
+    await vi.waitFor(() => {
+      expect(screen.getByText(/delete rpc failed/)).toBeDefined();
+    });
+    // 2. Cancel the delete dialog.
+    fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
+    expect(screen.queryByText(/delete rpc failed/)).toBeNull();
+    // 3. Enter model edit, dirty it, cancel → cancel-confirm dialog opens.
+    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    fireEvent.click(editButtons[editButtons.length - 1]);
+    fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
+      target: { value: "Changed" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    // 4. The cancel-confirm dialog should NOT show the stale deleteError.
+    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(screen.queryByText(/delete rpc failed/)).toBeNull();
+  });
+});
+
+// ─── aria-describedby association ────────────────────────────────────────
+describe("ProviderCard aria-describedby for edit URL error", () => {
+  it("links URL input to error element via aria-describedby when error is present", () => {
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    const urlInput = screen.getByDisplayValue("https://api.deepseek.com/v1");
+    fireEvent.change(urlInput, { target: { value: "bad" } });
+    fireEvent.blur(urlInput);
+    // aria-describedby should reference the error element's id.
+    const describedBy = urlInput.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    const errorEl = document.getElementById(describedBy!);
+    expect(errorEl).toBeTruthy();
+    expect(errorEl!.getAttribute("role")).toBe("alert");
+  });
+
+  it("does not set aria-describedby when there is no URL error", () => {
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    const urlInput = screen.getByDisplayValue("https://api.deepseek.com/v1");
+    expect(urlInput.getAttribute("aria-describedby")).toBeNull();
+  });
+});
+
+// ─── Autocomplete attribute ──────────────────────────────────────────────
+describe("ProviderCard autocomplete on API key input", () => {
+  it("sets autoComplete=off on the API key input in edit mode", () => {
+    const providerMutations = {
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never;
+    render(
+      <ProviderCard
+        {...defaultProps({
+          models: [makeModel()],
+          providerMutations,
+          isEditing: true,
+          onCancelEdit: vi.fn(),
+        })}
+      />,
+    );
+    const apiKeyInput = screen.getByPlaceholderText(/new api key/i);
+    expect(apiKeyInput.getAttribute("autocomplete")).toBe("off");
+  });
+});
