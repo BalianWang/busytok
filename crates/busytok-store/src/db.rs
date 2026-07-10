@@ -2053,14 +2053,20 @@ impl Database {
     pub fn subagent_task_counts_by_status(&self) -> Result<(u32, u32)> {
         crate::subagent_queries::task_counts_by_status(&self.conn)
     }
-    /// Reap orphaned `running` tasks older than `max_age_ms`. See
-    /// [`subagent_queries::reap_orphaned_running_tasks`].
+    /// Reap orphaned `running` tasks whose age exceeds their own timeout.
+    /// See [`subagent_queries::reap_orphaned_running_tasks`].
     pub fn subagent_reap_orphaned_running_tasks(
         &self,
         now_ms: i64,
-        max_age_ms: i64,
+        default_timeout_seconds: i64,
+        buffer_ms: i64,
     ) -> Result<Vec<String>> {
-        subagent_queries::reap_orphaned_running_tasks(self.conn(), now_ms, max_age_ms)
+        subagent_queries::reap_orphaned_running_tasks(
+            self.conn(),
+            now_ms,
+            default_timeout_seconds,
+            buffer_ms,
+        )
     }
     pub fn subagent_set_task_status(
         &self,

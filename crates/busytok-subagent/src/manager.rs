@@ -747,9 +747,10 @@ impl SubagentManager {
     /// This unblocks `pick_oldest_queued_task` (which excludes
     /// subagents with a running task) so queued delegates proceed.
     fn reap_orphaned_tasks(&self) {
-        // max_age = max(profile timeouts, pi_sidecar.task_timeout) + 60s buffer.
-        // The buffer covers non-sidecar overhead (context build, DB writes)
-        // so legitimate in-flight tasks are never reaped.
+        // default_timeout = max(profile timeouts, pi_sidecar.task_timeout).
+        // Used as the fallback when a task row has no `timeout_seconds`
+        // (NULL). Per-task timeout overrides are honored in SQL via
+        // COALESCE(timeout_seconds, default_timeout_seconds).
         let max_profile = self
             .settings
             .profiles
@@ -758,12 +759,12 @@ impl SubagentManager {
             .max()
             .unwrap_or(300);
         let sidecar_timeout = self.settings.pi_sidecar.task_timeout_seconds;
-        let max_timeout = max_profile.max(sidecar_timeout);
-        let max_age_ms = (max_timeout + 60) * 1000;
+        let default_timeout = max_profile.max(sidecar_timeout);
+        let buffer_ms = 60_000_i64; // 60s buffer for non-sidecar overhead
         let now_ms = busytok_domain::now_ms();
         let reaped = {
             let db = self.db.lock().expect("subagent db lock poisoned");
-            db.subagent_reap_orphaned_running_tasks(now_ms, max_age_ms as i64)
+            db.subagent_reap_orphaned_running_tasks(now_ms, default_timeout as i64, buffer_ms)
                 .unwrap_or_else(|e| {
                     warn!(
                         event_code = "subagent.reaper.failed",
@@ -778,7 +779,8 @@ impl SubagentManager {
                 event_code = "subagent.reaper.reaped",
                 count = reaped.len(),
                 task_ids = ?reaped,
-                max_age_ms,
+                default_timeout_seconds = default_timeout,
+                buffer_ms,
                 "reaped orphaned running tasks (likely dispatch_timeout orphans)"
             );
         }

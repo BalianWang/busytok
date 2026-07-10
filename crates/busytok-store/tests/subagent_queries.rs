@@ -585,21 +585,40 @@ fn insert_running_task_with_started_at(
     db.subagent_insert_task(&row).unwrap();
 }
 
+/// Helper: insert a running task with explicit `started_at_ms` + per-task
+/// `timeout_seconds` override (for testing per-task reaper cutoff).
+fn insert_running_task_with_timeout(
+    db: &Database,
+    id: &str,
+    subagent_id: &str,
+    started_at_ms: Option<i64>,
+    timeout_seconds: Option<i64>,
+) {
+    let mut row = SubagentTaskRow::for_test(id, subagent_id, "pi/search-cheap", "do");
+    row.status = "running".to_string();
+    row.started_at_ms = started_at_ms;
+    row.timeout_seconds = timeout_seconds;
+    db.subagent_insert_task(&row).unwrap();
+}
+
 #[test]
 fn reap_orphaned_running_tasks_marks_stale_running_as_failed() {
     let db = db();
-    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(
-        "sub-reap",
-        "reap",
-    ))
-    .unwrap();
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test("sub-reap", "reap"))
+        .unwrap();
     // An orphan: started 600s ago, max_age = 360s → should be reaped.
     let now = busytok_domain::now_ms();
     let stale_started = now - 600_000;
-    insert_running_task_with_started_at(&db, "orphan-1", "sub-reap", "running", Some(stale_started));
+    insert_running_task_with_started_at(
+        &db,
+        "orphan-1",
+        "sub-reap",
+        "running",
+        Some(stale_started),
+    );
 
     let reaped = db
-        .subagent_reap_orphaned_running_tasks(now, 360_000)
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
         .unwrap();
     assert_eq!(reaped, vec!["orphan-1".to_string()]);
     let task = db.subagent_get_task("orphan-1").unwrap().unwrap();
@@ -618,7 +637,7 @@ fn reap_orphaned_running_tasks_skips_fresh_running() {
     insert_running_task_with_started_at(&db, "fresh-1", "sub-fresh", "running", Some(now - 10_000));
 
     let reaped = db
-        .subagent_reap_orphaned_running_tasks(now, 360_000)
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
         .unwrap();
     assert!(reaped.is_empty());
     let task = db.subagent_get_task("fresh-1").unwrap().unwrap();
@@ -635,7 +654,7 @@ fn reap_orphaned_running_tasks_skips_null_started_at() {
     insert_running_task_with_started_at(&db, "null-1", "sub-null", "running", None);
 
     let reaped = db
-        .subagent_reap_orphaned_running_tasks(busytok_domain::now_ms(), 360_000)
+        .subagent_reap_orphaned_running_tasks(busytok_domain::now_ms(), 300, 60_000)
         .unwrap();
     assert!(reaped.is_empty());
     let task = db.subagent_get_task("null-1").unwrap().unwrap();
@@ -654,14 +673,22 @@ fn reap_orphaned_running_tasks_skips_non_running() {
     insert_running_task_with_started_at(&db, "completed-1", "sub-other", "completed", Some(stale));
     insert_running_task_with_started_at(&db, "failed-1", "sub-other", "failed", Some(stale));
 
-    let reaped = db.subagent_reap_orphaned_running_tasks(now, 360_000).unwrap();
+    let reaped = db
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
+        .unwrap();
     assert!(reaped.is_empty());
-    assert_eq!(db.subagent_get_task("queued-1").unwrap().unwrap().status, "queued");
+    assert_eq!(
+        db.subagent_get_task("queued-1").unwrap().unwrap().status,
+        "queued"
+    );
     assert_eq!(
         db.subagent_get_task("completed-1").unwrap().unwrap().status,
         "completed"
     );
-    assert_eq!(db.subagent_get_task("failed-1").unwrap().unwrap().status, "failed");
+    assert_eq!(
+        db.subagent_get_task("failed-1").unwrap().unwrap().status,
+        "failed"
+    );
 }
 
 #[test]
@@ -679,12 +706,17 @@ fn reap_orphaned_running_tasks_reaps_multiple_across_subagents() {
     // A fresh one that should survive.
     insert_running_task_with_started_at(&db, "fresh-b2", "sub-b", "running", Some(now - 10_000));
 
-    let reaped = db.subagent_reap_orphaned_running_tasks(now, 360_000).unwrap();
+    let reaped = db
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
+        .unwrap();
     assert_eq!(reaped.len(), 2);
     assert!(reaped.contains(&"orph-a1".to_string()));
     assert!(reaped.contains(&"orph-b1".to_string()));
     // Fresh survives.
-    assert_eq!(db.subagent_get_task("fresh-b2").unwrap().unwrap().status, "running");
+    assert_eq!(
+        db.subagent_get_task("fresh-b2").unwrap().unwrap().status,
+        "running"
+    );
 }
 
 #[test]
@@ -693,8 +725,11 @@ fn reap_orphaned_running_tasks_unblocks_queued_pick() {
     // blocks `pick_oldest_queued_task` (SQL excludes subagents with a
     // running task). After reaping, the queued task should become pickable.
     let db = db();
-    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test("sub-unblock", "unblock"))
-        .unwrap();
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test(
+        "sub-unblock",
+        "unblock",
+    ))
+    .unwrap();
     let now = busytok_domain::now_ms();
     let stale = now - 600_000;
     // Orphan running + a queued task on the SAME subagent.
@@ -705,7 +740,9 @@ fn reap_orphaned_running_tasks_unblocks_queued_pick() {
     assert!(db.subagent_pick_oldest_queued_task().unwrap().is_none());
 
     // Reap the orphan.
-    let reaped = db.subagent_reap_orphaned_running_tasks(now, 360_000).unwrap();
+    let reaped = db
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
+        .unwrap();
     assert_eq!(reaped, vec!["orph-1".to_string()]);
 
     // After reap: pick returns the queued task (subagent has no running task).
@@ -718,7 +755,7 @@ fn reap_orphaned_running_tasks_unblocks_queued_pick() {
 fn reap_orphaned_running_tasks_empty_db_returns_empty_vec() {
     let db = db();
     let reaped = db
-        .subagent_reap_orphaned_running_tasks(busytok_domain::now_ms(), 360_000)
+        .subagent_reap_orphaned_running_tasks(busytok_domain::now_ms(), 300, 60_000)
         .unwrap();
     assert!(reaped.is_empty());
 }
@@ -740,7 +777,9 @@ fn reap_uses_cas_guard_so_concurrent_completion_is_safe() {
     db.subagent_set_task_status("cas-1", "completed", Some("done".into()), None)
         .unwrap();
 
-    let _reaped = db.subagent_reap_orphaned_running_tasks(now, 360_000).unwrap();
+    let _reaped = db
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
+        .unwrap();
     // The SELECT found the row (it was running at SELECT time in this
     // serialized test), but the UPDATE's CAS guard means 0 rows affected.
     // The function still returns the id from SELECT, but the status is
@@ -748,4 +787,80 @@ fn reap_uses_cas_guard_so_concurrent_completion_is_safe() {
     // the reaped ids, and the task is in a terminal state either way.
     let task = db.subagent_get_task("cas-1").unwrap().unwrap();
     assert_eq!(task.status, "completed");
+}
+
+#[test]
+fn reap_honors_per_task_timeout_override() {
+    // Regression test for review finding P1: a task with a long
+    // `--timeout 600` override must NOT be reaped at the default ceiling
+    // (300s + 60s buffer = 360s). The reaper must use the per-task
+    // `timeout_seconds` column via COALESCE.
+    let db = db();
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test("sub-ovr", "ovr"))
+        .unwrap();
+    let now = busytok_domain::now_ms();
+
+    // Task with --timeout 600, started 400s ago.
+    // Default ceiling would be 360s → reaped (BUG).
+    // Per-task ceiling is 600s + 60s = 660s → NOT reaped (CORRECT).
+    insert_running_task_with_timeout(
+        &db,
+        "long-timeout",
+        "sub-ovr",
+        Some(now - 400_000),
+        Some(600),
+    );
+    // Task with default timeout (NULL), started 400s ago.
+    // Default ceiling 360s → reaped.
+    insert_running_task_with_timeout(&db, "default-timeout", "sub-ovr", Some(now - 400_000), None);
+
+    let reaped = db
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
+        .unwrap();
+    // Only the default-timeout task is reaped; the long-timeout task survives.
+    assert_eq!(reaped, vec!["default-timeout".to_string()]);
+    assert_eq!(
+        db.subagent_get_task("long-timeout")
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        db.subagent_get_task("default-timeout")
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed"
+    );
+}
+
+#[test]
+fn reap_honors_per_task_timeout_override_eventually_reaps() {
+    // Same setup as above, but the long-timeout task has now exceeded
+    // its own ceiling (600s + 60s = 660s). It should be reaped.
+    let db = db();
+    db.subagent_upsert_logical(&SubagentLogicalSubagentRow::for_test("sub-ovr2", "ovr2"))
+        .unwrap();
+    let now = busytok_domain::now_ms();
+
+    insert_running_task_with_timeout(
+        &db,
+        "long-timeout",
+        "sub-ovr2",
+        Some(now - 700_000), // 700s ago > 660s ceiling
+        Some(600),
+    );
+
+    let reaped = db
+        .subagent_reap_orphaned_running_tasks(now, 300, 60_000)
+        .unwrap();
+    assert_eq!(reaped, vec!["long-timeout".to_string()]);
+    assert_eq!(
+        db.subagent_get_task("long-timeout")
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed"
+    );
 }

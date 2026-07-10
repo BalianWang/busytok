@@ -507,9 +507,8 @@ pub fn task_counts_by_status(conn: &Connection) -> Result<(u32, u32)> {
     Ok((queued as u32, running as u32))
 }
 
-/// Reap orphaned `running` tasks: mark as `failed` any task whose
-/// `started_at_ms` is older than `now - max_age_ms`. Returns the reaped
-/// task ids (for logging / observability).
+/// Reap orphaned `running` tasks: mark as `failed` any task whose age
+/// exceeds its own timeout. Returns the reaped task ids (for logging).
 ///
 /// **Why this exists:** `dispatch_timeout` at the control-server layer
 /// drops the `execute_task` future without giving it a chance to persist
@@ -519,17 +518,31 @@ pub fn task_counts_by_status(conn: &Connection) -> Result<(u32, u32)> {
 /// that subagent. The reaper is the single recovery path that works
 /// regardless of how the orphan was produced (timeout / panic / crash).
 ///
-/// `max_age_ms` should be `task_timeout + buffer` so legitimate in-flight
-/// tasks are never reaped. The caller (dispatcher tick) passes the
-/// largest configured `task_timeout_seconds` across profiles + buffer.
-pub fn reap_orphaned_running_tasks(conn: &Connection, now_ms: i64, max_age_ms: i64) -> Result<Vec<String>> {
-    let cutoff = now_ms - max_age_ms;
+/// **Per-task timeout (review fix):** The cutoff is computed per-task as
+/// `COALESCE(timeout_seconds, default_timeout_seconds) * 1000 + buffer_ms`.
+/// This ensures a task with a long `--timeout` override (e.g. 600s) is
+/// NOT reaped at the default ceiling (e.g. 360s) — each task gets its own
+/// grace period. `default_timeout_seconds` is the fallback when the task
+/// row has no `timeout_seconds` (NULL), typically `max(profile timeouts,
+/// pi_sidecar.task_timeout)`. `buffer_ms` covers non-sidecar overhead
+/// (context build, DB writes) so legitimate in-flight tasks are never
+/// reaped.
+pub fn reap_orphaned_running_tasks(
+    conn: &Connection,
+    now_ms: i64,
+    default_timeout_seconds: i64,
+    buffer_ms: i64,
+) -> Result<Vec<String>> {
+    // Per-task cutoff: now - (COALESCE(timeout_seconds, default) * 1000 + buffer)
     let mut stmt = conn.prepare(
         "SELECT id FROM subagent_tasks \
-         WHERE status = 'running' AND started_at_ms IS NOT NULL AND started_at_ms < ?1",
+         WHERE status = 'running' AND started_at_ms IS NOT NULL \
+         AND started_at_ms < (?1 - (COALESCE(timeout_seconds, ?2) * 1000 + ?3))",
     )?;
     let ids: Vec<String> = stmt
-        .query_map(params![cutoff], |row| row.get::<_, String>(0))?
+        .query_map(params![now_ms, default_timeout_seconds, buffer_ms], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     if ids.is_empty() {
