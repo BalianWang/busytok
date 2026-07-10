@@ -11,9 +11,10 @@ import {
   useProviderMutations,
   useProviders,
 } from "../api/useBusytokData";
-import { ProviderCard } from "../components/ProviderCard";
+import { ProviderCard, type TestConnectionResult } from "../components/ProviderCard";
 import { ProviderCreationForm } from "../components/ProviderCreationForm";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
+import { errorMessage } from "./providerFormUtils";
 
 /**
  * ProvidersPage orchestrates the provider/model catalog UI.
@@ -47,6 +48,8 @@ export function ProvidersPage() {
 
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
+  // f3: surface test-connection results to the UI (keyed by provider id).
+  const [testResults, setTestResults] = useState<Record<string, TestConnectionResult>>({});
 
   // Group models by provider_id once per render. A single useModels query
   // feeds every ProviderCard — avoids N-per-card fetches.
@@ -60,25 +63,31 @@ export function ProvidersPage() {
     return map;
   }, [modelsQuery.data]);
 
-  const handleProviderDelete = (provider: ProviderDto) => {
-    providerMutations.deleteProvider.mutate(provider.id, {
-      onSuccess: () => {
-        reportFrontendEventSafely({
-          level: "INFO",
-          event_code: "provider.deleted",
-          message: "Provider deleted",
-          details: { id: provider.id, name: provider.name },
-        });
-      },
-      onError: (err: Error) => {
-        reportFrontendEventSafely({
-          level: "ERROR",
-          event_code: "provider.delete.failed",
-          message: "Provider delete failed",
-          details: { id: provider.id, name: provider.name, error: err.message },
-        });
-      },
-    });
+  const handleProviderDelete = async (provider: ProviderDto): Promise<void> => {
+    try {
+      await providerMutations.deleteProvider.mutateAsync(provider.id);
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "provider.deleted",
+        message: "Provider deleted",
+        details: { id: provider.id, name: provider.name },
+      });
+      // P2 #8: clear stale test result for deleted provider.
+      setTestResults((prev) => {
+        if (!(provider.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[provider.id];
+        return next;
+      });
+    } catch (err) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "provider.delete.failed",
+        message: "Provider delete failed",
+        details: { id: provider.id, name: provider.name, error: errorMessage(err, "unknown error") },
+      });
+      throw err;
+    }
   };
 
   const handleTestConnection = (id: string) => {
@@ -95,6 +104,11 @@ export function ProvidersPage() {
           message: "Provider connection test completed",
           details: { id, ok: response.ok, error: response.error },
         });
+        // f3: surface result to the card UI.
+        setTestResults((prev) => ({
+          ...prev,
+          [id]: { ok: response.ok, error: response.error },
+        }));
       },
       onError: (err: Error) => {
         reportFrontendEventSafely({
@@ -103,6 +117,11 @@ export function ProvidersPage() {
           message: "Provider connection test failed (client exception)",
           details: { id, error: err.message },
         });
+        // f3: surface client-side exception as a failure result.
+        setTestResults((prev) => ({
+          ...prev,
+          [id]: { ok: false, error: err.message },
+        }));
       },
     });
   };
@@ -118,7 +137,7 @@ export function ProvidersPage() {
         message: "Model added",
         details: { provider_id: entry.provider_id, model_id: entry.model_id },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.add.failed",
@@ -126,7 +145,7 @@ export function ProvidersPage() {
         details: {
           provider_id: payload.provider_id,
           model_id: payload.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;
@@ -153,7 +172,7 @@ export function ProvidersPage() {
           model_id: model.model_id,
         },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.update.failed",
@@ -161,7 +180,7 @@ export function ProvidersPage() {
         details: {
           provider_id: model.provider_id,
           model_id: model.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;
@@ -184,7 +203,7 @@ export function ProvidersPage() {
           tags,
         },
       });
-    } catch (err: any) {
+    } catch (err) {
       reportFrontendEventSafely({
         level: "ERROR",
         event_code: "model.tags.update.failed",
@@ -192,47 +211,46 @@ export function ProvidersPage() {
         details: {
           provider_id: model.provider_id,
           model_id: model.model_id,
-          error: err.message,
+          error: errorMessage(err, "unknown error"),
         },
       });
       throw err;
     }
   };
 
-  const handleModelDelete = (model: ModelCatalogEntryDto) => {
-    modelMutations.deleteModel.mutate(model.model_db_id, {
-      onSuccess: () => {
-        reportFrontendEventSafely({
-          level: "INFO",
-          event_code: "model.deleted",
-          message: "Model deleted",
-          details: {
-            provider_id: model.provider_id,
-            model_id: model.model_id,
-          },
-        });
-      },
-      onError: (err: Error) => {
-        reportFrontendEventSafely({
-          level: "ERROR",
-          event_code: "model.delete.failed",
-          message: "Model delete failed",
-          details: {
-            provider_id: model.provider_id,
-            model_id: model.model_id,
-            error: err.message,
-          },
-        });
-      },
-    });
+  const handleModelDelete = async (model: ModelCatalogEntryDto): Promise<void> => {
+    try {
+      await modelMutations.deleteModel.mutateAsync(model.model_db_id);
+      reportFrontendEventSafely({
+        level: "INFO",
+        event_code: "model.deleted",
+        message: "Model deleted",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+        },
+      });
+    } catch (err) {
+      reportFrontendEventSafely({
+        level: "ERROR",
+        event_code: "model.delete.failed",
+        message: "Model delete failed",
+        details: {
+          provider_id: model.provider_id,
+          model_id: model.model_id,
+          error: errorMessage(err, "unknown error"),
+        },
+      });
+      throw err;
+    }
   };
 
   return (
     <div className="settings-page">
-      <div className="settings-pane">
-        <div className="settings-section">
-          <h2>Providers</h2>
-          <button type="button" onClick={() => setShowCreateForm((v) => !v)}>
+      <div className="provider-catalog">
+        <div className="provider-catalog__header">
+          <h1>Providers</h1>
+          <button type="button" className="btn btn--primary" onClick={() => setShowCreateForm((v) => !v)}>
             + 新建 Provider
           </button>
         </div>
@@ -262,7 +280,16 @@ export function ProvidersPage() {
             models={modelsByProvider.get(provider.id) ?? []}
             isModelsLoading={modelsQuery.isLoading}
             providerMutations={providerMutations}
-            onEdit={() => setEditingProviderId(provider.id)}
+            onEdit={() => {
+              setEditingProviderId(provider.id);
+              // P2 #8: clear stale test result when entering edit mode.
+              setTestResults((prev) => {
+                if (!(provider.id in prev)) return prev;
+                const next = { ...prev };
+                delete next[provider.id];
+                return next;
+              });
+            }}
             onTestConnection={handleTestConnection}
             onDelete={handleProviderDelete}
             onModelCreate={handleModelCreate}
@@ -271,6 +298,7 @@ export function ProvidersPage() {
             onModelDelete={handleModelDelete}
             isEditing={editingProviderId === provider.id}
             onCancelEdit={() => setEditingProviderId(null)}
+            testResult={testResults[provider.id]}
           />
         ))}
       </div>

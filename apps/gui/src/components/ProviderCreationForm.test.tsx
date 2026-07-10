@@ -33,7 +33,15 @@ const makeProvider = (overrides: Partial<ProviderDto> = {}): ProviderDto => ({
   ...overrides,
 });
 
-function renderForm(overrides: { existingNames?: string[]; createProvider?: any; createModel?: any } = {}) {
+function renderForm(
+  overrides: {
+    existingNames?: string[];
+    createProvider?: any;
+    createModel?: any;
+    createProviderPending?: boolean;
+    createModelPending?: boolean;
+  } = {},
+) {
   const mockUseProviders = vi.mocked(useProviders);
   mockUseProviders.mockReturnValue({
     data: {
@@ -60,13 +68,13 @@ function renderForm(overrides: { existingNames?: string[]; createProvider?: any;
     });
 
   vi.mocked(useProviderMutations).mockReturnValue({
-    createProvider: { mutate: createProviderMutate, isPending: false },
+    createProvider: { mutate: createProviderMutate, isPending: overrides.createProviderPending ?? false },
     updateProvider: { mutate: vi.fn(), isPending: false },
     deleteProvider: { mutate: vi.fn(), isPending: false },
     testConnection: { mutate: vi.fn(), isPending: false },
   } as never);
   vi.mocked(useModelMutations).mockReturnValue({
-    createModel: { mutate: createModelMutate, isPending: false },
+    createModel: { mutate: createModelMutate, isPending: overrides.createModelPending ?? false },
     updateModel: { mutate: vi.fn(), isPending: false },
     deleteModel: { mutate: vi.fn(), isPending: false },
     tagsUpdate: { mutate: vi.fn(), isPending: false },
@@ -245,5 +253,257 @@ describe("ProviderCreationForm", () => {
         expect.objectContaining({ event_code: "provider.add.failed" }),
       );
     });
+  });
+
+  // ─── f2: aria-invalid on URL input ──────────────────────────────────
+  it("sets aria-invalid=true on URL input when validation fails", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    fireEvent.change(urlInput, { target: { value: "bad-url" } });
+    fireEvent.blur(urlInput);
+    expect(urlInput.getAttribute("aria-invalid")).toBe("true");
+  });
+
+  it("sets aria-invalid=false on URL input when validation passes", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    fireEvent.change(urlInput, { target: { value: "https://api.deepseek.com/v1" } });
+    fireEvent.blur(urlInput);
+    expect(urlInput.getAttribute("aria-invalid")).toBe("false");
+  });
+
+  it("uses role=alert for URL validation error (live region)", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    fireEvent.change(urlInput, { target: { value: "bad-url" } });
+    fireEvent.blur(urlInput);
+    expect(screen.getByRole("alert")).toBeDefined();
+  });
+
+  // ─── f4: disable on mutation pending ───────────────────────────────
+  it("disables Save when createProvider.isPending is true", () => {
+    renderForm({ createProviderPending: true });
+    fillForm();
+    const saveBtn = screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
+  });
+
+  it("disables Save when createModel.isPending is true", () => {
+    renderForm({ createModelPending: true });
+    fillForm();
+    const saveBtn = screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(true);
+  });
+
+  // ─── Kind select + model tags inputs (cover onChange handlers) ──────
+  it("changes provider kind via select dropdown", () => {
+    const createProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: (p: ProviderDto) => void }) => {
+      opts?.onSuccess?.(makeProvider());
+    });
+    renderForm({ createProvider });
+    fillForm();
+    fireEvent.change(screen.getByLabelText(/kind/i), { target: { value: "anthropic_compatible" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(createProvider).toHaveBeenCalledWith(
+      expect.objectContaining({ provider_kind: "anthropic_compatible" }),
+      expect.anything(),
+    );
+  });
+
+  it("passes parsed model tags to createModel", () => {
+    const createProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: (p: ProviderDto) => void }) => {
+      opts?.onSuccess?.(makeProvider());
+    });
+    const createModel = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.();
+    });
+    renderForm({ createProvider, createModel });
+    fillForm();
+    fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "claude-3" } });
+    fireEvent.change(screen.getByPlaceholderText(/tags/i), { target: { value: "fast, expensive" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    expect(createModel).toHaveBeenCalledWith(
+      expect.objectContaining({ tags: ["fast", "expensive"] }),
+      expect.anything(),
+    );
+  });
+
+  // ─── Retry model failure (cover onError at handleRetryModel) ────────
+  it("stays in partial-success when model retry fails again", async () => {
+    const createProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: (p: ProviderDto) => void }) => {
+      opts?.onSuccess?.(makeProvider());
+    });
+    const createModel = vi.fn((_payload: unknown, opts?: { onError?: (e: Error) => void; onSuccess?: () => void }) => {
+      // Both first attempt and retry fail.
+      opts?.onError?.(new Error("model conflict"));
+    });
+    renderForm({ createProvider, createModel });
+    fillForm();
+    fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+
+    // Wait for partial-success state + retry button.
+    await waitFor(() => expect(screen.getByRole("button", { name: /重试 model/i })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /重试 model/i }));
+
+    // Retry failed → still in partial-success, error banner still shows.
+    await waitFor(() => {
+      expect(screen.getByText(/model conflict/)).toBeDefined();
+    });
+    expect(screen.getByRole("button", { name: /重试 model/i })).toBeDefined();
+  });
+
+  // ─── providersQuery.data null fallback (branch at line 54) ──────────
+  it("handles null providersQuery.data gracefully (no existing names)", () => {
+    const createProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: (p: ProviderDto) => void }) => {
+      opts?.onSuccess?.(makeProvider());
+    });
+    renderForm({ createProvider });
+    // Override useProviders AFTER renderForm (which sets data to { providers: [] }).
+    // The next state change (fillForm) triggers a re-render that picks up the new mock.
+    vi.mocked(useProviders).mockReturnValue({ data: undefined } as never);
+    fillForm();
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Name derived from URL without collision suffix (existingNames falls back to empty Set).
+    expect(createProvider).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "deepseek_openai" }),
+      expect.anything(),
+    );
+  });
+
+  // ─── aria-describedby association for URL error ─────────────────────
+  it("links URL input to error element via aria-describedby when error is present", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    fireEvent.change(urlInput, { target: { value: "bad-url" } });
+    fireEvent.blur(urlInput);
+    const describedBy = urlInput.getAttribute("aria-describedby");
+    expect(describedBy).toBe("new-prov-url-error");
+    const errorEl = document.getElementById("new-prov-url-error");
+    expect(errorEl).toBeTruthy();
+    expect(errorEl!.getAttribute("role")).toBe("alert");
+  });
+
+  it("does not set aria-describedby when there is no URL error", () => {
+    renderForm();
+    const urlInput = screen.getByPlaceholderText(/base url/i);
+    expect(urlInput.getAttribute("aria-describedby")).toBeNull();
+  });
+
+  // ─── Focus management on submit validation failure ─────────────────
+  it("moves focus to URL input when submit is attempted with invalid URL", () => {
+    renderForm();
+    // Enter a valid API key so the only validation failure is the URL.
+    fireEvent.change(screen.getByPlaceholderText(/api key/i), { target: { value: "sk-test" } });
+    // Enter an invalid URL but don't blur (so blur validation hasn't fired).
+    fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "bad" } });
+    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    // Focus should move to the URL input.
+    expect(document.activeElement).toBe(screen.getByPlaceholderText(/base url/i));
+  });
+
+  // ─── autoComplete=off on API key input ─────────────────────────────
+  it("sets autoComplete=off on the API key input", () => {
+    renderForm();
+    const apiKeyInput = screen.getByPlaceholderText(/api key/i);
+    expect(apiKeyInput.getAttribute("autocomplete")).toBe("off");
+  });
+
+  // ─── Dirty form protection ─────────────────────────────────────────
+  it("shows confirm dialog when canceling with unsaved changes", () => {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useProviderMutations).mockReturnValue({
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never);
+    vi.mocked(useModelMutations).mockReturnValue({
+      createModel: { mutate: vi.fn(), isPending: false },
+      updateModel: { mutate: vi.fn(), isPending: false },
+      deleteModel: { mutate: vi.fn(), isPending: false },
+      tagsUpdate: { mutate: vi.fn(), isPending: false },
+    } as never);
+    render(
+      <QueryClientProvider client={qc}>
+        <ProviderCreationForm onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    // Type something → dirty.
+    fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes immediately when canceling with no input", () => {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useProviderMutations).mockReturnValue({
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never);
+    vi.mocked(useModelMutations).mockReturnValue({
+      createModel: { mutate: vi.fn(), isPending: false },
+      updateModel: { mutate: vi.fn(), isPending: false },
+      deleteModel: { mutate: vi.fn(), isPending: false },
+      tagsUpdate: { mutate: vi.fn(), isPending: false },
+    } as never);
+    render(
+      <QueryClientProvider client={qc}>
+        <ProviderCreationForm onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    // No input → cancel should close immediately.
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(screen.queryByText("放弃修改")).toBeNull();
+  });
+
+  it("discards and closes when confirm dialog confirmed", () => {
+    const onClose = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.mocked(useProviders).mockReturnValue({
+      data: { providers: [] } as ProviderListResponseDto,
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    } as never);
+    vi.mocked(useProviderMutations).mockReturnValue({
+      createProvider: { mutate: vi.fn(), isPending: false },
+      updateProvider: { mutate: vi.fn(), isPending: false },
+      deleteProvider: { mutate: vi.fn(), isPending: false },
+      testConnection: { mutate: vi.fn(), isPending: false },
+    } as never);
+    vi.mocked(useModelMutations).mockReturnValue({
+      createModel: { mutate: vi.fn(), isPending: false },
+      updateModel: { mutate: vi.fn(), isPending: false },
+      deleteModel: { mutate: vi.fn(), isPending: false },
+      tagsUpdate: { mutate: vi.fn(), isPending: false },
+    } as never);
+    render(
+      <QueryClientProvider client={qc}>
+        <ProviderCreationForm onClose={onClose} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });

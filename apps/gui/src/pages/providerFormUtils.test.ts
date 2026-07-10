@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   deriveProviderName,
   deriveUniqueProviderName,
+  errorMessage,
   parseTags,
   validateBaseUrl,
 } from "./providerFormUtils";
@@ -79,5 +80,26 @@ describe("validateBaseUrl", () => {
   });
   it("returns error for malformed URL", () => {
     expect(validateBaseUrl("https://")).toBe("URL 格式不正确");
+  });
+});
+
+describe("errorMessage", () => {
+  it("extracts message from Error instance", () => {
+    expect(errorMessage(new Error("network failure"), "fallback")).toBe("network failure");
+  });
+  it("returns fallback for Error with empty message", () => {
+    expect(errorMessage(new Error(""), "fallback")).toBe("fallback");
+  });
+  it("returns the string when error is a non-empty string", () => {
+    expect(errorMessage("something went wrong", "fallback")).toBe("something went wrong");
+  });
+  it("returns fallback for empty string", () => {
+    expect(errorMessage("", "fallback")).toBe("fallback");
+  });
+  it("returns fallback for non-Error, non-string values", () => {
+    expect(errorMessage({}, "fallback")).toBe("fallback");
+    expect(errorMessage(null, "fallback")).toBe("fallback");
+    expect(errorMessage(undefined, "fallback")).toBe("fallback");
+    expect(errorMessage(42, "fallback")).toBe("fallback");
   });
 });

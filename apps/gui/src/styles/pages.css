@@ -1302,46 +1302,7 @@
   color: var(--color-text-muted);
 }
 
-/* ── Settings row ──────────────────────────────────────────────── */
-
-.settings-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding: var(--space-3) 0;
-  border-bottom: 1px solid var(--color-border-subtle);
-}
-
-.settings-row:last-child {
-  border-bottom: 0;
-}
-
-.settings-row h3 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 650;
-  color: var(--color-text);
-  white-space: nowrap;
-}
-
-.settings-row p {
-  margin: var(--space-1) 0 0;
-  font-size: 12px;
-  color: var(--color-text-muted);
-  line-height: 1.4;
-  max-width: 360px;
-}
-
-/* ── Settings panel ────────────────────────────────────────────── */
-
-.settings-panel {
-  padding: var(--space-1) var(--space-3);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-subtle);
-  box-shadow: var(--material-shadow-card);
-}
+/* Settings row + panel definitions live in components.css (single owner). */
 
 /* ── Usage page tabs ───────────────────────────────────────── */
 
@@ -1454,21 +1415,38 @@
 
 /* ─── Provider page redesign (always-expanded cards) ─────────────────────── */
 
+.provider-catalog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  max-width: 880px;
+}
+
+.provider-catalog__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.provider-catalog__header h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
 .provider-card {
   border: 1px solid var(--color-border-subtle);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: var(--color-surface);
-  margin-bottom: 12px;
-  transition: box-shadow 0.15s ease;
-}
-.provider-card:hover {
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  margin-bottom: var(--space-3);
 }
 .provider-card__header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--color-border-subtle);
 }
 .provider-card__name {
@@ -1477,37 +1455,79 @@
   color: var(--color-text);
 }
 .provider-card__info {
-  padding: 8px 16px;
+  padding: var(--space-2) var(--space-4);
   font-size: 0.85rem;
   color: var(--color-text-muted);
 }
+.provider-card__id {
+  font-family: var(--font-code);
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+.provider-card__url {
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
 .provider-card__models {
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
 }
 .provider-card__models--disabled {
   opacity: 0.5;
   pointer-events: none;
 }
 .provider-card__notice {
-  padding: 6px 16px;
+  padding: var(--space-1) var(--space-4);
   font-size: 0.8rem;
   color: var(--color-status-warning);
   background: var(--color-status-warning-soft);
 }
 .provider-card__error-banner {
-  padding: 8px 16px;
+  padding: var(--space-2) var(--space-4);
   font-size: 0.85rem;
   color: var(--color-status-danger);
   background: var(--color-status-danger-soft);
-  border-radius: 4px;
-  margin: 8px 16px;
+  border-radius: var(--radius-sm);
+  margin: var(--space-2) var(--space-4);
+}
+.provider-card__test-result {
+  padding: var(--space-1) var(--space-4);
+  font-size: 0.85rem;
+}
+.provider-card__test-result--ok {
+  color: var(--color-status-success);
+}
+.provider-card__test-result--fail {
+  color: var(--color-status-danger);
+}
+.provider-card__body {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.provider-card__actions {
+  display: flex;
+  gap: var(--space-2);
+}
+.provider-card__actions--end {
+  margin-left: auto;
+}
+.provider-card__models-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+.provider-card__empty {
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
 }
 .model-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  border-radius: 6px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
   transition: background 0.1s ease;
 }
 .model-row:hover {
@@ -1516,22 +1536,67 @@
 .model-row__name {
   font-weight: 500;
   color: var(--color-text);
+  overflow-wrap: break-word;
+  word-break: break-all;
 }
 .model-row__tags {
   display: inline-flex;
-  gap: 4px;
+  gap: var(--space-1);
   flex-wrap: wrap;
+}
+.model-row__edit-form {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
 }
 .chip {
   display: inline-flex;
   align-items: center;
-  padding: 2px 8px;
-  border-radius: 4px;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
   font-size: 0.75rem;
   background: var(--color-surface-subtle);
   color: var(--color-text-muted);
 }
+/* Provider kind is neutral metadata, not a status indicator. */
 .chip--kind {
-  background: var(--color-status-info-soft);
+  background: var(--color-surface-subtle);
+  color: var(--color-text-muted);
+}
+
+/* ─── Shared form field styles (provider forms) ────────────────────────── */
+
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.field-label {
+  font-size: 13px;
+  font-weight: 500;
   color: var(--color-text);
+}
+.field-input,
+.field-select {
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  padding: var(--space-2) var(--space-3);
+  font-size: 13px;
+  min-width: 0;
+}
+.field-input:focus-visible,
+.field-select:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.field-input[aria-invalid="true"] {
+  border-color: color-mix(in srgb, var(--color-status-danger) 60%, transparent);
+}
+.field-error {
+  color: var(--color-status-danger);
+  font-size: 12px;
 }
