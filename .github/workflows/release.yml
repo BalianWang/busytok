@@ -146,7 +146,18 @@ jobs:
           TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           BUNDLE_DIR="target/universal-apple-darwin/release/bundle/macos"
-          cd "$BUNDLE_DIR" && tar -czf Busytok.app.tar.gz Busytok.app && cd -
+          # COPYFILE_DISABLE=1 + --no-mac-metadata: prevent BSD tar from
+          # embedding AppleDouble `._*` metadata files in the archive.
+          # Code-signed Mach-O binaries carry xattrs; without these flags
+          # tar emits `._` files that the Tauri Rust `tar` crate extracts as
+          # regular files inside the .app bundle. These extra files are not
+          # listed in _CodeSignature/CodeResources, breaking Gatekeeper's
+          # seal check → "app is damaged" on auto-update restart.
+          # COPYFILE_DISABLE=1 is the load-bearing suppression in create
+          # mode; --no-mac-metadata is defense-in-depth (man page scopes it
+          # to x mode only, but bsdtar accepts it without error in c mode).
+          export COPYFILE_DISABLE=1
+          cd "$BUNDLE_DIR" && tar --no-mac-metadata -czf Busytok.app.tar.gz Busytok.app && cd -
           # tauri signer auto-detects TAURI_PRIVATE_KEY + TAURI_PRIVATE_KEY_PASSWORD
           # from the environment — no CLI flags needed. This is the canonical CI
           # invocation; avoids the env:// / --private-key / --private-key-path /

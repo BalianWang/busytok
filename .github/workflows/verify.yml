@@ -87,6 +87,52 @@ jobs:
           source packaging/macos/scripts/_release_vars.sh
           test -n "$BUNDLE_ROOT"
           test -n "$SIDECAR_NODE_VERSION"
+          # 4. Artifact-level AppleDouble regression check: construct a
+          # minimal .app tree with xattrs (simulating codesign), pack it
+          # with the same flags as release.yml, and assert the archive
+          # contains zero `._*` entries. This catches not only missing
+          # flags but also refactored commands, env not reaching the tar
+          # process, and bsdtar behavior changes.
+          AD_TEST_DIR="$(mktemp -d)"
+          mkdir -p "$AD_TEST_DIR/FakeApp.app/Contents/MacOS"
+          printf '#!/bin/bash\necho hi\n' > "$AD_TEST_DIR/FakeApp.app/Contents/MacOS/FakeApp"
+          chmod +x "$AD_TEST_DIR/FakeApp.app/Contents/MacOS/FakeApp"
+          # Simulate codesign xattrs (the trigger for AppleDouble emission).
+          xattr -w com.apple.cs.CodeDirectory "fake-sig" \
+            "$AD_TEST_DIR/FakeApp.app/Contents/MacOS/FakeApp"
+          # Sanity: confirm the xattr is set.
+          test -n "$(xattr "$AD_TEST_DIR/FakeApp.app/Contents/MacOS/FakeApp")"
+          # Pack with the release flags.
+          export COPYFILE_DISABLE=1
+          ( cd "$AD_TEST_DIR" && tar --no-mac-metadata -czf fake.tar.gz FakeApp.app )
+          # Assert no AppleDouble `._*` entries in the archive.
+          # Use Python's tarfile (not `tar -tzf | grep`) because BSD tar's
+          # -t flag filters AppleDouble ._ entries from its listing, giving
+          # a false negative. Python lists all members including ._ entries.
+          python3 -c '
+          import sys, tarfile
+          with tarfile.open(sys.argv[1]) as t:
+              bad = [m.name for m in t.getmembers() if "/._" in m.name or m.name.startswith("._")]
+              if bad:
+                  print("ERROR: archive contains AppleDouble ._ files:")
+                  for b in bad[:10]:
+                      print(f"  {b}")
+                  sys.exit(1)
+          ' "$AD_TEST_DIR/fake.tar.gz"
+          # Negative control: without the flags, BSD tar MUST emit ._ files.
+          # This proves the test actually catches the regression.
+          unset COPYFILE_DISABLE
+          ( cd "$AD_TEST_DIR" && tar -czf fake_noflags.tar.gz FakeApp.app )
+          python3 -c '
+          import sys, tarfile
+          with tarfile.open(sys.argv[1]) as t:
+              bad = [m.name for m in t.getmembers() if "/._" in m.name or m.name.startswith("._")]
+              if not bad:
+                  print("WARNING: negative control has no ._ files — test may not catch regression")
+              else:
+                  print(f"Negative control confirmed: {len(bad)} ._ files present without flags")
+          ' "$AD_TEST_DIR/fake_noflags.tar.gz"
+          rm -rf "$AD_TEST_DIR"
           echo "Packaging script smoke check passed."
 
       - name: Install cargo-audit
