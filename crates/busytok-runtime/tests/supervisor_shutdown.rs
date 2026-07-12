@@ -18,6 +18,25 @@ use busytok_subagent::sidecar::{
 };
 use busytok_subagent::SubagentManager;
 
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(m: &std::sync::Arc<SubagentManager>, task_id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 fn mock_sidecar_script() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("../busytok-subagent/tests/fixtures/mock-sidecar.sh");
@@ -208,15 +227,23 @@ async fn sidecar_shutdown_kills_subprocess_then_restart_works() {
         .expect("ensure_worker seeded provider");
 
     let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
-    let manager =
-        SubagentManager::new(Arc::clone(&db), SubagentSettings::default(), "pi", exec_dyn);
+    let manager = std::sync::Arc::new(SubagentManager::new(
+        Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        exec_dyn,
+    ));
 
     // First delegate spawns the sidecar.
     let r1 = manager
         .delegate(req("reviewer", "first", &provider_id, &model_id))
         .await
         .unwrap();
-    assert!(r1.adapter_session_id.is_some());
+    // delegate() now returns Running immediately; the executor runs in a
+    // background tokio::spawn. Wait for terminal status before shutting
+    // down the sidecar (Bug #1/#2 fix).
+    let final_status = await_task_done(&manager, &r1.task_id).await;
+    assert_eq!(final_status, "completed");
 
     // Graceful shutdown — sidecar process exits.
     supervisor.shutdown().await.unwrap();
@@ -226,7 +253,8 @@ async fn sidecar_shutdown_kills_subprocess_then_restart_works() {
         .delegate(req("reviewer", "second", &provider_id, &model_id))
         .await
         .unwrap();
-    assert!(r2.adapter_session_id.is_some());
+    let final_status = await_task_done(&manager, &r2.task_id).await;
+    assert_eq!(final_status, "completed");
 
     supervisor.shutdown().await.unwrap();
 }

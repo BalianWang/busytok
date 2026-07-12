@@ -5438,9 +5438,14 @@ impl RuntimeControl for BusytokSupervisor {
             .delegate(delegate_request_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
-        // Only bridge usage for completed/failed tasks — queued tasks have
-        // no usage yet (the dispatcher will write it when the task runs).
-        if r.status != busytok_subagent::models::TaskStatus::Queued {
+        // Only bridge usage for terminal-status tasks — `Running` and
+        // `Queued` tasks have no usage yet. After the Bug #1/#2 fix,
+        // `delegate()` always returns `Running` or `Queued`, so this bridge
+        // is effectively deferred to the `task_completion_hook` (invoked by
+        // `execute_and_persist`). The check is kept for correctness: if
+        // `delegate()` ever returns a terminal status (e.g. immediate fail),
+        // the usage is bridged here.
+        if r.status.is_terminal() {
             if let Err(e) = self.write_subagent_usage_event(&r, &cwd) {
                 tracing::warn!(
                     event_code = "subagent.usage_write_failed",

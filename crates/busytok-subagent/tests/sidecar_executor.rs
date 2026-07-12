@@ -29,6 +29,25 @@ type SharedDb = Arc<std::sync::Mutex<Database>>;
 /// The test provider ID used by all pool-based tests.
 const TEST_PROVIDER_ID: &str = "test-prov";
 
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(m: &std::sync::Arc<SubagentManager>, task_id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 fn empty_memory_snapshot() -> MemorySnapshot {
     MemorySnapshot {
         hot_summary: None,
@@ -158,7 +177,7 @@ fn settings_with_test_provider() -> SubagentSettings {
 }
 
 struct TestHarness {
-    manager: SubagentManager,
+    manager: std::sync::Arc<SubagentManager>,
     db: SharedDb,
     pool: Arc<WorkerPool>,
     supervisor: Arc<PiSidecarSupervisor>,
@@ -179,12 +198,12 @@ fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     let (pool, executor, supervisor, holder) =
         make_pool_with_config(mock_sidecar_config_with_env(env), Some(Arc::clone(&db)));
     let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         Arc::clone(&db),
         settings_with_test_provider(),
         "pi",
         exec_dyn,
-    );
+    ));
     TestHarness {
         manager,
         db,
@@ -254,26 +273,34 @@ async fn delegate_via_sidecar_writes_binding_and_sets_hot() {
         .await
         .unwrap();
 
-    // Sidecar returned a real session.
-    assert!(
-        r.adapter_session_id.is_some(),
-        "expected adapter_session_id"
-    );
-    assert_eq!(r.adapter, "pi");
-    assert_eq!(r.status, TaskStatus::Completed);
-    assert!(r.usage.input_tokens.is_some());
+    // delegate() now returns Running immediately; the executor runs in a
+    // background tokio::spawn. Wait for terminal status before checking
+    // post-completion state (Bug #1/#2 fix).
+    assert_eq!(r.status, TaskStatus::Running);
+    let final_status = await_task_done(&h.manager, &r.task_id).await;
+    assert_eq!(final_status, "completed");
 
-    // Hot binding was upserted.
-    {
+    // Hot binding was upserted. The adapter_session_id is now read from the
+    // DB (the immediate DelegateResult has it as None because delegate
+    // returns Running before the executor runs).
+    let adapter_session_id = {
         let db = h.db.lock().unwrap();
         let binding = db.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
         assert!(binding.is_some(), "hot binding not found");
         let binding = binding.unwrap();
         assert_eq!(binding.is_hot, 1);
         assert_eq!(binding.status, "hot");
-        assert_eq!(binding.adapter_session_id, r.adapter_session_id);
+        binding.adapter_session_id
+    };
+    assert!(
+        adapter_session_id.is_some(),
+        "expected adapter_session_id"
+    );
+    assert_eq!(r.adapter, "pi");
 
-        // Subagent status is Hot (not Warm).
+    // Subagent status is Hot (not Warm).
+    {
+        let db = h.db.lock().unwrap();
         let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
         assert!(sub.is_some());
         assert_eq!(sub.unwrap().status, "hot");
@@ -289,11 +316,17 @@ async fn delegate_via_sidecar_reuses_hot_binding_on_redelegate() {
         .delegate(req("reviewer", "first turn"))
         .await
         .unwrap();
+    // delegate() now returns Running immediately; wait for terminal status
+    // before re-delegating (Bug #1/#2 fix).
+    assert_eq!(r1.status, TaskStatus::Running);
+    await_task_done(&h.manager, &r1.task_id).await;
     let r2 = h
         .manager
         .delegate(req("reviewer", "second turn"))
         .await
         .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    await_task_done(&h.manager, &r2.task_id).await;
 
     // Same subagent (resolved by name+cwd).
     assert_eq!(r1.subagent_id, r2.subagent_id);
@@ -324,14 +357,12 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_cold() {
         .await
         .unwrap();
 
-    // The executor extracts Some("") verbatim — the delegate is the authority
-    // that decides hot vs warm/cold, and an empty id must NOT create a hot binding.
-    assert_eq!(
-        r.adapter_session_id.as_deref(),
-        Some(""),
-        "executor should pass through the empty id"
-    );
-    assert_eq!(r.status, TaskStatus::Completed);
+    // delegate() now returns Running immediately; the executor runs in a
+    // background tokio::spawn. Wait for terminal status before checking
+    // post-completion state (Bug #1/#2 fix).
+    assert_eq!(r.status, TaskStatus::Running);
+    let final_status = await_task_done(&h.manager, &r.task_id).await;
+    assert_eq!(final_status, "completed");
 
     {
         let db = h.db.lock().unwrap();

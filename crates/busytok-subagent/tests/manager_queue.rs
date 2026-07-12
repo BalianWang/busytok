@@ -20,6 +20,25 @@ use busytok_subagent::SubagentManager;
 const TEST_PROVIDER_ID: &str = "test-prov";
 const TEST_MODEL_NAME: &str = "test-model";
 
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(m: &std::sync::Arc<SubagentManager>, task_id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Minimal mock executor that returns a fixed `Completed` result. Used by
 /// both the queued-when-paused test (verifies delegate returns early without
 /// invoking the executor) and the dispatcher test (verifies the dispatcher
@@ -105,13 +124,13 @@ async fn delegate_returns_queued_when_gate_paused() {
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
     let gate = Arc::new(PressureGate::new());
     gate.set_action(PressureAction::PauseNewTasks);
-    let manager = SubagentManager::with_pressure_gate(
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
         Arc::clone(&db),
         settings,
         "mock",
         executor,
         Some(Arc::clone(&gate)),
-    );
+    ));
     let result = manager.delegate(req("test", "hello")).await.unwrap();
     assert_eq!(
         result.status,
@@ -404,8 +423,9 @@ async fn delegate_queues_when_subagent_already_running() {
         std::time::Duration::from_millis(500),
         Arc::clone(&call_count),
     )) as Arc<dyn TaskExecutor>;
-    let manager =
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+    let manager = std::sync::Arc::new(
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
+    );
 
     // Run two delegates concurrently for the SAME subagent.
     // r1 inserts as "running" + starts executing (sleeps 500ms).
@@ -417,7 +437,7 @@ async fn delegate_queues_when_subagent_already_running() {
     let r1 = r1.unwrap();
     let r2 = r2.unwrap();
 
-    assert_eq!(r1.status, TaskStatus::Completed, "first task completes");
+    assert_eq!(r1.status, TaskStatus::Running, "first task starts running");
     assert_eq!(
         r2.status,
         TaskStatus::Queued,
@@ -427,6 +447,9 @@ async fn delegate_queues_when_subagent_already_running() {
         r1.subagent_id, r2.subagent_id,
         "both tasks target the same subagent"
     );
+
+    // Wait for the first task to complete (now async via tokio::spawn).
+    await_task_done(&manager, &r1.task_id).await;
 
     // Executor called exactly once — second task was queued, not executed.
     assert_eq!(
@@ -466,8 +489,9 @@ async fn delegate_rejects_both_prompt_and_artifact_ref() {
     let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
-    let manager =
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+    let manager = std::sync::Arc::new(
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
+    );
     let mut r = req("test", "inline prompt");
     r.prompt_artifact_ref = Some("sub/task/prompt.txt".to_string());
     let err = manager.delegate(r).await.unwrap_err();
@@ -484,8 +508,9 @@ async fn delegate_rejects_neither_prompt_nor_artifact_ref() {
     let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
-    let manager =
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+    let manager = std::sync::Arc::new(
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
+    );
     let r = req("test", "");
     let err = manager.delegate(r).await.unwrap_err();
     assert_eq!(
@@ -522,13 +547,15 @@ async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
     let settings = SubagentSettings::default();
     let captured = Arc::new(StdMutex::new(None));
     let executor = Arc::new(CapturingExecutor(Arc::clone(&captured))) as Arc<dyn TaskExecutor>;
-    let manager =
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None);
+    let manager = std::sync::Arc::new(
+        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
+    );
 
     let mut r = req("artifact-sub", "");
     r.prompt_artifact_ref = Some("sub123/task456/prompt.txt".to_string());
     let result = manager.delegate(r).await.unwrap();
-    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(result.status, TaskStatus::Running);
+    await_task_done(&manager, &result.task_id).await;
 
     // Verify task row in DB has the artifact ref.
     {

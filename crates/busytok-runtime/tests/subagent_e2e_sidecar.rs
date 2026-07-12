@@ -23,6 +23,28 @@ use busytok_runtime::BusytokSupervisor;
 use busytok_subagent::sidecar::SidecarConfig;
 use serial_test::serial;
 
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(
+    m: &std::sync::Arc<busytok_subagent::SubagentManager>,
+    task_id: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Path to the mock-sidecar.sh fixture, resolved relative to
 /// CARGO_MANIFEST_DIR (crates/busytok-runtime). The fixture lives in
 /// busytok-subagent/tests/fixtures/.
@@ -255,19 +277,34 @@ async fn sidecar_e2e_delegate_list_show_hibernate_delete() {
         .unwrap();
 
     let sub_id = delegate_resp.subagent_id.clone();
-    assert_eq!(delegate_resp.status, "completed");
-    assert!(
-        delegate_resp.adapter_session_id.is_some(),
-        "adapter_session_id must be set — proves the sidecar subprocess was used"
-    );
-    assert!(
-        delegate_resp
-            .adapter_session_id
-            .as_ref()
+    assert_eq!(delegate_resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background).
+    let final_status =
+        await_task_done(&supervisor.subagent_manager(), &delegate_resp.task_id).await;
+    assert_eq!(final_status, "completed");
+    // adapter_session_id is now in the DB hot binding, not the delegate
+    // response — query the hot binding to prove the sidecar was used
+    // (the mock executor returns None for this field on the response).
+    let binding = {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        db_guard
+            .subagent_hot_binding(&delegate_resp.subagent_id, "pi")
             .unwrap()
+    };
+    assert!(
+        binding.is_some(),
+        "hot binding should exist — proves the sidecar was used"
+    );
+    let binding = binding.unwrap();
+    assert!(
+        binding
+            .adapter_session_id
+            .as_deref()
+            .unwrap_or("")
             .starts_with("pi_sess_mock_"),
         "adapter_session_id should come from mock-sidecar.sh, got: {:?}",
-        delegate_resp.adapter_session_id
+        binding.adapter_session_id
     );
 
     // 2. list — the just-created subagent must appear.
@@ -429,19 +466,34 @@ async fn sidecar_e2e_delegate_then_shutdown_releases_hot_binding() {
         .unwrap();
 
     let sub_id = delegate_resp.subagent_id.clone();
-    assert_eq!(delegate_resp.status, "completed");
-    assert!(
-        delegate_resp.adapter_session_id.is_some(),
-        "adapter_session_id must be set — proves the sidecar subprocess was used"
-    );
-    assert!(
-        delegate_resp
-            .adapter_session_id
-            .as_ref()
+    assert_eq!(delegate_resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background).
+    let final_status =
+        await_task_done(&supervisor.subagent_manager(), &delegate_resp.task_id).await;
+    assert_eq!(final_status, "completed");
+    // adapter_session_id is now in the DB hot binding, not the delegate
+    // response — query the hot binding to prove the sidecar was used
+    // (the mock executor returns None for this field on the response).
+    let binding = {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        db_guard
+            .subagent_hot_binding(&delegate_resp.subagent_id, "pi")
             .unwrap()
+    };
+    assert!(
+        binding.is_some(),
+        "hot binding should exist — proves the sidecar was used"
+    );
+    let binding = binding.unwrap();
+    assert!(
+        binding
+            .adapter_session_id
+            .as_deref()
+            .unwrap_or("")
             .starts_with("pi_sess_mock_"),
         "adapter_session_id should come from mock-sidecar.sh, got: {:?}",
-        delegate_resp.adapter_session_id
+        binding.adapter_session_id
     );
 
     // 2. verify the subagent is hot (proves a hot binding exists pre-shutdown).
@@ -560,7 +612,11 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
         .await
         .unwrap();
     let sub_id = resp1.subagent_id.clone();
-    assert_eq!(resp1.status, "completed");
+    assert_eq!(resp1.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background).
+    let final_status1 = await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    assert_eq!(final_status1, "completed");
 
     // Assert memory merged after first delegate.
     {
@@ -605,14 +661,29 @@ async fn sidecar_e2e_delegate_merges_memory_and_builds_context_from_memory() {
         })
         .await
         .unwrap();
-    assert_eq!(resp2.status, "completed");
+    assert_eq!(resp2.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background).
+    let final_status2 = await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    assert_eq!(final_status2, "completed");
+    // The summary now lives on the task row (the delegate response is
+    // immediate and does not carry the executor's output). Query the
+    // task row to assert the echoed compact_context.
+    let task_row2 = {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        db_guard
+            .subagent_get_task(&resp2.task_id)
+            .unwrap()
+            .expect("task row must exist after second delegate completes")
+    };
     assert!(
-        resp2.summary
+        task_row2
+            .result_summary
             .as_deref()
             .unwrap_or("")
             .contains("Investigated context; produced memory update."),
-        "second delegate's summary echoes compact_context which must contain the first delegate's hot_summary; got: {:?}",
-        resp2.summary
+        "second delegate's result_summary echoes compact_context which must contain the first delegate's hot_summary; got: {:?}",
+        task_row2.result_summary
     );
 
     // After the second delegate, key_files should still have 1 entry (deduped).
@@ -685,15 +756,21 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
         "error should mention the bundle issue, got: {init_err}"
     );
 
-    // delegate MUST fail — never return mock output. The error must carry
-    // the semantic code `subagent.sidecar_spawn_failed` (not the generic
-    // `subagent.store_error`), proving FailingTaskExecutor's error
-    // downcasts to SubagentError::SidecarSpawn through the manager.
+    // delegate MUST fail — never return mock output. Bug #1/#2 fix:
+    // `delegate()` returns `Running` immediately and `execute_and_persist`
+    // runs in the background. The FailingTaskExecutor (injected because
+    // sidecar config resolve failed) returns `SubagentError::SidecarSpawn`,
+    // which `execute_and_persist` catches and persists as `status="failed"`
+    // with the error string in the task row. The test asserts the final
+    // status is "failed" (NOT "completed" — which would indicate a silent
+    // Mock fallback) and that the error string carries the Display of
+    // `SubagentError::SidecarSpawn` (proving the FailingTaskExecutor's
+    // error downcasts through the manager — not a generic store_error).
     // Task 5: bound_provider_id / bound_model_id are required on the create
     // path (sourced from TEST_PROVIDER_SEED) so the validation chain in
     // `execute_task` passes and the FailingTaskExecutor's SidecarSpawn
     // error surfaces.
-    let result = supervisor
+    let resp = supervisor
         .subagent_delegate(SubagentDelegateRequestDto {
             subagent_name: "misconfigured-test".to_string(),
             subagent_id: None,
@@ -710,21 +787,38 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
             bound_model_id: Some(TEST_PROVIDER_SEED.models[0].to_string()),
             reuse_policy: None,
         })
-        .await;
+        .await
+        .expect("delegate must succeed at the RPC layer (returns Running immediately)");
 
-    let err = match result {
-        Ok(_) => panic!(
-            "delegate must fail when sidecar is enabled but misconfigured — got success (silent mock fallback)"
-        ),
-        Err(e) => e,
+    // delegate() returns Running immediately — the failure happens in the
+    // background. Wait for the terminal status and assert it is "failed"
+    // (NOT "completed" — a "completed" status would mean a silent Mock
+    // fallback masked the misconfiguration).
+    assert_eq!(resp.status, "running");
+    let final_status =
+        await_task_done(&supervisor.subagent_manager(), &resp.task_id).await;
+    assert_eq!(
+        final_status, "failed",
+        "task must reach 'failed' status — got success (silent mock fallback would have completed)"
+    );
+
+    // The task row's `error` field carries the Display of the
+    // `SubagentError::SidecarSpawn` returned by FailingTaskExecutor. The
+    // Display prefix is "sidecar spawn failed" — NOT a generic store
+    // error — proving the FailingTaskExecutor's error downcasts to
+    // SubagentError::SidecarSpawn through the manager.
+    let task_row = {
+        let db_guard = supervisor.db_handle().lock().unwrap();
+        db_guard
+            .subagent_get_task(&resp.task_id)
+            .unwrap()
+            .expect("task row must exist after delegate")
     };
-    // The error string from the runtime layer is formatted as "{code}: {message}".
-    // Assert the code is `subagent.sidecar_spawn_failed` — NOT `subagent.store_error`.
-    let err_str = err.to_string();
+    let err_str = task_row.error.as_deref().unwrap_or("");
     assert!(
-        err_str.contains("subagent.sidecar_spawn_failed"),
-        "delegate error must carry code 'subagent.sidecar_spawn_failed' \
-         (not generic store_error), got: {err_str}"
+        err_str.contains("sidecar spawn failed"),
+        "task error must carry the Display of SubagentError::SidecarSpawn \
+         (not a generic store_error), got: {err_str:?}"
     );
 
     supervisor.shutdown_writer().await.unwrap();
@@ -782,7 +876,12 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
         })
         .await
         .unwrap();
-    assert_eq!(resp1.status, "completed");
+    assert_eq!(resp1.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background).
+    let final_status1 =
+        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    assert_eq!(final_status1, "completed");
     let sub1 = resp1.subagent_id;
 
     // 2. Second delegate — triggers eviction
@@ -805,7 +904,13 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
         })
         .await
         .unwrap();
-    assert_eq!(resp2.status, "completed");
+    assert_eq!(resp2.status, "running");
+    // Wait for async completion (Bug #1/#2 fix). The second delegate
+    // triggers eviction of sub1 (prepare_hibernate → persist → close),
+    // then retries turn_auto for itself.
+    let final_status2 =
+        await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    assert_eq!(final_status2, "completed");
     let sub2 = resp2.subagent_id;
 
     // 3. Verify: sub1 is warm (evicted with memory), sub2 is hot
@@ -1542,9 +1647,16 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             reuse_policy: None,
         })
         .await
-        .expect("first delegate must complete (response sent before crash)");
+        .expect("first delegate must return a response (response sent before crash)");
     let sub_id = resp1.subagent_id.clone();
-    assert_eq!(resp1.status, "completed");
+    assert_eq!(resp1.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background). The mock
+    // sends the turn_auto response THEN exits — so the task completes
+    // before the crash is observed by the supervision loop.
+    let final_status1 =
+        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    assert_eq!(final_status1, "completed");
 
     // 2. Wait for the supervision loop to observe the crash + write the
     //    sidecar_crash event. The loop polls every 100ms; give it up to 4s
@@ -1590,9 +1702,16 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
             reuse_policy: None,
         })
         .await
-        .expect("second delegate must succeed after auto-restart");
+        .expect("second delegate must return a response after auto-restart");
     assert_eq!(
-        resp2.status, "completed",
+        resp2.status, "running",
+        "second delegate returns Running immediately after restart"
+    );
+    // Wait for async completion (Bug #1/#2 fix).
+    let final_status2 =
+        await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    assert_eq!(
+        final_status2, "completed",
         "second delegate completes after restart"
     );
     assert_eq!(
@@ -1690,7 +1809,12 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
         })
         .await
         .expect("first delegate must complete");
-    assert_eq!(resp1.status, "completed");
+    assert_eq!(resp1.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate returns Running
+    // immediately and execute_and_persist runs in the background).
+    let final_status1 =
+        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    assert_eq!(final_status1, "completed");
     let sub_id = resp1.subagent_id.clone();
 
     // Wait for crash #1 to be detected by the supervision loop.
@@ -1737,7 +1861,11 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
         })
         .await
         .expect("second delegate must complete after restart");
-    assert_eq!(resp2.status, "completed");
+    assert_eq!(resp2.status, "running");
+    // Wait for async completion (Bug #1/#2 fix).
+    let final_status2 =
+        await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    assert_eq!(final_status2, "completed");
 
     // Wait for crash #2 to be detected. WITHOUT the fix, this would time
     // out because the supervision loop was never revived.
@@ -1784,7 +1912,11 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
         })
         .await
         .expect("third delegate must complete after second restart");
-    assert_eq!(resp3.status, "completed");
+    assert_eq!(resp3.status, "running");
+    // Wait for async completion (Bug #1/#2 fix).
+    let final_status3 =
+        await_task_done(&supervisor.subagent_manager(), &resp3.task_id).await;
+    assert_eq!(final_status3, "completed");
 
     // 4. Verify event counts: at least 2 crashes + exactly 2 restarts.
     //    crash_count uses `>= 2` (not `== 2`) because the mock also crashes
@@ -2150,12 +2282,14 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     };
     let exec = Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
-    let manager = busytok_subagent::SubagentManager::with_pressure_gate(
-        db2.clone(),
-        settings2,
-        "pi",
-        exec,
-        Some(gate.clone()),
+    let manager = std::sync::Arc::new(
+        busytok_subagent::SubagentManager::with_pressure_gate(
+            db2.clone(),
+            settings2,
+            "pi",
+            exec,
+            Some(gate.clone()),
+        ),
     );
 
     let req = busytok_subagent::DelegateRequest {

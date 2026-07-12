@@ -63,6 +63,16 @@ impl TaskStatus {
             TaskStatus::Cancelled => "cancelled",
         }
     }
+
+    /// Whether this status is terminal (no further transitions).
+    /// `Completed`, `Failed`, and `Cancelled` are terminal; `Queued` and
+    /// `Running` are not.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
 }
 
 impl FromStr for TaskStatus {
@@ -145,10 +155,11 @@ pub struct DelegateRequest {
     pub bound_provider_id: Option<String>,
     pub bound_model_id: Option<String>,
     /// Reuse policy for name-based resolution:
-    /// - `create`: only create a new subagent; fail if one with the same name exists
-    /// - `reuse`: only reuse an existing subagent; fail if not found
-    /// - `fail` (default / None): create-or-reuse, but fail if `--bind-*` is
-    ///   given and the existing subagent's binding differs from the request.
+    /// - `create`: fail if a subagent with the same name exists; otherwise create new
+    /// - `reuse`: fail if no such subagent exists; otherwise reuse existing
+    /// - `fail`: fail if a subagent with the same name exists (alias for `create`)
+    /// Default (None): create-or-reuse, but fail if `--bind-*` is given
+    ///   and the existing subagent's binding differs from the request.
     pub reuse_policy: Option<String>,
 }
 

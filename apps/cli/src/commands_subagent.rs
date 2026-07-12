@@ -103,6 +103,33 @@ fn resolve_prompt(
     Ok((p, None))
 }
 
+/// Resolve a relative cwd to an absolute path BEFORE sending it over the
+/// wire to the sidecar service.
+///
+/// Bug #5 fix: the CLI's default `--cwd .` is a relative path. The
+/// service-side resolver calls `std::fs::canonicalize`, which resolves
+/// relative paths against the SIDECAR's process cwd — `/` under launchd.
+/// This loses the actual repo path, causing `subagent show` to report
+/// `repo_path: "/"` instead of the user's working directory.
+///
+/// By resolving here (against the CLI's process cwd — the user's actual
+/// working directory), the service receives an absolute path and
+/// `canonicalize` behaves correctly.
+///
+/// - Absolute paths are returned unchanged.
+/// - Relative paths are joined to `std::env::current_dir()`.
+/// - If `current_dir()` fails (e.g. deleted cwd), the original string is
+///   returned as a fallback — the service will handle the error.
+fn resolve_cwd(cwd: &str) -> String {
+    if std::path::Path::new(cwd).is_absolute() {
+        cwd.to_string()
+    } else {
+        std::env::current_dir()
+            .map(|p| p.join(cwd).to_string_lossy().to_string())
+            .unwrap_or_else(|_| cwd.to_string())
+    }
+}
+
 pub async fn handle_delegate(
     subagent: String,
     id: Option<String>,
@@ -146,7 +173,9 @@ pub async fn handle_delegate(
         }
     }
 
-    // Do NOT canonicalize cwd — the service resolver canonicalizes at one chokepoint.
+    // Bug #5 fix: resolve relative cwd BEFORE sending over the wire.
+    let cwd = resolve_cwd(&cwd);
+
     let mut client = connect().await?;
 
     // Phase 2: auto-resolution. Only the `(None, Some(model))` branch
@@ -315,6 +344,7 @@ pub async fn handle_show(
     cwd: String,
     output: String,
 ) -> Result<()> {
+    let cwd = resolve_cwd(&cwd);
     let mut client = connect().await?;
     let req = SubagentResolveRequestDto {
         name,
@@ -339,6 +369,7 @@ pub async fn handle_tasks(
     limit: i64,
     output: String,
 ) -> Result<()> {
+    let cwd = resolve_cwd(&cwd);
     let mut client = connect().await?;
     let req = SubagentTasksRequestDto {
         name,
@@ -363,6 +394,7 @@ pub async fn handle_hibernate(
     cwd: String,
     output: String,
 ) -> Result<()> {
+    let cwd = resolve_cwd(&cwd);
     let mut client = connect().await?;
     let req = SubagentResolveRequestDto {
         name,
@@ -402,6 +434,7 @@ pub async fn handle_delete(
         }
     }
 
+    let cwd = resolve_cwd(&cwd);
     let mut client = connect().await?;
     let req = SubagentDeleteRequestDto {
         name,
@@ -854,6 +887,46 @@ mod tests {
         assert!(
             msg.contains("subagent missing"),
             "should include the error message: {msg}"
+        );
+    }
+
+    // ── resolve_cwd (Bug #5) ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_cwd_absolute_path_returned_as_is() {
+        let result = resolve_cwd("/Users/test/repo");
+        assert_eq!(result, "/Users/test/repo");
+    }
+
+    #[test]
+    fn resolve_cwd_dot_resolves_to_current_dir() {
+        let result = resolve_cwd(".");
+        // Must be absolute (not "/"), proving the fix
+        assert!(
+            std::path::Path::new(&result).is_absolute(),
+            "resolved cwd should be absolute, got: {result}"
+        );
+        assert_ne!(result, "/", "resolved cwd should not be '/'");
+        // resolve_cwd(".") may produce a trailing "/." — normalize via
+        // canonicalize for comparison. Both paths point to the same directory.
+        let canonical_result = std::fs::canonicalize(&result).unwrap_or_default();
+        let canonical_cwd = std::env::current_dir().unwrap_or_default();
+        assert_eq!(
+            canonical_result, canonical_cwd,
+            "resolve_cwd('.') should point to the current directory"
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_relative_subdir_joins_to_current_dir() {
+        let result = resolve_cwd("subdir");
+        assert!(
+            std::path::Path::new(&result).is_absolute(),
+            "joined path should be absolute, got: {result}"
+        );
+        assert!(
+            result.ends_with("subdir"),
+            "joined path should end with 'subdir', got: {result}"
         );
     }
 
