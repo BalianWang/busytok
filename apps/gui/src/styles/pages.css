@@ -1448,28 +1448,74 @@
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--color-border-subtle);
+  flex-wrap: wrap;
+}
+.provider-card__identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  flex: 1 1 auto;
 }
 .provider-card__name {
   font-weight: 600;
   font-size: 0.95rem;
   color: var(--color-text);
+  overflow-wrap: break-word;
+  word-break: break-all;
 }
-.provider-card__info {
-  padding: var(--space-2) var(--space-4);
+.provider-card__body {
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.provider-card__metadata {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.provider-card__metadata-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.provider-card__metadata-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-faint);
+  flex-shrink: 0;
+  min-width: 60px;
+}
+.provider-card__metadata-value {
+  margin: 0;
   font-size: 0.85rem;
   color: var(--color-text-muted);
+  overflow-wrap: break-word;
+  word-break: break-all;
 }
-.provider-card__id {
+.provider-card__metadata-value--mono {
   font-family: var(--font-code);
-  overflow-wrap: break-word;
-  word-break: break-all;
+  font-size: 0.8rem;
 }
-.provider-card__url {
-  overflow-wrap: break-word;
-  word-break: break-all;
+.provider-card__section-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.provider-card__section-label--muted {
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+.provider-card__section-divider {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-subtle);
+  margin-top: var(--space-1);
 }
 .provider-card__models {
   padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border-subtle);
 }
 .provider-card__models--disabled {
   opacity: 0.5;
@@ -1480,6 +1526,7 @@
   font-size: 0.8rem;
   color: var(--color-status-warning);
   background: var(--color-status-warning-soft);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-status-warning) 30%, transparent);
 }
 .provider-card__error-banner {
   padding: var(--space-2) var(--space-4);
@@ -1490,7 +1537,7 @@
   margin: var(--space-2) var(--space-4);
 }
 .provider-card__test-result {
-  padding: var(--space-1) var(--space-4);
+  padding: var(--space-1) 0;
   font-size: 0.85rem;
 }
 .provider-card__test-result--ok {
@@ -1499,15 +1546,10 @@
 .provider-card__test-result--fail {
   color: var(--color-status-danger);
 }
-.provider-card__body {
-  padding: var(--space-4);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
 .provider-card__actions {
   display: flex;
   gap: var(--space-2);
+  flex-shrink: 0;
 }
 .provider-card__actions--end {
   margin-left: auto;
@@ -1529,6 +1571,7 @@
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   transition: background 0.1s ease;
+  flex-wrap: wrap;
 }
 .model-row:hover {
   background: var(--color-hover);
@@ -1536,13 +1579,21 @@
 .model-row__name {
   font-weight: 500;
   color: var(--color-text);
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
   word-break: break-all;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 .model-row__tags {
   display: inline-flex;
   gap: var(--space-1);
   flex-wrap: wrap;
+}
+.model-row__actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-left: auto;
+  flex-shrink: 0;
 }
 .model-row__edit-form {
   width: 100%;
@@ -1564,6 +1615,33 @@
 .chip--kind {
   background: var(--color-surface-subtle);
   color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+/* ─── Status indicator (compact dot + label) ────────────────────────── */
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+.status-indicator__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-indicator--ok .status-indicator__dot {
+  background: var(--color-status-success);
+}
+.status-indicator--muted .status-indicator__dot {
+  background: var(--color-text-faint);
+}
+.status-indicator--inline {
+  font-size: 11px;
 }
 
 /* ─── Shared form field styles (provider forms) ────────────────────────── */

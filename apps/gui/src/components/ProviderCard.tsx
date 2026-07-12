@@ -8,7 +8,7 @@ import type {
   ProviderUpdateRequestDto,
 } from "@busytok/protocol-types";
 import type { useProviderMutations } from "../api/useBusytokData";
-import { errorMessage, parseTags, validateBaseUrl } from "../pages/providerFormUtils";
+import { errorMessage, parseTags, validateBaseUrl, KIND_LABELS, KIND_OPTIONS } from "../pages/providerFormUtils";
 import { reportFrontendEventSafely } from "../logging/safeReporter";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -35,11 +35,6 @@ interface ProviderCardProps {
   /** Latest test-connection result for this provider (undefined = not tested yet). */
   testResult?: TestConnectionResult;
 }
-
-const KIND_LABEL: Record<string, string> = {
-  openai_compatible: "openai",
-  anthropic_compatible: "anthropic",
-};
 
 interface NewModelDraft {
   modelId: string;
@@ -202,7 +197,7 @@ export function ProviderCard({
           message: "Provider update failed",
           details: { id: provider.id, error: err.message },
         });
-        setProviderSaveError(err.message ?? "保存失败");
+        setProviderSaveError(err.message ?? "Save failed");
       },
     });
   };
@@ -262,7 +257,7 @@ export function ProviderCard({
       }
       setConfirmState({ kind: "none" });
     } catch (err) {
-      setDeleteError(errorMessage(err, "删除失败"));
+      setDeleteError(errorMessage(err, "Delete failed"));
     } finally {
       setDeleteInFlight(false);
     }
@@ -287,7 +282,7 @@ export function ProviderCard({
       setShowCreateModel(false);
       setModelFormError(null);
     } catch (err) {
-      setModelFormError(errorMessage(err, "创建失败"));
+      setModelFormError(errorMessage(err, "Create failed"));
     } finally {
       setModelFormInFlight(false);
     }
@@ -346,7 +341,7 @@ export function ProviderCard({
       cancelModelEdit();
       setModelFormError(null);
     } catch (err) {
-      setModelFormError(errorMessage(err, "保存失败"));
+      setModelFormError(errorMessage(err, "Save failed"));
     } finally {
       setModelFormInFlight(false);
     }
@@ -355,23 +350,23 @@ export function ProviderCard({
   // ─── Confirm dialog content (f1) ─────────────────────────────────────
   const confirmDialog =
     confirmState.kind === "provider-delete" ? {
-      title: "删除 Provider",
-      body: `确定删除 provider「${provider.name}」及其关联的所有 models？`,
-      detail: "注意：已绑定此 provider/model 的 subagents 将在下次 delegate 时失败，需要手动重新绑定。",
-      confirmLabel: "删除",
+      title: "Delete Provider",
+      body: `Delete provider "${provider.name}" and all associated models?`,
+      detail: "Subagents bound to this provider or its models will fail on next delegate and must be rebound manually.",
+      confirmLabel: "Delete",
     } : confirmState.kind === "model-delete" ? {
-      title: "删除 Model",
-      body: `确定删除 model「${confirmState.model.model_id}」？`,
-      detail: "注意：已绑定此 model 的 subagents 将在下次 delegate 时失败。",
-      confirmLabel: "删除",
+      title: "Delete Model",
+      body: `Delete model "${confirmState.model.model_id}"?`,
+      detail: "Subagents bound to this model will fail on next delegate.",
+      confirmLabel: "Delete",
     } : confirmState.kind === "cancel-provider-edit" ? {
-      title: "放弃修改",
-      body: "Provider 有未保存的修改，确定放弃？",
-      confirmLabel: "放弃",
+      title: "Discard Changes",
+      body: "Provider has unsaved changes. Discard them?",
+      confirmLabel: "Discard",
     } : confirmState.kind === "cancel-model-edit" ? {
-      title: "放弃修改",
-      body: "Model 有未保存的修改，确定放弃？",
-      confirmLabel: "放弃",
+      title: "Discard Changes",
+      body: "Model has unsaved changes. Discard them?",
+      confirmLabel: "Discard",
     } : null;
 
   // ─── Edit mode render ────────────────────────────────────────────────
@@ -382,31 +377,34 @@ export function ProviderCard({
     return (
       <div className="provider-card">
         <div className="provider-card__header">
-          <div className="field-group">
-            <label className="field-label" htmlFor={`prov-name-${provider.id}`}>名称</label>
-            <input
-              id={`prov-name-${provider.id}`}
-              className="field-input"
-              type="text"
-              value={draft.name}
-              onChange={(e) => setProviderEditDraft({ ...draft, name: e.target.value })}
-            />
-          </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor={`prov-kind-${provider.id}`}>类型</label>
-            <select
-              id={`prov-kind-${provider.id}`}
-              className="field-select"
-              value={draft.provider_kind}
-              onChange={(e) => setProviderEditDraft({ ...draft, provider_kind: e.target.value as ProviderKind })}
-            >
-              <option value="openai_compatible">openai_compatible</option>
-              <option value="anthropic_compatible">anthropic_compatible</option>
-            </select>
+          <div className="provider-card__identity">
+            <div className="field-group">
+              <label className="field-label" htmlFor={`prov-name-${provider.id}`}>Name</label>
+              <input
+                id={`prov-name-${provider.id}`}
+                className="field-input"
+                type="text"
+                value={draft.name}
+                onChange={(e) => setProviderEditDraft({ ...draft, name: e.target.value })}
+              />
+            </div>
+            <div className="field-group">
+              <label className="field-label" htmlFor={`prov-kind-${provider.id}`}>Kind</label>
+              <select
+                id={`prov-kind-${provider.id}`}
+                className="field-select"
+                value={draft.provider_kind}
+                onChange={(e) => setProviderEditDraft({ ...draft, provider_kind: e.target.value as ProviderKind })}
+              >
+                {KIND_OPTIONS.map((k) => (
+                  <option key={k} value={k}>{KIND_LABELS[k] ?? k}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <div className="provider-card__actions provider-card__actions--end">
-            <button type="button" className="btn btn--primary" onClick={handleSaveProviderEdit} disabled={isProviderMutationPending || editUrlError !== null}>保存</button>
-            <button type="button" className="btn btn--secondary" onClick={handleProviderEditCancel} disabled={isProviderMutationPending}>取消</button>
+            <button type="button" className="btn btn--primary btn--sm" onClick={handleSaveProviderEdit} disabled={isProviderMutationPending || editUrlError !== null}>Save</button>
+            <button type="button" className="btn btn--secondary btn--sm" onClick={handleProviderEditCancel} disabled={isProviderMutationPending}>Cancel</button>
           </div>
         </div>
         <div className="provider-card__body">
@@ -438,26 +436,34 @@ export function ProviderCard({
               onChange={(e) => setProviderEditDraft({ ...draft, api_key: e.target.value })}
             />
           </div>
-          <div className="provider-card__id">ID: {provider.id}</div>
+          <dl className="provider-card__metadata">
+            <div className="provider-card__metadata-row">
+              <dt className="provider-card__metadata-label">ID</dt>
+              <dd className="provider-card__metadata-value provider-card__metadata-value--mono">{provider.id}</dd>
+            </div>
+          </dl>
           {providerSaveError && (
             <div className="provider-card__test-result provider-card__test-result--fail" role="alert">
               {providerSaveError}
             </div>
           )}
         </div>
-        <div className="provider-card__notice" role="status">正在编辑 Provider 信息，Models 操作暂不可用</div>
+        <div className="provider-card__notice" role="status">Editing provider details. Model operations are temporarily unavailable.</div>
         <div className="provider-card__models provider-card__models--disabled">
           <div className="provider-card__models-header">
-            <strong>Models</strong>
-            <button type="button" className="btn btn--secondary" disabled>+ Add Model</button>
+            <span className="provider-card__section-label">Models</span>
+            <button type="button" className="btn btn--secondary btn--sm" disabled>+ Add Model</button>
           </div>
           {models.map((m) => (
             <div key={m.model_db_id} className="model-row">
               <span className="model-row__name">{m.model_id}</span>
-              <span>{m.model_enabled ? "●enabled" : "○disabled"}</span>
-              <div className="provider-card__actions provider-card__actions--end">
-                <button type="button" className="btn btn--secondary" disabled>编辑</button>
-                <button type="button" className="btn btn--danger" disabled>删除</button>
+              <span className={`status-indicator status-indicator--inline ${m.model_enabled ? "status-indicator--ok" : "status-indicator--muted"}`}>
+                <span className="status-indicator__dot" />
+                {m.model_enabled ? "Enabled" : "Disabled"}
+              </span>
+              <div className="model-row__actions">
+                <button type="button" className="btn btn--secondary btn--sm" disabled>Edit</button>
+                <button type="button" className="btn btn--danger-quiet btn--sm" disabled>Delete</button>
               </div>
             </div>
           ))}
@@ -483,36 +489,49 @@ export function ProviderCard({
   return (
     <div className="provider-card">
       <div className="provider-card__header">
-        <span className="provider-card__name">{provider.name}</span>
-        <span className="chip chip--kind">{KIND_LABEL[provider.provider_kind] ?? provider.provider_kind}</span>
-        <span>{provider.enabled ? "● enabled" : "○ disabled"}</span>
+        <div className="provider-card__identity">
+          <span className="provider-card__name">{provider.name}</span>
+          <span className="chip chip--kind">{KIND_LABELS[provider.provider_kind] ?? provider.provider_kind}</span>
+        </div>
+        <span className={`status-indicator ${provider.enabled ? "status-indicator--ok" : "status-indicator--muted"}`}>
+          <span className="status-indicator__dot" />
+          {provider.enabled ? "Enabled" : "Disabled"}
+        </span>
         <div className="provider-card__actions provider-card__actions--end">
-          <button type="button" className="btn btn--secondary" onClick={onEdit} disabled={isProviderMutationPending}>编辑</button>
-          <button type="button" className="btn btn--secondary" onClick={() => onTestConnection(provider.id)} disabled={providerMutations.testConnection.isPending}>测试连接</button>
-          <button type="button" className="btn btn--danger" onClick={handleProviderDelete} disabled={isProviderMutationPending}>删除</button>
+          <button type="button" className="btn btn--secondary btn--sm" onClick={onEdit} disabled={isProviderMutationPending}>Edit</button>
+          <button type="button" className="btn btn--secondary btn--sm" onClick={() => onTestConnection(provider.id)} disabled={providerMutations.testConnection.isPending}>Test Connection</button>
+          <button type="button" className="btn btn--danger-quiet btn--sm" onClick={handleProviderDelete} disabled={isProviderMutationPending}>Delete</button>
         </div>
       </div>
-      <div className="provider-card__info">
-        <div className="provider-card__url">{provider.base_url}</div>
-        <div className="provider-card__id">ID: {provider.id}</div>
+      <div className="provider-card__body">
+        <dl className="provider-card__metadata">
+          <div className="provider-card__metadata-row">
+            <dt className="provider-card__metadata-label">Base URL</dt>
+            <dd className="provider-card__metadata-value">{provider.base_url}</dd>
+          </div>
+          <div className="provider-card__metadata-row">
+            <dt className="provider-card__metadata-label">ID</dt>
+            <dd className="provider-card__metadata-value provider-card__metadata-value--mono">{provider.id}</dd>
+          </div>
+        </dl>
+        {testResult && (
+          <div
+            className={`provider-card__test-result ${testResult.ok ? "provider-card__test-result--ok" : "provider-card__test-result--fail"}`}
+            role={testResult.ok ? "status" : "alert"}
+          >
+            {testResult.ok ? "Connection successful" : `Connection failed: ${testResult.error ?? "Unknown error"}`}
+          </div>
+        )}
+        {providerSaveSuccess && (
+          <div className="provider-card__test-result provider-card__test-result--ok" role="status">
+            Saved
+          </div>
+        )}
       </div>
-      {testResult && (
-        <div
-          className={`provider-card__test-result ${testResult.ok ? "provider-card__test-result--ok" : "provider-card__test-result--fail"}`}
-          role={testResult.ok ? "status" : "alert"}
-        >
-          {testResult.ok ? "连接成功" : `连接失败：${testResult.error ?? "未知错误"}`}
-        </div>
-      )}
-      {providerSaveSuccess && (
-        <div className="provider-card__test-result provider-card__test-result--ok" role="status">
-          保存成功
-        </div>
-      )}
       <div className="provider-card__models">
         <div className="provider-card__models-header">
-          <strong>Models</strong>
-          <button type="button" className="btn btn--secondary" onClick={() => setShowCreateModel((v) => !v)} disabled={isAnyMutationInFlight}>+ Add Model</button>
+          <span className="provider-card__section-label">Models</span>
+          <button type="button" className="btn btn--secondary btn--sm" onClick={() => setShowCreateModel((v) => !v)} disabled={isAnyMutationInFlight}>+ Add Model</button>
         </div>
         {showCreateModel && (
           <div className="model-row model-row__edit-form">
@@ -539,8 +558,8 @@ export function ProviderCard({
               />
             </div>
             <div className="provider-card__actions">
-              <button type="button" className="btn btn--primary" onClick={handleCreateSubmit} disabled={isAnyMutationInFlight}>保存</button>
-              <button type="button" className="btn btn--secondary" onClick={() => { setShowCreateModel(false); setNewModelDraft({ modelId: "", tags: "" }); setModelFormError(null); }}>取消</button>
+              <button type="button" className="btn btn--primary btn--sm" onClick={handleCreateSubmit} disabled={isAnyMutationInFlight}>Save</button>
+              <button type="button" className="btn btn--secondary btn--sm" onClick={() => { setShowCreateModel(false); setNewModelDraft({ modelId: "", tags: "" }); setModelFormError(null); }}>Cancel</button>
             </div>
             {modelFormError && (
               <div className="field-error" role="alert">{modelFormError}</div>
@@ -548,9 +567,9 @@ export function ProviderCard({
           </div>
         )}
         {isModelsLoading ? (
-          <div>加载中…</div>
+          <div className="provider-card__empty">Loading…</div>
         ) : models.length === 0 && !showCreateModel ? (
-          <div className="provider-card__empty">暂无 model</div>
+          <div className="provider-card__empty">No models</div>
         ) : (
           models.map((m) => (
             <div key={m.model_db_id} className="model-row">
@@ -614,8 +633,8 @@ export function ProviderCard({
                     Enabled
                   </label>
                   <div className="provider-card__actions">
-                    <button type="button" className="btn btn--primary" onClick={() => handleEditSubmit(m)} disabled={isAnyMutationInFlight}>保存</button>
-                    <button type="button" className="btn btn--secondary" onClick={handleModelEditCancel} disabled={isAnyMutationInFlight}>取消</button>
+                    <button type="button" className="btn btn--primary btn--sm" onClick={() => handleEditSubmit(m)} disabled={isAnyMutationInFlight}>Save</button>
+                    <button type="button" className="btn btn--secondary btn--sm" onClick={handleModelEditCancel} disabled={isAnyMutationInFlight}>Cancel</button>
                   </div>
                   {modelFormError && (
                     <div className="field-error" role="alert">{modelFormError}</div>
@@ -624,7 +643,6 @@ export function ProviderCard({
               ) : (
                 <>
                   <span className="model-row__name">{m.model_id}</span>
-                  <span>{m.model_enabled ? "●enabled" : "○disabled"}</span>
                   {m.tags.length > 0 && (
                     <span className="model-row__tags">
                       {m.tags.map((t) => (
@@ -632,9 +650,13 @@ export function ProviderCard({
                       ))}
                     </span>
                   )}
-                  <div className="provider-card__actions provider-card__actions--end">
-                    <button type="button" className="btn btn--secondary" onClick={() => startModelEdit(m)} disabled={isAnyMutationInFlight}>编辑</button>
-                    <button type="button" className="btn btn--danger" onClick={() => handleModelDelete(m)} disabled={isAnyMutationInFlight}>删除</button>
+                  <span className={`status-indicator status-indicator--inline ${m.model_enabled ? "status-indicator--ok" : "status-indicator--muted"}`}>
+                    <span className="status-indicator__dot" />
+                    {m.model_enabled ? "Enabled" : "Disabled"}
+                  </span>
+                  <div className="model-row__actions">
+                    <button type="button" className="btn btn--secondary btn--sm" onClick={() => startModelEdit(m)} disabled={isAnyMutationInFlight}>Edit</button>
+                    <button type="button" className="btn btn--danger-quiet btn--sm" onClick={() => handleModelDelete(m)} disabled={isAnyMutationInFlight}>Delete</button>
                   </div>
                 </>
               )}

@@ -797,6 +797,21 @@
   background: var(--color-status-danger-soft);
 }
 
+/* Danger-quiet: neutral at rest, danger treatment on hover/focus.
+   Used for destructive actions that should not dominate the resting UI. */
+.btn--danger-quiet {
+  background: transparent;
+  color: var(--color-text-muted);
+  border-color: var(--color-border-subtle);
+}
+
+.btn--danger-quiet:hover:not(:disabled),
+.btn--danger-quiet:focus-visible:not(:disabled) {
+  color: var(--color-status-danger);
+  border-color: color-mix(in srgb, var(--color-status-danger) 30%, transparent);
+  background: var(--color-status-danger-soft);
+}
+
 .btn--sm {
   padding: var(--space-1) var(--space-2);
   font-size: 12px;

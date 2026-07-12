@@ -11,6 +11,8 @@ import {
   deriveUniqueProviderName,
   parseTags,
   validateBaseUrl,
+  KIND_LABELS,
+  KIND_OPTIONS,
 } from "../pages/providerFormUtils";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -192,7 +194,7 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
   return (
     <div className="provider-card">
       <div className="provider-card__header">
-        <strong>新建 Provider</strong>
+        <span className="provider-card__section-label">New Provider</span>
       </div>
       <div className="provider-card__body">
         <div className="field-group">
@@ -233,12 +235,14 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
             value={kind}
             onChange={(e) => setKind(e.target.value as ProviderKind)}
           >
-            <option value="openai_compatible">openai_compatible</option>
-            <option value="anthropic_compatible">anthropic_compatible</option>
+            {KIND_OPTIONS.map((k) => (
+              <option key={k} value={k}>{KIND_LABELS[k] ?? k}</option>
+            ))}
           </select>
         </div>
-        <hr />
-        <div>同步创建 Model</div>
+        <div className="provider-card__section-divider">
+          <span className="provider-card__section-label provider-card__section-label--muted">Sync-create Model (optional)</span>
+        </div>
         <div className="field-group">
           <label className="field-label" htmlFor="new-prov-model-name">Model Name</label>
           <input
@@ -264,34 +268,34 @@ export function ProviderCreationForm({ onClose }: ProviderCreationFormProps) {
 
         {state.kind === "partial-success" && (
           <div className="provider-card__error-banner" role="alert">
-            Provider 已创建，但 Model 创建失败：{state.modelError}
+            Provider created, but model creation failed: {state.modelError}
           </div>
         )}
         {state.kind === "provider-failed" && (
           <div className="provider-card__error-banner" role="alert">
-            Provider 创建失败：{state.error}
+            Provider creation failed: {state.error}
           </div>
         )}
 
         <div className="provider-card__actions">
-          <button type="button" className="btn btn--primary" onClick={handleSubmit} disabled={!canSubmit}>
-            保存
+          <button type="button" className="btn btn--primary btn--sm" onClick={handleSubmit} disabled={!canSubmit}>
+            Save
           </button>
           {state.kind === "partial-success" && (
-            <button type="button" className="btn btn--secondary" onClick={handleRetryModel} disabled={isMutationPending}>
-              重试 Model
+            <button type="button" className="btn btn--secondary btn--sm" onClick={handleRetryModel} disabled={isMutationPending}>
+              Retry Model
             </button>
           )}
-          <button type="button" className="btn btn--secondary" onClick={handleCancel} disabled={isMutationPending}>
-            取消
+          <button type="button" className="btn btn--secondary btn--sm" onClick={handleCancel} disabled={isMutationPending}>
+            Cancel
           </button>
         </div>
       </div>
       <ConfirmDialog
         open={showCancelConfirm}
-        title="放弃修改"
-        body="表单有未保存的内容，确定放弃？"
-        confirmLabel="放弃"
+        title="Discard Changes"
+        body="Form has unsaved changes. Discard them?"
+        confirmLabel="Discard"
         onConfirm={() => { setShowCancelConfirm(false); onClose(); }}
         onCancel={() => setShowCancelConfirm(false)}
       />

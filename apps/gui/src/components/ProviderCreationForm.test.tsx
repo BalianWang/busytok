@@ -99,13 +99,13 @@ describe("ProviderCreationForm", () => {
     const urlInput = screen.getByPlaceholderText(/base url/i);
     fireEvent.change(urlInput, { target: { value: "bad-url" } });
     fireEvent.blur(urlInput);
-    expect(screen.getByText(/请输入完整的 URL/i)).toBeDefined();
+    expect(screen.getByText(/Enter a complete URL/i)).toBeDefined();
   });
 
   it("disables Save when API key is empty", () => {
     renderForm();
     fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://api.deepseek.com/v1" } });
-    const saveBtn = screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement;
+    const saveBtn = screen.getByRole("button", { name: /^Save$/i }) as HTMLButtonElement;
     expect(saveBtn.disabled).toBe(true);
   });
 
@@ -115,7 +115,7 @@ describe("ProviderCreationForm", () => {
     });
     renderForm({ createProvider });
     fillForm();
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(createProvider).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "deepseek_openai",
@@ -134,7 +134,7 @@ describe("ProviderCreationForm", () => {
     });
     renderForm({ existingNames: ["deepseek_openai"], createProvider });
     fillForm();
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(createProvider).toHaveBeenCalledWith(
       expect.objectContaining({ name: "deepseek_openai_2" }),
       expect.anything(),
@@ -151,7 +151,7 @@ describe("ProviderCreationForm", () => {
     renderForm({ createProvider, createModel });
     fillForm();
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(createModel).toHaveBeenCalledWith(
       expect.objectContaining({
         provider_id: "prov-new",
@@ -177,16 +177,16 @@ describe("ProviderCreationForm", () => {
     renderForm({ createProvider, createModel });
     fillForm();
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
 
     await waitFor(() => {
       expect(screen.getByText(/model already exists/i)).toBeDefined();
     });
     // Save button should be disabled to prevent duplicate provider creation
-    const saveBtn = screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement;
+    const saveBtn = screen.getByRole("button", { name: /^Save$/i }) as HTMLButtonElement;
     expect(saveBtn.disabled).toBe(true);
     // Retry button should be enabled
-    const retryBtn = screen.getByRole("button", { name: /重试 model/i }) as HTMLButtonElement;
+    const retryBtn = screen.getByRole("button", { name: /Retry Model/i }) as HTMLButtonElement;
     expect(retryBtn.disabled).toBe(false);
   });
 
@@ -200,7 +200,7 @@ describe("ProviderCreationForm", () => {
     renderForm({ createProvider, createModel });
     fillForm();
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
 
     await waitFor(() => {
       expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
@@ -229,10 +229,10 @@ describe("ProviderCreationForm", () => {
     renderForm({ createProvider, createModel });
     fillForm();
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
 
-    await waitFor(() => expect(screen.getByRole("button", { name: /重试 model/i })).toBeDefined());
-    fireEvent.click(screen.getByRole("button", { name: /重试 model/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Retry Model/i })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /Retry Model/i }));
 
     // createProvider should only have been called once
     expect(createProvider).toHaveBeenCalledTimes(1);
@@ -246,7 +246,7 @@ describe("ProviderCreationForm", () => {
     });
     renderForm({ createProvider });
     fillForm();
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
 
     await waitFor(() => {
       expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
@@ -284,14 +284,14 @@ describe("ProviderCreationForm", () => {
   it("disables Save when createProvider.isPending is true", () => {
     renderForm({ createProviderPending: true });
     fillForm();
-    const saveBtn = screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement;
+    const saveBtn = screen.getByRole("button", { name: /^Save$/i }) as HTMLButtonElement;
     expect(saveBtn.disabled).toBe(true);
   });
 
   it("disables Save when createModel.isPending is true", () => {
     renderForm({ createModelPending: true });
     fillForm();
-    const saveBtn = screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement;
+    const saveBtn = screen.getByRole("button", { name: /^Save$/i }) as HTMLButtonElement;
     expect(saveBtn.disabled).toBe(true);
   });
 
@@ -303,7 +303,7 @@ describe("ProviderCreationForm", () => {
     renderForm({ createProvider });
     fillForm();
     fireEvent.change(screen.getByLabelText(/kind/i), { target: { value: "anthropic_compatible" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(createProvider).toHaveBeenCalledWith(
       expect.objectContaining({ provider_kind: "anthropic_compatible" }),
       expect.anything(),
@@ -321,7 +321,7 @@ describe("ProviderCreationForm", () => {
     fillForm();
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "claude-3" } });
     fireEvent.change(screen.getByPlaceholderText(/tags/i), { target: { value: "fast, expensive" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(createModel).toHaveBeenCalledWith(
       expect.objectContaining({ tags: ["fast", "expensive"] }),
       expect.anything(),
@@ -340,17 +340,17 @@ describe("ProviderCreationForm", () => {
     renderForm({ createProvider, createModel });
     fillForm();
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
 
     // Wait for partial-success state + retry button.
-    await waitFor(() => expect(screen.getByRole("button", { name: /重试 model/i })).toBeDefined());
-    fireEvent.click(screen.getByRole("button", { name: /重试 model/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Retry Model/i })).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /Retry Model/i }));
 
     // Retry failed → still in partial-success, error banner still shows.
     await waitFor(() => {
       expect(screen.getByText(/model conflict/)).toBeDefined();
     });
-    expect(screen.getByRole("button", { name: /重试 model/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /Retry Model/i })).toBeDefined();
   });
 
   // ─── providersQuery.data null fallback (branch at line 54) ──────────
@@ -363,7 +363,7 @@ describe("ProviderCreationForm", () => {
     // The next state change (fillForm) triggers a re-render that picks up the new mock.
     vi.mocked(useProviders).mockReturnValue({ data: undefined } as never);
     fillForm();
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     // Name derived from URL without collision suffix (existingNames falls back to empty Set).
     expect(createProvider).toHaveBeenCalledWith(
       expect.objectContaining({ name: "deepseek_openai" }),
@@ -397,7 +397,7 @@ describe("ProviderCreationForm", () => {
     fireEvent.change(screen.getByPlaceholderText(/api key/i), { target: { value: "sk-test" } });
     // Enter an invalid URL but don't blur (so blur validation hasn't fired).
     fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "bad" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     // Focus should move to the URL input.
     expect(document.activeElement).toBe(screen.getByPlaceholderText(/base url/i));
   });
@@ -438,8 +438,8 @@ describe("ProviderCreationForm", () => {
     );
     // Type something → dirty.
     fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://example.com" } });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
-    expect(screen.getByText("放弃修改")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
+    expect(screen.getByText("Discard Changes")).toBeDefined();
     expect(onClose).not.toHaveBeenCalled();
   });
 
@@ -470,9 +470,9 @@ describe("ProviderCreationForm", () => {
       </QueryClientProvider>,
     );
     // No input → cancel should close immediately.
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     expect(onClose).toHaveBeenCalledOnce();
-    expect(screen.queryByText("放弃修改")).toBeNull();
+    expect(screen.queryByText("Discard Changes")).toBeNull();
   });
 
   it("discards and closes when confirm dialog confirmed", () => {
@@ -502,8 +502,8 @@ describe("ProviderCreationForm", () => {
       </QueryClientProvider>,
     );
     fireEvent.change(screen.getByPlaceholderText(/base url/i), { target: { value: "https://example.com" } });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
-    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Discard$/i }));
     expect(onClose).toHaveBeenCalledOnce();
   });
 });

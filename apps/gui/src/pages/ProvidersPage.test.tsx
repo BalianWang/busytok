@@ -159,34 +159,34 @@ afterEach(() => cleanup());
 describe("ProvidersPage (rewritten)", () => {
   it("renders empty state when no providers", () => {
     renderPage();
-    expect(screen.getByText(/新建 Provider/i)).toBeTruthy();
+    expect(screen.getByText(/New Provider/i)).toBeTruthy();
   });
 
-  it("shows creation form when + 新建 button clicked", () => {
+  it("shows creation form when + New Provider button clicked", () => {
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /\+ 新建/i }));
+    fireEvent.click(screen.getByRole("button", { name: /\+ New Provider/i }));
     expect(screen.getByPlaceholderText(/base url/i)).toBeTruthy();
   });
 
-  it("closes creation form when 取消 clicked (exercises onClose callback)", () => {
+  it("closes creation form when Cancel clicked (exercises onClose callback)", () => {
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /\+ 新建/i }));
+    fireEvent.click(screen.getByRole("button", { name: /\+ New Provider/i }));
     expect(screen.getByPlaceholderText(/base url/i)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     expect(screen.queryByPlaceholderText(/base url/i)).toBeNull();
   });
 
   it("enters and exits provider edit mode (exercises onEdit + onCancelEdit)", () => {
     renderPage({ providers: [makeProvider()] });
-    // Click the provider's 编辑 button (first one — in the card header).
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    // Click the provider's Edit button (first one — in the card header).
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[0]);
-    // Edit mode shows a 取消 button in the card header.
-    expect(screen.getByRole("button", { name: /^取消$/i })).toBeTruthy();
-    // Click 取消 to exit edit mode.
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
-    // Back in view mode — no 取消 button.
-    expect(screen.queryByRole("button", { name: /^取消$/i })).toBeNull();
+    // Edit mode shows a Cancel button in the card header.
+    expect(screen.getByRole("button", { name: /^Cancel$/i })).toBeTruthy();
+    // Click Cancel to exit edit mode.
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
+    // Back in view mode — no Cancel button.
+    expect(screen.queryByRole("button", { name: /^Cancel$/i })).toBeNull();
   });
 
   it("renders a ProviderCard for each provider", () => {
@@ -218,8 +218,8 @@ describe("ProvidersPage (rewritten)", () => {
   it("emits provider.deleted event on successful delete", async () => {
     renderPage({ providers: [makeProvider()] });
     // Click delete in the card → ConfirmDialog opens → click dialog confirm.
-    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(screen.getByRole("button", { name: /Delete/i }));
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     await waitFor(() => {
       expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
@@ -242,8 +242,8 @@ describe("ProvidersPage (rewritten)", () => {
     } as never);
     renderPage({ providers: [makeProvider()] });
     // Click delete in the card → ConfirmDialog opens → click dialog confirm.
-    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(screen.getByRole("button", { name: /Delete/i }));
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     await waitFor(() => {
       expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
@@ -255,13 +255,13 @@ describe("ProvidersPage (rewritten)", () => {
       );
     });
     // P1 #2: dialog must stay open and surface the error (no silent close).
-    expect(screen.getByText("删除 Provider")).toBeDefined();
+    expect(screen.getByText("Delete Provider")).toBeDefined();
     expect(screen.getByText(/delete rpc failed/)).toBeDefined();
   });
 
   it("emits provider.tested event on successful test connection", () => {
     renderPage({ providers: [makeProvider()] });
-    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Test Connection/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "provider.tested",
@@ -282,7 +282,7 @@ describe("ProvidersPage (rewritten)", () => {
       },
     } as never);
     renderPage({ providers: [makeProvider()] });
-    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Test Connection/i }));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
         event_code: "provider.test.failed",
@@ -298,7 +298,7 @@ describe("ProvidersPage (rewritten)", () => {
     fireEvent.change(screen.getByPlaceholderText(/model name/i), {
       target: { value: "new-model" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -325,7 +325,7 @@ describe("ProvidersPage (rewritten)", () => {
     fireEvent.change(screen.getByPlaceholderText(/model name/i), {
       target: { value: "new-model" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -345,11 +345,11 @@ describe("ProvidersPage (rewritten)", () => {
       models: [makeModel()],
     });
     // Click model row's delete → ConfirmDialog opens → click dialog confirm.
-    let deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    let deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     // Last delete button before dialog is the model row's.
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     // Dialog confirm is now the last delete button.
-    deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     await waitFor(() => {
       expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
@@ -378,9 +378,9 @@ describe("ProvidersPage (rewritten)", () => {
       models: [makeModel()],
     });
     // Click model row's delete → ConfirmDialog opens → click dialog confirm.
-    let deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    let deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     await waitFor(() => {
       expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
@@ -395,19 +395,19 @@ describe("ProvidersPage (rewritten)", () => {
       );
     });
     // P1 #2: dialog must stay open and surface the error (no silent close).
-    expect(screen.getByText("删除 Model")).toBeDefined();
+    expect(screen.getByText("Delete Model")).toBeDefined();
     expect(screen.getByText(/model delete rpc failed/)).toBeDefined();
   });
 
   it("emits model.updated event on successful model update", async () => {
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
     // Enter model edit mode, change display_name, save.
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
       target: { value: "DeepSeek Chat" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -431,12 +431,12 @@ describe("ProvidersPage (rewritten)", () => {
       },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
       target: { value: "DeepSeek Chat" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await new Promise((r) => setTimeout(r, 0));
     expect(vi.mocked(reportFrontendEventSafely)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -457,12 +457,12 @@ describe("ProvidersPage (rewritten)", () => {
       tagsUpdate: { mutate: vi.fn(), mutateAsync: mutateAsyncSpy, isPending: false },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     fireEvent.change(screen.getByPlaceholderText(/tags/i), {
       target: { value: "cheap,fast" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await new Promise((r) => setTimeout(r, 0));
     // Regression (C1): mutateAsync must receive the SQL PK (model_db_id), not
     // the human-readable model_id string. makeModel() sets them distinctly.
@@ -488,12 +488,12 @@ describe("ProvidersPage (rewritten)", () => {
       tagsUpdate: { mutate: vi.fn(), mutateAsync: mutateAsyncSpy, isPending: false },
     } as never);
     renderPage({ providers: [makeProvider()], models: [makeModel()] });
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     fireEvent.change(screen.getByPlaceholderText(/tags/i), {
       target: { value: "cheap,fast" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await new Promise((r) => setTimeout(r, 0));
     // Regression (C1): same payload assertion as the success case.
     expect(mutateAsyncSpy).toHaveBeenCalledWith(
@@ -530,7 +530,7 @@ describe("ProvidersPage (rewritten)", () => {
         <ProvidersPage />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/Provider 列表加载失败/i)).toBeTruthy();
+    expect(screen.getByText(/Failed to load providers/i)).toBeTruthy();
   });
 
   it("shows error banner when models query fails", () => {
@@ -552,7 +552,7 @@ describe("ProvidersPage (rewritten)", () => {
         <ProvidersPage />
       </QueryClientProvider>,
     );
-    expect(screen.getByText(/Model 列表加载失败/i)).toBeTruthy();
+    expect(screen.getByText(/Failed to load models/i)).toBeTruthy();
   });
 
   it("renders H1 heading for the provider catalog (f7)", () => {
@@ -562,8 +562,8 @@ describe("ProvidersPage (rewritten)", () => {
 
   it("surfaces test-connection success result in the card UI (f3)", () => {
     renderPage({ providers: [makeProvider()] });
-    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
-    expect(screen.getByText("连接成功")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Test Connection/i }));
+    expect(screen.getByText("Connection successful")).toBeTruthy();
   });
 
   it("surfaces test-connection failure result in the card UI (f3)", () => {
@@ -577,8 +577,8 @@ describe("ProvidersPage (rewritten)", () => {
       },
     } as never);
     renderPage({ providers: [makeProvider()] });
-    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
-    expect(screen.getByText(/连接失败/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Test Connection/i }));
+    expect(screen.getByText(/Connection failed/)).toBeTruthy();
     expect(screen.getByText(/connection refused/)).toBeTruthy();
   });
 });
