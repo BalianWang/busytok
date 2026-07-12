@@ -14,6 +14,7 @@ use busytok_store::repository::{
 };
 use busytok_store::Database;
 use busytok_subagent::context::{CompactContext, MemorySnapshot};
+use busytok_subagent::error::SubagentError;
 use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
 use busytok_subagent::pressure::{PressureGate, PressureResponder};
@@ -799,10 +800,29 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
+    // Bug 2 fix: the error must be a structured SubagentError::HotSessionStateDivergence,
+    // NOT a bare anyhow wrapped as SubagentError::Store ("database error") and
+    // NOT HotSessionLimit (which would mislead callers into retrying for capacity).
+    // This is a state sync issue — the sidecar holds a session the DB has no
+    // binding for. Downcast to verify the structured variant survives the
+    // anyhow round-trip.
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        format!("{err}").contains("no hot binding found"),
-        "error should explain the sync failure, got: {err}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionStateDivergence(msg) => {
+            assert!(
+                msg.contains("pi_sess_mock_1"),
+                "error message should name the divergent session, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionStateDivergence, got {other:?} — \
+             Bug 2 regression: state-divergence misclassified"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }
@@ -937,11 +957,25 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
-    let err_msg = format!("{err}");
+    // Bug 2 fix: the error must be a structured SubagentError::SidecarRpc,
+    // NOT a bare anyhow wrapped as SubagentError::Store ("database error").
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        err_msg.contains("session.close failed"),
-        "error should mention the close failure, got: {err_msg}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::SidecarRpc { message, .. } => {
+            assert!(
+                message.contains("session.close failed"),
+                "error message should mention the close failure, got: {message}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::SidecarRpc, got {other:?} — \
+             Bug 2 regression: close failure misclassified"
+        ),
+    }
 
     // Verify the fatal-close invariant: the DB HAS been flipped (binding
     // is_hot=0, status='closed'; logical status='warm') BEFORE close was
@@ -1136,10 +1170,11 @@ fn seed_hot_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &s
 
 #[tokio::test]
 async fn executor_eviction_fails_when_candidate_missing_from_error() {
-    // The sidecar returns HOT_SESSION_LIMIT_REACHED but omits data.candidate
-    // (sidecar protocol violation). `extract_candidate_from_data` must error
-    // and the executor must propagate it — never silently retry or evict a
-    // phantom session.
+    // The sidecar returns HOT_SESSION_LIMIT_REACHED but omits the `data`
+    // field entirely (sidecar protocol violation). `classify_hot_limit_error`
+    // must return `ProtocolViolation` and the executor must surface a
+    // structured `SubagentError::Validation` — never silently retry or evict
+    // a phantom session (Bug 1 + Bug 2 fix).
     let mut cfg = mock_config();
     cfg.max_hot_sessions = 1;
     cfg.env
@@ -1155,15 +1190,78 @@ async fn executor_eviction_fails_when_candidate_missing_from_error() {
         .await
         .expect("first delegate must succeed");
 
-    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with no candidate.
+    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with no data field.
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
+    // Bug 2 fix: the error must downcast to a structured SubagentError (not a
+    // bare anyhow that would be mislabeled as "database error").
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        format!("{err}").contains("missing data.candidate"),
-        "error should explain the protocol violation, got: {err}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::Validation(msg) => {
+            assert!(
+                msg.contains("missing data"),
+                "error should explain the protocol violation, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::Validation, got {other:?} — Bug 2 regression"
+        ),
+    }
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_skips_when_all_sessions_busy() {
+    // Bug 1 fix: when the sidecar returns HOT_SESSION_LIMIT_REACHED with
+    // `data.candidate = null` + `data.all_busy = true` (all sessions are
+    // in-use), the executor must NOT attempt eviction — there is no safe
+    // candidate. It surfaces `SubagentError::HotSessionLimit` with an empty
+    // candidate so the task fails with a clear, structured error instead of
+    // a doomed eviction + "database error" mislabel (Bug 2).
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
+
+    // Fill the pool (max_hot=1).
+    executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+
+    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with all_busy=true.
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    // Bug 2 fix: error must downcast to structured SubagentError.
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            assert!(
+                candidate.is_empty(),
+                "candidate must be empty (all-busy path), got: {candidate}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionLimit, got {other:?} — Bug 1 regression"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }
@@ -1178,7 +1276,7 @@ async fn executor_eviction_fails_without_db() {
     // This covers the `db.is_none()` short-circuit at the top of `evict_session`.
     //
     // Unlike `executor_eviction_fails_when_candidate_missing_from_error` (which
-    // also uses a no-DB executor but errors in `extract_candidate_from_data`
+    // also uses a no-DB executor but errors in `classify_hot_limit_error`
     // before reaching `evict_session`), this test lets candidate extraction
     // succeed so `evict_session` itself is entered and the no-DB guard fires.
     let mut cfg = mock_config();
@@ -1195,8 +1293,8 @@ async fn executor_eviction_fails_without_db() {
         .expect("first delegate must succeed");
 
     // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with a valid
-    // data.candidate (extract_candidate_from_data succeeds), then evict_session
-    // hits the no-DB guard and returns an error before any RPC.
+    // data.candidate (classify_hot_limit_error returns Evict), then
+    // evict_session hits the no-DB guard and returns an error before any RPC.
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,

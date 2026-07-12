@@ -40,7 +40,13 @@
 #   BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE=1  Emit HOT_SESSION_LIMIT_REACHED with no
 #                                     data.candidate field (sidecar protocol
 #                                     violation). Exercises
-#                                     extract_candidate_from_data error path.
+#                                     classify_hot_limit_error ProtocolViolation path.
+#   BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY=1  Emit HOT_SESSION_LIMIT_REACHED with
+#                                     data.candidate=null + data.all_busy=true
+#                                     (all sessions in-use). Exercises the
+#                                     classify_hot_limit_error AllBusy path —
+#                                     executor skips eviction and surfaces
+#                                     SubagentError::HotSessionLimit.
 #   BUSYTOK_MOCK_MEMORY_UPDATE=1
 #                                When set, session.turn_auto includes a
 #                                `result.memory_update` object with
@@ -65,6 +71,7 @@ PREPARE_HIBERNATE_FAILS="${BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS:-0}"
 NULL_MEMORY_DELTA="${BUSYTOK_MOCK_NULL_MEMORY_DELTA:-0}"
 TURN_AUTO_FAILS_AFTER_CLOSE="${BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE:-0}"
 HOT_LIMIT_NO_CANDIDATE="${BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE:-0}"
+HOT_LIMIT_ALL_BUSY="${BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY:-0}"
 MEMORY_UPDATE="${BUSYTOK_MOCK_MEMORY_UPDATE:-0}"
 AUTH_FAIL="${BUSYTOK_MOCK_AUTH_FAIL:-0}"
 COUNT=0
@@ -183,9 +190,13 @@ while IFS= read -r line; do
             # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED
             CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
             if [[ "$HOT_LIMIT_NO_CANDIDATE" == "1" ]]; then
-              # Omit data.candidate — sidecar protocol violation. Exercises
-              # executor.rs extract_candidate_from_data error path.
+              # Omit data entirely — sidecar protocol violation. Exercises
+              # executor.rs classify_hot_limit_error ProtocolViolation path.
               printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached"},"id":%s}\n' "$ID"
+            elif [[ "$HOT_LIMIT_ALL_BUSY" == "1" ]]; then
+              # All sessions in-use — legitimate "all busy" signal. Exercises
+              # executor.rs classify_hot_limit_error AllBusy path (skip eviction).
+              printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached — all sessions busy","data":{"candidate":null,"all_busy":true}},"id":%s}\n' "$ID"
             else
               printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
             fi

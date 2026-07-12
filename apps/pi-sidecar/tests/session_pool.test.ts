@@ -165,4 +165,100 @@ describe('SessionPool', () => {
     expect(pool.size()).toBe(1);
     expect(pool.get('sess-1')).toBeUndefined();
   });
+
+  // --- Bug 1 fix: in-use (busy) session tracking ---
+
+  it('getLruCandidate skips in-use sessions', async () => {
+    // A session running a turn (beginTurn without endTurn) must NOT be
+    // selected as an eviction candidate — evicting it would corrupt the
+    // in-flight task and fail on the Rust side (no DB binding yet).
+    const pool = new SessionPool(2);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1')); // LRU
+    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2')); // MRU
+    pool.beginTurn('sess-1');
+    // sess-1 is busy → getLruCandidate skips it, returns sess-2 instead.
+    expect(pool.getLruCandidate()).toBe('sess-2');
+  });
+
+  it('getLruCandidate returns undefined when all sessions are in-use', async () => {
+    // When every session is busy, there is no safe eviction candidate.
+    const pool = new SessionPool(2);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
+    pool.beginTurn('sess-1');
+    pool.beginTurn('sess-2');
+    expect(pool.getLruCandidate()).toBeUndefined();
+  });
+
+  it('endTurn restores session evictability', async () => {
+    // After endTurn, the session is again a valid LRU candidate.
+    const pool = new SessionPool(1);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.beginTurn('sess-1');
+    expect(pool.getLruCandidate()).toBeUndefined();
+    pool.endTurn('sess-1');
+    expect(pool.getLruCandidate()).toBe('sess-1');
+  });
+
+  it('ensure throws all_busy when pool is full and all sessions are in-use', async () => {
+    // Bug 1 core scenario: pool full + all sessions busy → the sidecar
+    // returns `data.candidate = null` + `data.all_busy = true` so the
+    // executor knows NOT to attempt eviction.
+    const pool = new SessionPool(1);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.beginTurn('sess-1');
+    try {
+      await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(SidecarError);
+      expect((e as SidecarError).code).toBe(-32002);
+      expect((e as SidecarError).data).toEqual({
+        candidate: null,
+        all_busy: true,
+      });
+    }
+  });
+
+  it('ensure names non-busy candidate when pool is full but some sessions are idle', async () => {
+    // Mixed: pool full, one busy + one idle → the idle session is the
+    // eviction candidate (not the busy one).
+    const pool = new SessionPool(2);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1')); // LRU, busy
+    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2')); // MRU, idle
+    pool.beginTurn('sess-1');
+    try {
+      await pool.ensure('sub-c', OPTS, fakeFactory('sess-3'));
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(SidecarError);
+      expect((e as SidecarError).code).toBe(-32002);
+      // candidate is sess-2 (idle), NOT sess-1 (busy).
+      expect((e as SidecarError).data).toEqual({ candidate: 'sess-2' });
+    }
+  });
+
+  it('close cleans up busy state', async () => {
+    // close() must remove the session from busySessions — otherwise a
+    // stale busy flag could block future evictions after the session is gone.
+    const pool = new SessionPool(1);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.beginTurn('sess-1');
+    pool.close('sess-1');
+    expect(pool.size()).toBe(0);
+    // After close, a new session can be created (no stale busy block).
+    const result = await pool.ensure('sub-a', OPTS, fakeFactory('sess-2'));
+    expect(result.session.adapter_session_id).toBe('sess-2');
+  });
+
+  it('endTurn is safe on a session that was already closed', async () => {
+    // endTurn must be a no-op (not throw) if the session was removed via
+    // close before endTurn was called — mirrors the try/finally contract
+    // in turn_auto where close can happen between beginTurn and endTurn.
+    const pool = new SessionPool(1);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.beginTurn('sess-1');
+    pool.close('sess-1');
+    expect(() => pool.endTurn('sess-1')).not.toThrow();
+  });
 });

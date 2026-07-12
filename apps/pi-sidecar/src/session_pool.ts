@@ -15,6 +15,16 @@ import { logger } from './logger.js';
  * (-32002) with `data.candidate` naming the LRU session — busytok-service
  * then drives eviction via prepare_hibernate + close.
  *
+ * **In-use tracking (Bug 1 fix):** sessions that are currently running a
+ * turn (`beginTurn` called, `endTurn` not yet called) are excluded from
+ * LRU eviction candidates. This prevents evicting a session whose
+ * `turn_auto` is still in-flight — a state that would (a) corrupt the
+ * in-flight task and (b) trigger a spurious "no hot binding" error in
+ * the Rust eviction flow (the binding is only persisted AFTER `turn_auto`
+ * returns). When the pool is full and ALL sessions are in-use, the error
+ * includes `data.all_busy = true` and `data.candidate = null` so the
+ * executor knows NOT to attempt eviction.
+ *
  * Sessions are real `PiSdkSession` wrappers around the Pi SDK's
  * `AgentSession`. The factory is injectable so tests can supply fakes
  * without `vi.mock` (Phase 3 Task 6).
@@ -28,6 +38,7 @@ export class SessionPool {
   private readonly sessions = new Map<string, PiSdkSession>();       // adapter_session_id → session
   private readonly subagentMap = new Map<string, string>();          // logical_subagent_id → adapter_session_id
   private readonly lru: string[] = [];                               // adapter_session_ids, MRU first
+  private readonly busySessions = new Set<string>();                 // adapter_session_ids with in-flight turns
 
   constructor(maxHot: number, factory: SessionFactory = defaultSessionFactory) {
     if (maxHot < 1) throw new Error(`maxHot must be >= 1, got ${maxHot}`);
@@ -86,8 +97,19 @@ export class SessionPool {
       }
     }
     // 2. Miss + full — throw HOT_SESSION_LIMIT_REACHED with `data.candidate`.
+    //    Bug 1 fix: skip in-use sessions (currently running a turn) —
+    //    evicting them would corrupt the in-flight task AND fail on the
+    //    Rust side (no DB binding yet). If all sessions are in-use,
+    //    `data.candidate = null` and `data.all_busy = true` so the executor
+    //    knows NOT to attempt eviction.
     if (this.sessions.size >= this.maxHot) {
       const candidate = this.getLruCandidate();
+      if (candidate === undefined) {
+        throw new SidecarError('hot session limit reached — all sessions busy', -32002, {
+          candidate: null,
+          all_busy: true,
+        });
+      }
       throw new SidecarError('hot session limit reached', -32002, { candidate });
     }
     // 3. Miss + capacity — create a new session via the factory.
@@ -134,8 +156,29 @@ export class SessionPool {
     this.subagentMap.delete(session.logical_subagent_id);
     const idx = this.lru.indexOf(adapter_session_id);
     if (idx >= 0) this.lru.splice(idx, 1);
+    this.busySessions.delete(adapter_session_id);
     // Dispose the underlying SDK session (fire-and-forget; dispose() is sync).
     void session.close();
+  }
+
+  /**
+   * Mark a session as "in-use" (running a turn). In-use sessions are
+   * excluded from LRU eviction candidates — evicting them would corrupt
+   * the in-flight turn and trigger a spurious "no hot binding" error on
+   * the Rust side (the binding is only persisted AFTER `turn_auto`
+   * returns). Must be paired with `endTurn` in a try/finally block.
+   */
+  beginTurn(adapter_session_id: string): void {
+    this.busySessions.add(adapter_session_id);
+  }
+
+  /**
+   * Mark a session as idle (turn completed). Paired with `beginTurn`.
+   * Safe to call on a session that was already removed via `close()` —
+   * the busy flag is cleaned up on close as well.
+   */
+  endTurn(adapter_session_id: string): void {
+    this.busySessions.delete(adapter_session_id);
   }
 
   /** Current number of hot sessions. */
@@ -161,8 +204,16 @@ export class SessionPool {
     }
   }
 
-  /** Get the LRU candidate for eviction (used in error data). */
+  /**
+   * Get the LRU evictable candidate. Skips sessions currently running a
+   * turn (`beginTurn` without `endTurn`). Returns `undefined` when no
+   * evictable session exists (all sessions are in-use or pool is empty).
+   */
   getLruCandidate(): string | undefined {
-    return this.lru[this.lru.length - 1];
+    for (let i = this.lru.length - 1; i >= 0; i--) {
+      const id = this.lru[i]!;
+      if (!this.busySessions.has(id)) return id;
+    }
+    return undefined;
   }
 }

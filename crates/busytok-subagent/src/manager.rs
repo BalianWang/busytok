@@ -1859,13 +1859,28 @@ fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind>
             Some(TaskErrorKind::Timeout)
         }
         SubagentError::SidecarCrashed(_) => Some(TaskErrorKind::Crash),
+        // Bug 2 fix: SidecarIo (e.g. Broken pipe) is a network-class failure.
+        SubagentError::SidecarIo(_) => Some(TaskErrorKind::Network),
+        // Bug 2 fix: SidecarSpawn failure is a crash-class failure.
+        SubagentError::SidecarSpawn(_) => Some(TaskErrorKind::Crash),
+        // Bug 2 fix: HotSessionLimit is a contention failure — not a DB
+        // error. Classify as Unknown so error_kind is set (not NULL).
+        SubagentError::HotSessionLimit { .. } => Some(TaskErrorKind::Unknown),
+        // State divergence (sidecar/DB out of sync) — not retryable as a
+        // capacity condition. Classify as Unknown so error_kind is set
+        // for observability; the `error` code distinguishes it from
+        // HotSessionLimit for callers that need to handle it differently.
+        SubagentError::HotSessionStateDivergence(_) => Some(TaskErrorKind::Unknown),
         SubagentError::SidecarRpc { code, .. } => match *code {
             Some(AUTH_FAILURE) => Some(TaskErrorKind::Auth),
             Some(RATE_LIMIT) => Some(TaskErrorKind::RateLimit),
             Some(NETWORK_ERROR) => Some(TaskErrorKind::Network),
             Some(TASK_TIMEOUT) => Some(TaskErrorKind::Timeout),
-            _ => None,
+            _ => Some(TaskErrorKind::Unknown),
         },
+        // Store: real DB failures — no retry classification (caller surfaces
+        // as "database error"). Validation/NotFound/etc.: config/lookup errors,
+        // not task-failure kinds. None = no error_kind persisted.
         _ => None,
     }
 }
@@ -1924,29 +1939,74 @@ mod tests {
             }),
             Some(TaskErrorKind::Timeout)
         );
-        // SidecarRpc with no code → unclassified.
+        // SidecarRpc with no code → Unknown (Bug 2 fix: was None, now
+        // classified so error_kind is always set for sidecar errors).
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
                 message: "unknown".into(),
                 code: None
             }),
-            None
+            Some(TaskErrorKind::Unknown)
         );
-        // SidecarRpc with an unrecognized code → unclassified.
+        // SidecarRpc with an unrecognized code → Unknown.
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
                 message: "misc".into(),
                 code: Some(-39999)
             }),
-            None
+            Some(TaskErrorKind::Unknown)
         );
-        // Non-sidecar errors → unclassified.
+        // Bug 2 fix: HotSessionLimit → Unknown (was None — now classified
+        // so error_kind is set instead of missing).
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::HotSessionLimit {
+                candidate: "sess-1".into()
+            }),
+            Some(TaskErrorKind::Unknown)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::HotSessionLimit {
+                candidate: "".into()
+            }),
+            Some(TaskErrorKind::Unknown)
+        );
+        // State divergence (sidecar/DB out of sync) → Unknown. error_kind is
+        // set so callers can alert; the `error` code distinguishes it from
+        // HotSessionLimit for handling decisions.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::HotSessionStateDivergence(
+                "no binding for sess-1".into()
+            )),
+            Some(TaskErrorKind::Unknown)
+        );
+        // Bug 2 fix: SidecarIo → Network (was None).
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarIo(
+                "Broken pipe (os error 32)".into()
+            )),
+            Some(TaskErrorKind::Network)
+        );
+        // Bug 2 fix: SidecarSpawn → Crash (was None).
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarSpawn(
+                "spawn failed".into()
+            )),
+            Some(TaskErrorKind::Crash)
+        );
+        // Non-sidecar errors → None (no error_kind — these are config/lookup
+        // errors, not task failures requiring retry classification).
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::Validation("x".into())),
             None
         );
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::NotFound("x".into())),
+            None
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::Store(anyhow::anyhow!(
+                "db error"
+            ))),
             None
         );
     }
