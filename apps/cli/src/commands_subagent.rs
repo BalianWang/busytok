@@ -894,8 +894,13 @@ mod tests {
 
     #[test]
     fn resolve_cwd_absolute_path_returned_as_is() {
-        let result = resolve_cwd("/Users/test/repo");
-        assert_eq!(result, "/Users/test/repo");
+        // Use a path that is genuinely absolute on the current platform.
+        // On Windows, "/Users/test/repo" is drive-relative (not absolute),
+        // so it would be joined to current_dir instead of returned as-is.
+        let abs = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let abs_str = abs.to_string_lossy();
+        let result = resolve_cwd(&abs_str);
+        assert_eq!(result, abs_str, "absolute path should be returned as-is");
     }
 
     #[test]
@@ -907,10 +912,12 @@ mod tests {
             "resolved cwd should be absolute, got: {result}"
         );
         assert_ne!(result, "/", "resolved cwd should not be '/'");
-        // resolve_cwd(".") may produce a trailing "/." — normalize via
-        // canonicalize for comparison. Both paths point to the same directory.
+        // resolve_cwd(".") may produce a trailing "/." (or "\.") — normalize
+        // via canonicalize for comparison. On Windows, canonicalize returns
+        // a `\\?\` UNC-prefixed path, so canonicalize BOTH sides to ensure
+        // they are compared with the same representation.
         let canonical_result = std::fs::canonicalize(&result).unwrap_or_default();
-        let canonical_cwd = std::env::current_dir().unwrap_or_default();
+        let canonical_cwd = std::fs::canonicalize(".").unwrap_or_default();
         assert_eq!(
             canonical_result, canonical_cwd,
             "resolve_cwd('.') should point to the current directory"
