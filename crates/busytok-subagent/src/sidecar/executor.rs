@@ -721,23 +721,36 @@ impl SidecarTaskExecutor {
         {
             Some(pair) => pair,
             None => {
-                // No supervisor owns this session: either the binding belongs
-                // to a removed provider (session already gone), or the sidecar
-                // and DB are out of sync (the sidecar named a candidate the DB
-                // doesn't track). Surface this as a state-divergence error —
-                // NOT HotSessionLimit (which would mislead callers into
-                // retrying for capacity). Silently skipping would cause the
-                // turn_auto retry to hit HOT_SESSION_LIMIT_REACHED again,
-                // hiding the root cause (out-of-sync) behind the symptom.
+                // Ghost session: the sidecar named a candidate the DB has no
+                // binding for. This is a TRANSIENT timing window — the
+                // sidecar's `endTurn()` marks a session as idle (evictable)
+                // BEFORE Rust commits the hot binding to DB
+                // (`subagent_commit_hot_binding_and_status` runs after
+                // `turn_auto` returns). A concurrent delegate that hits this
+                // window will receive a candidate whose DB binding doesn't
+                // exist YET but will be committed within milliseconds.
+                //
+                // Returning `HotSessionLimit` (transient) instead of
+                // `HotSessionStateDivergence` (fatal) causes the existing
+                // re-queue path to retry the task. By the time the task is
+                // retried, the binding will be committed and eviction will
+                // work correctly (or the pool will have freed up).
+                //
+                // The previous design returned `HotSessionStateDivergence`
+                // assuming a missing binding meant permanent divergence. This
+                // was wrong: the binding WILL be committed by the concurrent
+                // `turn_auto` that's finishing up, making this a transient
+                // condition, not a permanent one.
                 warn!(
-                    event_code = "subagent.session.eviction_no_supervisor",
+                    event_code = "subagent.session.eviction_ghost_session",
                     adapter_session_id = %adapter_session_id,
-                    "no supervisor owns this session — binding may belong to a removed provider, or sidecar/DB are out of sync; aborting eviction"
+                    "ghost session: sidecar returned candidate with no DB binding yet — \
+                     transient timing window (binding commit pending from concurrent turn_auto); \
+                     surfacing as HotSessionLimit for re-queue"
                 );
-                return Err(SubagentError::HotSessionStateDivergence(format!(
-                    "no supervisor owns adapter_session_id={adapter_session_id}; \
-                     binding may belong to a removed provider, or sidecar/DB are out of sync"
-                )));
+                return Err(SubagentError::HotSessionLimit {
+                    candidate: adapter_session_id.to_string(),
+                });
             }
         };
 

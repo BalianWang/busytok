@@ -68,16 +68,23 @@ pub enum SubagentError {
         candidate: String,
     },
 
-    /// Hot session state divergence: the sidecar's view of sessions
-    /// diverges from the DB/pool state (e.g. the sidecar named a candidate
-    /// that no supervisor owns, or the DB has no hot binding for the named
-    /// adapter_session_id). This is NOT a capacity condition — the pool
-    /// may or may not be full. Retrying with backoff will not help; the
-    /// caller should surface this for diagnosis (sidecar restart or DB
-    /// reconciliation may be needed). Distinguished from `HotSessionLimit`
-    /// (a genuine capacity condition) and `Validation` (input/config
-    /// errors) so callers can handle state-divergence without conflating
-    /// it with retryable capacity pressure.
+    /// Hot session state divergence: a PERMANENT divergence between the
+    /// sidecar and DB/pool state. This is NOT a capacity condition and NOT
+    /// a transient timing window. Retrying will not help; the caller should
+    /// surface this for diagnosis (sidecar restart or DB reconciliation
+    /// may be needed).
+    ///
+    /// **When to use this variant**: only for genuine, permanent state
+    /// divergence — e.g. the DB had a binding when `supervisor_for_session`
+    /// checked, but the binding was deleted by the time
+    /// `find_binding_by_session` checked (TOCTOU race after
+    /// `prepare_hibernate` returned `SESSION_NOT_FOUND`).
+    ///
+    /// **When NOT to use this variant**: for the "ghost session" case
+    /// (sidecar named a candidate whose DB binding doesn't exist YET but
+    /// will be committed within milliseconds by a concurrent `turn_auto`).
+    /// That is a TRANSIENT timing window — use `HotSessionLimit` instead
+    /// so the re-queue path can retry the task.
     #[error("hot session state divergence: {0}")]
     HotSessionStateDivergence(String),
 

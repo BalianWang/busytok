@@ -705,10 +705,12 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
 // --- eviction failure paths (Plan 3 Task 7) ---
 //
 // Two regression tests for the eviction driver's failure modes:
-//   1. The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X,
-//      but the DB has no hot binding for X (sidecar/service out of sync).
-//      The executor must error out rather than silently succeeding or
-//      retrying indefinitely.
+//   1. Ghost session: the sidecar returns HOT_SESSION_LIMIT_REACHED with
+//      data.candidate=X, but the DB has no hot binding for X YET. This is
+//      a transient timing window (binding commit pending from a concurrent
+//      turn_auto). The executor must surface `HotSessionLimit` (transient,
+//      re-queueable) — NOT `HotSessionStateDivergence` (fatal) — so the
+//      task gets re-queued and succeeds on retry once the binding is committed.
 //   2. session.close fails during eviction (BUSYTOK_MOCK_CLOSE_FAILS=1).
 //      The executor must abort (return Err) — the DB has been flipped to
 //      closed/warm but the sidecar still holds the session hot, so
@@ -716,11 +718,14 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
 //      diverge. State divergence risk → fatal.
 
 #[tokio::test]
-async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
-    // The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X,
-    // but the DB has no hot binding for X (sidecar and busytok-service are
-    // out of sync). The executor must error out rather than silently
-    // succeeding or retrying indefinitely.
+async fn executor_eviction_ghost_session_surfaces_hot_session_limit() {
+    // Ghost session scenario: the sidecar's `endTurn()` marks a session as
+    // idle (evictable) BEFORE Rust commits the hot binding to DB. When a
+    // concurrent delegate hits this window, the sidecar returns a candidate
+    // whose DB binding doesn't exist yet. The executor must surface
+    // `HotSessionLimit` (transient) so the task gets re-queued — NOT
+    // `HotSessionStateDivergence` (fatal), which would permanently fail
+    // the task with `error_kind = unknown`.
     let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let mut cfg = mock_config();
     cfg.max_hot_sessions = 1;
@@ -791,33 +796,39 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
     let result = executor.execute(&input2).await;
     assert!(
         result.is_err(),
-        "eviction must fail when the DB has no hot binding for the candidate"
+        "eviction must surface an error when the DB has no hot binding for the candidate"
     );
     let err = match result {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
-    // Bug 2 fix: the error must be a structured SubagentError::HotSessionStateDivergence,
-    // NOT a bare anyhow wrapped as SubagentError::Store ("database error") and
-    // NOT HotSessionLimit (which would mislead callers into retrying for capacity).
-    // This is a state sync issue — the sidecar holds a session the DB has no
-    // binding for. Downcast to verify the structured variant survives the
-    // anyhow round-trip.
+    // Ghost session fix: the error must be SubagentError::HotSessionLimit
+    // (transient, re-queueable), NOT HotSessionStateDivergence (fatal).
+    //
+    // The sidecar named a candidate whose DB binding doesn't exist YET —
+    // this is a transient timing window (the binding will be committed by
+    // the concurrent turn_auto that's finishing up). Treating it as
+    // HotSessionLimit lets the re-queue path retry the task; by the time
+    // it's retried, the binding will be committed and eviction will work.
+    //
+    // The previous design returned HotSessionStateDivergence (fatal),
+    // which caused the task to be permanently marked as `failed` with
+    // `error_kind = unknown` — see the matrix bug report for details.
     let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
         downcasted.is_some(),
         "error must downcast to SubagentError, got bare anyhow: {err}"
     );
     match downcasted.unwrap() {
-        SubagentError::HotSessionStateDivergence(msg) => {
+        SubagentError::HotSessionLimit { candidate } => {
             assert!(
-                msg.contains("pi_sess_mock_1"),
-                "error message should name the divergent session, got: {msg}"
+                candidate.contains("pi_sess_mock_1"),
+                "candidate should name the ghost session, got: {candidate}"
             );
         }
         other => panic!(
-            "expected SubagentError::HotSessionStateDivergence, got {other:?} — \
-             Bug 2 regression: state-divergence misclassified"
+            "expected SubagentError::HotSessionLimit, got {other:?} — \
+             ghost session must be re-queueable (transient), not fatal"
         ),
     }
 
