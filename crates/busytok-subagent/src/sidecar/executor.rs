@@ -345,9 +345,9 @@ impl SidecarTaskExecutor {
                             outcome = ?outcome,
                             "exhausted retries waiting for slot to free — surfacing as HotSessionLimit"
                         );
-                        return Err(anyhow::Error::from(SubagentError::HotSessionLimit {
+                        Err(anyhow::Error::from(SubagentError::HotSessionLimit {
                             candidate: String::new(),
-                        }));
+                        }))
                     }
                     HotLimitOutcome::AllBusy => {
                         // Transient capacity contention: all hot sessions are
@@ -436,9 +436,9 @@ impl SidecarTaskExecutor {
                             retries = ALL_BUSY_MAX_RETRIES,
                             "all hot sessions busy after retries — surfacing as HotSessionLimit"
                         );
-                        return Err(anyhow::Error::from(SubagentError::HotSessionLimit {
+                        Err(anyhow::Error::from(SubagentError::HotSessionLimit {
                             candidate: String::new(),
-                        }));
+                        }))
                     }
                     HotLimitOutcome::ProtocolViolation(msg) => {
                         warn!(
@@ -447,7 +447,7 @@ impl SidecarTaskExecutor {
                             error = %msg,
                             "sidecar returned HOT_SESSION_LIMIT_REACHED without a valid candidate or all_busy flag"
                         );
-                        return Err(anyhow::Error::from(SubagentError::Validation(msg)));
+                        Err(anyhow::Error::from(SubagentError::Validation(msg)))
                     }
                 }
             }

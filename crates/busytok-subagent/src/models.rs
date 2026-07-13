@@ -158,6 +158,7 @@ pub struct DelegateRequest {
     /// - `create`: fail if a subagent with the same name exists; otherwise create new
     /// - `reuse`: fail if no such subagent exists; otherwise reuse existing
     /// - `fail`: fail if a subagent with the same name exists (alias for `create`)
+    ///
     /// Default (None): create-or-reuse, but fail if `--bind-*` is given
     ///   and the existing subagent's binding differs from the request.
     pub reuse_policy: Option<String>,
