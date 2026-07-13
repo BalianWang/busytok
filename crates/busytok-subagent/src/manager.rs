@@ -16,7 +16,7 @@ use crate::error::{Result, SubagentError};
 use crate::memory::MemoryUpdater;
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
-    DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
+    DelegateRequest, DelegateResult, LogicalSubagent, QueueReason, ResolveParams, SubagentStatus,
     SubagentTaskSummary, TaskErrorKind, TaskStatus, TaskUsage,
 };
 use crate::pressure::PressureGate;
@@ -56,6 +56,18 @@ const REAPER_BUFFER_MS: i64 = 60_000;
 /// 64-bit integer domain. Values above this are rejected at delegate time
 /// and capped at the reaper fallback path.
 const MAX_SAFE_TIMEOUT_SECONDS: i64 = (i64::MAX - REAPER_BUFFER_MS) / 1000;
+
+/// Maximum wall-clock age (ms) a task may reach before `HotSessionLimit`
+/// re-queuing gives up and marks the task as `failed`. When the executor
+/// exhausts its in-call retries (`ALL_BUSY_MAX_RETRIES` × `ALL_BUSY_BACKOFF`
+/// ≈ 5s) and returns `HotSessionLimit`, `execute_and_persist` flips the task
+/// back to `queued` so the dispatcher can retry. This creates a bounded retry
+/// loop: each cycle is ~5s of executor retry + 200ms dispatcher tick. At 5
+/// minutes the task has had ~60 cycles — enough for any well-behaved
+/// concurrent task to finish and free the hot session slot. Past this
+/// deadline the task is marked `failed` with `error_kind = hot_session_limit`
+/// so it doesn't loop forever.
+const HOT_SESSION_RETRY_DEADLINE_MS: i64 = 300_000;
 
 /// Convert a delegate-request `timeout_seconds` override (`u64` from
 /// CLI/DTO) to the `i64` representation stored in
@@ -478,6 +490,11 @@ impl SubagentManager {
                 summary: None,
                 usage: TaskUsage::default(),
                 created,
+                queue_reason: Some(if paused {
+                    QueueReason::PressureGatePaused
+                } else {
+                    QueueReason::SubagentBusy
+                }),
             });
         }
 
@@ -527,6 +544,7 @@ impl SubagentManager {
             summary: None,
             usage: TaskUsage::default(),
             created,
+            queue_reason: None,
         })
     }
 
@@ -554,6 +572,54 @@ impl SubagentManager {
                 }
             }
             Err(e) => {
+                // HotSessionLimit is a transient capacity contention
+                // error: all hot sessions were busy and the executor's
+                // in-call retries were exhausted. `execute_task` already
+                // skipped the `failed` write (Phase 4c) — re-queue the task
+                // so the dispatcher can retry when the hot session slot
+                // frees up, bounded by `HOT_SESSION_RETRY_DEADLINE_MS` to
+                // prevent infinite re-queuing. Past the deadline, mark as
+                // `failed` with `error_kind = hot_session_limit`.
+                if let SubagentError::HotSessionLimit { .. } = &e {
+                    let now = busytok_domain::now_ms();
+                    let age_ms = now.saturating_sub(task.created_at_ms);
+                    if age_ms < HOT_SESSION_RETRY_DEADLINE_MS {
+                        info!(
+                            event_code = "subagent.hot_session_limit_requeued",
+                            task_id = %task.id,
+                            subagent_id = %subagent.id,
+                            age_ms,
+                            deadline_ms = HOT_SESSION_RETRY_DEADLINE_MS,
+                            "HotSessionLimit — re-queuing task for dispatcher retry"
+                        );
+                        let db = self.db.lock().expect("subagent db lock poisoned");
+                        let _ = db.subagent_set_task_status_if_not_cancelled(
+                            &task.id,
+                            "queued",
+                            None,
+                            None,
+                        );
+                        return;
+                    }
+                    warn!(
+                        event_code = "subagent.hot_session_limit_deadline_exceeded",
+                        task_id = %task.id,
+                        subagent_id = %subagent.id,
+                        age_ms,
+                        deadline_ms = HOT_SESSION_RETRY_DEADLINE_MS,
+                        "HotSessionLimit deadline exceeded — marking task failed"
+                    );
+                    let db = self.db.lock().expect("subagent db lock poisoned");
+                    let _ = db.subagent_set_task_status_if_not_cancelled(
+                        &task.id,
+                        "failed",
+                        None,
+                        Some(e.to_string()),
+                    );
+                    let _ = db
+                        .subagent_set_task_error_kind(&task.id, Some(TaskErrorKind::HotSessionLimit.as_str()));
+                    return;
+                }
                 warn!(
                     event_code = "subagent.execute_failed",
                     task_id = %task.id,
@@ -724,6 +790,7 @@ impl SubagentManager {
                     summary: Some("cancelled by user".to_string()),
                     created: false,
                     usage: TaskUsage::default(),
+                    queue_reason: None,
                 });
             }
         }
@@ -874,6 +941,7 @@ impl SubagentManager {
                         summary: Some("cancelled by user".to_string()),
                         created: false,
                         usage: TaskUsage::default(),
+                        queue_reason: None,
                     });
                 }
                 exec_result = exec_fut => {
@@ -891,6 +959,16 @@ impl SubagentManager {
         let out = match out {
             Ok(out) => out,
             Err(e) => {
+                // HotSessionLimit is a transient capacity contention error.
+                // Do NOT mark the task as 'failed' here — the caller
+                // (`execute_and_persist`) will re-queue the task so the
+                // dispatcher can retry when the hot session slot frees up.
+                // Returning the error without persisting 'failed' lets the
+                // caller decide whether to re-queue or mark as failed (based
+                // on the task's age deadline).
+                if matches!(e, SubagentError::HotSessionLimit { .. }) {
+                    return Err(e);
+                }
                 // Persist failure state before propagating. The executor
                 // classified the error (auth/rate_limit/network/timeout) and
                 // already killed the worker on auth-fail — but since
@@ -1119,6 +1197,7 @@ impl SubagentManager {
             // `created` is set by the caller (`delegate` or the dispatcher);
             // default to `false` here (the dispatcher path always reuses).
             created: false,
+            queue_reason: None,
         })
     }
 
@@ -1863,9 +1942,10 @@ fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind>
         SubagentError::SidecarIo(_) => Some(TaskErrorKind::Network),
         // Bug 2 fix: SidecarSpawn failure is a crash-class failure.
         SubagentError::SidecarSpawn(_) => Some(TaskErrorKind::Crash),
-        // Bug 2 fix: HotSessionLimit is a contention failure — not a DB
-        // error. Classify as Unknown so error_kind is set (not NULL).
-        SubagentError::HotSessionLimit { .. } => Some(TaskErrorKind::Unknown),
+        // HotSessionLimit is a capacity contention failure. Classified as
+        // its own variant so callers can surface "capacity limit reached"
+        // instead of the generic "unknown".
+        SubagentError::HotSessionLimit { .. } => Some(TaskErrorKind::HotSessionLimit),
         // State divergence (sidecar/DB out of sync) — not retryable as a
         // capacity condition. Classify as Unknown so error_kind is set
         // for observability; the `error` code distinguishes it from
@@ -1956,19 +2036,18 @@ mod tests {
             }),
             Some(TaskErrorKind::Unknown)
         );
-        // Bug 2 fix: HotSessionLimit → Unknown (was None — now classified
-        // so error_kind is set instead of missing).
+        // HotSessionLimit → HotSessionLimit (dedicated variant, not Unknown).
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::HotSessionLimit {
                 candidate: "sess-1".into()
             }),
-            Some(TaskErrorKind::Unknown)
+            Some(TaskErrorKind::HotSessionLimit)
         );
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::HotSessionLimit {
                 candidate: "".into()
             }),
-            Some(TaskErrorKind::Unknown)
+            Some(TaskErrorKind::HotSessionLimit)
         );
         // State divergence (sidecar/DB out of sync) → Unknown. error_kind is
         // set so callers can alert; the `error` code distinguishes it from

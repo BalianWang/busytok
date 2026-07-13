@@ -33,6 +33,20 @@
 #   BUSYTOK_MOCK_NULL_MEMORY_DELTA=1  session.prepare_hibernate returns
 #                                     {"memory_delta":null,...} so the executor
 #                                     skips write_hot_summary.
+#   BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS=1  session.prepare_hibernate removes
+#                                     the session from the mock sidecar's pool
+#                                     before returning (simulates a concurrent
+#                                     evictor's close having already freed the
+#                                     slot). Used with a pre-flipped DB binding
+#                                     (is_hot=0) to test the AlreadyEvicted +
+#                                     retry-succeeds path.
+#   BUSYTOK_MOCK_PREPARE_HIBERNATE_NOT_FOUND=1  session.prepare_hibernate removes
+#                                     the session from the mock pool (if present)
+#                                     and returns SESSION_NOT_FOUND (-32001).
+#                                     Simulates a concurrent evictor having
+#                                     already closed the session — tests the
+#                                     SESSION_NOT_FOUND → AlreadyEvicted path
+#                                     (distinct from the DB is_hot=0 path).
 #   BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE=1  After a successful session.close,
 #                                     the next session.turn_auto returns a
 #                                     JSON-RPC error (-32603). Exercises the
@@ -59,6 +73,30 @@
 #                                success response. Used to test the
 #                                SidecarTaskExecutor auth-fail kill path
 #                                (pool.remove_worker_and_kill).
+#   BUSYTOK_MOCK_REFILL_AFTER_CLOSE=1  After a successful session.close, a
+#                                fake session for a different subagent is
+#                                immediately added to the mock pool. Simulates
+#                                a concurrent task grabbing the freed slot
+#                                before the evictor's retry turn_auto. The
+#                                retry then hits HOT_SESSION_LIMIT_REACHED again
+#                                (with the fake session as candidate), exercising
+#                                the Evicted + retry-hot-limit path.
+#   BUSYTOK_MOCK_REFILL_AFTER_CLOSE_LIMIT=N  When set, limits the number of
+#                                refills to N. After N closes, subsequent
+#                                closes clear all fake refill sessions from
+#                                the pool — the next eviction genuinely frees
+#                                the slot, allowing the task to complete. Used
+#                                by the executor-level test. -1 (default) =
+#                                unlimited refills.
+#   BUSYTOK_MOCK_HOT_LIMIT_RESPONSES=N  Return HOT_SESSION_LIMIT_REACHED for
+#                                the first N turn_auto calls that would
+#                                trigger it, then stop (let the session be
+#                                created). Simulates a concurrent task
+#                                finishing after N hot-limit responses.
+#                                Used by manager/runtime e2e tests to verify
+#                                the running → queued → running → completed
+#                                cycle. -1 (default) = always return
+#                                hot-limit when pool is full.
 set -euo pipefail
 CRASH_AFTER="${BUSYTOK_MOCK_CRASH_AFTER:--1}"
 DELAY_MS="${BUSYTOK_MOCK_DELAY_MS:-0}"
@@ -69,16 +107,25 @@ CLOSE_FAILS="${BUSYTOK_MOCK_CLOSE_FAILS:-0}"
 TURN_STATUS="${BUSYTOK_MOCK_TURN_STATUS:-}"
 PREPARE_HIBERNATE_FAILS="${BUSYTOK_MOCK_PREPARE_HIBERNATE_FAILS:-0}"
 NULL_MEMORY_DELTA="${BUSYTOK_MOCK_NULL_MEMORY_DELTA:-0}"
+PREPARE_HIBERNATE_EVICTS="${BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS:-0}"
+PREPARE_HIBERNATE_NOT_FOUND="${BUSYTOK_MOCK_PREPARE_HIBERNATE_NOT_FOUND:-0}"
 TURN_AUTO_FAILS_AFTER_CLOSE="${BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE:-0}"
 HOT_LIMIT_NO_CANDIDATE="${BUSYTOK_MOCK_HOT_LIMIT_NO_CANDIDATE:-0}"
 HOT_LIMIT_ALL_BUSY="${BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY:-0}"
 MEMORY_UPDATE="${BUSYTOK_MOCK_MEMORY_UPDATE:-0}"
 AUTH_FAIL="${BUSYTOK_MOCK_AUTH_FAIL:-0}"
+REFILL_AFTER_CLOSE="${BUSYTOK_MOCK_REFILL_AFTER_CLOSE:-0}"
+REFILL_AFTER_CLOSE_LIMIT="${BUSYTOK_MOCK_REFILL_AFTER_CLOSE_LIMIT:--1}"
+HOT_LIMIT_RESPONSES="${BUSYTOK_MOCK_HOT_LIMIT_RESPONSES:--1}"
 COUNT=0
 # Number of successful session.close responses sent. Used by
 # BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE to fail the retry turn_auto issued
 # after an eviction close.
 CLOSES=0
+# Number of HOT_SESSION_LIMIT_REACHED responses sent. Used by
+# BUSYTOK_MOCK_HOT_LIMIT_RESPONSES to stop returning hot-limit after N
+# responses (simulating a concurrent task finishing and freeing the slot).
+HOT_LIMIT_COUNT=0
 
 # Track active sessions using parallel indexed arrays (portable to bash 3.2
 # which does NOT support `declare -A`). SUB_IDS[i] maps to SESS_IDS[i].
@@ -186,7 +233,17 @@ while IFS= read -r line; do
           printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"","session_reused":false,"status":"%s","result":{"task_summary":"%s"%s},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$STATUS_OUT" "$COMPACT_CTX" "$MEM_FRAGMENT" "$ID"
         else
           EXISTING_SESS=$(sub_to_sess_lookup "$SUB_ID")
-          if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" ]]; then
+          # When HOT_LIMIT_RESPONSES is set (>= 0), only return hot-limit for
+          # the first N qualifying calls. After N responses, fall through to
+          # the "create new session" branch (simulating the concurrent task
+          # finishing and freeing the slot). This lets manager/runtime e2e
+          # tests verify the running → queued → running → completed cycle.
+          HOT_LIMIT_BUDGET_OK=1
+          if [[ "$HOT_LIMIT_RESPONSES" -ge 0 && "$HOT_LIMIT_COUNT" -ge "$HOT_LIMIT_RESPONSES" ]]; then
+            HOT_LIMIT_BUDGET_OK=0
+          fi
+          if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" && "$HOT_LIMIT_BUDGET_OK" == "1" ]]; then
+            HOT_LIMIT_COUNT=$((HOT_LIMIT_COUNT + 1))
             # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED
             CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
             if [[ "$HOT_LIMIT_NO_CANDIDATE" == "1" ]]; then
@@ -229,14 +286,48 @@ while IFS= read -r line; do
       ;;
     session.prepare_hibernate)
       if [[ "$PREPARE_HIBERNATE_FAILS" == "1" ]]; then
-        # Simulate a sidecar that fails prepare_hibernate — exercises
-        # executor.rs evict_session prepare_hibernate error path (lines 150-156).
-        printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"prepare_hibernate failed: adapter error"},"id":%s}\n' "$ID"
+        # Simulate a sidecar that fails prepare_hibernate with a generic
+        # error (NOT -32001/SESSION_NOT_FOUND, which is now intercepted by
+        # the concurrent-eviction fix as "already evicted"). Using -32050
+        # ensures the error propagates through the generic SidecarError
+        # path, exercising the evict_session prepare_hibernate error path.
+        printf '{"jsonrpc":"2.0","error":{"code":-32050,"message":"prepare_hibernate failed: adapter error"},"id":%s}\n' "$ID"
+      elif [[ "$PREPARE_HIBERNATE_NOT_FOUND" == "1" ]]; then
+        # Simulate a concurrent evictor having already closed the session.
+        # Remove the session from the mock pool (if present) so the retry
+        # turn_auto sees a free slot, then return SESSION_NOT_FOUND (-32001).
+        # The executor's evict_session intercepts -32001 and returns
+        # AlreadyEvicted (distinct from the DB is_hot=0 path).
+        for i in "${!SESS_ORDER[@]}"; do
+          if [[ "${SESS_ORDER[$i]}" == "$SESS_ID_PARAM" ]]; then
+            unset 'SESS_ORDER[i]'
+            SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
+            break
+          fi
+        done
+        sub_to_sess_remove_by_sess "$SESS_ID_PARAM"
+        printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"session not found: %s"},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
       elif [[ "$NULL_MEMORY_DELTA" == "1" ]]; then
         # Return a null memory_delta — exercises executor.rs null-delta skip
         # path (lines 189-190): write_hot_summary is skipped.
         printf '{"jsonrpc":"2.0","result":{"memory_delta":null,"stats":{}},"id":%s}\n' "$ID"
       else
+        # BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS=1: simulate a concurrent
+        # evictor's close having already freed the slot. The session is
+        # removed from the mock pool BEFORE returning the memory delta, so
+        # the retry turn_auto sees a free slot and succeeds. Used with a
+        # pre-flipped DB binding (is_hot=0) to test the AlreadyEvicted +
+        # retry-succeeds path.
+        if [[ "$PREPARE_HIBERNATE_EVICTS" == "1" ]]; then
+          for i in "${!SESS_ORDER[@]}"; do
+            if [[ "${SESS_ORDER[$i]}" == "$SESS_ID_PARAM" ]]; then
+              unset 'SESS_ORDER[i]'
+              SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
+              break
+            fi
+          done
+          sub_to_sess_remove_by_sess "$SESS_ID_PARAM"
+        fi
         printf '{"jsonrpc":"2.0","result":{"memory_delta":{"hot_summary":"hibernated"},"stats":{"adapter_session_id":"%s"}},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
       fi
       ;;
@@ -259,6 +350,39 @@ while IFS= read -r line; do
         # Track successful closes so BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE
         # can fail the retry turn_auto issued after an eviction close.
         CLOSES=$((CLOSES + 1))
+        # BUSYTOK_MOCK_REFILL_AFTER_CLOSE=1: simulate a concurrent task
+        # grabbing the freed slot immediately after close. A fake session
+        # for a different subagent is added to the pool so the next turn_auto
+        # for a NEW subagent sees the pool as full and gets
+        # HOT_SESSION_LIMIT_REACHED again. This exercises the Evicted +
+        # retry-hot-limit path (concurrent slot takeover after eviction).
+        #
+        # BUSYTOK_MOCK_REFILL_AFTER_CLOSE_LIMIT=N: stop refilling after N
+        # closes AND clear all fake refill sessions from the pool. This
+        # simulates the concurrent task finishing and releasing its slot,
+        # so the next eviction genuinely frees the slot and the task can
+        # complete. This lets manager/runtime e2e tests verify the full
+        # running → queued → running → completed cycle under transient
+        # contention. -1 (default) = unlimited refills (never clear).
+        if [[ "$REFILL_AFTER_CLOSE" == "1" ]]; then
+          if [[ "$REFILL_AFTER_CLOSE_LIMIT" -lt 0 ]] || [[ "$CLOSES" -le "$REFILL_AFTER_CLOSE_LIMIT" ]]; then
+            SESS_COUNTER=$((SESS_COUNTER + 1))
+            FAKE_SESS="pi_sess_refill_${SESS_COUNTER}"
+            FAKE_SUB="concurrent_sub_${SESS_COUNTER}"
+            SUB_IDS+=("$FAKE_SUB")
+            SESS_IDS+=("$FAKE_SESS")
+            SESS_ORDER+=("$FAKE_SESS")
+          else
+            # Limit exceeded — simulate the concurrent task finishing by
+            # clearing all fake refill sessions from the pool. The pool
+            # becomes empty, so the next turn_auto creates a new session
+            # and succeeds. (Fake sessions have no DB binding and can't be
+            # evicted by the executor — they MUST be removed here.)
+            SESS_ORDER=()
+            SUB_IDS=()
+            SESS_IDS=()
+          fi
+        fi
         printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
       fi
       ;;

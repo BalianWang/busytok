@@ -1,7 +1,7 @@
 {
   "schema_version": "3",
-  "version": "2026-06-24",
-  "updated": "2026-06-24",
+  "version": "2026-07-13",
+  "updated": "2026-07-13",
   "aliases": {
     "chat-latest": "chat-latest",
     "claude-4.5-haiku": "claude-haiku-4-5-20251001",
@@ -11,8 +11,13 @@
     "claude-4.6-sonnet": "claude-sonnet-4-6",
     "claude-4.7-opus": "claude-opus-4-7",
     "claude-4.8-opus": "claude-opus-4-8",
+    "claude-5-fable": "claude-fable-5",
+    "claude-5-mythos": "claude-mythos-5",
+    "claude-5-sonnet": "claude-sonnet-5",
+    "claude-fable-5": "claude-fable-5",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
     "claude-haiku-4.5": "claude-haiku-4-5-20251001",
+    "claude-mythos-5": "claude-mythos-5",
     "claude-opus-4-5-20251101": "claude-opus-4-5-20251101",
     "claude-opus-4-6": "claude-opus-4-6",
     "claude-opus-4-7": "claude-opus-4-7",
@@ -23,6 +28,7 @@
     "claude-opus-4.8": "claude-opus-4-8",
     "claude-sonnet-4-5-20250929": "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude-sonnet-5": "claude-sonnet-5",
     "claude-sonnet-4.5": "claude-sonnet-4-5-20250929",
     "claude-sonnet-4.6": "claude-sonnet-4-6",
     "codex-gpt-5.3": "gpt-5.3-codex",
@@ -52,6 +58,9 @@
     "gpt-5.5": "gpt-5.5",
     "gpt-5.5-pro": "gpt-5.5-pro",
     "gpt-5.5-turbo": "gpt-5.5",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-sol": "gpt-5.6-sol",
+    "gpt-5.6-terra": "gpt-5.6-terra",
     "kimi-k2.5": "kimi-k2.5",
     "kimi-k2.6": "kimi-k2.6",
     "kimi-k2.7": "kimi-k2.7-code",
@@ -79,6 +88,63 @@
     "zhipu/glm-5.1": "glm-5.1"
   },
   "prices": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "currency": "USD",
+      "effective_date": "2026-07-14",
+      "fast_multiplier": null,
+      "tier_mode": "marginal",
+      "tiers": [
+        {
+          "from_tokens": 0,
+          "input_per_million": 7.0,
+          "output_per_million": 35.0,
+          "cached_input_per_million": 0.7,
+          "cache_write_per_million": 8.75,
+          "cache_storage_per_million_hour": null,
+          "reasoning_per_million": null
+        }
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-mythos-5",
+      "currency": "USD",
+      "effective_date": "2026-07-14",
+      "fast_multiplier": null,
+      "tier_mode": "marginal",
+      "tiers": [
+        {
+          "from_tokens": 0,
+          "input_per_million": 7.0,
+          "output_per_million": 35.0,
+          "cached_input_per_million": 0.7,
+          "cache_write_per_million": 8.75,
+          "cache_storage_per_million_hour": null,
+          "reasoning_per_million": null
+        }
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "currency": "USD",
+      "effective_date": "2026-07-14",
+      "fast_multiplier": null,
+      "tier_mode": "marginal",
+      "tiers": [
+        {
+          "from_tokens": 0,
+          "input_per_million": 2.0,
+          "output_per_million": 10.0,
+          "cached_input_per_million": 0.2,
+          "cache_write_per_million": 2.5,
+          "cache_storage_per_million_hour": null,
+          "reasoning_per_million": null
+        }
+      ]
+    },
     {
       "provider": "anthropic",
       "model": "claude-opus-4-8",
@@ -198,6 +264,63 @@
       "model": "claude-haiku-4-5-20251001",
       "currency": "USD",
       "effective_date": "2025-10-15",
+      "fast_multiplier": null,
+      "tier_mode": "marginal",
+      "tiers": [
+        {
+          "from_tokens": 0,
+          "input_per_million": 1.0,
+          "output_per_million": 5.0,
+          "cached_input_per_million": 0.1,
+          "cache_write_per_million": 1.25,
+          "cache_storage_per_million_hour": null,
+          "reasoning_per_million": null
+        }
+      ]
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "currency": "USD",
+      "effective_date": "2026-07-10",
+      "fast_multiplier": null,
+      "tier_mode": "marginal",
+      "tiers": [
+        {
+          "from_tokens": 0,
+          "input_per_million": 5.0,
+          "output_per_million": 25.0,
+          "cached_input_per_million": 0.5,
+          "cache_write_per_million": 6.25,
+          "cache_storage_per_million_hour": null,
+          "reasoning_per_million": null
+        }
+      ]
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "currency": "USD",
+      "effective_date": "2026-07-10",
+      "fast_multiplier": null,
+      "tier_mode": "marginal",
+      "tiers": [
+        {
+          "from_tokens": 0,
+          "input_per_million": 2.5,
+          "output_per_million": 12.5,
+          "cached_input_per_million": 0.25,
+          "cache_write_per_million": 3.125,
+          "cache_storage_per_million_hour": null,
+          "reasoning_per_million": null
+        }
+      ]
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "currency": "USD",
+      "effective_date": "2026-07-10",
       "fast_multiplier": null,
       "tier_mode": "marginal",
       "tiers": [

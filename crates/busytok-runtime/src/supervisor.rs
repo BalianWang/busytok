@@ -5476,6 +5476,7 @@ impl RuntimeControl for BusytokSupervisor {
                 cost_usd: r.usage.cost_usd,
             },
             created: r.created,
+            queue_reason: r.queue_reason.map(|q| q.as_str().to_string()),
         })
     }
 

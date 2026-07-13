@@ -295,7 +295,14 @@ export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string
  * Whether a new subagent was created (true) or an existing one was
  * reused (false). Lets the caller verify the reuse-policy outcome.
  */
-created: boolean, };
+created: boolean, 
+/**
+ * Why the task was queued (`None` when the task started immediately).
+ * Present only when `status == "queued"`. Lets CLI/automation
+ * distinguish "blocked by pressure gate" (`"pressure_gate_paused"`)
+ * from "subagent busy" (`"subagent_busy"`) without reading logs.
+ */
+queue_reason: string | null, };
 
 export type SubagentResolveRequestDto = { name: string | null, id: string | null, cwd: string | null, };
 

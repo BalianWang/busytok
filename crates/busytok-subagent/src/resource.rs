@@ -177,26 +177,27 @@ impl ResourceMonitor {
         }
     }
 
-    /// System available memory in bytes, with a macOS fallback.
+    /// System available memory in bytes.
     ///
-    /// sysinfo's `available_memory()` returns 0 on some macOS versions (the
-    /// computation via `host_statistics64` breaks silently). Without a
-    /// fallback, the pressure gate spuriously triggers and — because the
-    /// recovery path requires `available >= threshold` — never resumes,
-    /// deadlocking `delegate` until the service is restarted.
+    /// **macOS:** sysinfo's `available_memory()` is unreliable — it returns a
+    /// non-zero but **incorrect** value. Verified on macOS 15 (sysinfo 0.32):
+    /// `available_memory()` returns ~633 MB while the true available is ~5566 MB
+    /// (matching `memory_pressure`'s "59% free"). The existing 0-check fallback
+    /// only covered the "returns 0" case; this non-zero wrong value slipped
+    /// through, causing the pressure gate to spuriously trigger AND never
+    /// recover (recovery requires `available >= threshold`, which never holds
+    /// with the wrong reading). On macOS we ALWAYS use `total - used`, which
+    /// correctly includes inactive + speculative pages that ARE reclaimable.
     ///
-    /// When `available_memory()` is 0 but `total_memory()` / `used_memory()`
-    /// are valid, fall back to `total - used` (≈ free + inactive + speculative,
-    /// the same categories `available` is meant to compute). Both are reliable
-    /// on macOS where `available` is not.
+    /// **Other platforms:** `available_memory()` is reliable when non-zero
+    /// (Linux reads `/proc/meminfo`'s `MemAvailable`). Fall back to
+    /// `total - used` only when it returns 0.
     fn available_bytes(&self) -> u64 {
-        let available = self.system.available_memory();
-        if available > 0 {
-            return available;
-        }
-        self.system
-            .total_memory()
-            .saturating_sub(self.system.used_memory())
+        choose_available_bytes(
+            self.system.available_memory(),
+            self.system.total_memory(),
+            self.system.used_memory(),
+        )
     }
 
     /// The configured sampling interval (spec §8.2). Read by the supervision
@@ -259,4 +260,116 @@ impl ResourceMonitor {
 /// Convert bytes (sysinfo's `u64` memory) to megabytes as `f64`.
 fn bytes_to_mb(bytes: u64) -> f64 {
     (bytes as f64) / (1024.0 * 1024.0)
+}
+
+/// Pure decision function: choose which memory value to use as "available".
+///
+/// Extracted from `available_bytes()` so the platform-specific logic is
+/// unit-testable without a live `sysinfo::System`. See `available_bytes()`
+/// doc comment for the macOS rationale (sysinfo returns non-zero but wrong).
+///
+/// On macOS, always returns `total - used` (includes inactive + speculative
+/// pages that ARE reclaimable, matching `memory_pressure`'s "free percentage").
+/// On other platforms, returns `available` when non-zero (Linux
+/// `/proc/meminfo`'s `MemAvailable`), falling back to `total - used` when 0.
+fn choose_available_bytes(available: u64, total: u64, used: u64) -> u64 {
+    // On macOS, sysinfo's `available_memory()` is unreliable (returns a
+    // non-zero but incorrect value). Always use `total - used`, which
+    // correctly accounts for reclaimable inactive + speculative pages.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = available; // unused on macOS
+        total.saturating_sub(used)
+    }
+    // On other platforms, `available_memory()` is reliable when non-zero.
+    // Fall back to `total - used` only when it returns 0.
+    #[cfg(not(target_os = "macos"))]
+    {
+        if available > 0 {
+            available
+        } else {
+            total.saturating_sub(used)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_available_bytes;
+
+    #[test]
+    fn choose_available_bytes_macos_ignores_available_uses_total_minus_used() {
+        // On macOS, sysinfo's `available_memory()` returns a non-zero but
+        // INCORRECT value (verified: 633 MB when real available is ~5566 MB).
+        // The function must ALWAYS return `total - used` on macOS, ignoring
+        // the bogus `available` value — even when it's non-zero.
+        //
+        // This is the root-cause regression test for the macOS pressure-gate
+        // false-positive bug: the old 0-check fallback let the wrong non-zero
+        // value through, causing spurious `memory_pressure` events that
+        // never recovered (recovery requires available >= threshold).
+        #[cfg(target_os = "macos")]
+        {
+            // Real values from the diagnostic on macOS 15, sysinfo 0.32:
+            let available_wrong = 633 * 1024 * 1024; // sysinfo's bogus value
+            let total = 16384 * 1024 * 1024; // 16 GB
+            let used = 10818 * 1024 * 1024;
+            let result = choose_available_bytes(available_wrong, total, used);
+            assert_eq!(
+                result,
+                total - used,
+                "on macOS, must use total - used (={}), not the bogus available (={})",
+                (total - used) / 1024 / 1024,
+                available_wrong / 1024 / 1024
+            );
+            // 5566 MB, NOT 633 MB
+            assert_eq!(result / 1024 / 1024, 5566);
+        }
+    }
+
+    #[test]
+    fn choose_available_bytes_non_macos_uses_available_when_nonzero() {
+        // On non-macOS, `available_memory()` is reliable when non-zero.
+        // The function should return it directly.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let available = 4096 * 1024 * 1024;
+            let total = 16384 * 1024 * 1024;
+            let used = 8000 * 1024 * 1024;
+            let result = choose_available_bytes(available, total, used);
+            assert_eq!(
+                result, available,
+                "on non-macOS, must use `available` when non-zero"
+            );
+        }
+    }
+
+    #[test]
+    fn choose_available_bytes_non_macos_falls_back_when_zero() {
+        // On non-macOS, when `available_memory()` returns 0 (some CI
+        // runners / containers), fall back to `total - used`.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let available = 0;
+            let total = 16384 * 1024 * 1024;
+            let used = 8000 * 1024 * 1024;
+            let result = choose_available_bytes(available, total, used);
+            assert_eq!(
+                result,
+                total - used,
+                "on non-macOS with available=0, must fall back to total - used"
+            );
+        }
+    }
+
+    #[test]
+    fn choose_available_bytes_handles_used_exceeding_total() {
+        // Defensive: `saturating_sub` must return 0 (not panic) if used > total.
+        // In practice this shouldn't happen, but the function must not overflow.
+        let available = 0;
+        let total = 4096 * 1024 * 1024;
+        let used = 8192 * 1024 * 1024; // exceeds total
+        let result = choose_available_bytes(available, total, used);
+        assert_eq!(result, 0, "saturating_sub must clamp to 0");
+    }
 }

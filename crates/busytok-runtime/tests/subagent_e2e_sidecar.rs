@@ -939,6 +939,192 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     supervisor.shutdown_writer().await.unwrap();
 }
 
+/// Regression (P0, manager/runtime level): when the hot session pool is
+/// full (simulated by `BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY=1`), the task must be
+/// re-queued (status flips `running → queued`) with `error_kind` staying
+/// `None` — NOT marked as `failed` with `error_kind = "unknown"`.
+///
+/// This test exercises the real sidecar subprocess path (not a mock
+/// executor) and verifies the full `running → queued → running → completed`
+/// cycle under transient capacity contention. It complements the
+/// executor-level test `executor_evicted_retry_hot_limit_surfaces_transient`
+/// which only verifies the executor returns `SubagentError::HotSessionLimit`.
+///
+/// Setup:
+/// - `max_hot_sessions = 1`: only one hot session at a time.
+/// - `BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY=1`: when the pool is full, return
+///   HOT_SESSION_LIMIT_REACHED with `all_busy=true` (no candidate). The
+///   executor skips eviction and retries with backoff
+///   (ALL_BUSY_MAX_RETRIES × ALL_BUSY_BACKOFF ≈ 5s), then surfaces
+///   `SubagentError::HotSessionLimit` → `execute_and_persist` re-queues.
+/// - `BUSYTOK_MOCK_HOT_LIMIT_RESPONSES=N`: after N hot-limit responses,
+///   the mock stops returning hot-limit and lets the session be created.
+///   This simulates the concurrent task finishing and freeing the slot,
+///   bounding the test (no infinite re-queue loop).
+///
+/// Expected flow:
+/// 1. First delegate (sub-a) succeeds — fills the hot session slot.
+/// 2. Second delegate (sub-b) hits AllBusy → executor retries 10x (5s) →
+///    HotSessionLimit → `execute_and_persist` re-queues the task.
+/// 3. Dispatcher picks up the queued task → retries → after the hot-limit
+///    response budget is exhausted, the mock lets the session be created →
+///    task completes.
+///
+/// Assertions:
+/// - Task `sub-b` must pass through `queued` state at least once.
+/// - While `queued`, `error_kind` must be `None` (not "unknown", not
+///   "hot_session_limit" — those are terminal failure states).
+/// - Final status must be `completed` (not `failed`).
+/// - Final `error_kind` must be `None`.
+#[tokio::test]
+#[serial]
+async fn sidecar_e2e_evicted_retry_hot_limit_requeues_then_completes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let paths = BusytokPaths::for_test(tmp.path());
+    let (mut settings, seeds) = make_sidecar_settings();
+    settings.subagent.pi_sidecar.max_hot_sessions = 1;
+    seed_test_providers(&db, &seeds);
+    settings
+        .save_to_file(&paths.config_dir().join("settings.toml"))
+        .expect("failed to save test settings");
+
+    let mut cfg = make_sidecar_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY".into(), "1".into());
+    // After 25 hot-limit responses, the mock stops returning hot-limit and
+    // lets the session be created. This simulates the concurrent task
+    // finishing and freeing the slot, bounding the test. Each executor
+    // attempt uses 10 hot-limit responses (ALL_BUSY_MAX_RETRIES=10), so 25
+    // responses covers 2 full attempts + a partial 3rd that succeeds.
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_LIMIT_RESPONSES".into(), "25".into());
+    let supervisor = BusytokSupervisor::new_with_sidecar_config(db, paths, cfg);
+
+    // 1. First delegate — fills the pool.
+    let resp1 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "matrix-a".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do 1".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp1.status, "running");
+    let final_status1 =
+        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    assert_eq!(final_status1, "completed", "first task must complete");
+
+    // 2. Second delegate — triggers eviction → refill → HotSessionLimit →
+    //    re-queue → retry → eviction succeeds → completed.
+    let resp2 = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "matrix-b".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do 2".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: Some("test-provider".to_string()),
+            bound_model_id: Some("test-model".to_string()),
+            reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp2.status, "running");
+
+    // 3. Poll the task row, recording every status transition. The task
+    //    MUST pass through `queued` at least once (proving the re-queue
+    //    path was taken, not the terminal `failed` path). While `queued`,
+    //    `error_kind` MUST be `None`.
+    let mut saw_queued = false;
+    let mut saw_queued_with_error_kind = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let final_status: String;
+    let final_error_kind: Option<String>;
+    let mut prev_status = String::new();
+    loop {
+        let snap = {
+            let db_guard = supervisor.db_handle().lock().unwrap();
+            db_guard
+                .subagent_get_task(&resp2.task_id)
+                .ok()
+                .flatten()
+                .map(|t| (t.status, t.error_kind))
+        };
+        if let Some((status, error_kind)) = snap {
+            if status != prev_status {
+                // Status transition detected — log it for debugging.
+                eprintln!("task {} transition: {} → {}", resp2.task_id, prev_status, status);
+                prev_status = status.clone();
+            }
+            if status == "queued" {
+                saw_queued = true;
+                if error_kind.is_some() {
+                    saw_queued_with_error_kind = true;
+                    eprintln!(
+                        "ERROR: task was queued with error_kind={:?} (must be None)",
+                        error_kind
+                    );
+                }
+            }
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                final_status = status;
+                final_error_kind = error_kind;
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "task {} did not reach terminal status within 30s (last status: {})",
+                resp2.task_id, prev_status
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // 4. Assertions.
+    assert!(
+        saw_queued,
+        "task must pass through 'queued' state (re-queue path), \
+         final status: {final_status}"
+    );
+    assert!(
+        !saw_queued_with_error_kind,
+        "task must NOT have error_kind set while queued (must stay None)"
+    );
+    assert_eq!(
+        final_status, "completed",
+        "task must eventually complete after re-queue + retry"
+    );
+    assert!(
+        final_error_kind.is_none(),
+        "completed task must have error_kind = None, got: {final_error_kind:?}"
+    );
+
+    supervisor.shutdown_sidecar().await;
+    supervisor.shutdown_writer().await.unwrap();
+}
+
 // --- doctor via settings.diagnostics (Plan 5 Task 3, spec §7.1 + §7.3) ---
 //
 // Verifies that the EXISTING settings.diagnostics RPC path now includes

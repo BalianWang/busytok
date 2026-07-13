@@ -1423,6 +1423,12 @@ pub struct SubagentDelegateResponseDto {
     /// reused (false). Lets the caller verify the reuse-policy outcome.
     #[serde(default)]
     pub created: bool,
+    /// Why the task was queued (`None` when the task started immediately).
+    /// Present only when `status == "queued"`. Lets CLI/automation
+    /// distinguish "blocked by pressure gate" (`"pressure_gate_paused"`)
+    /// from "subagent busy" (`"subagent_busy"`) without reading logs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub queue_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]

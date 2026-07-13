@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use busytok_config::SubagentSettings;
 use busytok_subagent::mock_executor::{ExecutorInput, ExecutorOutput, TaskExecutor};
-use busytok_subagent::models::{DelegateRequest, TaskStatus};
+use busytok_subagent::models::{DelegateRequest, QueueReason, TaskStatus};
 use busytok_subagent::pressure::{PressureAction, PressureGate};
 use busytok_subagent::SubagentManager;
 
@@ -136,6 +136,12 @@ async fn delegate_returns_queued_when_gate_paused() {
         result.status,
         TaskStatus::Queued,
         "delegate must return Queued when gate is paused"
+    );
+    assert_eq!(
+        result.queue_reason,
+        Some(QueueReason::PressureGatePaused),
+        "queued-via-pressure-gate task must carry queue_reason = PressureGatePaused, got: {:?}",
+        result.queue_reason
     );
     assert!(result.summary.is_none(), "queued task has no summary yet");
 
@@ -444,6 +450,12 @@ async fn delegate_queues_when_subagent_already_running() {
         "second task must be queued — subagent was busy (spec §6.4)"
     );
     assert_eq!(
+        r2.queue_reason,
+        Some(QueueReason::SubagentBusy),
+        "queued-via-subagent-busy task must carry queue_reason = SubagentBusy, got: {:?}",
+        r2.queue_reason
+    );
+    assert_eq!(
         r1.subagent_id, r2.subagent_id,
         "both tasks target the same subagent"
     );
@@ -580,4 +592,281 @@ async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
         Some("sub123/task456/prompt.txt"),
         "ExecutorInput must preserve prompt_artifact_ref"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HotSessionLimit re-queue regression (P0 fix):
+// When two different subagents compete for the global hot session limit,
+// the task that hits HotSessionLimit must be RE-QUEUED (not failed).
+// Root cause: `execute_and_persist` treated ALL errors as terminal `failed`,
+// including transient HotSessionLimit capacity contention. Fix: re-queue
+// the task (flip status back to `queued`) when within deadline; mark `failed`
+// with `error_kind = hot_session_limit` only after deadline is exceeded.
+// ---------------------------------------------------------------------------
+
+/// Mock executor that always returns `SubagentError::HotSessionLimit`.
+/// Simulates the capacity contention that occurs when a different subagent
+/// is holding the only hot session slot and retries are exhausted.
+struct HotSessionLimitExecutor;
+
+#[async_trait]
+impl TaskExecutor for HotSessionLimitExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        Err(anyhow::Error::from(
+            busytok_subagent::SubagentError::HotSessionLimit {
+                candidate: String::new(),
+            },
+        ))
+    }
+}
+
+/// Mock executor that returns `HotSessionLimit` for the first `fail_count`
+/// invocations, then succeeds. Simulates a hot session slot freeing up after
+/// a concurrent task completes.
+struct FlakeyHotSessionExecutor {
+    call_count: Arc<std::sync::atomic::AtomicU32>,
+    fail_count: u32,
+}
+
+#[async_trait]
+impl TaskExecutor for FlakeyHotSessionExecutor {
+    async fn execute(&self, _input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        let n = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n < self.fail_count {
+            return Err(anyhow::Error::from(
+                busytok_subagent::SubagentError::HotSessionLimit {
+                    candidate: String::new(),
+                },
+            ));
+        }
+        Ok(ExecutorOutput {
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Completed,
+            summary: "done after retry".into(),
+            usage: Default::default(),
+            memory_update: Default::default(),
+            error_kind: None,
+        })
+    }
+}
+
+/// Helper: poll a task's (status, error_kind, error) until it reaches a
+/// terminal state or timeout. Returns the final tuple.
+async fn await_task_terminal(
+    db: &Arc<Mutex<busytok_store::Database>>,
+    subagent_id: &str,
+    task_id: &str,
+) -> (String, Option<String>, Option<String>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snap = {
+            let db = db.lock().unwrap();
+            db.subagent_list_tasks(subagent_id, 10)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == task_id)
+                .map(|t| (t.status, t.error_kind, t.error))
+        };
+        if let Some((ref status, _, _)) = snap {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return snap.unwrap();
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 10s (last: {snap:?})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Regression (P0): when `execute_task` returns `HotSessionLimit`, the task
+/// must be re-queued (status flips back to "queued") — NOT marked as "failed".
+/// This is the core fix for the bug where concurrent different-subagent tasks
+/// cause one to fail with "hot session limit reached" instead of
+/// waiting/retrying/re-queuing.
+#[tokio::test]
+async fn hot_session_limit_requeues_task_within_deadline() {
+    let db = test_db();
+    let settings = SubagentSettings::default();
+    let executor = Arc::new(HotSessionLimitExecutor) as Arc<dyn TaskExecutor>;
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
+
+    // delegate() inserts as "running" + spawns background execute_and_persist.
+    let result = manager.delegate(req("hot-limit-sub", "do work")).await.unwrap();
+    assert_eq!(result.status, TaskStatus::Running);
+
+    // Poll for up to 5s for the task to be re-queued (status = "queued").
+    // The background executor returns HotSessionLimit immediately, so
+    // execute_and_persist should flip it to "queued" within milliseconds.
+    let mut requeued = false;
+    for _ in 0..100 {
+        let snap = {
+            let db = db.lock().unwrap();
+            db.subagent_list_tasks(&result.subagent_id, 10)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == result.task_id)
+                .map(|t| (t.status, t.error_kind))
+        };
+        if let Some((status, error_kind)) = snap {
+            if status == "queued" {
+                assert!(
+                    error_kind.is_none(),
+                    "re-queued task must NOT have error_kind set, got: {error_kind:?}"
+                );
+                requeued = true;
+                break;
+            }
+            if status == "failed" {
+                panic!(
+                    "task was marked failed instead of re-queued — HotSessionLimit regression. \
+                     error_kind: {error_kind:?}"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        requeued,
+        "task must be re-queued after HotSessionLimit (not failed)"
+    );
+}
+
+/// Regression (P0): when the task exceeds the re-queue deadline
+/// (`HOT_SESSION_RETRY_DEADLINE_MS`), `execute_and_persist` must mark it as
+/// "failed" with `error_kind = "hot_session_limit"` — NOT `"unknown"` and NOT
+/// infinite re-queuing. This addresses the `error_kind = "unknown"` issue
+/// in the bug report.
+#[tokio::test]
+async fn hot_session_limit_marks_failed_after_deadline() {
+    let db = test_db();
+    let settings = SubagentSettings::default();
+    let executor = Arc::new(HotSessionLimitExecutor) as Arc<dyn TaskExecutor>;
+    let gate = Arc::new(PressureGate::new());
+    gate.set_action(PressureAction::PauseNewTasks);
+    let manager = Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        Some(Arc::clone(&gate)),
+    ));
+
+    // Queue a task while the gate is paused.
+    let result = manager
+        .delegate(req("hot-limit-deadline-sub", "do work"))
+        .await
+        .unwrap();
+    assert_eq!(result.status, TaskStatus::Queued);
+
+    // Age the task beyond the re-queue deadline so the next
+    // execute_and_persist cycle will hit the deadline-exceeded path.
+    // HOT_SESSION_RETRY_DEADLINE_MS = 300_000 (5 min); set created_at_ms to
+    // 400_000ms in the past so age_ms > deadline.
+    {
+        let db = db.lock().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE subagent_tasks SET created_at_ms = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    busytok_domain::now_ms() - 400_000,
+                    result.task_id,
+                ],
+            )
+            .unwrap();
+    }
+
+    // Start the dispatcher + clear the gate.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(shutdown_rx);
+    gate.set_action(PressureAction::Resume);
+
+    // Poll for up to 10s for the task to be marked failed.
+    let (status, error_kind, error) =
+        await_task_terminal(&db, &result.subagent_id, &result.task_id).await;
+
+    assert_eq!(status, "failed", "deadline-exceeded task must be marked failed");
+    assert_eq!(
+        error_kind.as_deref(),
+        Some("hot_session_limit"),
+        "error_kind must be 'hot_session_limit' (not 'unknown'), got: {error_kind:?}"
+    );
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or("")
+            .contains("hot session limit"),
+        "error message must mention hot session limit, got: {error:?}"
+    );
+
+    // Deterministic shutdown.
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+}
+
+/// Regression (P0): full re-queue → retry → success cycle. When the hot
+/// session slot frees up (simulated by a flaky executor that fails N times
+/// then succeeds), the re-queued task must eventually complete — NOT remain
+/// stuck in re-queue loops or fail.
+///
+/// This mirrors the user's expected behavior: "一边运行、另一边进入可观测的
+/// queued / 等待态" then "两边都完成" when the slot frees up.
+#[tokio::test]
+async fn hot_session_limit_requeue_then_succeeds_when_slot_frees() {
+    let db = test_db();
+    let settings = SubagentSettings::default();
+    let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let executor = Arc::new(FlakeyHotSessionExecutor {
+        call_count: Arc::clone(&call_count),
+        fail_count: 2,
+    }) as Arc<dyn TaskExecutor>;
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
+
+    // Start the dispatcher so re-queued tasks get picked up automatically.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = manager.clone().spawn_task_dispatcher(shutdown_rx);
+
+    // delegate() → running → HotSessionLimit → re-queue → running →
+    // HotSessionLimit → re-queue → running → success → completed.
+    let result = manager
+        .delegate(req("hot-limit-flakey-sub", "do work"))
+        .await
+        .unwrap();
+
+    let (status, error_kind, _) =
+        await_task_terminal(&db, &result.subagent_id, &result.task_id).await;
+
+    assert_eq!(
+        status, "completed",
+        "task must eventually complete after re-queue retries — got status: {status}"
+    );
+    assert!(
+        error_kind.is_none(),
+        "completed task must have no error_kind, got: {error_kind:?}"
+    );
+    // Executor was called 3 times: 2 failures + 1 success.
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "executor called 3 times (2 HotSessionLimit + 1 success)"
+    );
+
+    // Deterministic shutdown.
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
 }

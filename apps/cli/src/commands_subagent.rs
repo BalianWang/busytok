@@ -1264,6 +1264,7 @@ mod tests {
                     summary: Some("did the thing".to_string()),
                     usage: SubagentUsageDto::default(),
                     created: true,
+                    queue_reason: None,
                 },
                 list_response: SubagentListResponseDto {
                     subagents: vec![SubagentDetailDto {

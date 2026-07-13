@@ -451,12 +451,20 @@ impl WorkerPool {
     ///
     /// **Routing strategy:** the binding schema (`subagent_harness_bindings`)
     /// stores `harness` but NOT `provider_id`. So we iterate the pool's
-    /// supervisors and query `find_hot_binding_by_session` for each
-    /// supervisor's `harness_name`. The first match wins. Since all current
-    /// providers use `harness_name = "pi"`, the first supervisor with a
-    /// matching harness is returned. This is O(n) in the number of
+    /// supervisors and query `find_binding_by_session` (no `is_hot` filter)
+    /// for each supervisor's `harness_name`. The first match wins. Since all
+    /// current providers use `harness_name = "pi"`, the first supervisor
+    /// with a matching harness is returned. This is O(n) in the number of
     /// providers (small — typically 1-3) and avoids a schema migration to
     /// add `provider_id` to the binding table.
+    ///
+    /// **Why not `find_hot_binding_by_session`?** A concurrent evictor may
+    /// have already flipped the binding to `is_hot=0` (Bug 1 race). The
+    /// supervisor that owns the session is the same regardless of the
+    /// binding's hot/cold state — using the non-hot query lets us route
+    /// `prepare_hibernate` / `close` RPCs correctly even after the flip.
+    /// If the session was already closed, `prepare_hibernate` returns
+    /// `SESSION_NOT_FOUND` and `evict_session` returns `AlreadyEvicted`.
     pub fn supervisor_for_session(
         &self,
         adapter_session_id: &str,
@@ -489,7 +497,7 @@ impl WorkerPool {
         let db = db.lock().expect("db lock poisoned");
         for (pid, sup, harness) in &candidates {
             if let Ok(Some(_binding)) =
-                db.subagent_find_hot_binding_by_session(adapter_session_id, harness)
+                db.subagent_find_binding_by_session(adapter_session_id, harness)
             {
                 return Some((pid.clone(), Arc::clone(sup)));
             }

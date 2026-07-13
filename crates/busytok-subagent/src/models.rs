@@ -184,6 +184,34 @@ pub struct TaskUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// Why a task was placed in `queued` status instead of starting immediately.
+///
+/// Surfaced on `DelegateResult` so external orchestrators (CLI, automation
+/// scripts) can distinguish "gate paused" from "subagent busy" without
+/// guessing from logs. `None` when the task started immediately (`running`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueReason {
+    /// The pressure gate is paused (memory pressure or sidecar RSS limit).
+    /// The task will start automatically when the gate clears and the
+    /// subagent is free.
+    PressureGatePaused,
+    /// The subagent already has a running task. The queued task will start
+    /// after the current one completes (per-subagent FIFO).
+    SubagentBusy,
+}
+
+impl QueueReason {
+    /// Stable string representation for the IPC/DTO boundary.
+    /// Mirrors `#[serde(rename_all = "snake_case")]` — keep in sync.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueueReason::PressureGatePaused => "pressure_gate_paused",
+            QueueReason::SubagentBusy => "subagent_busy",
+        }
+    }
+}
+
 /// The result of a `delegate` call.
 #[derive(Debug, Clone, Serialize)]
 pub struct DelegateResult {
@@ -202,6 +230,11 @@ pub struct DelegateResult {
     /// reused (false). Surfaced on the response DTO so callers can verify
     /// the reuse-policy outcome.
     pub created: bool,
+    /// Why the task was queued (`None` when the task started immediately).
+    /// Present only when `status == Queued`. Lets CLI/automation distinguish
+    /// "blocked by pressure gate" from "subagent busy" without reading logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_reason: Option<QueueReason>,
 }
 
 /// Classification of task failures (Task 1 / Phase 3). Used by Task 3's
@@ -223,6 +256,11 @@ pub enum TaskErrorKind {
     Timeout,
     Crash,
     Network,
+    /// Hot session capacity contention — all hot sessions were busy
+    /// and retries/re-queues were exhausted. Distinguished from `Unknown`
+    /// so callers can surface "capacity limit reached" instead of a
+    /// generic failure.
+    HotSessionLimit,
     Unknown,
 }
 
@@ -238,6 +276,7 @@ impl TaskErrorKind {
             TaskErrorKind::Timeout => "timeout",
             TaskErrorKind::Crash => "crash",
             TaskErrorKind::Network => "network",
+            TaskErrorKind::HotSessionLimit => "hot_session_limit",
             TaskErrorKind::Unknown => "unknown",
         }
     }
@@ -268,6 +307,44 @@ mod tests {
         }
     }
 
+    /// `QueueReason` serializes to stable `snake_case` strings for the IPC
+    /// contract (CLI output, Tauri command results). Mirrors the
+    /// `task_error_kind_serializes_snake_case` pattern. `QueueReason` is
+    /// `Serialize`-only (output field), so no round-trip test.
+    #[test]
+    fn queue_reason_serializes_snake_case() {
+        let cases = [
+            (QueueReason::PressureGatePaused, "\"pressure_gate_paused\""),
+            (QueueReason::SubagentBusy, "\"subagent_busy\""),
+        ];
+        for (reason, expected) in cases {
+            let s = serde_json::to_string(&reason).unwrap();
+            assert_eq!(s, expected, "serialize mismatch for {reason:?}");
+        }
+    }
+
+    /// `as_str()` must return the same string serde emits (without quotes).
+    /// The DTO boundary in `supervisor.rs` uses `as_str()` — NOT serde — to
+    /// convert `QueueReason` to a string for `SubagentDelegateResponseDto`.
+    /// If `as_str()` and serde diverge, the JSON output would carry a
+    /// different string than the DB-persisted value. This cross-check catches
+    /// that drift for both variants. Mirrors `task_error_kind_as_str_matches_serde`.
+    #[test]
+    fn queue_reason_as_str_matches_serde() {
+        let cases = [
+            (QueueReason::PressureGatePaused, "pressure_gate_paused"),
+            (QueueReason::SubagentBusy, "subagent_busy"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected, "as_str mismatch for {reason:?}");
+            // Cross-check: as_str() must equal the serde serialization
+            // (without the surrounding quotes).
+            let serde = serde_json::to_string(&reason).unwrap();
+            let stripped = serde.trim_matches('"');
+            assert_eq!(reason.as_str(), stripped, "as_str != serde for {reason:?}");
+        }
+    }
+
     /// All variants are constructible and comparable — Task 3's error
     /// classifier will `match` on this enum, so variant equality matters.
     #[test]
@@ -278,6 +355,7 @@ mod tests {
             TaskErrorKind::Timeout,
             TaskErrorKind::Crash,
             TaskErrorKind::Network,
+            TaskErrorKind::HotSessionLimit,
             TaskErrorKind::Unknown,
         ];
         for (i, a) in all.iter().enumerate() {
@@ -303,6 +381,7 @@ mod tests {
             (TaskErrorKind::Timeout, "timeout"),
             (TaskErrorKind::Crash, "crash"),
             (TaskErrorKind::Network, "network"),
+            (TaskErrorKind::HotSessionLimit, "hot_session_limit"),
             (TaskErrorKind::Unknown, "unknown"),
         ];
         for (kind, expected) in cases {

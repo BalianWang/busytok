@@ -30,7 +30,7 @@ That can cause false failures, state corruption, misleading results, or accident
 
 ### 2.1 Why conflict happens
 
-By default, Busytok resolves paths from standard XDG directories under the `busytok` app name. That means the source build and the installed release will use the same locations unless explicitly isolated.
+By default, Busytok resolves paths from platform-standard directories under the `busytok` app name. On Linux these are XDG directories (`$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`, `$XDG_RUNTIME_DIR`); on macOS the `dirs` crate uses `~/Library/Application Support` and `~/.config` — and **ignores `XDG_*` env vars**. That means the source build and the installed release will use the same locations unless explicitly isolated via the `BUSYTOK_*` env vars.
 
 Shared defaults include:
 
@@ -46,7 +46,7 @@ For all source-based testing in this document:
 
 - run the source-built `busytok-service`
 - run the source-built `busytok` CLI
-- use dedicated temporary XDG directories
+- use dedicated temporary `BUSYTOK_*` directories (see §3.2) — `XDG_*` env vars do NOT work reliably on macOS
 - do not use the installed release binary for functional verification of this branch
 
 ### 2.3 Industry best practice
@@ -73,36 +73,38 @@ Run all source-build commands from:
 
 ### 3.2 Required shell environment
 
-Use an isolated environment root:
+Use an isolated environment root. The `BUSYTOK_*` env vars override the platform-default directories on **all** platforms (Linux, macOS, Windows). Each value is used as-is — no `busytok` app-name suffix is appended:
 
 ```bash
 export BUSYTOK_DEV_ROOT=/tmp/busytok-subagent-dev
 rm -rf "$BUSYTOK_DEV_ROOT"
 mkdir -p "$BUSYTOK_DEV_ROOT"/{data,config,runtime,logs}
 
-export XDG_DATA_HOME="$BUSYTOK_DEV_ROOT/data"
-export XDG_CONFIG_HOME="$BUSYTOK_DEV_ROOT/config"
-export XDG_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
+export BUSYTOK_DATA_DIR="$BUSYTOK_DEV_ROOT/data"
+export BUSYTOK_CONFIG_DIR="$BUSYTOK_DEV_ROOT/config"
+export BUSYTOK_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
 export BUSYTOK_LOG_DIR="$BUSYTOK_DEV_ROOT/logs"
 ```
 
+> **Why not `XDG_*`?** On macOS the `dirs` crate ignores `XDG_DATA_HOME` / `XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR` and resolves to `~/Library/Application Support` etc. Source-built services would then write into the installed release's data directory. The `BUSYTOK_*` vars bypass `dirs` entirely, providing reliable isolation on every platform.
+
 ### 3.3 Optional safety step
 
-If the installed release service is running, stop it before manual testing. This is not strictly required when the XDG environment is isolated, but it reduces operator confusion.
+If the installed release service is running, stop it before manual testing. This is not strictly required when the `BUSYTOK_*` environment is isolated, but it reduces operator confusion.
 
 ### 3.4 Verification that isolation is active
 
 Before running tests, confirm:
 
-- `$XDG_DATA_HOME` points to `/tmp/busytok-subagent-dev/data`
-- `$XDG_CONFIG_HOME` points to `/tmp/busytok-subagent-dev/config`
-- `$XDG_RUNTIME_DIR` points to `/tmp/busytok-subagent-dev/runtime`
+- `$BUSYTOK_DATA_DIR` points to `/tmp/busytok-subagent-dev/data`
+- `$BUSYTOK_CONFIG_DIR` points to `/tmp/busytok-subagent-dev/config`
+- `$BUSYTOK_RUNTIME_DIR` points to `/tmp/busytok-subagent-dev/runtime`
 - `$BUSYTOK_LOG_DIR` points to `/tmp/busytok-subagent-dev/logs`
 
 Expected isolated artifacts during testing:
 
-- DB: `/tmp/busytok-subagent-dev/data/busytok/busytok.db`
-- socket: `/tmp/busytok-subagent-dev/runtime/busytok/busytok.sock`
+- DB: `/tmp/busytok-subagent-dev/data/busytok.db`
+- socket: `/tmp/busytok-subagent-dev/runtime/busytok.sock`
 - logs: `/tmp/busytok-subagent-dev/logs`
 
 ### 3.5 Settings file location
@@ -110,13 +112,13 @@ Expected isolated artifacts during testing:
 The source-build service reads settings from:
 
 ```bash
-$XDG_CONFIG_HOME/busytok/settings.toml
+$BUSYTOK_CONFIG_DIR/settings.toml
 ```
 
 With the recommended isolated environment, that becomes:
 
 ```bash
-/tmp/busytok-subagent-dev/config/busytok/settings.toml
+/tmp/busytok-subagent-dev/config/settings.toml
 ```
 
 ### 3.6 Switching between mock and real sidecar modes
@@ -209,9 +211,9 @@ Start the source service in one terminal:
 cd /Users/wsd/Data/Busytok/busytok/.worktrees/feat-subagent-foundation
 
 export BUSYTOK_DEV_ROOT=/tmp/busytok-subagent-dev
-export XDG_DATA_HOME="$BUSYTOK_DEV_ROOT/data"
-export XDG_CONFIG_HOME="$BUSYTOK_DEV_ROOT/config"
-export XDG_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
+export BUSYTOK_DATA_DIR="$BUSYTOK_DEV_ROOT/data"
+export BUSYTOK_CONFIG_DIR="$BUSYTOK_DEV_ROOT/config"
+export BUSYTOK_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
 export BUSYTOK_LOG_DIR="$BUSYTOK_DEV_ROOT/logs"
 
 cargo run -p busytok-service
@@ -223,9 +225,9 @@ Use a second terminal for CLI verification:
 cd /Users/wsd/Data/Busytok/busytok/.worktrees/feat-subagent-foundation
 
 export BUSYTOK_DEV_ROOT=/tmp/busytok-subagent-dev
-export XDG_DATA_HOME="$BUSYTOK_DEV_ROOT/data"
-export XDG_CONFIG_HOME="$BUSYTOK_DEV_ROOT/config"
-export XDG_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
+export BUSYTOK_DATA_DIR="$BUSYTOK_DEV_ROOT/data"
+export BUSYTOK_CONFIG_DIR="$BUSYTOK_DEV_ROOT/config"
+export BUSYTOK_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
 export BUSYTOK_LOG_DIR="$BUSYTOK_DEV_ROOT/logs"
 ```
 
@@ -595,7 +597,7 @@ If a test fails, capture:
 - full stdout / stderr
 - relevant log slice around the same timestamp
 - whether sidecar was enabled or disabled
-- whether the test was running under isolated XDG env
+- whether the test was running under isolated `BUSYTOK_*` env
 
 ---
 
@@ -612,14 +614,14 @@ Likely causes:
 Checks:
 
 - confirm `cargo run -p busytok-service` is active
-- confirm `$XDG_RUNTIME_DIR`
+- confirm `$BUSYTOK_RUNTIME_DIR`
 - confirm socket exists under isolated runtime dir
 
 ### 8.2 Unexpected interaction with installed release
 
 Likely causes:
 
-- source CLI launched from a shell missing the exported XDG vars
+- source CLI launched from a shell missing the exported `BUSYTOK_*` vars
 - tester accidentally used installed `busytok` instead of `cargo run -p busytok`
 
 Checks:
@@ -679,9 +681,9 @@ The subagent branch is considered QA-passed only if all of the following are tru
 export BUSYTOK_DEV_ROOT=/tmp/busytok-subagent-dev
 rm -rf "$BUSYTOK_DEV_ROOT"
 mkdir -p "$BUSYTOK_DEV_ROOT"/{data,config,runtime,logs}
-export XDG_DATA_HOME="$BUSYTOK_DEV_ROOT/data"
-export XDG_CONFIG_HOME="$BUSYTOK_DEV_ROOT/config"
-export XDG_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
+export BUSYTOK_DATA_DIR="$BUSYTOK_DEV_ROOT/data"
+export BUSYTOK_CONFIG_DIR="$BUSYTOK_DEV_ROOT/config"
+export BUSYTOK_RUNTIME_DIR="$BUSYTOK_DEV_ROOT/runtime"
 export BUSYTOK_LOG_DIR="$BUSYTOK_DEV_ROOT/logs"
 ```
 

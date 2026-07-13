@@ -1339,10 +1339,23 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
+    // Bug 2 fix: error must be a structured SubagentError (not bare anyhow).
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        format!("{err}").contains("prepare_hibernate"),
-        "error should mention prepare_hibernate, got: {err}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::SidecarRpc { message, .. } => {
+            assert!(
+                message.contains("prepare_hibernate"),
+                "error should mention prepare_hibernate, got: {message}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::SidecarRpc for prepare_hibernate failure, got {other:?}"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }
@@ -1499,6 +1512,296 @@ async fn executor_eviction_propagates_error_when_retry_turn_auto_fails() {
         format!("{err}").contains("turn_auto failed"),
         "error should mention the turn_auto failure, got: {err}"
     );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+// --- AlreadyEvicted bounded retry (concurrent eviction race) ---
+//
+// When two concurrent delegates both get the same LRU candidate, the first
+// evictor flips the DB binding to is_hot=0 and calls close; the second
+// evictor's `evict_session` detects is_hot=0 → returns `AlreadyEvicted`.
+// The caller then retries `turn_auto` with bounded backoff, waiting for the
+// first evictor's close to free the sidecar slot.
+//
+// Test 1 (retry succeeds): the concurrent close has already freed the slot
+//   (mock removes the session from its pool during prepare_hibernate), so
+//   the retry `turn_auto` succeeds.
+// Test 2 (exhaustion): the concurrent close never happens (mock keeps the
+//   session in its pool), so all retries hit HOT_SESSION_LIMIT_REACHED and
+//   the executor surfaces `HotSessionLimit`.
+
+/// Pre-seed a binding already flipped to `is_hot=0` + `status=closed`,
+/// simulating a concurrent evictor that already committed the eviction.
+/// The session is still in the sidecar's hot pool (close may or may not
+/// have completed yet — that's what the retry loop handles).
+fn seed_cold_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &str) {
+    let now = busytok_domain::now_ms();
+    let db_guard = db.lock().unwrap();
+    db_guard
+        .subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: subagent_id.into(),
+            name: name.into(),
+            project_id: "p".into(),
+            repo_path: "/r".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: "test-provider".into(),
+            bound_model_id: "test-model".into(),
+            status: "warm".into(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_active_at_ms: Some(now),
+        })
+        .unwrap();
+    db_guard
+        .subagent_upsert_memory(&SubagentMemoryRow::new_empty(subagent_id))
+        .unwrap();
+    db_guard
+        .subagent_commit_hot_binding_and_status(
+            &SubagentHarnessBindingRow {
+                id: format!("bind-{subagent_id}"),
+                subagent_id: subagent_id.into(),
+                harness: "pi".into(),
+                adapter_session_id: Some(session_id.into()),
+                adapter_process_id: None,
+                is_hot: 0,
+                status: "closed".into(),
+                created_at_ms: now,
+                last_used_at_ms: Some(now),
+                closed_at_ms: Some(now),
+                detail_json: None,
+            },
+            subagent_id,
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_already_evicted_retry_succeeds() {
+    // Concurrent eviction race: a concurrent evictor already flipped the DB
+    // binding to is_hot=0. The mock sidecar's prepare_hibernate (with
+    // BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS=1) removes the session from its
+    // pool before returning — simulating the concurrent evictor's close
+    // having already freed the slot. The executor returns AlreadyEvicted,
+    // retries turn_auto, and the retry succeeds because the slot is now free.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Pre-flip the DB binding to is_hot=0 (concurrent evictor already
+    // committed the eviction). The sidecar still holds the session in its
+    // pool — until prepare_hibernate runs with EVICTS=1.
+    seed_cold_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. The mock pool is full (sess-a still in it),
+    // so turn_auto returns HOT_SESSION_LIMIT_REACHED with candidate=sess-a.
+    // evict_session: prepare_hibernate removes sess-a from the mock pool
+    // (EVICTS=1), DB check finds is_hot=0 → AlreadyEvicted. Retry turn_auto
+    // succeeds because the mock pool now has room.
+    let out2 = executor
+        .execute(&evict_input("sub-b"))
+        .await
+        .expect("AlreadyEvicted retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+    assert!(
+        out2.adapter_session_id.is_some(),
+        "retry turn_auto must return a session id"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_already_evicted_exhaustion_surfaces_hot_limit() {
+    // Concurrent eviction race: the DB binding is already is_hot=0
+    // (concurrent evictor flipped it), but the concurrent evictor's close
+    // NEVER completes — the sidecar pool stays full. Without
+    // BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS, prepare_hibernate returns the
+    // memory delta but does NOT remove the session from the mock pool.
+    // evict_session returns AlreadyEvicted, all 5 retries hit
+    // HOT_SESSION_LIMIT_REACHED, and the executor surfaces HotSessionLimit.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    // NOTE: BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS is NOT set — the mock pool
+    // keeps the session, simulating a concurrent close that never completes.
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Pre-flip the DB binding to is_hot=0 (concurrent evictor already
+    // committed the eviction). The sidecar still holds the session — and
+    // will keep holding it (no EVICTS flag).
+    seed_cold_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. evict_session returns AlreadyEvicted (is_hot=0).
+    // Retry turn_auto keeps hitting HOT_SESSION_LIMIT_REACHED because the mock
+    // pool never frees the slot. After EVICT_WAIT_MAX_RETRIES, the executor
+    // surfaces SubagentError::HotSessionLimit.
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected HotSessionLimit after AlreadyEvicted exhaustion, got success"),
+        Err(e) => e,
+    };
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            // candidate is empty — the executor surfaces it without a
+            // specific candidate because the retry exhausted waiting for
+            // a concurrent close (not because all sessions were busy).
+            assert!(
+                candidate.is_empty(),
+                "exhausted-retry HotSessionLimit should have empty candidate, got: {candidate}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionLimit after AlreadyEvicted exhaustion, got {other:?}"
+        ),
+    }
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_already_evicted_via_session_not_found() {
+    // The second AlreadyEvicted path: prepare_hibernate returns
+    // SESSION_NOT_FOUND (-32001) because a concurrent evictor already
+    // closed the session. The mock (with PREPARE_HIBERNATE_NOT_FOUND=1)
+    // removes the session from its pool and returns -32001. The executor
+    // intercepts -32001 → AlreadyEvicted → retry turn_auto succeeds (slot
+    // is now free). Unlike the is_hot=0 path, no DB pre-flip is needed —
+    // the -32001 short-circuits before the DB check.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_NOT_FOUND".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Seed a hot binding (normal state — no pre-flip; the -32001 from
+    // prepare_hibernate is what triggers AlreadyEvicted, not the DB state).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. turn_auto returns HOT_SESSION_LIMIT_REACHED
+    // with candidate=sess-a. evict_session calls prepare_hibernate(sess-a):
+    // mock removes sess-a from its pool + returns -32001. Executor
+    // intercepts → AlreadyEvicted. Retry turn_auto succeeds (pool now empty).
+    let out2 = executor
+        .execute(&evict_input("sub-b"))
+        .await
+        .expect("SESSION_NOT_FOUND AlreadyEvicted retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+    assert!(
+        out2.adapter_session_id.is_some(),
+        "retry turn_auto must return a session id"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_evicted_retry_hot_limit_surfaces_transient() {
+    // Concurrent slot takeover after eviction (P0 regression):
+    //
+    // sub-a holds the only hot session. sub-b triggers eviction (Evicted
+    // outcome — close succeeds). But BUSYTOK_MOCK_REFILL_AFTER_CLOSE=1
+    // simulates a concurrent task grabbing the freed slot before sub-b's
+    // retry. The retry turn_auto returns HOT_SESSION_LIMIT_REACHED again.
+    //
+    // Before the fix, the Evicted path only allowed 1 retry, and the retry
+    // guard only matched AlreadyEvicted — so HOT_SESSION_LIMIT_REACHED on
+    // the Evicted retry fell through to the generic failed_after_eviction
+    // path, returning a raw error (logged as error_kind=Unknown).
+    //
+    // After the fix, both Evicted and AlreadyEvicted retry
+    // HOT_SESSION_LIMIT_REACHED with bounded backoff (EVICT_WAIT_MAX_RETRIES=5).
+    // After exhaustion, the executor surfaces SubagentError::HotSessionLimit
+    // (NOT a generic error) so execute_and_persist can re-queue the task.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_REFILL_AFTER_CLOSE".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Seed a hot binding (normal state — the Evicted path will flip it).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. turn_auto returns HOT_SESSION_LIMIT_REACHED
+    // with candidate=sess-a. evict_session succeeds (Evicted): prepare_hibernate
+    // returns memory delta, close removes sess-a from pool. But
+    // REFILL_AFTER_CLOSE adds a fake session to the pool, so the retry
+    // turn_auto for sub-b sees the pool as full and returns
+    // HOT_SESSION_LIMIT_REACHED again. After EVICT_WAIT_MAX_RETRIES, the
+    // executor surfaces SubagentError::HotSessionLimit (NOT a generic error).
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected HotSessionLimit after Evicted retry exhaustion, got success"),
+        Err(e) => e,
+    };
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError (not bare anyhow) so execute_and_persist can re-queue, got: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            // candidate is empty — the executor surfaces it without a
+            // specific candidate because the retry exhausted waiting for
+            // the slot to free (not because all sessions were busy).
+            assert!(
+                candidate.is_empty(),
+                "exhausted-retry HotSessionLimit should have empty candidate, got: {candidate}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionLimit after Evicted retry exhaustion, got {other:?}"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }

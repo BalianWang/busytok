@@ -14,7 +14,7 @@ use busytok_subagent::mock_executor::{
     ExecutorInput, ExecutorOutput, FailingTaskExecutor, MockTaskExecutor, TaskExecutor,
 };
 use busytok_subagent::models::{
-    DelegateRequest, ResolveParams, SubagentStatus, TaskStatus, TaskUsage,
+    DelegateRequest, QueueReason, ResolveParams, SubagentStatus, TaskStatus, TaskUsage,
 };
 use busytok_subagent::pressure::{PressureAction, PressureGate};
 use busytok_subagent::SubagentError;
@@ -1578,6 +1578,66 @@ async fn dispatcher_skips_queued_task_while_gate_paused() {
     }
     tx.send(true).unwrap();
     let _ = handle.await;
+}
+
+/// `queue_reason` field on `DelegateResult` — distinguishes "blocked by
+/// pressure gate" from "subagent busy" for CLI/automation observability.
+/// When the gate is paused, `delegate` must return `status: Queued` with
+/// `queue_reason: PressureGatePaused`.
+#[tokio::test]
+async fn delegate_queue_reason_pressure_gate_paused() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let gate = std::sync::Arc::new(PressureGate::new());
+    gate.set_action(PressureAction::PauseNewTasks);
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+        Some(gate.clone()),
+    ));
+    let r = manager
+        .delegate(req("sub-qr-gate", "do"))
+        .await
+        .unwrap();
+    assert_eq!(r.status, TaskStatus::Queued);
+    assert_eq!(
+        r.queue_reason,
+        Some(QueueReason::PressureGatePaused),
+        "queued while gate paused must set queue_reason = PressureGatePaused"
+    );
+}
+
+/// `queue_reason` = `SubagentBusy` when the subagent already has a running
+/// task (no gate pause). The second delegate for the same subagent must
+/// return `status: Queued` with `queue_reason: SubagentBusy`.
+#[tokio::test]
+async fn delegate_queue_reason_subagent_busy() {
+    let _guard = install_tracing();
+    let db = test_db();
+    // Use a BlockingExecutor so the first task stays "running" — the
+    // second delegate for the same subagent must queue.
+    let manager = std::sync::Arc::new(SubagentManager::new(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+    // First delegate starts executing (running).
+    let r1 = manager.delegate(req("sub-qr-busy", "first")).await.unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    assert_eq!(r1.queue_reason, None, "running task must have no queue_reason");
+    // Second delegate for the same subagent → must queue (subagent busy).
+    let r2 = manager.delegate(req("sub-qr-busy", "second")).await.unwrap();
+    assert_eq!(r2.status, TaskStatus::Queued);
+    assert_eq!(
+        r2.queue_reason,
+        Some(QueueReason::SubagentBusy),
+        "queued while subagent busy must set queue_reason = SubagentBusy"
+    );
+    // Clean up: cancel the blocking task so the runtime can shut down.
+    let _ = manager.cancel_task(&r1.task_id, None).await;
 }
 
 /// Dispatcher marks a queued task as 'failed' when the subagent can't be

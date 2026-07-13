@@ -303,25 +303,36 @@ fn sample_includes_queued_and_running_task_counts() {
 
 #[test]
 fn sample_system_available_mb_is_nonzero_on_real_host() {
-    // Regression test: sysinfo's available_memory() returns 0 on macOS (known
-    // sysinfo bug — the host_statistics64 computation breaks silently). Without
-    // the total-used fallback in ResourceMonitor::available_bytes(), this test
-    // fails on macOS: system_available_mb == 0, the pressure gate spuriously
-    // triggers, and because the recovery path requires available >= threshold,
-    // the gate never resumes — deadlocking delegate until restart.
+    // Regression test: sysinfo's `available_memory()` is unreliable on macOS.
+    // On macOS 15 (sysinfo 0.32) it returns a non-zero but INCORRECT value
+    // (~633 MB when real available is ~5566 MB). Without the `total - used`
+    // path in `choose_available_bytes()`, the pressure gate spuriously
+    // triggers AND never recovers (recovery requires available >= threshold).
+    //
+    // This test asserts the sample returns a value that is at least 5% of
+    // total memory — a threshold that catches the "633 MB out of 16384 MB"
+    // regression (3.9%) while being lenient enough for genuinely constrained
+    // hosts. On the bug's machine, the correct reading (~5566 MB / 16384 MB
+    // = 34%) passes easily; the wrong reading (633 / 16384 = 3.9%) would fail.
     let policy = busytok_config::SubagentResourcePolicyConfig::default();
     let mut monitor = ResourceMonitor::new(policy, 800, 1200);
     let sample = monitor.sample(None, 0, 0, 0);
     assert!(
         sample.system_available_mb > 0.0,
-        "system_available_mb must be > 0 on a real host (macOS fallback); got {}",
+        "system_available_mb must be > 0 on a real host; got {}",
         sample.system_available_mb
     );
-    // memory_used_pct must also use the fallback (not 100%).
+    // The value must be "reasonable" — at least 5% of total. The bogus
+    // sysinfo reading (633 MB on a 16GB machine = 3.9%) would fail this.
+    // We can't read total_memory directly from ResourceSample, but we can
+    // check via memory_used_pct: if available is wrongly tiny, used_pct
+    // would be ~96%+, which is implausible on an idle test machine.
     let pct = monitor.memory_used_pct().expect("pct on real host");
     assert!(
-        pct < 100,
-        "memory_used_pct must be < 100 on a host with available memory; got {}",
+        pct < 95,
+        "memory_used_pct must be < 95 on a real host with available memory; got {} \
+         (if this fires on macOS, sysinfo's available_memory() is returning a bogus value — \
+         verify choose_available_bytes uses total-used on macOS)",
         pct
     );
 }

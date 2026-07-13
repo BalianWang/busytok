@@ -208,11 +208,16 @@ export class SessionPool {
    * Get the LRU evictable candidate. Skips sessions currently running a
    * turn (`beginTurn` without `endTurn`). Returns `undefined` when no
    * evictable session exists (all sessions are in-use or pool is empty).
+   *
+   * Concurrent eviction race is handled at the DB layer: if two delegates
+   * both get the same candidate, the second one's `evict_session` detects
+   * `is_hot=0` (already flipped by the first) and returns `AlreadyEvicted`.
    */
   getLruCandidate(): string | undefined {
     for (let i = this.lru.length - 1; i >= 0; i--) {
       const id = this.lru[i]!;
-      if (!this.busySessions.has(id)) return id;
+      if (this.busySessions.has(id)) continue;
+      return id;
     }
     return undefined;
   }
