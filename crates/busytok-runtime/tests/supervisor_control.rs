@@ -122,6 +122,29 @@ where
     }
 }
 
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Used by tests that
+/// `subagent_delegate` and now see `status == "running"` immediately (Bug #1/#2
+/// fix: `delegate()` returns `Running` and execution happens via
+/// `tokio::spawn(execute_and_persist)`).
+async fn await_task_done(
+    m: &std::sync::Arc<busytok_subagent::SubagentManager>,
+    task_id: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -3596,7 +3619,11 @@ async fn subagent_delegate_list_show_hibernate_delete_round_trips() {
         .unwrap();
     // SubagentDelegateResponseDto serializes with task_id / subagent_id / status.
     let sub_id = delegate_resp.subagent_id.clone();
-    assert_eq!(delegate_resp.status, "completed");
+    assert_eq!(delegate_resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status =
+        await_task_done(&supervisor.subagent_manager(), &delegate_resp.task_id).await;
+    assert_eq!(final_status, "completed");
 
     // list (no filters → all active; the just-created subagent must appear).
     // Response is SubagentListResponseDto { subagents: [...] }.
@@ -5276,7 +5303,10 @@ async fn write_usage_event_inserts_into_usage_events() {
         })
         .await
         .unwrap();
-    assert_eq!(resp.status, "completed");
+    assert_eq!(resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status = await_task_done(&sup.subagent_manager(), &resp.task_id).await;
+    assert_eq!(final_status, "completed");
 
     // The mock executor produces non-zero token usage.
     let count = count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
@@ -5322,7 +5352,10 @@ async fn write_usage_event_idempotent_on_same_task_id() {
         })
         .await
         .unwrap();
-    assert_eq!(resp1.status, "completed");
+    assert_eq!(resp1.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status = await_task_done(&sup.subagent_manager(), &resp1.task_id).await;
+    assert_eq!(final_status, "completed");
 
     let count = count_usage_events(&sup.db_handle().lock().unwrap(), "client_kind = 'subagent'");
     assert_eq!(
@@ -5354,6 +5387,7 @@ async fn write_usage_event_idempotent_on_same_task_id() {
             cost_usd: None,
         },
         created: true,
+        queue_reason: None,
     };
     sup.write_subagent_usage_event(&result, &cwd).unwrap();
 
@@ -5398,7 +5432,10 @@ async fn write_usage_event_uses_active_generation_id() {
         })
         .await
         .unwrap();
-    assert_eq!(resp.status, "completed");
+    assert_eq!(resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status = await_task_done(&sup.subagent_manager(), &resp.task_id).await;
+    assert_eq!(final_status, "completed");
 
     let event_gen = subagent_event_generation_id(&sup.db_handle().lock().unwrap());
     assert_eq!(
@@ -5443,7 +5480,10 @@ async fn write_usage_event_produces_real_rollup_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(resp.status, "completed");
+    assert_eq!(resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status = await_task_done(&sup.subagent_manager(), &resp.task_id).await;
+    assert_eq!(final_status, "completed");
 
     let db_ref = sup.db_handle().lock().unwrap();
     let daily_count = count_rows(
@@ -5510,7 +5550,10 @@ async fn write_usage_event_visible_in_overview_read_path() {
         })
         .await
         .unwrap();
-    assert_eq!(resp.status, "completed");
+    assert_eq!(resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status = await_task_done(&sup.subagent_manager(), &resp.task_id).await;
+    assert_eq!(final_status, "completed");
 
     // The mock executor produces input_tokens = prompt.len() and
     // output_tokens = summary.len(), both non-zero. Read the overview
@@ -5590,24 +5633,29 @@ async fn e2e_usage_events_agent_kind_is_codex() {
     let sup = make_supervisor(db, &tmp);
     sup.hydrate_status_from_db().unwrap();
 
-    sup.subagent_delegate(SubagentDelegateRequestDto {
-        subagent_name: "writer".to_string(),
-        subagent_id: None,
-        cwd: tmp.path().join("repo").to_string_lossy().to_string(),
-        profile: "pi/search-cheap".to_string(),
-        intent: None,
-        prompt: "do work".to_string(),
-        prompt_artifact_ref: None,
-        timeout_seconds: None,
-        model_override: None,
-        source_harness: None,
-        source_session_id: None,
-        bound_provider_id: Some(bound_provider_id),
-        bound_model_id: Some(bound_model_id),
-        reuse_policy: None,
-    })
-    .await
-    .unwrap();
+    let resp = sup
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "writer".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "do work".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "running");
+    // Wait for async completion (Bug #1/#2 fix: delegate spawns execution).
+    let final_status = await_task_done(&sup.subagent_manager(), &resp.task_id).await;
+    assert_eq!(final_status, "completed");
 
     let agent: String = sup
         .db_handle()
@@ -5948,4 +5996,94 @@ async fn profile_create_rejects_empty_id() {
         "expected empty-id rejection, got: {err}"
     );
     sup.shutdown_writer().await.unwrap();
+}
+
+/// Verify `queue_reason` propagates through the full stack:
+/// manager `DelegateResult.queue_reason` → DTO `SubagentDelegateResponseDto.queue_reason`
+/// → JSON output contains `"queue_reason": "subagent_busy"`.
+///
+/// This is the regression test for the CLI observability gap: the field
+/// existed in `DelegateResult` but was dropped at the DTO boundary, so
+/// `delegate --output json` omitted it from the JSON output.
+#[tokio::test]
+#[serial]
+async fn delegate_dto_carries_queue_reason_when_subagent_busy() {
+    let db = Database::open_in_memory().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let (bound_provider_id, bound_model_id) = seed_bound_provider_model(&db);
+    let supervisor = make_supervisor(db, &tmp);
+
+    // First delegate — starts executing (status: running).
+    let first = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "qr-prop".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "find the bug".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: Some(bound_provider_id.clone()),
+            bound_model_id: Some(bound_model_id.clone()),
+            reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.status, "running", "first delegate must start running");
+    assert!(
+        first.queue_reason.is_none(),
+        "running task must not have queue_reason, got: {:?}",
+        first.queue_reason
+    );
+    // JSON for a running task must NOT contain the queue_reason field
+    // (skip_serializing_if = "Option::is_none").
+    let first_json = serde_json::to_string(&first).unwrap();
+    assert!(
+        !first_json.contains("queue_reason"),
+        "running task JSON must not contain queue_reason (skip_serializing_if), got: {first_json}"
+    );
+
+    // Second delegate for the same subagent — must queue (subagent busy).
+    let second = supervisor
+        .subagent_delegate(SubagentDelegateRequestDto {
+            subagent_name: "qr-prop".to_string(),
+            subagent_id: None,
+            cwd: tmp.path().join("repo").to_string_lossy().to_string(),
+            profile: "pi/search-cheap".to_string(),
+            intent: None,
+            prompt: "second turn".to_string(),
+            prompt_artifact_ref: None,
+            timeout_seconds: None,
+            model_override: None,
+            source_harness: None,
+            source_session_id: None,
+            bound_provider_id: Some(bound_provider_id),
+            bound_model_id: Some(bound_model_id),
+            reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.status, "queued", "second delegate must be queued");
+    assert_eq!(
+        second.queue_reason.as_deref(),
+        Some("subagent_busy"),
+        "queued task must carry queue_reason = subagent_busy, got: {:?}",
+        second.queue_reason
+    );
+    // JSON for a queued task MUST contain the queue_reason field — this is
+    // the exact assertion that would have caught the CLI observability gap.
+    let second_json = serde_json::to_string(&second).unwrap();
+    assert!(
+        second_json.contains("\"queue_reason\":\"subagent_busy\""),
+        "queued task JSON must contain queue_reason field, got: {second_json}"
+    );
+
+    // Wait for the first task to complete so the test can shut down cleanly.
+    let _ = await_task_done(&supervisor.subagent_manager(), &first.task_id).await;
+    // The queued task will start after the first completes — wait for it too.
+    let _ = await_task_done(&supervisor.subagent_manager(), &second.task_id).await;
 }

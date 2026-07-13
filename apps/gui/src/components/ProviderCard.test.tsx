@@ -60,7 +60,7 @@ describe("ProviderCard (view mode)", () => {
   it("renders provider name, kind chip, and base url", () => {
     render(<ProviderCard {...defaultProps()} />);
     expect(screen.getByText("deepseek_openai")).toBeDefined();
-    expect(screen.getByText("openai")).toBeDefined();
+    expect(screen.getByText("OpenAI-compatible")).toBeDefined();
     expect(screen.getByText("https://api.deepseek.com/v1")).toBeDefined();
   });
 
@@ -92,31 +92,31 @@ describe("ProviderCard (view mode)", () => {
 
   it("renders empty-state message when models list is empty and not loading", () => {
     render(<ProviderCard {...defaultProps()} />);
-    expect(screen.getByText(/暂无 model/)).toBeDefined();
+    expect(screen.getByText(/No models/)).toBeDefined();
   });
 
   it("renders loading state when isModelsLoading is true", () => {
     render(<ProviderCard {...defaultProps({ isModelsLoading: true })} />);
-    expect(screen.getByText(/加载中/)).toBeDefined();
+    expect(screen.getByText(/Loading/)).toBeDefined();
   });
 
   it("calls onEdit when Edit button clicked", () => {
     const onEdit = vi.fn();
     render(<ProviderCard {...defaultProps({ onEdit })} />);
-    fireEvent.click(screen.getByRole("button", { name: /编辑/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Edit/i }));
     expect(onEdit).toHaveBeenCalledOnce();
   });
 
   it("calls onTestConnection when Test button clicked", () => {
     const onTestConnection = vi.fn();
     render(<ProviderCard {...defaultProps({ onTestConnection })} />);
-    fireEvent.click(screen.getByRole("button", { name: /测试连接/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Test Connection/i }));
     expect(onTestConnection).toHaveBeenCalledWith("prov-1");
   });
 
   it("renders disabled indicator when provider.enabled is false", () => {
     render(<ProviderCard {...defaultProps({ provider: makeProvider({ enabled: false }) })} />);
-    expect(screen.getByText(/○ disabled/)).toBeDefined();
+    expect(screen.getByText(/Disabled/)).toBeDefined();
   });
 
   it("renders raw provider_kind when kind is not in KIND_LABEL", () => {
@@ -134,7 +134,7 @@ describe("ProviderCard (view mode)", () => {
         {...defaultProps({ models: [makeModel({ model_enabled: false })] })}
       />,
     );
-    expect(screen.getByText(/○disabled/)).toBeDefined();
+    expect(screen.getByText(/Disabled/)).toBeDefined();
   });
 });
 
@@ -148,7 +148,7 @@ describe("ProviderCard model edit with null optional fields", () => {
       reasoning: undefined as never,
     });
     render(<ProviderCard {...defaultProps({ models: [model] })} />);
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     // display_name defaults to "" → input is empty
     expect((screen.getByLabelText(/display name/i) as HTMLInputElement).value).toBe("");
@@ -163,19 +163,19 @@ describe("ProviderCard model edit with null optional fields", () => {
 
 // ─── ConfirmDialog integration (f1) ─────────────────────────────────────
 describe("ProviderCard delete via ConfirmDialog", () => {
-  it("opens confirm dialog with provider delete content when 删除 clicked", () => {
+  it("opens confirm dialog with provider delete content when Delete clicked", () => {
     render(<ProviderCard {...defaultProps()} />);
-    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
-    expect(screen.getByText("删除 Provider")).toBeDefined();
-    expect(screen.getByText(/确定删除 provider「deepseek_openai」/)).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /Delete/i }));
+    expect(screen.getByText("Delete Provider")).toBeDefined();
+    expect(screen.getByText(/Delete provider "deepseek_openai"/)).toBeDefined();
   });
 
   it("calls onDelete when dialog confirm clicked", () => {
     const onDelete = vi.fn();
     render(<ProviderCard {...defaultProps({ onDelete })} />);
-    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
-    // Dialog confirm button is the last 删除 button after dialog opens.
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    fireEvent.click(screen.getByRole("button", { name: /Delete/i }));
+    // Dialog confirm button is the last Delete button after dialog opens.
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     expect(onDelete).toHaveBeenCalledWith(makeProvider());
   });
@@ -183,27 +183,27 @@ describe("ProviderCard delete via ConfirmDialog", () => {
   it("does not call onDelete when dialog cancelled", () => {
     const onDelete = vi.fn();
     render(<ProviderCard {...defaultProps({ onDelete })} />);
-    fireEvent.click(screen.getByRole("button", { name: /删除/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete/i }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(onDelete).not.toHaveBeenCalled();
   });
 
-  it("opens confirm dialog with model delete content when model 删除 clicked", () => {
+  it("opens confirm dialog with model delete content when model Delete clicked", () => {
     render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
-    // Click the model row's 删除 (last one before dialog opens).
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
+    // Click the model row's Delete (last one before dialog opens).
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    expect(screen.getByText("删除 Model")).toBeDefined();
-    expect(screen.getByText(/确定删除 model「deepseek-chat」/)).toBeDefined();
+    expect(screen.getByText("Delete Model")).toBeDefined();
+    expect(screen.getByText(/Delete model "deepseek-chat"/)).toBeDefined();
   });
 
   it("calls onModelDelete when dialog confirm clicked", () => {
     const onModelDelete = vi.fn();
     render(<ProviderCard {...defaultProps({ models: [makeModel()], onModelDelete })} />);
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
-    // Dialog confirm is now the last 删除 button.
-    const dialogDeleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    // Dialog confirm is now the last Delete button.
+    const dialogDeleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(dialogDeleteButtons[dialogDeleteButtons.length - 1]);
     expect(onModelDelete).toHaveBeenCalledWith(makeModel());
   });
@@ -211,7 +211,7 @@ describe("ProviderCard delete via ConfirmDialog", () => {
   it("does not call onModelDelete when dialog cancelled", () => {
     const onModelDelete = vi.fn();
     render(<ProviderCard {...defaultProps({ models: [makeModel()], onModelDelete })} />);
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(onModelDelete).not.toHaveBeenCalled();
@@ -222,19 +222,19 @@ describe("ProviderCard delete via ConfirmDialog", () => {
 describe("ProviderCard test result display", () => {
   it("renders success result when testResult.ok is true", () => {
     render(<ProviderCard {...defaultProps({ testResult: { ok: true, error: null } })} />);
-    expect(screen.getByText("连接成功")).toBeDefined();
+    expect(screen.getByText("Connection successful")).toBeDefined();
   });
 
   it("renders failure result with error message when testResult.ok is false", () => {
     render(<ProviderCard {...defaultProps({ testResult: { ok: false, error: "timeout" } })} />);
-    expect(screen.getByText(/连接失败/)).toBeDefined();
+    expect(screen.getByText(/Connection failed/)).toBeDefined();
     expect(screen.getByText(/timeout/)).toBeDefined();
   });
 
   it("does not render test result section when testResult is undefined", () => {
     render(<ProviderCard {...defaultProps()} />);
-    expect(screen.queryByText(/连接成功/)).toBeNull();
-    expect(screen.queryByText(/连接失败/)).toBeNull();
+    expect(screen.queryByText(/Connection successful/)).toBeNull();
+    expect(screen.queryByText(/Connection failed/)).toBeNull();
   });
 });
 
@@ -248,8 +248,8 @@ describe("ProviderCard disable on mutation pending", () => {
       testConnection: { mutate: vi.fn(), isPending: false },
     } as never;
     render(<ProviderCard {...defaultProps({ providerMutations: pendingMutations })} />);
-    expect((screen.getByRole("button", { name: /编辑/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: /删除/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /Edit/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /Delete/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("disables test connection button when testConnection.isPending", () => {
@@ -260,7 +260,7 @@ describe("ProviderCard disable on mutation pending", () => {
       testConnection: { mutate: vi.fn(), isPending: true },
     } as never;
     render(<ProviderCard {...defaultProps({ providerMutations: pendingMutations })} />);
-    expect((screen.getByRole("button", { name: /测试连接/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /Test Connection/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -277,7 +277,7 @@ describe("ProviderCard model create", () => {
     render(<ProviderCard {...defaultProps({ onModelCreate })} />);
     fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     const expected: ModelCreateRequestDto = {
       provider_id: "prov-1",
       model_id: "deepseek-chat",
@@ -297,17 +297,17 @@ describe("ProviderCard model create", () => {
     fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "deepseek-chat" } });
     fireEvent.change(screen.getByPlaceholderText(/tags/i), { target: { value: "cheap, fast" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelCreate).toHaveBeenCalledWith(
       expect.objectContaining({ tags: ["cheap", "fast"] }),
     );
   });
 
-  it("hides create form and clears draft when 取消 clicked", () => {
+  it("hides create form and clears draft when Cancel clicked", () => {
     render(<ProviderCard {...defaultProps()} />);
     fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "temp" } });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     expect(screen.queryByPlaceholderText(/model name/i)).toBeNull();
   });
 
@@ -315,7 +315,7 @@ describe("ProviderCard model create", () => {
     const onModelCreate = vi.fn();
     render(<ProviderCard {...defaultProps({ onModelCreate })} />);
     fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelCreate).not.toHaveBeenCalled();
   });
 
@@ -325,9 +325,9 @@ describe("ProviderCard model create", () => {
     render(<ProviderCard {...defaultProps({ onModelCreate })} />);
     fireEvent.click(screen.getByRole("button", { name: /\+ Add Model/i }));
     fireEvent.change(screen.getByPlaceholderText(/model name/i), { target: { value: "test-model" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await vi.waitFor(() => {
-      expect(screen.getByText(/创建失败/)).toBeDefined();
+      expect(screen.getByText(/Create failed/)).toBeDefined();
     });
   });
 });
@@ -345,9 +345,9 @@ describe("ProviderCard model edit", () => {
     return { ...result, onModelUpdate, onModelTagsUpdate };
   };
 
-  it("shows edit form with current model values when 编辑 clicked", () => {
+  it("shows edit form with current model values when Edit clicked", () => {
     renderCardWithModel();
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     expect(screen.getByDisplayValue("deepseek-chat")).toBeDefined();
     expect(screen.getByDisplayValue("200000")).toBeDefined();
@@ -357,11 +357,11 @@ describe("ProviderCard model edit", () => {
 
   it("calls onModelUpdate with only changed fields on save (single-state Option semantics)", () => {
     const { onModelUpdate } = renderCardWithModel();
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     const nameInput = screen.getByDisplayValue("deepseek-chat");
     fireEvent.change(nameInput, { target: { value: "DeepSeek Chat" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelUpdate).toHaveBeenCalledWith(
       makeModel(),
       expect.objectContaining({
@@ -379,37 +379,37 @@ describe("ProviderCard model edit", () => {
 
   it("calls onModelTagsUpdate when tags changed on save", () => {
     const { onModelTagsUpdate } = renderCardWithModel();
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     const tagsInput = screen.getByPlaceholderText(/tags/i);
     fireEvent.change(tagsInput, { target: { value: "cheap,fast" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelTagsUpdate).toHaveBeenCalledWith(makeModel(), ["cheap", "fast"]);
   });
 
   it("does not call onModelTagsUpdate when tags unchanged", () => {
     const { onModelTagsUpdate } = renderCardWithModel();
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelTagsUpdate).not.toHaveBeenCalled();
   });
 
   it("exits edit mode on Cancel", () => {
     renderCardWithModel();
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
-    fireEvent.click(screen.getByRole("button", { name: /取消/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Cancel/i }));
     expect(screen.queryByRole("checkbox", { name: /reasoning/i })).toBeNull();
   });
 
   it("does not clear display_name when edit input is empty (single-state Option semantics)", () => {
     const { onModelUpdate } = renderCardWithModel();
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     const nameInput = screen.getByDisplayValue("deepseek-chat");
     fireEvent.change(nameInput, { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelUpdate).not.toHaveBeenCalled();
   });
 
@@ -421,14 +421,14 @@ describe("ProviderCard model edit", () => {
         {...defaultProps({ models: [makeModel()], onModelUpdate, onModelTagsUpdate })}
       />,
     );
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     // Change all four fields.
     fireEvent.change(screen.getByDisplayValue("200000"), { target: { value: "128000" } });
     fireEvent.change(screen.getByDisplayValue("8192"), { target: { value: "4096" } });
     fireEvent.click(screen.getByRole("checkbox", { name: /reasoning/i }));
     fireEvent.click(screen.getByRole("checkbox", { name: /enabled/i }));
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(onModelUpdate).toHaveBeenCalledWith(
       makeModel(),
       expect.objectContaining({
@@ -450,13 +450,13 @@ describe("ProviderCard model edit", () => {
         {...defaultProps({ models: [makeModel()], onModelUpdate, onModelTagsUpdate })}
       />,
     );
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     const nameInput = screen.getByDisplayValue("deepseek-chat");
     fireEvent.change(nameInput, { target: { value: "changed" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     await vi.waitFor(() => {
-      expect(screen.getByText(/保存失败/)).toBeDefined();
+      expect(screen.getByText(/Save failed/)).toBeDefined();
     });
   });
 });
@@ -502,13 +502,13 @@ describe("ProviderCard edit mode", () => {
 
   it("shows notice when editing", () => {
     renderCardInEditMode();
-    expect(screen.getByText(/正在编辑 Provider 信息/i)).toBeDefined();
+    expect(screen.getByText(/Editing provider details/i)).toBeDefined();
   });
 
   it("calls updateProvider with patch on Save", () => {
     const { updateProvider } = renderCardInEditMode();
     fireEvent.change(screen.getByDisplayValue("https://api.deepseek.com/v1"), { target: { value: "https://api.deepseek.com/v2" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(updateProvider).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "prov-1",
@@ -520,7 +520,7 @@ describe("ProviderCard edit mode", () => {
 
   it("omits api_key from patch when key field is empty (no change)", () => {
     const { updateProvider } = renderCardInEditMode();
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     const call = (updateProvider as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as Record<string, unknown>;
     expect(call.api_key).toBeUndefined();
   });
@@ -528,7 +528,7 @@ describe("ProviderCard edit mode", () => {
   it("includes api_key in patch when key field is filled", () => {
     const { updateProvider } = renderCardInEditMode();
     fireEvent.change(screen.getByPlaceholderText(/new api key/i), { target: { value: "sk-new" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     const call = (updateProvider as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as Record<string, unknown>;
     expect(call.api_key).toBe("sk-new");
   });
@@ -536,7 +536,7 @@ describe("ProviderCard edit mode", () => {
   it("calls onCancelEdit on Cancel button click", () => {
     const onCancelEdit = vi.fn();
     renderCardInEditMode({ onCancelEdit });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     expect(onCancelEdit).toHaveBeenCalledOnce();
   });
 
@@ -545,7 +545,7 @@ describe("ProviderCard edit mode", () => {
       opts?.onError?.(new Error("update rpc failed"));
     });
     renderCardInEditMode({ updateProvider });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(screen.getByText(/update rpc failed/)).toBeDefined();
   });
 
@@ -555,15 +555,15 @@ describe("ProviderCard edit mode", () => {
       opts?.onError?.({} as Error);
     });
     renderCardInEditMode({ updateProvider });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
-    expect(screen.getByText(/保存失败/)).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
+    expect(screen.getByText(/Save failed/)).toBeDefined();
   });
 
   it("updates provider name and kind via edit form inputs", () => {
     const { updateProvider } = renderCardInEditMode();
     fireEvent.change(screen.getByDisplayValue("deepseek_openai"), { target: { value: "my_provider" } });
-    fireEvent.change(screen.getByDisplayValue("openai_compatible"), { target: { value: "anthropic_compatible" } });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.change(screen.getByDisplayValue("OpenAI-compatible"), { target: { value: "anthropic_compatible" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     const call = (updateProvider as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as Record<string, unknown>;
     expect(call.name).toBe("my_provider");
     expect(call.provider_kind).toBe("anthropic_compatible");
@@ -585,8 +585,8 @@ describe("ProviderCard edit mode", () => {
         })}
       />,
     );
-    expect((screen.getByRole("button", { name: /^保存$/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: /^取消$/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /^Save$/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /^Cancel$/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("sets aria-invalid and shows field-error when base URL is invalid on blur (P2 #7)", () => {
@@ -634,7 +634,7 @@ describe("ProviderCard edit mode", () => {
         })}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     expect(screen.getByText(/update rpc failed/)).toBeDefined();
     // 2. Exit edit mode (parent sets isEditing=false).
     rerender(
@@ -674,7 +674,7 @@ describe("ProviderCard edit mode", () => {
 
 // ─── Save success feedback ───────────────────────────────────────────────
 describe("ProviderCard save success feedback", () => {
-  it("shows 保存成功 banner in view mode after successful save", () => {
+  it("shows Saved banner in view mode after successful save", () => {
     const updateProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     });
@@ -699,7 +699,7 @@ describe("ProviderCard save success feedback", () => {
     fireEvent.change(screen.getByDisplayValue("https://api.deepseek.com/v1"), {
       target: { value: "https://api.deepseek.com/v2" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     // Parent would set isEditing=false after onCancelEdit.
     rerender(
       <ProviderCard
@@ -711,10 +711,10 @@ describe("ProviderCard save success feedback", () => {
         })}
       />,
     );
-    expect(screen.getByText("保存成功")).toBeDefined();
+    expect(screen.getByText("Saved")).toBeDefined();
   });
 
-  it("clears 保存成功 banner when re-entering edit mode", () => {
+  it("clears Saved banner when re-entering edit mode", () => {
     const updateProvider = vi.fn((_payload: unknown, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     });
@@ -737,7 +737,7 @@ describe("ProviderCard save success feedback", () => {
     fireEvent.change(screen.getByDisplayValue("https://api.deepseek.com/v1"), {
       target: { value: "https://api.deepseek.com/v2" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^保存$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
     // Exit edit mode → success banner shows.
     rerender(
       <ProviderCard
@@ -749,7 +749,7 @@ describe("ProviderCard save success feedback", () => {
         })}
       />,
     );
-    expect(screen.getByText("保存成功")).toBeDefined();
+    expect(screen.getByText("Saved")).toBeDefined();
     // Re-enter edit mode → banner cleared.
     rerender(
       <ProviderCard
@@ -761,7 +761,7 @@ describe("ProviderCard save success feedback", () => {
         })}
       />,
     );
-    expect(screen.queryByText("保存成功")).toBeNull();
+    expect(screen.queryByText("Saved")).toBeNull();
   });
 });
 
@@ -789,9 +789,9 @@ describe("ProviderCard dirty form protection", () => {
     fireEvent.change(screen.getByDisplayValue("deepseek_openai"), {
       target: { value: "new_name" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     // Confirm dialog should be open.
-    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(screen.getByText("Discard Changes")).toBeDefined();
     expect(onCancelEdit).not.toHaveBeenCalled();
   });
 
@@ -814,9 +814,9 @@ describe("ProviderCard dirty form protection", () => {
       />,
     );
     // No changes → cancel should exit immediately.
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     expect(onCancelEdit).toHaveBeenCalledOnce();
-    expect(screen.queryByText("放弃修改")).toBeNull();
+    expect(screen.queryByText("Discard Changes")).toBeNull();
   });
 
   it("discards changes and exits when confirm dialog confirmed (provider edit)", () => {
@@ -840,51 +840,51 @@ describe("ProviderCard dirty form protection", () => {
     fireEvent.change(screen.getByDisplayValue("deepseek_openai"), {
       target: { value: "new_name" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     // Confirm discard.
-    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Discard$/i }));
     expect(onCancelEdit).toHaveBeenCalledOnce();
   });
 
   it("shows confirm dialog when canceling model edit with unsaved changes", () => {
     render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
     // Enter model edit.
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     // Change display name → dirty.
     fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
       target: { value: "New Name" },
     });
     // Click cancel (the model edit cancel button).
-    const cancelButtons = screen.getAllByRole("button", { name: /^取消$/i });
+    const cancelButtons = screen.getAllByRole("button", { name: /^Cancel$/i });
     fireEvent.click(cancelButtons[cancelButtons.length - 1]);
     // Confirm dialog should be open.
-    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(screen.getByText("Discard Changes")).toBeDefined();
     // Model edit form should still be visible (not yet discarded).
     expect(screen.getByDisplayValue("New Name")).toBeDefined();
   });
 
   it("exits model edit immediately when canceling with no changes", () => {
     render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     // No changes → cancel should exit immediately.
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
-    expect(screen.queryByText("放弃修改")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
+    expect(screen.queryByText("Discard Changes")).toBeNull();
     expect(screen.queryByRole("checkbox", { name: /reasoning/i })).toBeNull();
   });
 
   it("discards model edit changes and exits when confirm dialog confirmed", () => {
     render(<ProviderCard {...defaultProps({ models: [makeModel()] })} />);
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
       target: { value: "Changed" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     // Confirm discard.
-    fireEvent.click(screen.getByRole("button", { name: /^放弃$/i }));
-    expect(screen.queryByText("放弃修改")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Discard$/i }));
+    expect(screen.queryByText("Discard Changes")).toBeNull();
     expect(screen.queryByDisplayValue("Changed")).toBeNull();
   });
 
@@ -894,10 +894,10 @@ describe("ProviderCard dirty form protection", () => {
     render(
       <ProviderCard {...defaultProps({ models: [makeModel()], onModelDelete })} />,
     );
-    const deleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    const deleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(deleteButtons[deleteButtons.length - 1]);
     // Confirm delete → onModelDelete rejects → deleteError shows in dialog.
-    const dialogDeleteButtons = screen.getAllByRole("button", { name: /删除/i });
+    const dialogDeleteButtons = screen.getAllByRole("button", { name: /Delete/i });
     fireEvent.click(dialogDeleteButtons[dialogDeleteButtons.length - 1]);
     await vi.waitFor(() => {
       expect(screen.getByText(/delete rpc failed/)).toBeDefined();
@@ -906,14 +906,14 @@ describe("ProviderCard dirty form protection", () => {
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(screen.queryByText(/delete rpc failed/)).toBeNull();
     // 3. Enter model edit, dirty it, cancel → cancel-confirm dialog opens.
-    const editButtons = screen.getAllByRole("button", { name: /编辑/i });
+    const editButtons = screen.getAllByRole("button", { name: /Edit/i });
     fireEvent.click(editButtons[editButtons.length - 1]);
     fireEvent.change(screen.getByDisplayValue("deepseek-chat"), {
       target: { value: "Changed" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^取消$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }));
     // 4. The cancel-confirm dialog should NOT show the stale deleteError.
-    expect(screen.getByText("放弃修改")).toBeDefined();
+    expect(screen.getByText("Discard Changes")).toBeDefined();
     expect(screen.queryByText(/delete rpc failed/)).toBeNull();
   });
 });

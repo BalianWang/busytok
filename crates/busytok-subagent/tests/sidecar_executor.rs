@@ -14,6 +14,7 @@ use busytok_store::repository::{
 };
 use busytok_store::Database;
 use busytok_subagent::context::{CompactContext, MemorySnapshot};
+use busytok_subagent::error::SubagentError;
 use busytok_subagent::mock_executor::{ExecutorInput, TaskExecutor};
 use busytok_subagent::models::{DelegateRequest, TaskStatus};
 use busytok_subagent::pressure::{PressureGate, PressureResponder};
@@ -28,6 +29,25 @@ type SharedDb = Arc<std::sync::Mutex<Database>>;
 
 /// The test provider ID used by all pool-based tests.
 const TEST_PROVIDER_ID: &str = "test-prov";
+
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(m: &std::sync::Arc<SubagentManager>, task_id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
 
 fn empty_memory_snapshot() -> MemorySnapshot {
     MemorySnapshot {
@@ -158,7 +178,7 @@ fn settings_with_test_provider() -> SubagentSettings {
 }
 
 struct TestHarness {
-    manager: SubagentManager,
+    manager: std::sync::Arc<SubagentManager>,
     db: SharedDb,
     pool: Arc<WorkerPool>,
     supervisor: Arc<PiSidecarSupervisor>,
@@ -179,12 +199,12 @@ fn make_harness_with_env(env: HashMap<String, String>) -> TestHarness {
     let (pool, executor, supervisor, holder) =
         make_pool_with_config(mock_sidecar_config_with_env(env), Some(Arc::clone(&db)));
     let exec_dyn: Arc<dyn TaskExecutor> = executor.clone();
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         Arc::clone(&db),
         settings_with_test_provider(),
         "pi",
         exec_dyn,
-    );
+    ));
     TestHarness {
         manager,
         db,
@@ -254,26 +274,31 @@ async fn delegate_via_sidecar_writes_binding_and_sets_hot() {
         .await
         .unwrap();
 
-    // Sidecar returned a real session.
-    assert!(
-        r.adapter_session_id.is_some(),
-        "expected adapter_session_id"
-    );
-    assert_eq!(r.adapter, "pi");
-    assert_eq!(r.status, TaskStatus::Completed);
-    assert!(r.usage.input_tokens.is_some());
+    // delegate() now returns Running immediately; the executor runs in a
+    // background tokio::spawn. Wait for terminal status before checking
+    // post-completion state (Bug #1/#2 fix).
+    assert_eq!(r.status, TaskStatus::Running);
+    let final_status = await_task_done(&h.manager, &r.task_id).await;
+    assert_eq!(final_status, "completed");
 
-    // Hot binding was upserted.
-    {
+    // Hot binding was upserted. The adapter_session_id is now read from the
+    // DB (the immediate DelegateResult has it as None because delegate
+    // returns Running before the executor runs).
+    let adapter_session_id = {
         let db = h.db.lock().unwrap();
         let binding = db.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
         assert!(binding.is_some(), "hot binding not found");
         let binding = binding.unwrap();
         assert_eq!(binding.is_hot, 1);
         assert_eq!(binding.status, "hot");
-        assert_eq!(binding.adapter_session_id, r.adapter_session_id);
+        binding.adapter_session_id
+    };
+    assert!(adapter_session_id.is_some(), "expected adapter_session_id");
+    assert_eq!(r.adapter, "pi");
 
-        // Subagent status is Hot (not Warm).
+    // Subagent status is Hot (not Warm).
+    {
+        let db = h.db.lock().unwrap();
         let sub = db.subagent_get_logical(&r.subagent_id).unwrap();
         assert!(sub.is_some());
         assert_eq!(sub.unwrap().status, "hot");
@@ -289,11 +314,17 @@ async fn delegate_via_sidecar_reuses_hot_binding_on_redelegate() {
         .delegate(req("reviewer", "first turn"))
         .await
         .unwrap();
+    // delegate() now returns Running immediately; wait for terminal status
+    // before re-delegating (Bug #1/#2 fix).
+    assert_eq!(r1.status, TaskStatus::Running);
+    await_task_done(&h.manager, &r1.task_id).await;
     let r2 = h
         .manager
         .delegate(req("reviewer", "second turn"))
         .await
         .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    await_task_done(&h.manager, &r2.task_id).await;
 
     // Same subagent (resolved by name+cwd).
     assert_eq!(r1.subagent_id, r2.subagent_id);
@@ -324,14 +355,12 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_cold() {
         .await
         .unwrap();
 
-    // The executor extracts Some("") verbatim — the delegate is the authority
-    // that decides hot vs warm/cold, and an empty id must NOT create a hot binding.
-    assert_eq!(
-        r.adapter_session_id.as_deref(),
-        Some(""),
-        "executor should pass through the empty id"
-    );
-    assert_eq!(r.status, TaskStatus::Completed);
+    // delegate() now returns Running immediately; the executor runs in a
+    // background tokio::spawn. Wait for terminal status before checking
+    // post-completion state (Bug #1/#2 fix).
+    assert_eq!(r.status, TaskStatus::Running);
+    let final_status = await_task_done(&h.manager, &r.task_id).await;
+    assert_eq!(final_status, "completed");
 
     {
         let db = h.db.lock().unwrap();
@@ -768,10 +797,29 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
+    // Bug 2 fix: the error must be a structured SubagentError::HotSessionStateDivergence,
+    // NOT a bare anyhow wrapped as SubagentError::Store ("database error") and
+    // NOT HotSessionLimit (which would mislead callers into retrying for capacity).
+    // This is a state sync issue — the sidecar holds a session the DB has no
+    // binding for. Downcast to verify the structured variant survives the
+    // anyhow round-trip.
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        format!("{err}").contains("no hot binding found"),
-        "error should explain the sync failure, got: {err}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionStateDivergence(msg) => {
+            assert!(
+                msg.contains("pi_sess_mock_1"),
+                "error message should name the divergent session, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionStateDivergence, got {other:?} — \
+             Bug 2 regression: state-divergence misclassified"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }
@@ -906,11 +954,25 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
-    let err_msg = format!("{err}");
+    // Bug 2 fix: the error must be a structured SubagentError::SidecarRpc,
+    // NOT a bare anyhow wrapped as SubagentError::Store ("database error").
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        err_msg.contains("session.close failed"),
-        "error should mention the close failure, got: {err_msg}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::SidecarRpc { message, .. } => {
+            assert!(
+                message.contains("session.close failed"),
+                "error message should mention the close failure, got: {message}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::SidecarRpc, got {other:?} — \
+             Bug 2 regression: close failure misclassified"
+        ),
+    }
 
     // Verify the fatal-close invariant: the DB HAS been flipped (binding
     // is_hot=0, status='closed'; logical status='warm') BEFORE close was
@@ -1105,10 +1167,11 @@ fn seed_hot_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &s
 
 #[tokio::test]
 async fn executor_eviction_fails_when_candidate_missing_from_error() {
-    // The sidecar returns HOT_SESSION_LIMIT_REACHED but omits data.candidate
-    // (sidecar protocol violation). `extract_candidate_from_data` must error
-    // and the executor must propagate it — never silently retry or evict a
-    // phantom session.
+    // The sidecar returns HOT_SESSION_LIMIT_REACHED but omits the `data`
+    // field entirely (sidecar protocol violation). `classify_hot_limit_error`
+    // must return `ProtocolViolation` and the executor must surface a
+    // structured `SubagentError::Validation` — never silently retry or evict
+    // a phantom session (Bug 1 + Bug 2 fix).
     let mut cfg = mock_config();
     cfg.max_hot_sessions = 1;
     cfg.env
@@ -1124,15 +1187,76 @@ async fn executor_eviction_fails_when_candidate_missing_from_error() {
         .await
         .expect("first delegate must succeed");
 
-    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with no candidate.
+    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with no data field.
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
+    // Bug 2 fix: the error must downcast to a structured SubagentError (not a
+    // bare anyhow that would be mislabeled as "database error").
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        format!("{err}").contains("missing data.candidate"),
-        "error should explain the protocol violation, got: {err}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::Validation(msg) => {
+            assert!(
+                msg.contains("missing data"),
+                "error should explain the protocol violation, got: {msg}"
+            );
+        }
+        other => panic!("expected SubagentError::Validation, got {other:?} — Bug 2 regression"),
+    }
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_skips_when_all_sessions_busy() {
+    // Bug 1 fix: when the sidecar returns HOT_SESSION_LIMIT_REACHED with
+    // `data.candidate = null` + `data.all_busy = true` (all sessions are
+    // in-use), the executor must NOT attempt eviction — there is no safe
+    // candidate. It surfaces `SubagentError::HotSessionLimit` with an empty
+    // candidate so the task fails with a clear, structured error instead of
+    // a doomed eviction + "database error" mislabel (Bug 2).
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_LIMIT_ALL_BUSY".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
+
+    // Fill the pool (max_hot=1).
+    executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+
+    // Second delegate triggers HOT_SESSION_LIMIT_REACHED with all_busy=true.
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    // Bug 2 fix: error must downcast to structured SubagentError.
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            assert!(
+                candidate.is_empty(),
+                "candidate must be empty (all-busy path), got: {candidate}"
+            );
+        }
+        other => {
+            panic!("expected SubagentError::HotSessionLimit, got {other:?} — Bug 1 regression")
+        }
+    }
 
     supervisor.shutdown().await.unwrap();
 }
@@ -1147,7 +1271,7 @@ async fn executor_eviction_fails_without_db() {
     // This covers the `db.is_none()` short-circuit at the top of `evict_session`.
     //
     // Unlike `executor_eviction_fails_when_candidate_missing_from_error` (which
-    // also uses a no-DB executor but errors in `extract_candidate_from_data`
+    // also uses a no-DB executor but errors in `classify_hot_limit_error`
     // before reaching `evict_session`), this test lets candidate extraction
     // succeed so `evict_session` itself is entered and the no-DB guard fires.
     let mut cfg = mock_config();
@@ -1164,8 +1288,8 @@ async fn executor_eviction_fails_without_db() {
         .expect("first delegate must succeed");
 
     // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with a valid
-    // data.candidate (extract_candidate_from_data succeeds), then evict_session
-    // hits the no-DB guard and returns an error before any RPC.
+    // data.candidate (classify_hot_limit_error returns Evict), then
+    // evict_session hits the no-DB guard and returns an error before any RPC.
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
@@ -1210,10 +1334,23 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
+    // Bug 2 fix: error must be a structured SubagentError (not bare anyhow).
+    let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
-        format!("{err}").contains("prepare_hibernate"),
-        "error should mention prepare_hibernate, got: {err}"
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
     );
+    match downcasted.unwrap() {
+        SubagentError::SidecarRpc { message, .. } => {
+            assert!(
+                message.contains("prepare_hibernate"),
+                "error should mention prepare_hibernate, got: {message}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::SidecarRpc for prepare_hibernate failure, got {other:?}"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }
@@ -1370,6 +1507,298 @@ async fn executor_eviction_propagates_error_when_retry_turn_auto_fails() {
         format!("{err}").contains("turn_auto failed"),
         "error should mention the turn_auto failure, got: {err}"
     );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+// --- AlreadyEvicted bounded retry (concurrent eviction race) ---
+//
+// When two concurrent delegates both get the same LRU candidate, the first
+// evictor flips the DB binding to is_hot=0 and calls close; the second
+// evictor's `evict_session` detects is_hot=0 → returns `AlreadyEvicted`.
+// The caller then retries `turn_auto` with bounded backoff, waiting for the
+// first evictor's close to free the sidecar slot.
+//
+// Test 1 (retry succeeds): the concurrent close has already freed the slot
+//   (mock removes the session from its pool during prepare_hibernate), so
+//   the retry `turn_auto` succeeds.
+// Test 2 (exhaustion): the concurrent close never happens (mock keeps the
+//   session in its pool), so all retries hit HOT_SESSION_LIMIT_REACHED and
+//   the executor surfaces `HotSessionLimit`.
+
+/// Pre-seed a binding already flipped to `is_hot=0` + `status=closed`,
+/// simulating a concurrent evictor that already committed the eviction.
+/// The session is still in the sidecar's hot pool (close may or may not
+/// have completed yet — that's what the retry loop handles).
+fn seed_cold_binding(db: &SharedDb, subagent_id: &str, name: &str, session_id: &str) {
+    let now = busytok_domain::now_ms();
+    let db_guard = db.lock().unwrap();
+    db_guard
+        .subagent_upsert_logical(&SubagentLogicalSubagentRow {
+            id: subagent_id.into(),
+            name: name.into(),
+            project_id: "p".into(),
+            repo_path: "/r".into(),
+            repo_hash: "h".into(),
+            branch: None,
+            intent: None,
+            default_profile: "pi/search-cheap".into(),
+            bound_provider_id: "test-provider".into(),
+            bound_model_id: "test-model".into(),
+            status: "warm".into(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_active_at_ms: Some(now),
+        })
+        .unwrap();
+    db_guard
+        .subagent_upsert_memory(&SubagentMemoryRow::new_empty(subagent_id))
+        .unwrap();
+    db_guard
+        .subagent_commit_hot_binding_and_status(
+            &SubagentHarnessBindingRow {
+                id: format!("bind-{subagent_id}"),
+                subagent_id: subagent_id.into(),
+                harness: "pi".into(),
+                adapter_session_id: Some(session_id.into()),
+                adapter_process_id: None,
+                is_hot: 0,
+                status: "closed".into(),
+                created_at_ms: now,
+                last_used_at_ms: Some(now),
+                closed_at_ms: Some(now),
+                detail_json: None,
+            },
+            subagent_id,
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_already_evicted_retry_succeeds() {
+    // Concurrent eviction race: a concurrent evictor already flipped the DB
+    // binding to is_hot=0. The mock sidecar's prepare_hibernate (with
+    // BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS=1) removes the session from its
+    // pool before returning — simulating the concurrent evictor's close
+    // having already freed the slot. The executor returns AlreadyEvicted,
+    // retries turn_auto, and the retry succeeds because the slot is now free.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Pre-flip the DB binding to is_hot=0 (concurrent evictor already
+    // committed the eviction). The sidecar still holds the session in its
+    // pool — until prepare_hibernate runs with EVICTS=1.
+    seed_cold_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. The mock pool is full (sess-a still in it),
+    // so turn_auto returns HOT_SESSION_LIMIT_REACHED with candidate=sess-a.
+    // evict_session: prepare_hibernate removes sess-a from the mock pool
+    // (EVICTS=1), DB check finds is_hot=0 → AlreadyEvicted. Retry turn_auto
+    // succeeds because the mock pool now has room.
+    let out2 = executor
+        .execute(&evict_input("sub-b"))
+        .await
+        .expect("AlreadyEvicted retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+    assert!(
+        out2.adapter_session_id.is_some(),
+        "retry turn_auto must return a session id"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_already_evicted_exhaustion_surfaces_hot_limit() {
+    // Concurrent eviction race: the DB binding is already is_hot=0
+    // (concurrent evictor flipped it), but the concurrent evictor's close
+    // NEVER completes — the sidecar pool stays full. Without
+    // BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS, prepare_hibernate returns the
+    // memory delta but does NOT remove the session from the mock pool.
+    // evict_session returns AlreadyEvicted, all 5 retries hit
+    // HOT_SESSION_LIMIT_REACHED, and the executor surfaces HotSessionLimit.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    // NOTE: BUSYTOK_MOCK_PREPARE_HIBERNATE_EVICTS is NOT set — the mock pool
+    // keeps the session, simulating a concurrent close that never completes.
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // Pre-flip the DB binding to is_hot=0 (concurrent evictor already
+    // committed the eviction). The sidecar still holds the session — and
+    // will keep holding it (no EVICTS flag).
+    seed_cold_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. evict_session returns AlreadyEvicted (is_hot=0).
+    // Retry turn_auto keeps hitting HOT_SESSION_LIMIT_REACHED because the mock
+    // pool never frees the slot. After EVICT_WAIT_MAX_RETRIES, the executor
+    // surfaces SubagentError::HotSessionLimit.
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected HotSessionLimit after AlreadyEvicted exhaustion, got success"),
+        Err(e) => e,
+    };
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            // candidate is empty — the executor surfaces it without a
+            // specific candidate because the retry exhausted waiting for
+            // a concurrent close (not because all sessions were busy).
+            assert!(
+                candidate.is_empty(),
+                "exhausted-retry HotSessionLimit should have empty candidate, got: {candidate}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionLimit after AlreadyEvicted exhaustion, got {other:?}"
+        ),
+    }
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_eviction_already_evicted_via_session_not_found() {
+    // The second AlreadyEvicted path: prepare_hibernate returns
+    // SESSION_NOT_FOUND (-32001) because a concurrent evictor already
+    // closed the session. The mock (with PREPARE_HIBERNATE_NOT_FOUND=1)
+    // removes the session from its pool and returns -32001. The executor
+    // intercepts -32001 → AlreadyEvicted → retry turn_auto succeeds (slot
+    // is now free). Unlike the is_hot=0 path, no DB pre-flip is needed —
+    // the -32001 short-circuits before the DB check.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env.insert(
+        "BUSYTOK_MOCK_PREPARE_HIBERNATE_NOT_FOUND".into(),
+        "1".into(),
+    );
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Seed a hot binding (normal state — no pre-flip; the -32001 from
+    // prepare_hibernate is what triggers AlreadyEvicted, not the DB state).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. turn_auto returns HOT_SESSION_LIMIT_REACHED
+    // with candidate=sess-a. evict_session calls prepare_hibernate(sess-a):
+    // mock removes sess-a from its pool + returns -32001. Executor
+    // intercepts → AlreadyEvicted. Retry turn_auto succeeds (pool now empty).
+    let out2 = executor
+        .execute(&evict_input("sub-b"))
+        .await
+        .expect("SESSION_NOT_FOUND AlreadyEvicted retry must succeed");
+    assert_eq!(out2.status, TaskStatus::Completed);
+    assert!(
+        out2.adapter_session_id.is_some(),
+        "retry turn_auto must return a session id"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn executor_evicted_retry_hot_limit_surfaces_transient() {
+    // Concurrent slot takeover after eviction (P0 regression):
+    //
+    // sub-a holds the only hot session. sub-b triggers eviction (Evicted
+    // outcome — close succeeds). But BUSYTOK_MOCK_REFILL_AFTER_CLOSE=1
+    // simulates a concurrent task grabbing the freed slot before sub-b's
+    // retry. The retry turn_auto returns HOT_SESSION_LIMIT_REACHED again.
+    //
+    // Before the fix, the Evicted path only allowed 1 retry, and the retry
+    // guard only matched AlreadyEvicted — so HOT_SESSION_LIMIT_REACHED on
+    // the Evicted retry fell through to the generic failed_after_eviction
+    // path, returning a raw error (logged as error_kind=Unknown).
+    //
+    // After the fix, both Evicted and AlreadyEvicted retry
+    // HOT_SESSION_LIMIT_REACHED with bounded backoff (EVICT_WAIT_MAX_RETRIES=5).
+    // After exhaustion, the executor surfaces SubagentError::HotSessionLimit
+    // (NOT a generic error) so execute_and_persist can re-queue the task.
+    let db: SharedDb = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.env
+        .insert("BUSYTOK_MOCK_REFILL_AFTER_CLOSE".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate succeeds — sub-a gets a hot session.
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Seed a hot binding (normal state — the Evicted path will flip it).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+
+    // Second delegate — sub-b. turn_auto returns HOT_SESSION_LIMIT_REACHED
+    // with candidate=sess-a. evict_session succeeds (Evicted): prepare_hibernate
+    // returns memory delta, close removes sess-a from pool. But
+    // REFILL_AFTER_CLOSE adds a fake session to the pool, so the retry
+    // turn_auto for sub-b sees the pool as full and returns
+    // HOT_SESSION_LIMIT_REACHED again. After EVICT_WAIT_MAX_RETRIES, the
+    // executor surfaces SubagentError::HotSessionLimit (NOT a generic error).
+    let err = match executor.execute(&evict_input("sub-b")).await {
+        Ok(_) => panic!("expected HotSessionLimit after Evicted retry exhaustion, got success"),
+        Err(e) => e,
+    };
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError (not bare anyhow) so execute_and_persist can re-queue, got: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            // candidate is empty — the executor surfaces it without a
+            // specific candidate because the retry exhausted waiting for
+            // the slot to free (not because all sessions were busy).
+            assert!(
+                candidate.is_empty(),
+                "exhausted-retry HotSessionLimit should have empty candidate, got: {candidate}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionLimit after Evicted retry exhaustion, got {other:?}"
+        ),
+    }
 
     supervisor.shutdown().await.unwrap();
 }

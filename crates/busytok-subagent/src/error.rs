@@ -60,7 +60,26 @@ pub enum SubagentError {
     SidecarCrashed(String),
 
     #[error("hot session limit reached, candidate: {candidate}")]
-    HotSessionLimit { candidate: String },
+    HotSessionLimit {
+        /// The adapter_session_id of the LRU eviction candidate. Empty
+        /// when all hot sessions are in-use (busy) and no candidate is
+        /// evictable — the executor surfaces this variant without
+        /// attempting eviction (Bug 1 fix).
+        candidate: String,
+    },
+
+    /// Hot session state divergence: the sidecar's view of sessions
+    /// diverges from the DB/pool state (e.g. the sidecar named a candidate
+    /// that no supervisor owns, or the DB has no hot binding for the named
+    /// adapter_session_id). This is NOT a capacity condition — the pool
+    /// may or may not be full. Retrying with backoff will not help; the
+    /// caller should surface this for diagnosis (sidecar restart or DB
+    /// reconciliation may be needed). Distinguished from `HotSessionLimit`
+    /// (a genuine capacity condition) and `Validation` (input/config
+    /// errors) so callers can handle state-divergence without conflating
+    /// it with retryable capacity pressure.
+    #[error("hot session state divergence: {0}")]
+    HotSessionStateDivergence(String),
 
     #[error("{0}")]
     Validation(String),
@@ -84,6 +103,7 @@ impl SubagentError {
             SubagentError::SidecarTimeout(_) => "subagent.sidecar_timeout",
             SubagentError::SidecarCrashed(_) => "subagent.sidecar_crashed",
             SubagentError::HotSessionLimit { .. } => "subagent.hot_session_limit",
+            SubagentError::HotSessionStateDivergence(_) => "subagent.hot_session_state_divergence",
             SubagentError::Validation(_) => "subagent.validation_error",
         }
     }

@@ -1958,6 +1958,14 @@ impl BusytokSupervisor {
     /// This is intentionally non-destructive: callers can surface a warning or
     /// trigger a controlled rebuild path later, but startup should never wipe
     /// persisted audit state before a rebuild has proven it can succeed.
+    ///
+    /// **Scope note:** `rebuild_rollups` only recalculates derived tables
+    /// (`daily_usage`, `sessions`, `projects`, `model_summary`,
+    /// `realtime_summary`) from the still-broken `usage_events` — it does NOT
+    /// repair the source audit rows. Clearing this recommendation requires
+    /// `rescan_all` (re-parse source logs and overwrite `usage_events`),
+    /// which is not yet implemented (see `settings_recovery_action`
+    /// `RescanAll` branch).
     pub fn legacy_audit_rebuild_recommended(&self) -> Result<bool> {
         let db = self.read_query_database()?;
         let conn = db.conn();
@@ -1982,7 +1990,7 @@ impl BusytokSupervisor {
         warn!(
             codex_legacy_rows = needs_codex_repair,
             claude_legacy_rows = needs_claude_repair,
-            "detected legacy audit rows; a controlled rebuild is recommended"
+            "detected legacy audit rows in usage_events; rebuild_rollups refreshes derived tables but cannot repair source rows — rescan_all is required for audit-row repair (not yet implemented)"
         );
         Ok(true)
     }
@@ -4680,14 +4688,14 @@ impl RuntimeControl for BusytokSupervisor {
                     SettingsRecoveryActionDto {
                         id: SettingsRecoveryActionIdDto::RescanAll,
                         label: "Rescan All Sources".to_string(),
-                        description: "Re-scan all configured log sources through the writer actor"
+                        description: "Re-parse source logs and overwrite usage_events to repair legacy audit rows (not yet implemented — returns accepted=false)"
                             .to_string(),
                         dangerous: false,
                     },
                     SettingsRecoveryActionDto {
                         id: SettingsRecoveryActionIdDto::RebuildRollups,
                         label: "Rebuild Rollups".to_string(),
-                        description: "Recalculate aggregate rollup tables through the writer actor"
+                        description: "Recalculate derived rollup tables (daily_usage, sessions, projects, model_summary) from existing usage_events — does NOT repair source audit rows"
                             .to_string(),
                         dangerous: false,
                     },
@@ -5062,7 +5070,8 @@ impl RuntimeControl for BusytokSupervisor {
                         Ok(Ok(())) => SettingsRecoveryActionResponseDto {
                             id: req.id,
                             accepted: true,
-                            message: "Rollups rebuilt through writer actor".to_string(),
+                            message: "Rollups rebuilt through writer actor (source usage_events unchanged — audit-row repair requires rescan_all)"
+                                .to_string(),
                         },
                         Ok(Err(err)) => SettingsRecoveryActionResponseDto {
                             id: req.id,
@@ -5438,9 +5447,14 @@ impl RuntimeControl for BusytokSupervisor {
             .delegate(delegate_request_from_dto(req))
             .await
             .map_err(map_subagent_error)?;
-        // Only bridge usage for completed/failed tasks — queued tasks have
-        // no usage yet (the dispatcher will write it when the task runs).
-        if r.status != busytok_subagent::models::TaskStatus::Queued {
+        // Only bridge usage for terminal-status tasks — `Running` and
+        // `Queued` tasks have no usage yet. After the Bug #1/#2 fix,
+        // `delegate()` always returns `Running` or `Queued`, so this bridge
+        // is effectively deferred to the `task_completion_hook` (invoked by
+        // `execute_and_persist`). The check is kept for correctness: if
+        // `delegate()` ever returns a terminal status (e.g. immediate fail),
+        // the usage is bridged here.
+        if r.status.is_terminal() {
             if let Err(e) = self.write_subagent_usage_event(&r, &cwd) {
                 tracing::warn!(
                     event_code = "subagent.usage_write_failed",
@@ -5471,6 +5485,7 @@ impl RuntimeControl for BusytokSupervisor {
                 cost_usd: r.usage.cost_usd,
             },
             created: r.created,
+            queue_reason: r.queue_reason.map(|q| q.as_str().to_string()),
         })
     }
 

@@ -295,7 +295,14 @@ export type SubagentDelegateResponseDto = { task_id: string, subagent_id: string
  * Whether a new subagent was created (true) or an existing one was
  * reused (false). Lets the caller verify the reuse-policy outcome.
  */
-created: boolean, };
+created: boolean, 
+/**
+ * Why the task was queued (`None` when the task started immediately).
+ * Present only when `status == "queued"`. Lets CLI/automation
+ * distinguish "blocked by pressure gate" (`"pressure_gate_paused"`)
+ * from "subagent busy" (`"subagent_busy"`) without reading logs.
+ */
+queue_reason: string | null, };
 
 export type SubagentResolveRequestDto = { name: string | null, id: string | null, cwd: string | null, };
 
@@ -321,9 +328,10 @@ prompt_artifact_ref: string | null, timeout_seconds: number | null, model_overri
 bound_provider_id: string | null, bound_model_id: string | null, 
 /**
  * Reuse policy for name-based resolution:
- * - `create`: only create a new subagent; fail if one with the same name exists
- * - `reuse`: only reuse an existing subagent; fail if not found
- * - `fail` (default): create-or-reuse, but fail if `--bind-*` is given
+ * - `create`: fail if a subagent with the same name exists; otherwise create new
+ * - `reuse`: fail if no such subagent exists; otherwise reuse existing
+ * - `fail`: fail if a subagent with the same name exists (alias for `create`)
+ * Default (None): create-or-reuse, but fail if `--bind-*` is given
  *   and the existing subagent's binding differs from the request
  */
 reuse_policy: string | null, };

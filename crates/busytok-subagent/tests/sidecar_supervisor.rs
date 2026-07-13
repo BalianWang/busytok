@@ -25,6 +25,25 @@ const TEST_PROVIDER_ID: &str = "test-prov";
 /// The test model ID used for seeding bound model rows.
 const TEST_MODEL_NAME: &str = "test-model";
 
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(m: &std::sync::Arc<SubagentManager>, task_id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Build the provider runtime entries map (Task 7: replaces the old
 /// `ProviderLookup` + `CredentialReader` closures).
 fn make_providers() -> HashMap<String, ProviderRuntimeEntry> {
@@ -262,18 +281,18 @@ async fn supervisor_writes_resource_events_when_db_provided() {
 
 struct Harness {
     db: Arc<Mutex<Database>>,
-    manager: SubagentManager,
+    manager: std::sync::Arc<SubagentManager>,
 }
 
 async fn make_harness() -> Harness {
     let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     seed_test_provider_model(&db.lock().unwrap());
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         Arc::new(MockTaskExecutor),
-    );
+    ));
     Harness { db, manager }
 }
 
@@ -374,6 +393,10 @@ async fn crash_reconciliation_marks_tasks_failed_releases_bindings_rolls_back_st
         .delegate(req("crash-test", "in-flight work"))
         .await
         .unwrap();
+    // Wait for the delegate's background task to finish so the task row is
+    // in 'completed' state before we flip it back to 'running' to simulate
+    // a crash-mid-task.
+    await_task_done(&h.manager, &r.task_id).await;
     {
         let db = h.db.lock().unwrap();
         // Flip the just-completed task back to 'running' to simulate the
@@ -399,6 +422,9 @@ async fn crash_reconciliation_marks_tasks_failed_releases_bindings_rolls_back_st
         .delegate(req("to-be-deleted", "work"))
         .await
         .unwrap();
+    // Wait for the delegate's background task to finish so the subagent row
+    // exists before we seed the hot binding and flip its status.
+    await_task_done(&h.manager, &deleted.task_id).await;
     {
         let db = h.db.lock().unwrap();
         // Seed hot binding FIRST (so it exists on a non-deleted row), then
@@ -1057,6 +1083,9 @@ async fn pressure_responder_force_kill_kills_sidecar_and_writes_crash_event() {
 async fn reconcile_crash_error_path_when_db_write_fails() {
     let h = make_harness().await;
     let r = h.manager.delegate(req("crash-err", "work")).await.unwrap();
+    // Wait for the delegate's background task to finish so the subagent row
+    // exists before we seed the hot binding.
+    await_task_done(&h.manager, &r.task_id).await;
     {
         let db = h.db.lock().unwrap();
         seed_hot_binding(&db, &r.subagent_id);
@@ -1460,6 +1489,9 @@ async fn shutdown_reconcile_error_path_when_db_read_only() {
         .delegate(req("shutdown-err", "work"))
         .await
         .unwrap();
+    // Wait for the delegate's background task to finish so the subagent row
+    // exists before we seed the hot binding.
+    await_task_done(&h.manager, &r.task_id).await;
     // Seed a hot binding so reconcile_shutdown has a row to UPDATE.
     {
         let db = h.db.lock().unwrap();

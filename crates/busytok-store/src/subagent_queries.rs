@@ -987,6 +987,43 @@ pub fn find_hot_binding_by_session(
     Ok(row_opt)
 }
 
+/// Find any binding by adapter_session_id and harness, regardless of is_hot
+/// state. Used by the eviction flow to distinguish "already evicted by a
+/// concurrent delegate" (binding exists, is_hot=0) from "never existed" (no
+/// binding at all → real state divergence). Without this, a concurrent
+/// evictor that flipped is_hot=0 before the second evictor's query would
+/// cause a spurious `HotSessionStateDivergence` error.
+pub fn find_binding_by_session(
+    conn: &Connection,
+    adapter_session_id: &str,
+    harness: &str,
+) -> Result<Option<SubagentHarnessBindingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, subagent_id, harness, adapter_session_id, adapter_process_id, \
+                is_hot, status, created_at_ms, last_used_at_ms, closed_at_ms, detail_json \
+         FROM subagent_harness_bindings \
+         WHERE adapter_session_id = ?1 AND harness = ?2",
+    )?;
+    let row_opt = stmt
+        .query_row(params![adapter_session_id, harness], |row| {
+            Ok(SubagentHarnessBindingRow {
+                id: row.get(0)?,
+                subagent_id: row.get(1)?,
+                harness: row.get(2)?,
+                adapter_session_id: row.get(3)?,
+                adapter_process_id: row.get(4)?,
+                is_hot: row.get(5)?,
+                status: row.get(6)?,
+                created_at_ms: row.get(7)?,
+                last_used_at_ms: row.get(8)?,
+                closed_at_ms: row.get(9)?,
+                detail_json: row.get(10)?,
+            })
+        })
+        .ok();
+    Ok(row_opt)
+}
+
 /// Write just the `hot_summary` field of a subagent's memory row.
 /// Used by the eviction flow to persist the memory delta returned by
 /// `session.prepare_hibernate`. Lives in the store layer so the executor
@@ -1603,5 +1640,93 @@ mod phase2_tests {
         assert_eq!(sub_id, "sub-a");
         assert_eq!(*created_at, 1000);
         assert_eq!(status, "failed", "higher id wins tie-break");
+    }
+
+    // --- Bug 1 fix: find_binding_by_session (no is_hot filter) ---
+
+    fn seed_hot_binding_row(
+        conn: &Connection,
+        id: &str,
+        subagent_id: &str,
+        adapter_session_id: &str,
+        is_hot: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO subagent_harness_bindings \
+                 (id, subagent_id, harness, adapter_session_id, adapter_process_id, \
+                  is_hot, status, created_at_ms, last_used_at_ms, closed_at_ms, detail_json) \
+             VALUES (?1, ?2, 'pi', ?3, NULL, ?4, ?5, 1000, 1000, NULL, NULL)",
+            rusqlite::params![
+                id,
+                subagent_id,
+                adapter_session_id,
+                is_hot,
+                if is_hot == 1 { "hot" } else { "closed" }
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn find_hot_binding_by_session_returns_hot_only() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 1);
+        let row = find_hot_binding_by_session(conn, "sess-1", "pi").unwrap();
+        assert!(row.is_some(), "hot binding should be found");
+        assert_eq!(row.unwrap().is_hot, 1);
+    }
+
+    #[test]
+    fn find_hot_binding_by_session_excludes_cold() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 0);
+        let row = find_hot_binding_by_session(conn, "sess-1", "pi").unwrap();
+        assert!(
+            row.is_none(),
+            "cold binding should NOT be found by hot query"
+        );
+    }
+
+    #[test]
+    fn find_binding_by_session_finds_hot() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 1);
+        let row = find_binding_by_session(conn, "sess-1", "pi").unwrap();
+        assert!(
+            row.is_some(),
+            "binding should be found regardless of is_hot"
+        );
+        assert_eq!(row.unwrap().is_hot, 1);
+    }
+
+    #[test]
+    fn find_binding_by_session_finds_cold() {
+        // Bug 1 core: a binding flipped to is_hot=0 by a concurrent evictor
+        // must still be findable by the non-hot query — this is what lets
+        // the executor distinguish "already evicted" from "never existed".
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        seed_subagent(conn, "sub-a");
+        seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 0);
+        let row = find_binding_by_session(conn, "sess-1", "pi").unwrap();
+        assert!(
+            row.is_some(),
+            "cold binding should be found by non-hot query"
+        );
+        assert_eq!(row.unwrap().is_hot, 0, "is_hot should be 0");
+    }
+
+    #[test]
+    fn find_binding_by_session_returns_none_when_no_binding() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+        let row = find_binding_by_session(conn, "nonexistent", "pi").unwrap();
+        assert!(row.is_none(), "should return None when no binding exists");
     }
 }

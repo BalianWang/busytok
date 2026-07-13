@@ -93,35 +93,43 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
     buildSessionOpts(p),
     mockSessionFactory,
   );
-  const now = Date.now();
-  const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
-    ? {
-        current_state_summary: 'Investigated context; produced memory update.',
-        key_files: [{ path: 'src/auth/token.ts', reason: 'refresh logic', last_seen_at_ms: now, score: 3 }],
-        decisions: ['Focus on read-only analysis'],
-        open_questions: [{ question: 'Concurrent refresh handled?', status: 'open' as const, created_at_ms: now, last_seen_at_ms: now }],
-      }
-    : undefined;
-  // task_summary is a REAL summary, NOT an echo of compact_context.
-  // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
-  return {
-    adapter_session_id: session.adapter_session_id,
-    session_reused: reused,
-    status: 'completed',
-    result: {
-      task_summary: `[mock] turn completed for: ${p.prompt.slice(0, 80)}`,
-      ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
-    },
-    usage: {
-      model: p.model,
-      provider: 'deepseek',
-      input_tokens: p.prompt.length,
-      output_tokens: 50,
-      cache_read_tokens: 0,
-      cache_write_tokens: 0,
-      cost_usd: 0.001,
-    },
-  };
+  // Bug 1 fix: mark the session as in-use so getLruCandidate skips it
+  // while the turn is running. `endTurn` in finally covers success,
+  // error, and abort paths.
+  pool.beginTurn(session.adapter_session_id);
+  try {
+    const now = Date.now();
+    const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
+      ? {
+          current_state_summary: 'Investigated context; produced memory update.',
+          key_files: [{ path: 'src/auth/token.ts', reason: 'refresh logic', last_seen_at_ms: now, score: 3 }],
+          decisions: ['Focus on read-only analysis'],
+          open_questions: [{ question: 'Concurrent refresh handled?', status: 'open' as const, created_at_ms: now, last_seen_at_ms: now }],
+        }
+      : undefined;
+    // task_summary is a REAL summary, NOT an echo of compact_context.
+    // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
+    return {
+      adapter_session_id: session.adapter_session_id,
+      session_reused: reused,
+      status: 'completed',
+      result: {
+        task_summary: `[mock] turn completed for: ${p.prompt.slice(0, 80)}`,
+        ...(memoryUpdate ? { memory_update: memoryUpdate } : {}),
+      },
+      usage: {
+        model: p.model,
+        provider: 'deepseek',
+        input_tokens: p.prompt.length,
+        output_tokens: 50,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_usd: 0.001,
+      },
+    };
+  } finally {
+    pool.endTurn(session.adapter_session_id);
+  }
 }
 
 /**
@@ -137,19 +145,26 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
     p.logical_subagent_id,
     buildSessionOpts(p),
   );
-  const result = await session.sendTurn(p.prompt, {
-    model: p.model,
-    provider_id: p.provider_id,
-    tools: p.tools,
-    timeout_ms: p.timeout_ms,
-  });
-  return {
-    adapter_session_id: session.adapter_session_id,
-    session_reused: reused,
-    status: result.status,
-    result: {
-      task_summary: result.task_summary,
-    },
-    usage: result.usage,
-  };
+  // Bug 1 fix: mark session as in-use during sendTurn so concurrent
+  // turn_auto calls cannot select it for eviction.
+  pool.beginTurn(session.adapter_session_id);
+  try {
+    const result = await session.sendTurn(p.prompt, {
+      model: p.model,
+      provider_id: p.provider_id,
+      tools: p.tools,
+      timeout_ms: p.timeout_ms,
+    });
+    return {
+      adapter_session_id: session.adapter_session_id,
+      session_reused: reused,
+      status: result.status,
+      result: {
+        task_summary: result.task_summary,
+      },
+      usage: result.usage,
+    };
+  } finally {
+    pool.endTurn(session.adapter_session_id);
+  }
 }

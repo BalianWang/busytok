@@ -2158,6 +2158,14 @@ impl Database {
         let conn = self.conn();
         subagent_queries::find_hot_binding_by_session(conn, adapter_session_id, harness)
     }
+    pub fn subagent_find_binding_by_session(
+        &self,
+        adapter_session_id: &str,
+        harness: &str,
+    ) -> Result<Option<SubagentHarnessBindingRow>> {
+        let conn = self.conn();
+        subagent_queries::find_binding_by_session(conn, adapter_session_id, harness)
+    }
     pub fn subagent_find_lru_hot_binding(
         &self,
         harness: &str,

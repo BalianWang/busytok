@@ -134,9 +134,12 @@ enum Command {
         #[arg(long)]
         poll_interval: Option<u64>,
         /// Binding reuse policy when a subagent with the same name already
-        /// exists: "create" (always create new), "reuse" (reuse existing),
-        /// "fail" (fail on conflict). Defaults to "fail" when --bind-* flags
-        /// are given and the existing binding differs.
+        /// exists:
+        /// - `create`: fail if a subagent with the same name exists; otherwise create new
+        /// - `reuse`: fail if no such subagent exists; otherwise reuse existing
+        /// - `fail`: fail if a subagent with the same name exists (alias for `create`)
+        /// Default (omitted): create-or-reuse, but fail if --bind-* flags
+        /// are given and the existing binding differs from the request.
         #[arg(long, value_parser = ["create", "reuse", "fail"])]
         reuse_policy: Option<String>,
         /// The task prompt (positional). Mutually exclusive with --prompt-file,

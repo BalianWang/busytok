@@ -53,19 +53,31 @@ export function deriveUniqueProviderName(
 }
 
 /**
+ * Provider kind → display label mapping. Shared between the card view-mode
+ * chip and the create/edit form selects so the surface uses one vocabulary.
+ */
+export const KIND_LABELS: Record<string, string> = {
+  openai_compatible: "OpenAI-compatible",
+  anthropic_compatible: "Anthropic-compatible",
+};
+
+/** Provider kind values for form <option> lists. */
+export const KIND_OPTIONS = Object.keys(KIND_LABELS);
+
+/**
  * Validate a Base URL. Returns an error message string, or null if valid.
  * Checks: non-empty, starts with http:// or https://, parses as URL.
  */
 export function validateBaseUrl(input: string): string | null {
   const trimmed = input.trim();
-  if (!trimmed) return "Base URL 不能为空";
+  if (!trimmed) return "Base URL is required";
   if (!/^https?:\/\//.test(trimmed)) {
-    return "请输入完整的 URL（以 http:// 或 https:// 开头）";
+    return "Enter a complete URL starting with http:// or https://";
   }
   try {
     new URL(trimmed);
   } catch {
-    return "URL 格式不正确";
+    return "Invalid URL format";
   }
   return null;
 }

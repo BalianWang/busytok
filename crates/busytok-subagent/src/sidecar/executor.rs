@@ -11,7 +11,8 @@ use crate::mock_executor::{ExecutorInput, ExecutorOutput, TaskExecutor};
 use crate::models::{TaskErrorKind, TaskStatus, TaskUsage};
 use crate::sidecar::pool::WorkerPool;
 use crate::sidecar::protocol::{
-    AUTH_FAILURE, HOT_SESSION_LIMIT_REACHED, NETWORK_ERROR, RATE_LIMIT, TASK_TIMEOUT,
+    AUTH_FAILURE, HOT_SESSION_LIMIT_REACHED, NETWORK_ERROR, RATE_LIMIT, SESSION_NOT_FOUND,
+    TASK_TIMEOUT,
 };
 use crate::sidecar::SidecarError;
 
@@ -41,6 +42,48 @@ pub struct SidecarTaskExecutor {
     pool: Arc<WorkerPool>,
     db: Option<Arc<Mutex<Database>>>,
 }
+
+/// Outcome of an eviction attempt (Bug 1 concurrent eviction fix).
+///
+/// When two concurrent delegates both receive the same LRU candidate from
+/// the sidecar, both call `evict_session`. The first evictor succeeds
+/// (`Evicted`); the second finds the DB binding already flipped to
+/// `is_hot=0` by the first — this is NOT an error, just `AlreadyEvicted`.
+/// The caller retries `turn_auto` in both cases. For `Evicted`, the slot
+/// is already free (close completed). For `AlreadyEvicted`, the concurrent
+/// evictor's `close` may not have completed yet — the caller uses bounded
+/// retry with backoff to wait for the slot to free up.
+#[derive(Debug)]
+enum EvictionOutcome {
+    /// We successfully drove the full eviction flow (prepare → DB commit → close).
+    Evicted,
+    /// Another concurrent evictor already flipped the DB binding to `is_hot=0`.
+    /// The session `close` may or may not have completed yet — the caller must
+    /// retry `turn_auto` with bounded backoff to wait for the slot to free.
+    AlreadyEvicted,
+}
+
+/// Max retry attempts for `turn_auto` after `AlreadyEvicted`. The concurrent
+/// evictor's `close` RPC is fast (just removes the session from the sidecar
+/// pool), so a small number of retries with short backoff is sufficient.
+const EVICT_WAIT_MAX_RETRIES: u32 = 5;
+
+/// Backoff between retries after `AlreadyEvicted`. 20ms × 5 retries = 100ms
+/// max wait — enough for a concurrent `close` RPC to complete.
+const EVICT_WAIT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Max retry attempts for `turn_auto` when all hot sessions are busy
+/// (`HotLimitOutcome::AllBusy`). This is transient capacity contention —
+/// a running task in a different subagent is holding the only hot session
+/// slot. We retry with backoff instead of immediately failing the task.
+/// 10 retries × 500ms = 5s max wait — enough for short tasks to complete
+/// and free the slot. Longer contention is handled by re-queuing the task
+/// in `execute_and_persist` (see `HOT_SESSION_RETRY_DEADLINE_MS`).
+const ALL_BUSY_MAX_RETRIES: u32 = 10;
+
+/// Backoff between retries when all hot sessions are busy. 500ms provides
+/// reasonable spacing without excessive latency for short tasks.
+const ALL_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl SidecarTaskExecutor {
     /// Construct with a `WorkerPool` + optional DB handle (production path).
@@ -211,41 +254,200 @@ impl SidecarTaskExecutor {
             Err(SidecarError::Application(code, _msg, data))
                 if code == HOT_SESSION_LIMIT_REACHED =>
             {
-                info!(
-                    event_code = "subagent.session.hot_limit_reached",
-                    subagent_id = %input.subagent_id,
-                    "hot session limit reached, driving eviction"
-                );
-                let candidate = extract_candidate_from_data(data.as_ref())?;
-                self.evict_session(&candidate).await?;
-                // Retry turn_auto after eviction. The sidecar's session pool
-                // now has a free slot (close released it), so this should
-                // succeed; any failure propagates as a normal turn_auto error.
-                match handle.turn_auto(params).await {
-                    Ok(result) => Ok(parse_turn_auto_result(&result)),
-                    Err(e) => {
-                        let kind = classify_sidecar_error(&e);
-                        warn!(
-                            event_code = "subagent.sidecar.turn_auto.failed_after_eviction",
-                            error = %e,
-                            error_kind = ?kind
+                // Bug 1 fix: the sidecar returns `data.candidate = null`
+                // + `data.all_busy = true` when all hot sessions are
+                // in-use (busy). In that case, skip eviction entirely —
+                // there is no safe candidate to evict. Surface a
+                // `HotSessionLimit` error so the task fails with a clear
+                // message instead of a doomed eviction attempt +
+                // "database error" mislabel (Bug 2).
+                match classify_hot_limit_error(data.as_ref()) {
+                    HotLimitOutcome::Evict(c) => {
+                        info!(
+                            event_code = "subagent.session.hot_limit_reached",
+                            subagent_id = %input.subagent_id,
+                            candidate = %c,
+                            "hot session limit reached, driving eviction"
                         );
-                        // Auth-fail kill: hard-remove + kill the worker so the
-                        // next execute() re-reads credentials (the bad key
-                        // might have been refreshed in the provider catalog).
-                        if kind == TaskErrorKind::Auth {
-                            if let Err(kill_err) =
-                                self.pool.remove_worker_and_kill(&provider_id).await
-                            {
-                                error!(
-                                    event_code = "subagent.pool.auth_kill_failed",
-                                    provider_id = %provider_id,
-                                    error = %kill_err,
-                                    "remove_worker_and_kill failed after auth error"
-                                );
+                        let outcome = self.evict_session(&c).await?;
+                        // Retry turn_auto after eviction. Both `Evicted` and
+                        // `AlreadyEvicted` use bounded retry with backoff:
+                        //
+                        // - `Evicted`: we successfully closed the LRU session,
+                        //   but a concurrent delegate may have grabbed the
+                        //   freed slot before our retry. HOT_SESSION_LIMIT_REACHED
+                        //   on retry is transient capacity contention — retry
+                        //   with backoff instead of failing.
+                        // - `AlreadyEvicted`: another evictor flipped the DB
+                        //   binding but their `close` may not have completed
+                        //   yet. Bounded retry with backoff until the slot
+                        //   frees up.
+                        //
+                        // In both cases, HOT_SESSION_LIMIT_REACHED during the
+                        // retry window is treated as transient and retried
+                        // (NOT propagated to the generic failed_after_eviction
+                        // path). After EVICT_WAIT_MAX_RETRIES, the executor
+                        // surfaces `SubagentError::HotSessionLimit` so
+                        // `execute_and_persist` can re-queue the task.
+                        let max_attempts = EVICT_WAIT_MAX_RETRIES;
+                        for attempt in 0..max_attempts {
+                            if attempt > 0 {
+                                tokio::time::sleep(EVICT_WAIT_BACKOFF).await;
+                            }
+                            match handle.turn_auto(params.clone()).await {
+                                Ok(result) => return Ok(parse_turn_auto_result(&result)),
+                                Err(SidecarError::Application(code, _msg, _data))
+                                    if code == HOT_SESSION_LIMIT_REACHED =>
+                                {
+                                    info!(
+                                        event_code = "subagent.session.eviction_wait_retry",
+                                        subagent_id = %input.subagent_id,
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        outcome = ?outcome,
+                                        "turn_auto hit HOT_SESSION_LIMIT after eviction — waiting for slot to free"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let kind = classify_sidecar_error(&e);
+                                    warn!(
+                                        event_code = "subagent.sidecar.turn_auto.failed_after_eviction",
+                                        error = %e,
+                                        error_kind = ?kind
+                                    );
+                                    if kind == TaskErrorKind::Auth {
+                                        if let Err(kill_err) =
+                                            self.pool.remove_worker_and_kill(&provider_id).await
+                                        {
+                                            error!(
+                                                event_code = "subagent.pool.auth_kill_failed",
+                                                provider_id = %provider_id,
+                                                error = %kill_err,
+                                                "remove_worker_and_kill failed after auth error"
+                                            );
+                                        }
+                                    }
+                                    return Err(sidecar_to_anyhow(e));
+                                }
                             }
                         }
-                        Err(sidecar_to_anyhow(e))
+                        // Reached when all EVICT_WAIT_MAX_RETRIES retries are
+                        // exhausted — the slot never freed within the retry
+                        // window (concurrent task holds it, or the evictor's
+                        // close never completed). Surface as HotSessionLimit so
+                        // `execute_and_persist` can re-queue the task for
+                        // dispatcher retry (bounded by HOT_SESSION_RETRY_DEADLINE_MS).
+                        warn!(
+                            event_code = "subagent.session.eviction_wait_exhausted",
+                            subagent_id = %input.subagent_id,
+                            retries = EVICT_WAIT_MAX_RETRIES,
+                            outcome = ?outcome,
+                            "exhausted retries waiting for slot to free — surfacing as HotSessionLimit"
+                        );
+                        Err(anyhow::Error::from(SubagentError::HotSessionLimit {
+                            candidate: String::new(),
+                        }))
+                    }
+                    HotLimitOutcome::AllBusy => {
+                        // Transient capacity contention: all hot sessions are
+                        // in-use by running tasks. The slot will free up when
+                        // one of them completes. Retry with backoff instead of
+                        // immediately failing the task.
+                        //
+                        // This is the fix for the P0 bug where two different
+                        // subagents competing for the global hot session limit
+                        // caused one to fail with "hot session limit reached"
+                        // instead of waiting for the slot to free up.
+                        info!(
+                            event_code = "subagent.session.hot_limit_all_busy",
+                            subagent_id = %input.subagent_id,
+                            "hot session limit reached — all sessions busy, retrying with backoff"
+                        );
+                        for attempt in 0..ALL_BUSY_MAX_RETRIES {
+                            tokio::time::sleep(ALL_BUSY_BACKOFF).await;
+                            match handle.turn_auto(params.clone()).await {
+                                Ok(result) => {
+                                    info!(
+                                        event_code = "subagent.session.hot_limit_all_busy_recovered",
+                                        subagent_id = %input.subagent_id,
+                                        attempt = attempt + 1,
+                                        "turn_auto succeeded after all-busy retry — slot freed"
+                                    );
+                                    return Ok(parse_turn_auto_result(&result));
+                                }
+                                Err(SidecarError::Application(code, _msg, data))
+                                    if code == HOT_SESSION_LIMIT_REACHED =>
+                                {
+                                    match classify_hot_limit_error(data.as_ref()) {
+                                        HotLimitOutcome::AllBusy => {
+                                            info!(
+                                                event_code = "subagent.session.hot_limit_all_busy_retry",
+                                                subagent_id = %input.subagent_id,
+                                                attempt = attempt + 1,
+                                                max_attempts = ALL_BUSY_MAX_RETRIES,
+                                                "all hot sessions still busy — retrying"
+                                            );
+                                            continue;
+                                        }
+                                        // A candidate surfaced during AllBusy
+                                        // retry — fall through to surface the
+                                        // error. Eviction mid-AllBusy is
+                                        // unexpected (the slot is busy, not
+                                        // evictable) but we don't want to loop
+                                        // forever on an unexpected state
+                                        // transition.
+                                        HotLimitOutcome::Evict(_)
+                                        | HotLimitOutcome::ProtocolViolation(_) => {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let kind = classify_sidecar_error(&e);
+                                    warn!(
+                                        event_code = "subagent.sidecar.turn_auto.failed_after_all_busy_retry",
+                                        error = %e,
+                                        error_kind = ?kind,
+                                        attempt = attempt + 1
+                                    );
+                                    if kind == TaskErrorKind::Auth {
+                                        if let Err(kill_err) =
+                                            self.pool.remove_worker_and_kill(&provider_id).await
+                                        {
+                                            error!(
+                                                event_code = "subagent.pool.auth_kill_failed",
+                                                provider_id = %provider_id,
+                                                error = %kill_err,
+                                                "remove_worker_and_kill failed after auth error"
+                                            );
+                                        }
+                                    }
+                                    return Err(sidecar_to_anyhow(e));
+                                }
+                            }
+                        }
+                        // Retries exhausted — surface HotSessionLimit so the
+                        // manager can re-queue the task (or mark as failed if
+                        // the deadline has passed).
+                        warn!(
+                            event_code = "subagent.session.hot_limit_all_busy_exhausted",
+                            subagent_id = %input.subagent_id,
+                            retries = ALL_BUSY_MAX_RETRIES,
+                            "all hot sessions busy after retries — surfacing as HotSessionLimit"
+                        );
+                        Err(anyhow::Error::from(SubagentError::HotSessionLimit {
+                            candidate: String::new(),
+                        }))
+                    }
+                    HotLimitOutcome::ProtocolViolation(msg) => {
+                        warn!(
+                            event_code = "subagent.session.hot_limit_protocol_violation",
+                            subagent_id = %input.subagent_id,
+                            error = %msg,
+                            "sidecar returned HOT_SESSION_LIMIT_REACHED without a valid candidate or all_busy flag"
+                        );
+                        Err(anyhow::Error::from(SubagentError::Validation(msg)))
                     }
                 }
             }
@@ -307,12 +509,12 @@ pub fn classify_sidecar_error(err: &SidecarError) -> TaskErrorKind {
                 RATE_LIMIT => TaskErrorKind::RateLimit,
                 NETWORK_ERROR => TaskErrorKind::Network,
                 TASK_TIMEOUT => TaskErrorKind::Timeout,
+                HOT_SESSION_LIMIT_REACHED => TaskErrorKind::HotSessionLimit,
                 // Other application codes (SESSION_NOT_FOUND,
-                // HOT_SESSION_LIMIT_REACHED, SIDECAR_UNHEALTHY,
-                // PROFILE_NOT_FOUND, TOOL_NOT_ALLOWED, INVALID_OUTPUT_SCHEMA,
-                // PROTOCOL_MISMATCH) are handled by their respective flows
-                // (eviction, profile resolution, etc.) — classify as Unknown
-                // for the general error-handling path.
+                // SIDECAR_UNHEALTHY, PROFILE_NOT_FOUND, TOOL_NOT_ALLOWED,
+                // INVALID_OUTPUT_SCHEMA, PROTOCOL_MISMATCH) are handled by
+                // their respective flows (eviction, profile resolution, etc.)
+                // — classify as Unknown for the general error-handling path.
                 _ => TaskErrorKind::Unknown,
             }
         }
@@ -342,22 +544,52 @@ pub fn classify_sidecar_error(err: &SidecarError) -> TaskErrorKind {
     }
 }
 
-/// Extract the LRU candidate `adapter_session_id` from the JSON-RPC error's
-/// `data.candidate` field. The sidecar is the hot-pool authority (spec §4.4) —
-/// it names the LRU session in the error response, so we read it directly
-/// rather than querying the local DB. A missing/malformed `candidate` is a
-/// sidecar protocol violation.
-fn extract_candidate_from_data(data: Option<&serde_json::Value>) -> anyhow::Result<String> {
-    let candidate = data
-        .and_then(|d| d.get("candidate"))
+/// Outcome of classifying a `HOT_SESSION_LIMIT_REACHED` error's `data` field
+/// (Bug 1 fix). Distinguishes three cases that the old `Option<String>`
+/// return collapsed into one, causing the protocol-violation path to be
+/// mislabeled as "all busy" and surface as `HotSessionLimit`.
+#[derive(Debug)]
+enum HotLimitOutcome {
+    /// A specific LRU session was named as the eviction candidate.
+    Evict(String),
+    /// All hot sessions are in-use (busy) — no candidate is evictable. The
+    /// sidecar signals this with `data.all_busy = true` +
+    /// `data.candidate = null`.
+    AllBusy,
+    /// The sidecar response is malformed: `data` is missing, or
+    /// `data.candidate` is missing/null without `data.all_busy = true`.
+    /// This is a sidecar protocol violation, not a capacity condition.
+    ProtocolViolation(String),
+}
+
+/// Classify the `data` field of a `HOT_SESSION_LIMIT_REACHED` JSON-RPC error
+/// into one of three outcomes (Bug 1 fix).
+///
+/// The sidecar is the hot-pool authority (spec §4.4):
+/// - `data.candidate = "<session_id>"` → evict that session.
+/// - `data.candidate = null` + `data.all_busy = true` → all sessions are
+///   in-use (running a turn); skip eviction, surface `HotSessionLimit`.
+/// - `data` missing or `data.candidate` missing without `all_busy` → sidecar
+///   protocol violation; surface a `Validation` error with a clear message.
+fn classify_hot_limit_error(data: Option<&serde_json::Value>) -> HotLimitOutcome {
+    let Some(d) = data else {
+        return HotLimitOutcome::ProtocolViolation(
+            "HOT_SESSION_LIMIT_REACHED error missing data field".into(),
+        );
+    };
+    if d.get("all_busy").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return HotLimitOutcome::AllBusy;
+    }
+    match d
+        .get("candidate")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "HOT_SESSION_LIMIT_REACHED error missing data.candidate — \
-                 sidecar protocol violation"
-            )
-        })?;
-    Ok(candidate.to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(c) => HotLimitOutcome::Evict(c.to_string()),
+        None => HotLimitOutcome::ProtocolViolation(
+            "HOT_SESSION_LIMIT_REACHED error missing data.candidate".into(),
+        ),
+    }
 }
 
 impl SidecarTaskExecutor {
@@ -391,9 +623,10 @@ impl SidecarTaskExecutor {
         // map lock is NOT held here - correct lock ordering.
         let candidates_for_lru: Vec<(SubagentHarnessBindingRow, String)> = {
             let Some(db) = &self.db else {
-                return Err(anyhow::anyhow!(
-                    "evict_lru requires a DB connection; no-DB executor cannot pick LRU"
-                ));
+                return Err(SubagentError::Validation(
+                    "evict_lru requires a DB connection; no-DB executor cannot pick LRU".into(),
+                )
+                .into());
             };
             let db = db.lock().expect("db lock poisoned");
             let mut all_candidates: Vec<(SubagentHarnessBindingRow, String)> = Vec::new();
@@ -422,13 +655,14 @@ impl SidecarTaskExecutor {
             return Ok(());
         };
 
-        let adapter_session_id = binding
-            .adapter_session_id
-            .ok_or_else(|| anyhow::anyhow!("LRU hot binding has no adapter_session_id"))?;
+        let adapter_session_id = binding.adapter_session_id.ok_or_else(|| {
+            SubagentError::Validation("LRU hot binding has no adapter_session_id".into())
+        })?;
 
         // Step 3: delegate to evict_session (resolves the supervisor via
         // supervisor_for_session — pool-wide routing).
-        self.evict_session(&adapter_session_id).await
+        self.evict_session(&adapter_session_id).await?;
+        Ok(())
     }
 
     /// Drive the eviction flow for a single session (spec §4.4):
@@ -448,7 +682,21 @@ impl SidecarTaskExecutor {
     /// sync) → log warning + return a fatal error. Silently skipping would
     /// cause the `turn_auto` retry to hit `HOT_SESSION_LIMIT_REACHED` again,
     /// hiding the root cause behind the symptom.
-    async fn evict_session(&self, adapter_session_id: &str) -> anyhow::Result<()> {
+    ///
+    /// **Bug 2 fix:** returns `Result<(), SubagentError>` (not
+    /// `anyhow::Result<()>`) so structured domain errors survive the
+    /// `anyhow::Error` round-trip through `execute()`. The caller
+    /// (`execute_task`) downcasts `anyhow::Error → SubagentError` — bare
+    /// `anyhow::anyhow!(...)` errors fail the downcast and degrade to
+    /// `SubagentError::Store` ("database error"), losing the root cause.
+    /// Only real SQLite/store failures use `SubagentError::Store`; all
+    /// other eviction failures use semantically-correct variants
+    /// (`HotSessionStateDivergence` for sidecar/DB sync issues,
+    /// `SidecarRpc` for close failures, `Validation` for config errors).
+    async fn evict_session(
+        &self,
+        adapter_session_id: &str,
+    ) -> std::result::Result<EvictionOutcome, SubagentError> {
         // No-DB path: eviction cannot be performed safely. The persist step
         // below (write memory + flip binding atomically) is what keeps the DB
         // and sidecar in sync; without a DB we would skip it, call `close`,
@@ -462,10 +710,10 @@ impl SidecarTaskExecutor {
                 adapter_session_id = %adapter_session_id,
                 "eviction requested but executor has no DB handle — cannot persist binding flip atomically; aborting to avoid state divergence"
             );
-            return Err(anyhow::anyhow!(
+            return Err(SubagentError::Validation(format!(
                 "eviction requires a DB connection for atomic persistence; \
                  no-DB executor cannot evict safely (adapter_session_id={adapter_session_id})"
-            ));
+            )));
         }
 
         // C7 fix: resolve which supervisor owns this session via the pool.
@@ -476,38 +724,50 @@ impl SidecarTaskExecutor {
                 // No supervisor owns this session: either the binding belongs
                 // to a removed provider (session already gone), or the sidecar
                 // and DB are out of sync (the sidecar named a candidate the DB
-                // doesn't track). Surface this as a fatal error — silently
-                // skipping would cause the turn_auto retry to hit
-                // HOT_SESSION_LIMIT_REACHED again, hiding the root cause
-                // (out-of-sync) behind the symptom (limit reached).
+                // doesn't track). Surface this as a state-divergence error —
+                // NOT HotSessionLimit (which would mislead callers into
+                // retrying for capacity). Silently skipping would cause the
+                // turn_auto retry to hit HOT_SESSION_LIMIT_REACHED again,
+                // hiding the root cause (out-of-sync) behind the symptom.
                 warn!(
                     event_code = "subagent.session.eviction_no_supervisor",
                     adapter_session_id = %adapter_session_id,
                     "no supervisor owns this session — binding may belong to a removed provider, or sidecar/DB are out of sync; aborting eviction"
                 );
-                return Err(anyhow::anyhow!(
-                    "no hot binding found for adapter_session_id {adapter_session_id} \
-                     — no supervisor owns this session (binding may belong to a removed \
-                     provider, or sidecar/DB are out of sync)"
-                ));
+                return Err(SubagentError::HotSessionStateDivergence(format!(
+                    "no supervisor owns adapter_session_id={adapter_session_id}; \
+                     binding may belong to a removed provider, or sidecar/DB are out of sync"
+                )));
             }
         };
 
         let handle = supervisor
             .ensure_started()
             .await
-            .map_err(sidecar_to_anyhow)?;
+            .map_err(SubagentError::from)?;
         // 1. prepare_hibernate → memory delta
-        let hibernate_result = handle
-            .prepare_hibernate(adapter_session_id)
-            .await
-            .map_err(|e| {
+        // Bug 1 concurrent eviction fix: if the session was already closed
+        // by a concurrent evictor, prepare_hibernate returns SESSION_NOT_FOUND
+        // (-32001). This is NOT an error — the eviction was already done.
+        // Return `AlreadyEvicted` so the caller retries `turn_auto`.
+        let hibernate_result = match handle.prepare_hibernate(adapter_session_id).await {
+            Ok(r) => r,
+            Err(SidecarError::Application(code, _msg, _data)) if code == SESSION_NOT_FOUND => {
+                info!(
+                    event_code = "subagent.session.eviction_already_evicted",
+                    adapter_session_id = %adapter_session_id,
+                    "prepare_hibernate returned SESSION_NOT_FOUND — concurrent evictor already closed this session"
+                );
+                return Ok(EvictionOutcome::AlreadyEvicted);
+            }
+            Err(e) => {
                 warn!(
                     event_code = "subagent.session.eviction_prepare_failed",
                     error = %e
                 );
-                sidecar_to_anyhow(e)
-            })?;
+                return Err(SubagentError::from(e));
+            }
+        };
         let memory_delta = hibernate_result.get("memory_delta").cloned();
         let stats = hibernate_result.get("stats").cloned();
 
@@ -518,15 +778,50 @@ impl SidecarTaskExecutor {
             let harness = supervisor.config().harness_name.clone();
             let (subagent_id, hot_summary_written) = {
                 let db_guard = db.lock().expect("db lock poisoned");
-                // Find the binding for this adapter_session_id.
+                // Bug 1 concurrent eviction fix: first try to find a HOT
+                // binding. If none exists, check if a non-hot binding exists
+                // (is_hot=0) — that means a concurrent evictor already
+                // flipped it. In that case, return `AlreadyEvicted` (not an
+                // error). Only if NO binding exists at all is it a real
+                // state divergence.
                 let binding = db_guard
                     .subagent_find_hot_binding_by_session(adapter_session_id, &harness)
-                    .map_err(|e| anyhow::anyhow!("find binding failed: {e}"))?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no hot binding found for adapter_session_id {adapter_session_id}"
-                        )
+                    .map_err(|e| {
+                        SubagentError::Store(anyhow::anyhow!("find hot binding failed: {e}"))
                     })?;
+                let binding = match binding {
+                    Some(b) => b,
+                    None => {
+                        // No hot binding — check if any binding exists.
+                        let any_binding = db_guard
+                            .subagent_find_binding_by_session(adapter_session_id, &harness)
+                            .map_err(|e| {
+                                SubagentError::Store(anyhow::anyhow!(
+                                    "find binding (any) failed: {e}"
+                                ))
+                            })?;
+                        match any_binding {
+                            Some(b) if b.is_hot == 0 => {
+                                // Concurrent evictor already flipped the binding.
+                                info!(
+                                    event_code = "subagent.session.eviction_already_evicted",
+                                    adapter_session_id = %adapter_session_id,
+                                    "hot binding already flipped (is_hot=0) — concurrent evictor completed eviction"
+                                );
+                                return Ok(EvictionOutcome::AlreadyEvicted);
+                            }
+                            _ => {
+                                // No binding at all — real state divergence.
+                                return Err(SubagentError::HotSessionStateDivergence(
+                                    format!(
+                                        "no binding found in DB for adapter_session_id={adapter_session_id}; \
+                                         sidecar/DB state divergence (sidecar holds session, DB has no binding)"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                };
                 let subagent_id = binding.subagent_id.clone();
                 // Compute the hot_summary to persist: only when memory_delta
                 // is present, non-null, and has a `hot_summary` field. A null
@@ -551,7 +846,9 @@ impl SidecarTaskExecutor {
                 flipped.closed_at_ms = Some(now);
                 let new_status = db_guard
                     .subagent_commit_eviction(&flipped, &subagent_id, hot_summary)
-                    .map_err(|e| anyhow::anyhow!("commit eviction failed: {e}"))?;
+                    .map_err(|e| {
+                        SubagentError::Store(anyhow::anyhow!("commit eviction failed: {e}"))
+                    })?;
                 // Explicit status transition log (§3.3): hot binding closed,
                 // logical status flips to warm (hot_summary present) or cold.
                 // `new_status` is the authoritative value computed by
@@ -619,12 +916,15 @@ impl SidecarTaskExecutor {
                 "session.close failed during eviction — DB flipped but sidecar slot not released; \
                  aborting retry to avoid state divergence (sidecar restart may be needed)"
             );
-            return Err(anyhow::anyhow!(
-                "session.close failed during eviction for {adapter_session_id}: {e} \
-                 — sidecar pool may be inconsistent, restart recommended"
-            ));
+            return Err(SubagentError::SidecarRpc {
+                message: format!(
+                    "session.close failed during eviction for {adapter_session_id}: {e} \
+                     — sidecar pool may be inconsistent, restart recommended"
+                ),
+                code: None,
+            });
         }
-        Ok(())
+        Ok(EvictionOutcome::Evicted)
     }
 }
 
@@ -821,6 +1121,20 @@ mod tests {
     }
 
     #[test]
+    fn classify_hot_session_limit() {
+        // -32002 (HOT_SESSION_LIMIT_REACHED) → HotSessionLimit (NOT Unknown).
+        // This ensures the failed_after_eviction and failed_after_all_busy_retry
+        // log paths emit error_kind=HotSessionLimit instead of Unknown when
+        // a HOT_SESSION_LIMIT_REACHED error reaches the generic error handler.
+        let err = SidecarError::Application(
+            HOT_SESSION_LIMIT_REACHED,
+            "hot session limit reached".to_string(),
+            None,
+        );
+        assert_eq!(classify_sidecar_error(&err), TaskErrorKind::HotSessionLimit);
+    }
+
+    #[test]
     fn classify_crash() {
         // SidecarError::Crashed → Crash.
         let err = SidecarError::Crashed("sidecar exited with code 1".to_string());
@@ -917,5 +1231,83 @@ mod tests {
         // SidecarError::Io without network keywords → Unknown.
         let err = SidecarError::Io("disk full".to_string());
         assert_eq!(classify_sidecar_error(&err), TaskErrorKind::Unknown);
+    }
+
+    // --- classify_hot_limit_error tests (Bug 1 fix) ---
+
+    #[test]
+    fn hot_limit_classify_evict_candidate() {
+        // Normal case: candidate is a non-empty session id → Evict.
+        let data = serde_json::json!({"candidate": "pi_sess_1"});
+        match classify_hot_limit_error(Some(&data)) {
+            HotLimitOutcome::Evict(c) => assert_eq!(c, "pi_sess_1"),
+            other => panic!("expected Evict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_limit_classify_all_busy() {
+        // All sessions in-use: candidate=null + all_busy=true → AllBusy.
+        let data = serde_json::json!({"candidate": null, "all_busy": true});
+        match classify_hot_limit_error(Some(&data)) {
+            HotLimitOutcome::AllBusy => {}
+            other => panic!("expected AllBusy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_limit_classify_all_busy_takes_priority() {
+        // If all_busy=true, return AllBusy even if a candidate is present —
+        // the candidate might be a busy session that must not be evicted.
+        let data = serde_json::json!({"candidate": "pi_sess_1", "all_busy": true});
+        match classify_hot_limit_error(Some(&data)) {
+            HotLimitOutcome::AllBusy => {}
+            other => panic!("expected AllBusy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_limit_classify_all_busy_false_falls_through_to_candidate() {
+        // all_busy present but false → check candidate normally.
+        let data = serde_json::json!({"candidate": "pi_sess_1", "all_busy": false});
+        match classify_hot_limit_error(Some(&data)) {
+            HotLimitOutcome::Evict(c) => assert_eq!(c, "pi_sess_1"),
+            other => panic!("expected Evict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_limit_classify_protocol_violation_no_data() {
+        // data field missing entirely → ProtocolViolation.
+        match classify_hot_limit_error(None) {
+            HotLimitOutcome::ProtocolViolation(msg) => {
+                assert!(msg.contains("missing data"), "got: {msg}");
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_limit_classify_protocol_violation_no_candidate() {
+        // data present but candidate missing, all_busy not set → ProtocolViolation.
+        let data = serde_json::json!({"foo": "bar"});
+        match classify_hot_limit_error(Some(&data)) {
+            HotLimitOutcome::ProtocolViolation(msg) => {
+                assert!(msg.contains("missing data.candidate"), "got: {msg}");
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hot_limit_classify_protocol_violation_empty_candidate() {
+        // candidate is an empty string → ProtocolViolation (treated as missing).
+        let data = serde_json::json!({"candidate": ""});
+        match classify_hot_limit_error(Some(&data)) {
+            HotLimitOutcome::ProtocolViolation(msg) => {
+                assert!(msg.contains("missing data.candidate"), "got: {msg}");
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
+        }
     }
 }

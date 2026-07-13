@@ -123,6 +123,40 @@ fn catalog_loads_from_embedded_json() {
 
 #[test]
 #[serial]
+fn embedded_catalog_includes_openai_56_and_claude_5_models() {
+    let catalog = load_catalog();
+
+    let sol = catalog
+        .resolve_model("gpt-5.6-sol")
+        .expect("gpt-5.6-sol should exist");
+    assert_eq!(sol.provider, "openai");
+    assert_eq!(sol.tiers[0].input_per_million, 5.0);
+    assert_eq!(sol.tiers[0].output_per_million, 25.0);
+    assert_eq!(sol.tiers[0].cached_input_per_million, Some(0.5));
+    assert_eq!(sol.tiers[0].cache_write_per_million, Some(6.25));
+
+    let sonnet = catalog
+        .resolve_model("claude-5-sonnet")
+        .expect("claude-5-sonnet alias should resolve");
+    assert_eq!(sonnet.model, "claude-sonnet-5");
+    assert_eq!(sonnet.provider, "anthropic");
+    assert_eq!(sonnet.tiers[0].input_per_million, 2.0);
+    assert_eq!(sonnet.tiers[0].output_per_million, 10.0);
+    assert_eq!(sonnet.tiers[0].cached_input_per_million, Some(0.2));
+    assert_eq!(sonnet.tiers[0].cache_write_per_million, Some(2.5));
+
+    let mythos = catalog
+        .resolve_model("claude-mythos-5")
+        .expect("claude-mythos-5 should exist");
+    assert_eq!(mythos.provider, "anthropic");
+    assert_eq!(mythos.tiers[0].input_per_million, 7.0);
+    assert_eq!(mythos.tiers[0].output_per_million, 35.0);
+    assert_eq!(mythos.tiers[0].cached_input_per_million, Some(0.7));
+    assert_eq!(mythos.tiers[0].cache_write_per_million, Some(8.75));
+}
+
+#[test]
+#[serial]
 fn reasoning_tokens_not_double_counted() {
     let catalog = PriceCatalog {
         schema_version: "3".to_string(),

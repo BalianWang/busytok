@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use busytok_config::SubagentSettings;
 use busytok_store::{
-    SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
+    Database, SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
 use tracing::{error, info, warn};
 
@@ -15,7 +15,7 @@ use crate::error::{Result, SubagentError};
 use crate::memory::MemoryUpdater;
 use crate::mock_executor::{ExecutorInput, TaskExecutor};
 use crate::models::{
-    DelegateRequest, DelegateResult, LogicalSubagent, ResolveParams, SubagentStatus,
+    DelegateRequest, DelegateResult, LogicalSubagent, QueueReason, ResolveParams, SubagentStatus,
     SubagentTaskSummary, TaskErrorKind, TaskStatus, TaskUsage,
 };
 use crate::pressure::PressureGate;
@@ -55,6 +55,18 @@ const REAPER_BUFFER_MS: i64 = 60_000;
 /// 64-bit integer domain. Values above this are rejected at delegate time
 /// and capped at the reaper fallback path.
 const MAX_SAFE_TIMEOUT_SECONDS: i64 = (i64::MAX - REAPER_BUFFER_MS) / 1000;
+
+/// Maximum wall-clock age (ms) a task may reach before `HotSessionLimit`
+/// re-queuing gives up and marks the task as `failed`. When the executor
+/// exhausts its in-call retries (`ALL_BUSY_MAX_RETRIES` × `ALL_BUSY_BACKOFF`
+/// ≈ 5s) and returns `HotSessionLimit`, `execute_and_persist` flips the task
+/// back to `queued` so the dispatcher can retry. This creates a bounded retry
+/// loop: each cycle is ~5s of executor retry + 200ms dispatcher tick. At 5
+/// minutes the task has had ~60 cycles — enough for any well-behaved
+/// concurrent task to finish and free the hot session slot. Past this
+/// deadline the task is marked `failed` with `error_kind = hot_session_limit`
+/// so it doesn't loop forever.
+const HOT_SESSION_RETRY_DEADLINE_MS: i64 = 300_000;
 
 /// Convert a delegate-request `timeout_seconds` override (`u64` from
 /// CLI/DTO) to the `i64` representation stored in
@@ -209,8 +221,13 @@ impl SubagentManager {
         *guard = Some(hook);
     }
 
-    /// Create-or-continue a subagent and run one task (mock execution in this plan).
-    pub async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult> {
+    /// Create-or-continue a subagent and run one task.
+    ///
+    /// Takes `&Arc<Self>` so execution can be spawned in the background
+    /// (Bug #1/#2 fix): `delegate()` inserts the task row and returns
+    /// `Running` (or `Queued` under contention) immediately. The spawned
+    /// task calls `execute_task` and persists results asynchronously.
+    pub async fn delegate(self: &Arc<Self>, req: DelegateRequest) -> Result<DelegateResult> {
         if !self.settings.enabled {
             warn!(
                 event_code = "subagent.delegate.rejected",
@@ -311,11 +328,17 @@ impl SubagentManager {
             }
         };
 
-        // Reuse-policy conflict detection (P1-4). Enforced after resolution so
-        // the resolver's own validation (bound fields required on create,
-        // canonical cwd) runs first.
+        // Reuse-policy conflict detection (P1-4 + Bug #3 fix). Enforced
+        // after resolution so the resolver's own validation (bound fields
+        // required on create, canonical cwd) runs first.
+        //
+        // Semantics:
+        //   create → fail if subagent already exists; otherwise create
+        //   reuse  → fail if subagent not found; otherwise reuse
+        //   fail   → alias for `create`: fail if subagent already exists
+        //   None   → default: create-or-reuse, fail on binding mismatch
         match (&req.reuse_policy.as_deref(), created) {
-            (Some("create"), false) => {
+            (Some("create"), false) | (Some("fail"), false) => {
                 return Err(SubagentError::InvalidArgument(format!(
                     "subagent '{}' already exists; use --reuse-policy=reuse to reuse it",
                     req.subagent_name
@@ -331,8 +354,8 @@ impl SubagentManager {
             // user opted into reusing the existing subagent regardless of
             // its current binding.
             (Some("reuse"), false) => {}
-            // Default policy (None / Some("fail")) on the reuse path: when the
-            // request carries bound fields, verify they match the existing
+            // Default / unknown policy on the reuse path: when the request
+            // carries bound fields, verify they match the existing
             // subagent's binding. A mismatch is a configuration error.
             (_, false) => {
                 if let (Some(req_pid), Some(req_mid)) =
@@ -357,6 +380,19 @@ impl SubagentManager {
             (_, true) => {}
         }
 
+        // Bug #1/#2 fix: validate bound resources BEFORE inserting the task
+        // row. Validation failures (disabled provider, missing api key,
+        // missing model metadata) are returned from delegate() immediately
+        // rather than being swallowed by the async error handler in
+        // execute_and_persist. This preserves the fail-fast contract: callers
+        // get a Validation error they can act on, not a silently-failed
+        // background task.
+        let effective_model_id = req
+            .model_override
+            .clone()
+            .unwrap_or_else(|| subagent.bound_model_id.clone());
+        self.validate_bound_resources(&subagent, &effective_model_id)?;
+
         // 2. insert task row. §8.3 step 2 "queue only" (Round 4 race-free
         //    design) + spec §6.4 per-subagent serialization: check the gate
         //    AND whether this subagent already has a running task BEFORE insert.
@@ -364,8 +400,8 @@ impl SubagentManager {
         //      `Queued` early. The background `TaskDispatcher` (Task 7) picks
         //      it up when the gate clears AND the subagent is free.
         //    - Gate not paused AND subagent free → insert as `"running"`
-        //      (with `started_at_ms = now`). The dispatcher only picks
-        //      `'queued'` tasks, so it never sees this task.
+        //      (with `started_at_ms = now`), spawn execution in the
+        //      background, and return `Running` immediately (Bug #1/#2 fix).
         //    The `has_running_task` check + insert happen inside the same DB
         //    lock, so the TOCTOU window is closed (single-process, Rust mutex
         //    serializes all DB access).
@@ -409,6 +445,13 @@ impl SubagentManager {
                 error_kind: None,
             })
             .map_err(SubagentError::Store)?;
+            // Bug #4 fix: runtime status is computed at read-time in
+            // `show()` / `list()` by joining against running tasks — NOT
+            // persisted here. Writing `status='hot'` at task start would
+            // violate the spec §3.3 invariant ("status='hot' iff is_hot=1
+            // binding exists") since no hot binding is created until task
+            // completion. On failure, the stale 'hot' would persist with no
+            // binding to back it.
             should_queue
         };
 
@@ -446,20 +489,19 @@ impl SubagentManager {
                 summary: None,
                 usage: TaskUsage::default(),
                 created,
+                queue_reason: Some(if paused {
+                    QueueReason::PressureGatePaused
+                } else {
+                    QueueReason::SubagentBusy
+                }),
             });
         }
 
-        // 3. Build context + memory snapshot from the store, then execute.
-        //    No lock held during execution. Task 7 Step 3: the post-insert
-        //    execute logic is delegated to `execute_task()` so the background
-        //    dispatcher can reuse it for queued tasks.
-        let model = req.model_override.clone();
-        // The task row is already inserted as 'running' (Round 4 race-free
-        // design). Reconstruct a `SubagentTaskRow` view to pass to
-        // `execute_task` — the row is the single source of truth for execution
-        // params (Round 3 Finding 1 fix). For the synchronous delegate path
-        // we read directly from `req` since the row was just inserted from
-        // the same values; the dispatcher path reads the row from the DB.
+        // Bug #1/#2 fix: spawn execution in the background and return
+        // `Running` immediately. The caller polls `subagent.task_get` for
+        // the final status. `execute_and_persist` handles execution, result
+        // persistence, and `task_completion_hook` invocation — the SAME
+        // seam used by the background dispatcher.
         let task_row = SubagentTaskRow {
             id: task_id.clone(),
             subagent_id: subagent.id.clone(),
@@ -482,24 +524,191 @@ impl SubagentManager {
             model_override: req.model_override.clone(),
             error_kind: None,
         };
-        let mut result = self.execute_task(&task_row, &subagent).await?;
-        // `execute_task` returns the model it actually used (which may differ
-        // from `model` when the task row's `model_override` is None and the
-        // subagent's `bound_model_id` is used). Preserve the model the caller
-        // expected when possible (synchronous path uses `req.model_override`);
-        // fall back to the `execute_task` value otherwise.
-        if result.model.is_none() {
-            result.model = model;
+        let manager = Arc::clone(self);
+        let subagent_clone = subagent.clone();
+        tokio::spawn(async move {
+            manager
+                .execute_and_persist(&task_row, &subagent_clone)
+                .await;
+        });
+
+        Ok(DelegateResult {
+            task_id,
+            subagent_id: subagent.id.clone(),
+            subagent_name: subagent.name.clone(),
+            adapter: self.adapter.clone(),
+            adapter_session_id: None,
+            session_reused: false,
+            status: TaskStatus::Running,
+            profile: req.profile.clone(),
+            model: req.model_override.clone(),
+            summary: None,
+            usage: TaskUsage::default(),
+            created,
+            queue_reason: None,
+        })
+    }
+
+    /// Execute a task, persist results, and invoke the `task_completion_hook`.
+    /// Shared by `delegate()` (in a spawned task) and the background dispatcher
+    /// (inline). This is the single seam for post-execution cleanup: on
+    /// success the hook bridges usage into `usage_events` + rollups; on
+    /// failure the task is marked `'failed'` in the DB.
+    async fn execute_and_persist(&self, task: &SubagentTaskRow, subagent: &LogicalSubagent) {
+        match self.execute_task(task, subagent).await {
+            Ok(result) => {
+                let hook = {
+                    let guard = self
+                        .task_completion_hook
+                        .lock()
+                        .expect("task_completion_hook lock poisoned");
+                    guard.as_ref().map(Arc::clone)
+                };
+                if let Some(hook) = hook {
+                    hook(&result, &subagent.repo_path);
+                }
+            }
+            Err(e) => {
+                // HotSessionLimit is a transient capacity contention
+                // error: all hot sessions were busy and the executor's
+                // in-call retries were exhausted. `execute_task` already
+                // skipped the `failed` write (Phase 4c) — re-queue the task
+                // so the dispatcher can retry when the hot session slot
+                // frees up, bounded by `HOT_SESSION_RETRY_DEADLINE_MS` to
+                // prevent infinite re-queuing. Past the deadline, mark as
+                // `failed` with `error_kind = hot_session_limit`.
+                if let SubagentError::HotSessionLimit { .. } = &e {
+                    let now = busytok_domain::now_ms();
+                    let age_ms = now.saturating_sub(task.created_at_ms);
+                    if age_ms < HOT_SESSION_RETRY_DEADLINE_MS {
+                        info!(
+                            event_code = "subagent.hot_session_limit_requeued",
+                            task_id = %task.id,
+                            subagent_id = %subagent.id,
+                            age_ms,
+                            deadline_ms = HOT_SESSION_RETRY_DEADLINE_MS,
+                            "HotSessionLimit — re-queuing task for dispatcher retry"
+                        );
+                        let db = self.db.lock().expect("subagent db lock poisoned");
+                        let _ = db.subagent_set_task_status_if_not_cancelled(
+                            &task.id, "queued", None, None,
+                        );
+                        return;
+                    }
+                    warn!(
+                        event_code = "subagent.hot_session_limit_deadline_exceeded",
+                        task_id = %task.id,
+                        subagent_id = %subagent.id,
+                        age_ms,
+                        deadline_ms = HOT_SESSION_RETRY_DEADLINE_MS,
+                        "HotSessionLimit deadline exceeded — marking task failed"
+                    );
+                    let db = self.db.lock().expect("subagent db lock poisoned");
+                    let _ = db.subagent_set_task_status_if_not_cancelled(
+                        &task.id,
+                        "failed",
+                        None,
+                        Some(e.to_string()),
+                    );
+                    let _ = db.subagent_set_task_error_kind(
+                        &task.id,
+                        Some(TaskErrorKind::HotSessionLimit.as_str()),
+                    );
+                    return;
+                }
+                warn!(
+                    event_code = "subagent.execute_failed",
+                    task_id = %task.id,
+                    error = %e,
+                    "execute_task failed; marking task failed"
+                );
+                let db = self.db.lock().expect("subagent db lock poisoned");
+                let _ = db.subagent_set_task_status_if_not_cancelled(
+                    &task.id,
+                    "failed",
+                    None,
+                    Some(e.to_string()),
+                );
+            }
         }
-        result.created = created;
-        Ok(result)
+    }
+
+    /// Validate the bound provider and model for a task. Returns the resolved
+    /// `Provider` and `Model` rows on success, or a `Validation` error on
+    /// failure. Called by `delegate()` (before spawning background execution)
+    /// so validation failures surface as the `delegate()` return value — not
+    /// as a silently-failed background task. Also called by `execute_task()`
+    /// (for the dispatcher path, where queued tasks are picked up without
+    /// going through `delegate()`).
+    ///
+    /// The double call (delegate + execute_task) is intentional: state may
+    /// change between the two calls (provider disabled, model deleted), and
+    /// `execute_task` needs the resolved rows to build `ExecutorInput`.
+    fn validate_bound_resources(
+        &self,
+        subagent: &LogicalSubagent,
+        effective_model_id: &str,
+    ) -> Result<(busytok_domain::Provider, busytok_domain::Model)> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let provider = db
+            .get_provider_with_secret(&subagent.bound_provider_id)
+            .map_err(SubagentError::Store)?
+            .ok_or_else(|| {
+                SubagentError::Validation(format!(
+                    "bound provider not found: {}",
+                    subagent.bound_provider_id
+                ))
+            })?;
+        if !provider.enabled {
+            return Err(SubagentError::Validation(format!(
+                "bound provider disabled: {}",
+                subagent.bound_provider_id
+            )));
+        }
+        let api_key = provider.api_key.clone().unwrap_or_default();
+        if api_key.is_empty() {
+            return Err(SubagentError::Validation(format!(
+                "bound provider missing api key: {}",
+                subagent.bound_provider_id
+            )));
+        }
+        let model = db
+            .get_model_by_provider_and_model_id(&subagent.bound_provider_id, effective_model_id)
+            .map_err(SubagentError::Store)?
+            .ok_or_else(|| {
+                SubagentError::Validation(format!(
+                    "bound model not found in provider: {effective_model_id}"
+                ))
+            })?;
+        if !model.enabled {
+            return Err(SubagentError::Validation(format!(
+                "bound model disabled: {effective_model_id}"
+            )));
+        }
+        // I-2 fail-fast: context_window + max_tokens are required at
+        // execute time. Pre-existing/seed models may have NULL for these
+        // columns. unwrap_or(0) would propagate 0 into the Pi SDK's
+        // registerProvider, causing silent breakage. Fail fast instead.
+        if model.context_window.is_none() {
+            return Err(SubagentError::Validation(format!(
+                "model '{effective_model_id}' missing context_window metadata; \
+                 re-create the model with context_window + max_tokens"
+            )));
+        }
+        if model.max_tokens.is_none() {
+            return Err(SubagentError::Validation(format!(
+                "model '{effective_model_id}' missing max_tokens metadata; \
+                 re-create the model with context_window + max_tokens"
+            )));
+        }
+        Ok((provider, model))
     }
 
     /// Execute a task that is ALREADY "running" (status + started_at_ms set
     /// by the caller). Builds context → executes → persists results.
-    /// Called by `delegate()` (synchronous, after inserting as 'running')
-    /// and the background dispatcher (after `pick_oldest_queued_task` which
-    /// does the atomic CAS flip).
+    /// Called by `execute_and_persist()` which is shared by `delegate()`
+    /// (in a spawned background task) and the background dispatcher (after
+    /// `pick_oldest_queued_task` which does the atomic CAS flip).
     ///
     /// **Round 3 Finding 2 fix:** this method does NOT call
     /// `subagent_set_task_status("running")` — the caller sets the status
@@ -574,55 +783,15 @@ impl SubagentManager {
                     summary: Some("cancelled by user".to_string()),
                     created: false,
                     usage: TaskUsage::default(),
+                    queue_reason: None,
                 });
             }
         }
         // Spec §4.3 validation chain — fail fast on bound provider/model
-        // issues. Reads happen under the DB lock; the resolved values are
-        // used below to populate `ExecutorInput`'s provider config + model
-        // metadata fields.
-        let (resolved_provider, resolved_model) = {
-            let db = self.db.lock().expect("subagent db lock poisoned");
-            let provider = db
-                .get_provider_with_secret(&subagent.bound_provider_id)
-                .map_err(SubagentError::Store)?
-                .ok_or_else(|| {
-                    SubagentError::Validation(format!(
-                        "bound provider not found: {}",
-                        subagent.bound_provider_id
-                    ))
-                })?;
-            if !provider.enabled {
-                return Err(SubagentError::Validation(format!(
-                    "bound provider disabled: {}",
-                    subagent.bound_provider_id
-                )));
-            }
-            let api_key = provider.api_key.clone().unwrap_or_default();
-            if api_key.is_empty() {
-                return Err(SubagentError::Validation(format!(
-                    "bound provider missing api key: {}",
-                    subagent.bound_provider_id
-                )));
-            }
-            let model = db
-                .get_model_by_provider_and_model_id(
-                    &subagent.bound_provider_id,
-                    &effective_model_id,
-                )
-                .map_err(SubagentError::Store)?
-                .ok_or_else(|| {
-                    SubagentError::Validation(format!(
-                        "bound model not found in provider: {effective_model_id}"
-                    ))
-                })?;
-            if !model.enabled {
-                return Err(SubagentError::Validation(format!(
-                    "bound model disabled: {effective_model_id}"
-                )));
-            }
-            (provider, model)
-        };
+        // issues. Delegates to `validate_bound_resources` (shared with
+        // `delegate()`) so validation logic has a single source of truth.
+        let (resolved_provider, resolved_model) =
+            self.validate_bound_resources(subagent, &effective_model_id)?;
         let started = busytok_domain::now_ms();
         let (input, memory_row, tasks_since_last_compaction, profile_cfg) = {
             let db = self.db.lock().expect("subagent db lock poisoned");
@@ -708,24 +877,16 @@ impl SubagentManager {
                 // 瞬态：不写回 task row，不进日志明文，不进 DTO/response/diagnostic.
                 provider_api_key: resolved_provider.api_key.clone().unwrap_or_default(),
                 model_reasoning: resolved_model.reasoning,
-                // I-2 fail-fast: context_window + max_tokens are required at
-                // execute time. Pre-existing/seed models may have NULL for
-                // these columns (migration 0007 adds them as nullable).
-                // `unwrap_or(0)` would propagate 0 into the Pi SDK's
-                // `registerProvider({ contextWindow: 0, maxTokens: 0 })`,
-                // which the SDK may interpret as "no context" / "no output" —
-                // silent breakage. Fail fast with a Validation error instead
-                // so the operator re-creates the model with proper metadata.
-                model_context_window: resolved_model.context_window.ok_or_else(|| {
-                    SubagentError::Validation(format!(
-                        "model '{effective_model_id}' missing context_window metadata; re-create the model with context_window + max_tokens"
-                    ))
-                })?,
-                model_max_tokens: resolved_model.max_tokens.ok_or_else(|| {
-                    SubagentError::Validation(format!(
-                        "model '{effective_model_id}' missing max_tokens metadata; re-create the model with context_window + max_tokens"
-                    ))
-                })?,
+                // context_window + max_tokens are validated non-null by
+                // `validate_bound_resources` above. Using `expect` documents
+                // the invariant and provides a clear panic message if the
+                // validation contract is ever broken.
+                model_context_window: resolved_model
+                    .context_window
+                    .expect("validated by validate_bound_resources"),
+                model_max_tokens: resolved_model
+                    .max_tokens
+                    .expect("validated by validate_bound_resources"),
                 model_display_name: resolved_model.display_name.clone(),
             };
             (
@@ -773,6 +934,7 @@ impl SubagentManager {
                         summary: Some("cancelled by user".to_string()),
                         created: false,
                         usage: TaskUsage::default(),
+                        queue_reason: None,
                     });
                 }
                 exec_result = exec_fut => {
@@ -790,6 +952,16 @@ impl SubagentManager {
         let out = match out {
             Ok(out) => out,
             Err(e) => {
+                // HotSessionLimit is a transient capacity contention error.
+                // Do NOT mark the task as 'failed' here — the caller
+                // (`execute_and_persist`) will re-queue the task so the
+                // dispatcher can retry when the hot session slot frees up.
+                // Returning the error without persisting 'failed' lets the
+                // caller decide whether to re-queue or mark as failed (based
+                // on the task's age deadline).
+                if matches!(e, SubagentError::HotSessionLimit { .. }) {
+                    return Err(e);
+                }
                 // Persist failure state before propagating. The executor
                 // classified the error (auth/rate_limit/network/timeout) and
                 // already killed the worker on auth-fail — but since
@@ -1018,6 +1190,7 @@ impl SubagentManager {
             // `created` is set by the caller (`delegate` or the dispatcher);
             // default to `false` here (the dispatcher path always reuses).
             created: false,
+            queue_reason: None,
         })
     }
 
@@ -1181,43 +1354,11 @@ impl SubagentManager {
                         );
                         continue;
                     }
-                    match manager.execute_task(&task, &subagent).await {
-                        Ok(result) => {
-                            // P1 #2 fix: invoke the post-task completion hook
-                            // so the runtime bridges the queued task's usage
-                            // into `usage_events` + rollups — the SAME seam as
-                            // synchronous `delegate()`. The hook is best-effort:
-                            // it logs failures internally and does NOT propagate
-                            // errors to the dispatcher. `cwd` is the subagent's
-                            // canonical `repo_path` (the cwd `execute_task`
-                            // used).
-                            let hook = {
-                                let guard = manager
-                                    .task_completion_hook
-                                    .lock()
-                                    .expect("task_completion_hook lock poisoned");
-                                guard.as_ref().map(Arc::clone)
-                            };
-                            if let Some(hook) = hook {
-                                hook(&result, &subagent.repo_path);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                event_code = "subagent.queue.execute_failed",
-                                task_id = %task.id,
-                                error = %e,
-                                "dispatcher execute_task failed; marking task failed"
-                            );
-                            let db = manager.db.lock().expect("subagent db lock poisoned");
-                            let _ = db.subagent_set_task_status_if_not_cancelled(
-                                &task.id,
-                                "failed",
-                                None,
-                                Some(e.to_string()),
-                            );
-                        }
-                    }
+                    // Bug #4 fix: runtime status is computed at read-time in
+                    // `show()` / `list()` — no persistent write here. See
+                    // `delegate()` for the rationale.
+                    // Shared execute + persist + hook seam (same as delegate()).
+                    manager.execute_and_persist(&task, &subagent).await;
                 }
             }
         })
@@ -1232,6 +1373,17 @@ impl SubagentManager {
     pub fn task_counts(&self) -> (u32, u32) {
         let db = self.db.lock().expect("subagent db lock poisoned");
         db.subagent_task_counts_by_status().unwrap_or((0, 0))
+    }
+
+    /// Get a task's current status string by ID. Returns `None` if the task
+    /// doesn't exist. Used by callers (and tests) that need to poll for
+    /// task completion without resolving the parent subagent.
+    pub fn task_status(&self, task_id: &str) -> Result<Option<String>> {
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        let task = db
+            .subagent_get_task(task_id)
+            .map_err(SubagentError::Store)?;
+        Ok(task.map(|t| t.status))
     }
 
     /// Cancel a task by id. Idempotent on terminal states: returns
@@ -1367,15 +1519,88 @@ impl SubagentManager {
         include_deleted: bool,
     ) -> Result<Vec<LogicalSubagent>> {
         let db = self.db.lock().expect("subagent db lock poisoned");
+        // Bug fix: for Hot/Warm/Cold filters, do NOT push the status filter
+        // into SQL. The runtime overlay (which promotes subagents with running
+        // tasks to `hot`) must run BEFORE the status filter, otherwise
+        // `list --status hot` misses subagents whose DB status is cold/warm
+        // but have an in-flight task. For `Deleted`, the overlay is irrelevant
+        // (deleted subagents have no running tasks), so the SQL filter is safe.
+        let db_status_filter = if matches!(status, Some(SubagentStatus::Deleted)) {
+            status.map(|s| s.as_str())
+        } else {
+            None
+        };
         let rows = db
-            .subagent_list_filtered(status.map(|s| s.as_str()), project, include_deleted)
+            .subagent_list_filtered(db_status_filter, project, include_deleted)
             .map_err(SubagentError::Store)?;
-        Ok(rows.iter().map(row_to_model).collect::<Vec<_>>())
+        let mut subagents: Vec<LogicalSubagent> = rows.iter().map(row_to_model).collect::<Vec<_>>();
+        // Bug #4 fix: overlay runtime status at read-time. A subagent with an
+        // in-flight task is presented as `hot` even if no hot binding exists
+        // yet — this is a display-time computation, NOT a persistent write,
+        // so the spec §3.3 invariant ("status='hot' iff is_hot=1 binding
+        // exists") is preserved in the DB.
+        self.overlay_runtime_status(&db, &mut subagents)?;
+        // Apply the requested status filter in Rust (post-overlay) so that
+        // runtime-promoted subagents are correctly included/excluded.
+        if let Some(filter) = status {
+            if !matches!(filter, SubagentStatus::Deleted) {
+                subagents.retain(|s| s.status == filter);
+            }
+        }
+        Ok(subagents)
     }
 
     pub async fn show(&self, resolve: ResolveParams) -> Result<LogicalSubagent> {
         let db = self.db.lock().expect("subagent db lock poisoned");
-        self.resolve(&db, &resolve)
+        let mut sub = self.resolve(&db, &resolve)?;
+        // Bug #4 fix: overlay runtime status so `show` reflects `hot` while a
+        // task is in-flight, without persisting `status='hot'` (which would
+        // violate the §3.3 invariant). See `overlay_runtime_status`.
+        self.overlay_runtime_status(&db, std::slice::from_mut(&mut sub))?;
+        Ok(sub)
+    }
+
+    /// Bug #4 fix: overlay runtime status onto a slice of logical subagents
+    /// at read-time. For each subagent that has a running task, override the
+    /// displayed `status` to `Hot` and set `last_active_at_ms` to `now` (if
+    /// not already set or older than the task's start).
+    ///
+    /// This is a DISPLAY-TIME computation — the DB row is NOT modified. The
+    /// spec §3.3 invariant ("status='hot' iff is_hot=1 binding exists") is
+    /// preserved in persistent storage. The override only affects what
+    /// `show()` / `list()` return to callers.
+    ///
+    /// Rationale: persisting `status='hot'` at task start (the previous fix)
+    /// broke the invariant because no hot binding exists until task
+    /// completion. On task failure, the stale `hot` would persist with no
+    /// binding to back it. Computing at read-time avoids this entirely.
+    fn overlay_runtime_status(
+        &self,
+        db: &Database,
+        subagents: &mut [LogicalSubagent],
+    ) -> Result<()> {
+        if subagents.is_empty() {
+            return Ok(());
+        }
+        let now = busytok_domain::now_ms();
+        for sub in subagents.iter_mut() {
+            let has_running = db
+                .subagent_has_running_task(&sub.id)
+                .map_err(|e| SubagentError::Store(anyhow::Error::new(e)))?;
+            if has_running {
+                sub.status = SubagentStatus::Hot;
+                // Refresh last_active_at_ms to now if it was null or stale
+                // (older than 5 minutes — avoids refreshing on every poll).
+                let needs_refresh = sub
+                    .last_active_at_ms
+                    .map(|ts| now - ts > 300_000)
+                    .unwrap_or(true);
+                if needs_refresh {
+                    sub.last_active_at_ms = Some(now);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn tasks(
@@ -1473,6 +1698,13 @@ impl SubagentManager {
             .filter(|r| r.status != "deleted")
             .map(row_to_model)
             .collect();
+        // Bug #4 fix: apply the same runtime-status overlay used by `show()` /
+        // `list()` so the monitoring page's `subagents[].status` is consistent
+        // with the per-subagent read paths. Without this, a subagent with an
+        // in-flight task would show as `cold`/`warm` on the monitoring page
+        // while `show()` shows `hot`.
+        let mut subagents = subagents;
+        self.overlay_runtime_status(&db, &mut subagents)?;
         let task_counts: std::collections::HashMap<String, u32> = db
             .subagent_count_tasks_by_subagent()
             .map_err(SubagentError::Store)?
@@ -1698,13 +1930,29 @@ fn subagent_error_to_task_error_kind(e: &SubagentError) -> Option<TaskErrorKind>
             Some(TaskErrorKind::Timeout)
         }
         SubagentError::SidecarCrashed(_) => Some(TaskErrorKind::Crash),
+        // Bug 2 fix: SidecarIo (e.g. Broken pipe) is a network-class failure.
+        SubagentError::SidecarIo(_) => Some(TaskErrorKind::Network),
+        // Bug 2 fix: SidecarSpawn failure is a crash-class failure.
+        SubagentError::SidecarSpawn(_) => Some(TaskErrorKind::Crash),
+        // HotSessionLimit is a capacity contention failure. Classified as
+        // its own variant so callers can surface "capacity limit reached"
+        // instead of the generic "unknown".
+        SubagentError::HotSessionLimit { .. } => Some(TaskErrorKind::HotSessionLimit),
+        // State divergence (sidecar/DB out of sync) — not retryable as a
+        // capacity condition. Classify as Unknown so error_kind is set
+        // for observability; the `error` code distinguishes it from
+        // HotSessionLimit for callers that need to handle it differently.
+        SubagentError::HotSessionStateDivergence(_) => Some(TaskErrorKind::Unknown),
         SubagentError::SidecarRpc { code, .. } => match *code {
             Some(AUTH_FAILURE) => Some(TaskErrorKind::Auth),
             Some(RATE_LIMIT) => Some(TaskErrorKind::RateLimit),
             Some(NETWORK_ERROR) => Some(TaskErrorKind::Network),
             Some(TASK_TIMEOUT) => Some(TaskErrorKind::Timeout),
-            _ => None,
+            _ => Some(TaskErrorKind::Unknown),
         },
+        // Store: real DB failures — no retry classification (caller surfaces
+        // as "database error"). Validation/NotFound/etc.: config/lookup errors,
+        // not task-failure kinds. None = no error_kind persisted.
         _ => None,
     }
 }
@@ -1763,29 +2011,69 @@ mod tests {
             }),
             Some(TaskErrorKind::Timeout)
         );
-        // SidecarRpc with no code → unclassified.
+        // SidecarRpc with no code → Unknown (Bug 2 fix: was None, now
+        // classified so error_kind is always set for sidecar errors).
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
                 message: "unknown".into(),
                 code: None
             }),
-            None
+            Some(TaskErrorKind::Unknown)
         );
-        // SidecarRpc with an unrecognized code → unclassified.
+        // SidecarRpc with an unrecognized code → Unknown.
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::SidecarRpc {
                 message: "misc".into(),
                 code: Some(-39999)
             }),
-            None
+            Some(TaskErrorKind::Unknown)
         );
-        // Non-sidecar errors → unclassified.
+        // HotSessionLimit → HotSessionLimit (dedicated variant, not Unknown).
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::HotSessionLimit {
+                candidate: "sess-1".into()
+            }),
+            Some(TaskErrorKind::HotSessionLimit)
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::HotSessionLimit {
+                candidate: "".into()
+            }),
+            Some(TaskErrorKind::HotSessionLimit)
+        );
+        // State divergence (sidecar/DB out of sync) → Unknown. error_kind is
+        // set so callers can alert; the `error` code distinguishes it from
+        // HotSessionLimit for handling decisions.
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::HotSessionStateDivergence(
+                "no binding for sess-1".into()
+            )),
+            Some(TaskErrorKind::Unknown)
+        );
+        // Bug 2 fix: SidecarIo → Network (was None).
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarIo(
+                "Broken pipe (os error 32)".into()
+            )),
+            Some(TaskErrorKind::Network)
+        );
+        // Bug 2 fix: SidecarSpawn → Crash (was None).
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::SidecarSpawn("spawn failed".into())),
+            Some(TaskErrorKind::Crash)
+        );
+        // Non-sidecar errors → None (no error_kind — these are config/lookup
+        // errors, not task failures requiring retry classification).
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::Validation("x".into())),
             None
         );
         assert_eq!(
             subagent_error_to_task_error_kind(&SubagentError::NotFound("x".into())),
+            None
+        );
+        assert_eq!(
+            subagent_error_to_task_error_kind(&SubagentError::Store(anyhow::anyhow!("db error"))),
             None
         );
     }

@@ -24,23 +24,61 @@ pub struct BusytokPaths {
 }
 
 impl BusytokPaths {
-    /// Create a new `BusytokPaths` using the system's standard directories.
+    /// Create a new `BusytokPaths` using environment overrides or the
+    /// system's standard directories.
     ///
-    /// - `data_dir`: `$XDG_DATA_HOME/busytok` or `~/.local/share/busytok`
-    /// - `config_dir`: `$XDG_CONFIG_HOME/busytok` or `~/.config/busytok`
-    /// - `runtime_dir`: `$XDG_RUNTIME_DIR/busytok` or fallback to data dir
+    /// Precedence (per directory):
+    /// 1. `BUSYTOK_DATA_DIR` / `BUSYTOK_CONFIG_DIR` / `BUSYTOK_RUNTIME_DIR`
+    ///    env vars (if set, used as-is — the caller controls the full path,
+    ///    including the app name suffix if desired).
+    /// 2. Platform default via `dirs` crate:
+    ///    - `data_dir`: `$XDG_DATA_HOME/busytok` (Linux) or
+    ///      `~/Library/Application Support/busytok` (macOS)
+    ///    - `config_dir`: `$XDG_CONFIG_HOME/busytok` or `~/.config/busytok`
+    ///    - `runtime_dir`: `$XDG_RUNTIME_DIR/busytok` or fallback to data dir
+    ///
+    /// **Bug 2 fix:** on macOS, `dirs` ignores `XDG_DATA_HOME` etc. and
+    /// returns `~/Library/Application Support`, so source-built services
+    /// would write to the installed app's data directory. The explicit
+    /// `BUSYTOK_*` env vars override this on all platforms, enabling
+    /// reliable test isolation without relying on XDG compliance.
     pub fn new() -> Self {
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from(".local/share"))
-            .join(APP_NAME);
+        Self::from_env()
+    }
 
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from(".config"))
-            .join(APP_NAME);
+    /// Resolve paths from environment variables, falling back to platform
+    /// defaults via `dirs`. Each `BUSYTOK_*` variable, when set, is used
+    /// as the complete directory path (no app-name suffix appended).
+    pub fn from_env() -> Self {
+        let data_dir = std::env::var("BUSYTOK_DATA_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::data_dir()
+                    .unwrap_or_else(|| PathBuf::from(".local/share"))
+                    .join(APP_NAME)
+            });
 
-        let runtime_dir = dirs::runtime_dir()
-            .unwrap_or_else(|| data_dir.clone())
-            .join(APP_NAME);
+        let config_dir = std::env::var("BUSYTOK_CONFIG_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from(".config"))
+                    .join(APP_NAME)
+            });
+
+        let runtime_dir = std::env::var("BUSYTOK_RUNTIME_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::runtime_dir()
+                    .unwrap_or_else(|| data_dir.clone())
+                    .join(APP_NAME)
+            });
 
         Self {
             data_dir,
@@ -274,5 +312,77 @@ mod tests {
         assert_eq!(from_new.data_dir(), from_default.data_dir());
         assert_eq!(from_new.config_dir(), from_default.config_dir());
         assert_eq!(from_new.runtime_dir(), from_default.runtime_dir());
+    }
+
+    // --- Bug 2 fix: BUSYTOK_* env var overrides ---
+    // Combined into a single test to avoid parallel env-var races.
+
+    #[test]
+    fn from_env_uses_busytk_overrides_and_falls_back() {
+        use std::sync::Mutex;
+        // Serialize env var tests — parallel tests that modify the same
+        // env vars would race.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Save old values.
+        let old_data = std::env::var("BUSYTOK_DATA_DIR").ok();
+        let old_config = std::env::var("BUSYTOK_CONFIG_DIR").ok();
+        let old_runtime = std::env::var("BUSYTOK_RUNTIME_DIR").ok();
+
+        // Test 1: all three overrides set.
+        let data = std::env::temp_dir().join("busytok-test-all-data");
+        let config = std::env::temp_dir().join("busytok-test-all-config");
+        let runtime = std::env::temp_dir().join("busytok-test-all-runtime");
+        std::env::set_var("BUSYTOK_DATA_DIR", &data);
+        std::env::set_var("BUSYTOK_CONFIG_DIR", &config);
+        std::env::set_var("BUSYTOK_RUNTIME_DIR", &runtime);
+        let paths = BusytokPaths::from_env();
+        assert_eq!(paths.data_dir(), &data, "data_dir override");
+        assert_eq!(paths.config_dir(), &config, "config_dir override");
+        assert_eq!(paths.runtime_dir(), &runtime, "runtime_dir override");
+        assert_eq!(paths.db_path(), data.join("busytok.db"));
+        assert_eq!(paths.log_dir(), data.join("logs"));
+
+        // Test 2: override is used as-is (no app-name suffix appended).
+        assert!(
+            !paths
+                .data_dir()
+                .to_string_lossy()
+                .ends_with("busytok/busytok-test-all-data"),
+            "override should be used as-is, not appended with app name"
+        );
+
+        // Test 3: new() delegates to from_env().
+        let from_new = BusytokPaths::new();
+        assert_eq!(from_new.data_dir(), paths.data_dir());
+        assert_eq!(from_new.config_dir(), paths.config_dir());
+        assert_eq!(from_new.runtime_dir(), paths.runtime_dir());
+
+        // Test 4: when env vars are unset, falls back to dirs crate.
+        std::env::remove_var("BUSYTOK_DATA_DIR");
+        std::env::remove_var("BUSYTOK_CONFIG_DIR");
+        std::env::remove_var("BUSYTOK_RUNTIME_DIR");
+        let paths = BusytokPaths::from_env();
+        let s = paths.data_dir().to_string_lossy();
+        assert!(
+            s.contains("busytok"),
+            "fallback data_dir should contain 'busytok': {s}"
+        );
+
+        // Restore old values.
+        match old_data {
+            Some(v) => std::env::set_var("BUSYTOK_DATA_DIR", v),
+            None => std::env::remove_var("BUSYTOK_DATA_DIR"),
+        }
+        match old_config {
+            Some(v) => std::env::set_var("BUSYTOK_CONFIG_DIR", v),
+            None => std::env::remove_var("BUSYTOK_CONFIG_DIR"),
+        }
+        match old_runtime {
+            Some(v) => std::env::set_var("BUSYTOK_RUNTIME_DIR", v),
+            None => std::env::remove_var("BUSYTOK_RUNTIME_DIR"),
+        }
     }
 }

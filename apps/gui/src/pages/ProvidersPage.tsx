@@ -250,8 +250,8 @@ export function ProvidersPage() {
       <div className="provider-catalog">
         <div className="provider-catalog__header">
           <h1>Providers</h1>
-          <button type="button" className="btn btn--primary" onClick={() => setShowCreateForm((v) => !v)}>
-            + 新建 Provider
+          <button type="button" className="btn btn--primary btn--sm" onClick={() => setShowCreateForm((v) => !v)}>
+            + New Provider
           </button>
         </div>
 
@@ -262,14 +262,14 @@ export function ProvidersPage() {
         {providersQuery.isError && (
           <div className="degraded-ribbon" role="alert">
             <span className="degraded-ribbon__dot" />
-            Provider 列表加载失败，请刷新页面重试。
+            Failed to load providers. Please refresh the page.
           </div>
         )}
 
         {modelsQuery.isError && (
           <div className="degraded-ribbon" role="alert">
             <span className="degraded-ribbon__dot" />
-            Model 列表加载失败，Model 操作可能不可用。请刷新页面重试。
+            Failed to load models. Model operations may be unavailable. Please refresh the page.
           </div>
         )}
 

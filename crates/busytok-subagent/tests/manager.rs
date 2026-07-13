@@ -14,7 +14,7 @@ use busytok_subagent::mock_executor::{
     ExecutorInput, ExecutorOutput, FailingTaskExecutor, MockTaskExecutor, TaskExecutor,
 };
 use busytok_subagent::models::{
-    DelegateRequest, ResolveParams, SubagentStatus, TaskStatus, TaskUsage,
+    DelegateRequest, QueueReason, ResolveParams, SubagentStatus, TaskStatus, TaskUsage,
 };
 use busytok_subagent::pressure::{PressureAction, PressureGate};
 use busytok_subagent::SubagentError;
@@ -97,15 +97,34 @@ fn install_tracing() -> tracing::subscriber::DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
-async fn manager() -> SubagentManager {
+async fn manager() -> std::sync::Arc<SubagentManager> {
     // std::sync::Mutex — matches the supervisor's db field type.
     let db = test_db();
-    SubagentManager::new(
+    std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
-    )
+    ))
+}
+
+/// Wait for a task to reach a terminal status (completed/failed/cancelled).
+/// Polls the DB every 5ms with a 5-second timeout. Bridges the async
+/// execution gap: `delegate()` returns `Running` immediately and spawns
+/// execution in the background (Bug #1/#2 fix).
+async fn await_task_done(m: &std::sync::Arc<SubagentManager>, task_id: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = m.task_status(task_id).unwrap() {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return status;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("task {task_id} did not reach terminal status within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 // Thread-local storage for the seeded test provider/model IDs. Each
@@ -230,7 +249,9 @@ async fn delegate_creates_subagent_then_reuses_it() {
     let m = manager().await;
     let r1 = m.delegate(req("reviewer", "step one")).await.unwrap();
     assert_eq!(r1.subagent_name, "reviewer");
-    assert_eq!(r1.status.as_str(), "completed");
+    assert_eq!(r1.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r1.task_id).await;
+    assert_eq!(final_status, "completed");
 
     let r2 = m.delegate(req("reviewer", "step two")).await.unwrap();
     assert_eq!(r2.subagent_id, r1.subagent_id, "same subagent reused");
@@ -239,8 +260,10 @@ async fn delegate_creates_subagent_then_reuses_it() {
 #[tokio::test]
 async fn list_returns_active_subagents() {
     let m = manager().await;
-    m.delegate(req("a", "do")).await.unwrap();
-    m.delegate(req("b", "do")).await.unwrap();
+    let r1 = m.delegate(req("a", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
+    let r2 = m.delegate(req("b", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r2.task_id).await;
     // no filters → all active subagents
     let list = m.list(None, None, false).await.unwrap();
     assert_eq!(list.len(), 2);
@@ -261,6 +284,7 @@ async fn list_returns_active_subagents() {
 async fn delete_then_lookup_fails() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     m.delete(
         ResolveParams {
             id: Some(r.subagent_id.clone()),
@@ -279,6 +303,7 @@ async fn delete_then_lookup_fails() {
 async fn hibernate_clears_hot_binding_keeps_state() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     m.hibernate(ResolveParams {
         id: Some(r.subagent_id.clone()),
         ..Default::default()
@@ -307,7 +332,9 @@ async fn reject_invalid_subagent_name() {
 async fn tasks_returns_history_for_subagent() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "first")).await.unwrap();
-    m.delegate(req("reviewer", "second")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
+    let r2 = m.delegate(req("reviewer", "second")).await.unwrap();
+    let _ = await_task_done(&m, &r2.task_id).await;
     let tasks = m
         .tasks(
             ResolveParams {
@@ -330,6 +357,7 @@ async fn tasks_resolves_by_name_and_clamps_limit() {
         .delegate(req_with_cwd("worker", "do", "/tmp/worker-repo"))
         .await
         .unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     // resolve by name + cwd
     let tasks = m
         .tasks(
@@ -350,6 +378,7 @@ async fn tasks_resolves_by_name_and_clamps_limit() {
 async fn hard_delete_removes_subagent_and_excludes_from_list() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     m.delete(
         ResolveParams {
             id: Some(r.subagent_id.clone()),
@@ -376,6 +405,7 @@ async fn hard_delete_removes_subagent_and_excludes_from_list() {
 async fn delegate_with_subagent_id_shortcut_reuses_existing() {
     let m = manager().await;
     let r1 = m.delegate(req("reviewer", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // second delegate resolves by UUID directly, bypassing name resolution
     let r2 = m
         .delegate(DelegateRequest {
@@ -388,7 +418,9 @@ async fn delegate_with_subagent_id_shortcut_reuses_existing() {
         r2.subagent_id, r1.subagent_id,
         "id shortcut reuses subagent"
     );
-    assert_eq!(r2.status.as_str(), "completed");
+    assert_eq!(r2.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r2.task_id).await;
+    assert_eq!(final_status, "completed");
 }
 
 #[tokio::test]
@@ -443,9 +475,24 @@ async fn delegate_review_and_plan_profiles_resolve_default_models() {
         })
         .await
         .unwrap();
+    // delegate() returns Running immediately with `model: req.model_override.clone()`
+    // (None here). The resolved model (bound_model_id) is computed in execute_task
+    // (background). Verify it after completion via the subagent's bound_model_id.
     assert!(
-        r_review.model.is_some(),
-        "review profile should map to a model"
+        r_review.model.is_none(),
+        "Running result carries model_override only — None when no override"
+    );
+    let _ = await_task_done(&m, &r_review.task_id).await;
+    let shown_review = m
+        .show(ResolveParams {
+            id: Some(r_review.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !shown_review.bound_model_id.is_empty(),
+        "review profile should map to a model (bound_model_id)"
     );
     let r_plan = m
         .delegate(DelegateRequest {
@@ -454,7 +501,22 @@ async fn delegate_review_and_plan_profiles_resolve_default_models() {
         })
         .await
         .unwrap();
-    assert!(r_plan.model.is_some(), "plan profile should map to a model");
+    assert!(
+        r_plan.model.is_none(),
+        "Running result carries model_override only — None when no override"
+    );
+    let _ = await_task_done(&m, &r_plan.task_id).await;
+    let shown_plan = m
+        .show(ResolveParams {
+            id: Some(r_plan.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !shown_plan.bound_model_id.is_empty(),
+        "plan profile should map to a model (bound_model_id)"
+    );
 }
 
 #[tokio::test]
@@ -464,7 +526,12 @@ async fn delegate_rejected_when_feature_disabled() {
         enabled: false,
         ..Default::default()
     };
-    let m = SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor));
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        settings,
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    ));
     let err = m.delegate(req("reviewer", "do")).await.unwrap_err();
     assert!(matches!(err, SubagentError::Disabled));
 }
@@ -476,6 +543,7 @@ async fn show_by_name_resolves_within_repo_scope() {
         .delegate(req_with_cwd("reviewer", "do", "/tmp/scope-repo"))
         .await
         .unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     let shown = m
         .show(ResolveParams {
             name: Some("reviewer".to_string()),
@@ -528,7 +596,8 @@ async fn resolve_with_both_id_and_name_returns_invalid_argument() {
 async fn name_only_resolve_without_cwd_returns_invalid_argument() {
     let m = manager().await;
     // delegate first so the subagent exists
-    let _ = m.delegate(req("reviewer", "do")).await.unwrap();
+    let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     // show by name without cwd → rejected by server-side contract
     let err = m
         .show(ResolveParams {
@@ -568,7 +637,8 @@ async fn name_only_resolve_without_cwd_returns_invalid_argument() {
 #[tokio::test]
 async fn soft_then_hard_delete_by_name_succeeds() {
     let m = manager().await;
-    let _ = m.delegate(req("reviewer", "do")).await.unwrap();
+    let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     // soft delete by name + cwd
     m.delete(
         ResolveParams {
@@ -607,6 +677,7 @@ async fn soft_then_hard_delete_by_name_succeeds() {
 async fn soft_deleted_subagent_cannot_be_resolved_by_id() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     let id = r.subagent_id.clone();
     // soft delete
     m.delete(
@@ -651,6 +722,7 @@ async fn soft_deleted_subagent_cannot_be_resolved_by_id() {
 async fn hard_delete_can_operate_on_soft_deleted_subagent() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     let id = r.subagent_id.clone();
     // soft delete first
     m.delete(
@@ -687,6 +759,7 @@ async fn hard_delete_can_operate_on_soft_deleted_subagent() {
 async fn tasks_with_negative_limit_returns_invalid_argument() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     let err = m
         .tasks(
             ResolveParams {
@@ -705,6 +778,7 @@ async fn tasks_with_negative_limit_returns_invalid_argument() {
 async fn tasks_with_large_limit_is_clamped() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     // limit 10000 should be clamped to 500 and succeed (returns 1 task)
     let tasks = m
         .tasks(
@@ -752,6 +826,7 @@ async fn delete_unknown_id_returns_not_found() {
 async fn list_with_include_deleted_returns_soft_deleted_rows() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     m.delete(
         ResolveParams {
             id: Some(r.subagent_id.clone()),
@@ -779,6 +854,7 @@ async fn list_with_include_deleted_returns_soft_deleted_rows() {
 async fn hibernate_then_show_status_is_cold_when_no_memory() {
     let m = manager().await;
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
     m.hibernate(ResolveParams {
         id: Some(r.subagent_id.clone()),
         ..Default::default()
@@ -822,14 +898,16 @@ impl TaskExecutor for WarmMemoryExecutor {
 #[tokio::test]
 async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
     let db = test_db();
-    let m = SubagentManager::new(
+    let m = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(WarmMemoryExecutor),
-    );
+    ));
     let r = m.delegate(req("warm-reviewer", "do")).await.unwrap();
-    assert_eq!(r.status.as_str(), "completed");
+    assert_eq!(r.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r.task_id).await;
+    assert_eq!(final_status, "completed");
 
     m.hibernate(ResolveParams {
         id: Some(r.subagent_id.clone()),
@@ -855,12 +933,12 @@ async fn hibernate_without_binding_keeps_warm_status_when_memory_exists() {
 #[tokio::test]
 async fn task_counts_returns_zero_when_task_table_query_fails() {
     let db = test_db();
-    let m = SubagentManager::new(
+    let m = std::sync::Arc::new(SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
     {
         let db = db.lock().unwrap();
         db.conn().execute("DROP TABLE subagent_tasks", []).unwrap();
@@ -878,13 +956,14 @@ async fn hibernate_closes_existing_hot_binding() {
     // delegate creates no hot binding (Plan 1), so seed one manually to cover
     // the `if let Some(mut b) = binding` branch in manager::hibernate.
     let db = test_db();
-    let m = SubagentManager::new(
+    let m = std::sync::Arc::new(SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
     let r = m.delegate(req("reviewer", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
 
     // insert a hot binding for the "pi" adapter
     {
@@ -998,12 +1077,12 @@ async fn delegate_builds_context_and_merges_memory_update() {
     let executor = std::sync::Arc::new(MemoryUpdateExecutor {
         captured_input: Mutex::new(None),
     });
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db.clone(),
         SubagentSettings::default(),
         "pi",
         executor.clone(),
-    );
+    ));
     let req = DelegateRequest {
         subagent_name: "auth-investigator".into(),
         subagent_id: None,
@@ -1021,7 +1100,9 @@ async fn delegate_builds_context_and_merges_memory_update() {
         reuse_policy: None,
     };
     let result = manager.delegate(req).await.unwrap();
-    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(result.status, TaskStatus::Running);
+    let final_status = await_task_done(&manager, &result.task_id).await;
+    assert_eq!(final_status, "completed");
 
     // Verify context was built and sent to the executor.
     let captured = executor
@@ -1096,7 +1177,7 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
     let db = test_db();
     let settings = SubagentSettings::default();
     let executor = std::sync::Arc::new(MockTaskExecutor);
-    let manager = SubagentManager::new(db.clone(), settings, "mock", executor);
+    let manager = std::sync::Arc::new(SubagentManager::new(db.clone(), settings, "mock", executor));
     let req = DelegateRequest {
         subagent_name: "cold-test".to_string(),
         subagent_id: None,
@@ -1114,6 +1195,7 @@ async fn delegate_mock_executor_fresh_subagent_status_is_cold_not_warm() {
         reuse_policy: None,
     };
     let result = manager.delegate(req).await.unwrap();
+    let _ = await_task_done(&manager, &result.task_id).await;
     // Verify status is Cold, not Warm.
     let shown = manager
         .show(ResolveParams {
@@ -1152,12 +1234,12 @@ async fn delegate_populates_attempts_after_first_completed_task() {
     // fix the fresh snapshot's most-recent task carries that summary and an
     // attempt entry is appended.
     let db = test_db();
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db.clone(),
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
     let req = DelegateRequest {
         subagent_name: "worker".to_string(),
         subagent_id: None,
@@ -1175,11 +1257,22 @@ async fn delegate_populates_attempts_after_first_completed_task() {
         reuse_policy: None,
     };
     let result = manager.delegate(req).await.unwrap();
-    assert_eq!(result.status.as_str(), "completed");
-    let summary = result
-        .summary
+    assert_eq!(result.status.as_str(), "running");
+    // delegate() now returns Running immediately; wait for completion,
+    // then read the task row from the DB for the summary.
+    let final_status = await_task_done(&manager, &result.task_id).await;
+    assert_eq!(final_status, "completed");
+    let task_row = {
+        let db_guard = db.lock().unwrap();
+        db_guard
+            .subagent_get_task(&result.task_id)
+            .unwrap()
+            .unwrap()
+    };
+    let summary = task_row
+        .result_summary
         .as_deref()
-        .expect("delegate always wraps Some(out.summary)");
+        .expect("delegate always sets result_summary on completion");
     assert!(
         !summary.is_empty(),
         "mock executor must return a non-empty summary so it becomes result_summary"
@@ -1246,44 +1339,75 @@ impl TaskExecutor for HotSessionExecutor {
     }
 }
 
-/// Executor returns a `SubagentError` (via anyhow) → downcast Ok branch (line 390).
+/// Executor returns a `SubagentError` (via anyhow) → downcast Ok branch.
 /// `FailingTaskExecutor` returns `SubagentError::SidecarSpawn` wrapped in anyhow.
+///
+/// After the Bug #1/#2 fix, `delegate()` returns `Running` immediately and the
+/// executor error surfaces asynchronously via `execute_and_persist`, which
+/// persists `status="failed"` + `error=e.to_string()`. The error string for
+/// `SidecarSpawn` is `"sidecar spawn failed: ..."` (from `#[error("sidecar
+/// spawn failed: {0}")]`), proving the downcast succeeded — a generic
+/// `anyhow::Error` would have been wrapped as `Store` with Display
+/// `"database error"`.
 #[tokio::test]
 async fn delegate_executor_subagent_error_downcasts_and_propagates() {
     let _guard = install_tracing();
     let db = test_db();
-    let m = SubagentManager::new(
-        db,
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(FailingTaskExecutor {
             reason: "init failed".into(),
         }),
+    ));
+    let r = m.delegate(req("fail-sub", "do")).await.unwrap();
+    assert_eq!(r.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r.task_id).await;
+    assert_eq!(final_status, "failed");
+    let task_row = {
+        let g = db.lock().unwrap();
+        g.subagent_get_task(&r.task_id).unwrap().unwrap()
+    };
+    let err_str = task_row.error.as_deref().unwrap_or("");
+    assert!(
+        err_str.contains("sidecar spawn failed"),
+        "SubagentError should downcast — expected 'sidecar spawn failed' in error, got: {err_str}"
     );
-    let err = m.delegate(req("fail-sub", "do")).await.unwrap_err();
-    assert_eq!(
-        err.code(),
-        "subagent.sidecar_spawn_failed",
-        "SubagentError should downcast and propagate its code"
+    assert!(
+        err_str.contains("init failed"),
+        "expected 'init failed' in error, got: {err_str}"
     );
 }
 
-/// Executor returns a generic anyhow error → downcast Err branch (lines 391-393).
+/// Executor returns a generic anyhow error → downcast Err branch.
+///
+/// After the Bug #1/#2 fix, the error is persisted to the task row. A
+/// non-`SubagentError` anyhow is wrapped as `SubagentError::Store` (Display:
+/// `"database error"`) — distinct from `SidecarSpawn`'s `"sidecar spawn
+/// failed: ..."`, proving the wrapping path was taken.
 #[tokio::test]
 async fn delegate_executor_generic_error_wrapped_as_store() {
     let _guard = install_tracing();
     let db = test_db();
-    let m = SubagentManager::new(
-        db,
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(BoomExecutor),
-    );
-    let err = m.delegate(req("boom-sub", "do")).await.unwrap_err();
-    assert_eq!(
-        err.code(),
-        "subagent.store_error",
-        "non-SubagentError anyhow should be wrapped as Store"
+    ));
+    let r = m.delegate(req("boom-sub", "do")).await.unwrap();
+    assert_eq!(r.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r.task_id).await;
+    assert_eq!(final_status, "failed");
+    let task_row = {
+        let g = db.lock().unwrap();
+        g.subagent_get_task(&r.task_id).unwrap().unwrap()
+    };
+    let err_str = task_row.error.as_deref().unwrap_or("");
+    assert!(
+        err_str.contains("database error"),
+        "non-SubagentError anyhow should be wrapped as Store — expected 'database error' in error, got: {err_str}"
     );
 }
 
@@ -1305,7 +1429,12 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         },
     );
     let db = test_db();
-    let m = SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor));
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        settings,
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    ));
     let expected_model = bound_model_id();
     let r = m
         .delegate(DelegateRequest {
@@ -1315,16 +1444,35 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         .await
         .unwrap();
     assert_eq!(r.profile, "custom/empty-model");
+    // delegate() returns Running immediately with `model: req.model_override.clone()`
+    // (None here). The resolved model (bound_model_id) is computed in execute_task
+    // (background). Verify it after completion via the subagent's bound_model_id.
+    assert!(
+        r.model.is_none(),
+        "Running result carries model_override only — None when no override"
+    );
+    let _ = await_task_done(&m, &r.task_id).await;
+    let shown = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        r.model.as_deref(),
-        Some(expected_model.as_str()),
+        shown.bound_model_id, expected_model,
         "model falls back to bound_model_id when profile model is empty and no override"
     );
 }
 
-/// Hot binding commit failure (table dropped) → lines 509-515.
+/// Hot binding commit failure (table dropped) → Store error path.
 /// The executor returns a non-empty adapter_session_id, triggering the hot
-/// binding commit path. Dropping the bindings table makes the commit fail.
+/// binding commit path in `execute_task`. Dropping the bindings table makes
+/// the commit fail with `SubagentError::Store` (Display: `"database error"`).
+///
+/// After the Bug #1/#2 fix, the error surfaces asynchronously: `delegate()`
+/// returns `Running`, `execute_and_persist` catches the error and persists
+/// `status="failed"` + `error=e.to_string()`.
 #[tokio::test]
 async fn delegate_hot_binding_commit_failure_returns_store_error() {
     let _guard = install_tracing();
@@ -1335,17 +1483,24 @@ async fn delegate_hot_binding_commit_failure_returns_store_error() {
             .execute("DROP TABLE subagent_harness_bindings", [])
             .unwrap();
     }
-    let m = SubagentManager::new(
-        db,
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(HotSessionExecutor),
-    );
-    let err = m.delegate(req("hot-bind-sub", "do")).await.unwrap_err();
-    assert_eq!(
-        err.code(),
-        "subagent.store_error",
-        "hot binding commit failure should surface as store_error"
+    ));
+    let r = m.delegate(req("hot-bind-sub", "do")).await.unwrap();
+    assert_eq!(r.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r.task_id).await;
+    assert_eq!(final_status, "failed");
+    let task_row = {
+        let g = db.lock().unwrap();
+        g.subagent_get_task(&r.task_id).unwrap().unwrap()
+    };
+    let err_str = task_row.error.as_deref().unwrap_or("");
+    assert!(
+        err_str.contains("database error"),
+        "hot binding commit failure should surface as store_error — expected 'database error' in error, got: {err_str}"
     );
 }
 
@@ -1436,6 +1591,69 @@ async fn dispatcher_skips_queued_task_while_gate_paused() {
     }
     tx.send(true).unwrap();
     let _ = handle.await;
+}
+
+/// `queue_reason` field on `DelegateResult` — distinguishes "blocked by
+/// pressure gate" from "subagent busy" for CLI/automation observability.
+/// When the gate is paused, `delegate` must return `status: Queued` with
+/// `queue_reason: PressureGatePaused`.
+#[tokio::test]
+async fn delegate_queue_reason_pressure_gate_paused() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let gate = std::sync::Arc::new(PressureGate::new());
+    gate.set_action(PressureAction::PauseNewTasks);
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+        Some(gate.clone()),
+    ));
+    let r = manager.delegate(req("sub-qr-gate", "do")).await.unwrap();
+    assert_eq!(r.status, TaskStatus::Queued);
+    assert_eq!(
+        r.queue_reason,
+        Some(QueueReason::PressureGatePaused),
+        "queued while gate paused must set queue_reason = PressureGatePaused"
+    );
+}
+
+/// `queue_reason` = `SubagentBusy` when the subagent already has a running
+/// task (no gate pause). The second delegate for the same subagent must
+/// return `status: Queued` with `queue_reason: SubagentBusy`.
+#[tokio::test]
+async fn delegate_queue_reason_subagent_busy() {
+    let _guard = install_tracing();
+    let db = test_db();
+    // Use a BlockingExecutor so the first task stays "running" — the
+    // second delegate for the same subagent must queue.
+    let manager = std::sync::Arc::new(SubagentManager::new(
+        db.clone(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+    // First delegate starts executing (running).
+    let r1 = manager.delegate(req("sub-qr-busy", "first")).await.unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    assert_eq!(
+        r1.queue_reason, None,
+        "running task must have no queue_reason"
+    );
+    // Second delegate for the same subagent → must queue (subagent busy).
+    let r2 = manager
+        .delegate(req("sub-qr-busy", "second"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Queued);
+    assert_eq!(
+        r2.queue_reason,
+        Some(QueueReason::SubagentBusy),
+        "queued while subagent busy must set queue_reason = SubagentBusy"
+    );
+    // Clean up: cancel the blocking task so the runtime can shut down.
+    let _ = manager.cancel_task(&r1.task_id, None).await;
 }
 
 /// Dispatcher marks a queued task as 'failed' when the subagent can't be
@@ -1605,13 +1823,15 @@ fn seed_task(
     db.subagent_insert_task(&row).unwrap();
 }
 
-fn manager_with_db(db: std::sync::Arc<std::sync::Mutex<Database>>) -> SubagentManager {
-    SubagentManager::new(
+fn manager_with_db(
+    db: std::sync::Arc<std::sync::Mutex<Database>>,
+) -> std::sync::Arc<SubagentManager> {
+    std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
-    )
+    ))
 }
 
 #[tokio::test]
@@ -1793,12 +2013,12 @@ async fn execute_task_fails_when_bound_provider_disabled() {
             .unwrap();
     }
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub".into(),
@@ -1893,12 +2113,12 @@ async fn execute_task_fails_when_bound_provider_missing_api_key() {
             .unwrap();
     }
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub-nokey".into(),
@@ -1980,12 +2200,12 @@ async fn execute_task_fails_when_bound_model_not_found() {
             .unwrap();
     }
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub-nomodel".into(),
@@ -2077,12 +2297,12 @@ async fn execute_task_fails_when_bound_model_disabled() {
             .unwrap();
     }
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub-model-disabled".into(),
@@ -2181,12 +2401,12 @@ async fn execute_task_fails_when_model_missing_context_window() {
             .unwrap();
     }
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub-no-ctx".into(),
@@ -2272,12 +2492,12 @@ async fn execute_task_fails_when_model_missing_max_tokens() {
             .unwrap();
     }
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub-no-max".into(),
@@ -2412,12 +2632,12 @@ async fn execute_task_fails_when_bound_provider_deleted() {
         .delete_provider(&provider.id)
         .expect("delete provider");
 
-    let manager = SubagentManager::new(
+    let manager = std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
         "mock",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
 
     let req = DelegateRequest {
         subagent_name: "test-sub-del".into(),
@@ -2550,7 +2770,9 @@ async fn delegate_accepts_boundary_timeout_at_max_safe_value() {
         })
         .await
         .unwrap();
-    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(result.status, TaskStatus::Running);
+    let final_status = await_task_done(&m, &result.task_id).await;
+    assert_eq!(final_status, "completed");
 }
 
 /// `delegate()` must accept a normal, realistic timeout (e.g. 600s). This is
@@ -2566,7 +2788,9 @@ async fn delegate_accepts_normal_timeout() {
         })
         .await
         .unwrap();
-    assert_eq!(result.status, TaskStatus::Completed);
+    assert_eq!(result.status, TaskStatus::Running);
+    let final_status = await_task_done(&m, &result.task_id).await;
+    assert_eq!(final_status, "completed");
 }
 
 // ── reuse_policy conflict detection (P1-4) ─────────────────────────────────
@@ -2576,7 +2800,8 @@ async fn reuse_policy_create_fails_when_subagent_exists() {
     let _guard = install_tracing();
     let m = manager().await;
     // First delegate creates the subagent.
-    m.delegate(req("reviewer", "first")).await.unwrap();
+    let r1 = m.delegate(req("reviewer", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // Second delegate with reuse_policy="create" should fail.
     let err = m
         .delegate(DelegateRequest {
@@ -2601,7 +2826,9 @@ async fn reuse_policy_create_succeeds_when_subagent_does_not_exist() {
         })
         .await
         .unwrap();
-    assert_eq!(r.status.as_str(), "completed");
+    assert_eq!(r.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r.task_id).await;
+    assert_eq!(final_status, "completed");
     assert!(r.created, "created should be true for a new subagent");
 }
 
@@ -2627,6 +2854,7 @@ async fn reuse_policy_reuse_succeeds_when_subagent_exists() {
     let m = manager().await;
     // Create the subagent first.
     let r1 = m.delegate(req("worker", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // Reuse it with reuse_policy="reuse".
     let r2 = m
         .delegate(DelegateRequest {
@@ -2644,7 +2872,8 @@ async fn reuse_policy_default_fails_on_binding_mismatch() {
     let _guard = install_tracing();
     let m = manager().await;
     // Create a subagent with the default bound provider/model.
-    m.delegate(req("mismatch-test", "first")).await.unwrap();
+    let r1 = m.delegate(req("mismatch-test", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // Try to reuse with DIFFERENT bound fields (non-existent IDs).
     let err = m
         .delegate(DelegateRequest {
@@ -2663,6 +2892,7 @@ async fn reuse_policy_default_succeeds_when_binding_matches() {
     let _guard = install_tracing();
     let m = manager().await;
     let r1 = m.delegate(req("match-test", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // Reuse with the SAME bound fields → should succeed.
     let r2 = m
         .delegate(DelegateRequest {
@@ -2685,7 +2915,8 @@ async fn reuse_policy_reuse_succeeds_with_mismatched_bindings() {
     let _guard = install_tracing();
     let m = manager().await;
     // Create a subagent bound to the seeded test provider/model (A/X).
-    m.delegate(req("reuse-mismatch", "first")).await.unwrap();
+    let r1 = m.delegate(req("reuse-mismatch", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // Delegate with reuse_policy="reuse" and DIFFERENT bound fields (B/Y).
     // The conflict check is bypassed; execute_task uses the stored A/X binding.
     let r2 = m
@@ -2697,23 +2928,29 @@ async fn reuse_policy_reuse_succeeds_with_mismatched_bindings() {
         })
         .await
         .expect("reuse policy must bypass the binding conflict check");
-    assert_eq!(r2.status.as_str(), "completed");
+    assert_eq!(r2.status.as_str(), "running");
+    let final_status = await_task_done(&m, &r2.task_id).await;
+    assert_eq!(final_status, "completed");
     assert!(
         !r2.created,
         "created should be false when reusing an existing subagent"
     );
 }
 
-// I1 fix companion: the default/fail policy runs the binding conflict check,
-// so a delegate with mismatched bound fields must FAIL with a conflict error.
+// Bug #3 fix: `--reuse-policy fail` must error when the subagent already
+// exists — even if the bound fields also differ. The "already exists" check
+// runs FIRST (subagent exists → fail), before the binding conflict check.
+// The hint should point users to `--reuse-policy=reuse` to override.
 #[tokio::test]
 async fn reuse_policy_fail_errors_with_mismatched_bindings() {
     let _guard = install_tracing();
     let m = manager().await;
     // Create a subagent bound to the seeded test provider/model (A/X).
-    m.delegate(req("fail-mismatch", "first")).await.unwrap();
+    let r1 = m.delegate(req("fail-mismatch", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     // Delegate with reuse_policy="fail" and DIFFERENT bound fields (B/Y).
-    // The conflict check runs and must reject the mismatch.
+    // Bug #3 fix: "fail" when subagent exists → error "already exists" (the
+    // binding mismatch is secondary — the name conflict is the primary error).
     let err = m
         .delegate(DelegateRequest {
             reuse_policy: Some("fail".into()),
@@ -2726,8 +2963,40 @@ async fn reuse_policy_fail_errors_with_mismatched_bindings() {
     assert!(matches!(err, SubagentError::InvalidArgument(_)));
     let msg = format!("{err}");
     assert!(
-        msg.contains("differs"),
-        "expected 'differs' in conflict error, got: {msg}"
+        msg.contains("already exists"),
+        "expected 'already exists' in conflict error, got: {msg}"
+    );
+    assert!(
+        msg.contains("--reuse-policy=reuse"),
+        "expected hint to use --reuse-policy=reuse, got: {msg}"
+    );
+}
+
+// Bug #3 fix: `--reuse-policy fail` must error even when the bound fields
+// MATCH — the name conflict alone is sufficient to trigger the failure.
+// This is the core regression: previously, "fail" fell into the default
+// catch-all and was silently treated as create-or-reuse.
+#[tokio::test]
+async fn reuse_policy_fail_errors_when_subagent_exists_with_matching_bindings() {
+    let _guard = install_tracing();
+    let m = manager().await;
+    // Create a subagent.
+    let r1 = m.delegate(req("fail-match", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
+    // Delegate with reuse_policy="fail" and the SAME bound fields.
+    // Must error "already exists" — not silently reuse the subagent.
+    let err = m
+        .delegate(DelegateRequest {
+            reuse_policy: Some("fail".into()),
+            ..req("fail-match", "second")
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::InvalidArgument(_)));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("already exists"),
+        "expected 'already exists' in error, got: {msg}"
     );
     assert!(
         msg.contains("--reuse-policy=reuse"),
@@ -2747,7 +3016,8 @@ async fn delegate_result_created_is_true_for_new_subagent() {
 async fn delegate_result_created_is_false_for_reused_subagent() {
     let _guard = install_tracing();
     let m = manager().await;
-    m.delegate(req("reused-sub", "first")).await.unwrap();
+    let r1 = m.delegate(req("reused-sub", "first")).await.unwrap();
+    let _ = await_task_done(&m, &r1.task_id).await;
     let r2 = m.delegate(req("reused-sub", "second")).await.unwrap();
     assert!(!r2.created, "created should be false when reusing");
 }
@@ -2760,6 +3030,9 @@ async fn cancel_task_cancels_queued_task() {
     let m = manager().await;
     // Delegate a task to create a task row.
     let r = m.delegate(req("cancel-queued", "do")).await.unwrap();
+    // Wait for the background task to complete — cancel_task reads the
+    // task's status from the DB and must see "completed" (not "running").
+    let _ = await_task_done(&m, &r.task_id).await;
     // The task should already be completed (mock executor is synchronous).
     // Cancel should return cancelled=false since it's terminal.
     let outcome = m.cancel_task(&r.task_id, None).await.unwrap();
@@ -2786,13 +3059,17 @@ async fn cancel_task_returns_not_found_for_missing_task() {
 async fn cancel_task_cancels_running_task() {
     let _guard = install_tracing();
     let db = test_db();
-    let m = SubagentManager::new(
+    let m = std::sync::Arc::new(SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
     let r = m.delegate(req("cancel-running", "do")).await.unwrap();
+    // Wait for the background task to complete before manually flipping
+    // the status to "running" — otherwise the background write could
+    // overwrite our manual status change.
+    let _ = await_task_done(&m, &r.task_id).await;
     // Manually set the task to running via DB.
     {
         let g = db.lock().unwrap();
@@ -2813,6 +3090,9 @@ async fn cancel_task_skips_already_terminal_task() {
     let _guard = install_tracing();
     let m = manager().await;
     let r = m.delegate(req("cancel-terminal", "do")).await.unwrap();
+    // Wait for the background task to reach terminal status before
+    // asserting cancel is a no-op.
+    let _ = await_task_done(&m, &r.task_id).await;
     // Task is already completed. Cancel should be a no-op.
     let outcome = m.cancel_task(&r.task_id, None).await.unwrap();
     assert!(!outcome.cancelled);
@@ -2834,35 +3114,28 @@ async fn cancel_task_aborts_in_flight_executor() {
         std::sync::Arc::new(executor) as std::sync::Arc<dyn TaskExecutor>,
     ));
 
-    // Spawn delegate — it will hang on the BlockingExecutor inside
-    // execute_task's `tokio::select!` (cancel signal registered, executor
-    // future pending). The cooperative cancel signal is the only way out.
-    let m2 = std::sync::Arc::clone(&m);
-    let delegate_task =
-        tokio::spawn(async move { m2.delegate(req("cancel-in-flight", "do slow thing")).await });
+    // Bug #1/#2 fix: delegate() returns Running immediately and spawns
+    // execute_and_persist in the background. The BlockingExecutor hangs on
+    // a pending future inside execute_task's `tokio::select!` — the
+    // cooperative cancel signal is the only way out.
+    let r = m
+        .delegate(req("cancel-in-flight", "do slow thing"))
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_str(), "running");
+    let task_id = r.task_id.clone();
 
-    // Give delegate time to insert the task as 'running' and reach the
-    // select! (which registers the cancel signal). All DB work up to the
-    // select! is synchronous, so 200ms is ample.
+    // Give the background execute_task time to reach the BlockingExecutor
+    // (which hangs on pending future). The cancel signal is already
+    // registered at the start of execute_task, so 200ms is ample.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Resolve the task id: find the subagent by name, then its latest task.
-    let task_id = {
+    // Verify the task is running (background executor is blocked).
+    {
         let g = db.lock().unwrap();
-        let subagents = g.subagent_list_filtered(None, None, false).unwrap();
-        let sa = subagents
-            .iter()
-            .find(|s| s.name == "cancel-in-flight")
-            .expect("subagent cancel-in-flight should exist");
-        let tasks = g.subagent_list_tasks(&sa.id, 10).unwrap();
-        assert_eq!(
-            tasks.len(),
-            1,
-            "exactly one task expected for cancel-in-flight"
-        );
-        assert_eq!(tasks[0].status, "running", "task should be running");
-        tasks[0].id.clone()
-    };
+        let task = g.subagent_get_task(&task_id).unwrap().unwrap();
+        assert_eq!(task.status, "running", "task should be running");
+    }
 
     // Cancel the in-flight task — this sends the cooperative cancel signal.
     let outcome = m.cancel_task(&task_id, Some("test abort")).await.unwrap();
@@ -2870,16 +3143,12 @@ async fn cancel_task_aborts_in_flight_executor() {
     assert_eq!(outcome.previous_status, "running");
     assert_eq!(outcome.new_status, "cancelled");
 
-    // delegate() should now return with Cancelled status. The cancel branch
-    // in execute_task returns early without a terminal DB write (the status
-    // was already flipped to "cancelled" by cancel_task).
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), delegate_task)
-        .await
-        .expect("delegate did not return within 2s after cancel");
-    let result = result.unwrap(); // join: delegate task did not panic
-    let result = result.unwrap(); // delegate() returned Ok
-    assert_eq!(result.status, TaskStatus::Cancelled);
-    assert_eq!(result.task_id, task_id);
+    // The background execute_task's tokio::select! drops the BlockingExecutor
+    // future, returns Ok(Cancelled). execute_and_persist sees Ok → calls hook
+    // (None in test) → done. Status was already flipped to "cancelled" by
+    // cancel_task. await_task_done confirms the terminal state.
+    let final_status = await_task_done(&m, &task_id).await;
+    assert_eq!(final_status, "cancelled");
 }
 
 /// Executor that records `cancel()` calls. Used to verify that
@@ -2993,13 +3262,17 @@ async fn cancel_task_invokes_executor_cancel() {
 async fn cancel_task_flips_queued_task_to_cancelled() {
     let _guard = install_tracing();
     let db = test_db();
-    let m = SubagentManager::new(
+    let m = std::sync::Arc::new(SubagentManager::new(
         std::sync::Arc::clone(&db),
         SubagentSettings::default(),
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
-    );
+    ));
     let r = m.delegate(req("cancel-queued", "do")).await.unwrap();
+    // Wait for the background task to complete before simulating a
+    // queued task — the status flip below must not race with the
+    // background executor's terminal write.
+    let _ = await_task_done(&m, &r.task_id).await;
     // MockTaskExecutor completes synchronously, so the task is now
     // "completed". Simulate a queued task (as if the dispatcher hasn't
     // picked it up yet) by flipping the status back to "queued".
@@ -3096,4 +3369,358 @@ async fn dispatcher_skips_cancelled_queued_task() {
         g.subagent_get_task("task-cancel-skip").unwrap().unwrap()
     };
     assert_eq!(task.status, "cancelled");
+}
+
+// ── Bug #1/#2: delegate() must return Running immediately ───────────────────
+
+/// Bug #1/#2 fix: `delegate()` must return `Running` immediately without
+/// blocking on the executor. Previously, `delegate()` awaited `execute_task()`
+/// synchronously — a long-running sidecar call would block the CLI until
+/// the task reached a terminal state.
+///
+/// This test uses `BlockingExecutor` (which never completes on its own)
+/// and verifies that `delegate()` returns within 2 seconds. If the bug
+/// regressed, this test would hang indefinitely.
+#[tokio::test]
+async fn delegate_returns_running_without_blocking_on_executor() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    let start = std::time::Instant::now();
+    let r = m
+        .delegate(req("nonblock-check", "do slow thing"))
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(r.status.as_str(), "running");
+    assert!(
+        elapsed.as_secs() < 2,
+        "delegate() must return immediately, took {elapsed:?}"
+    );
+
+    // Clean up: cancel the blocking task so the test can exit cleanly.
+    let _ = m.cancel_task(&r.task_id, Some("test cleanup")).await;
+    let _ = await_task_done(&m, &r.task_id).await;
+}
+
+// ── Bug #4: subagent show reflects hot status during running task ──────────
+
+/// Bug #4 fix: `subagent show` must reflect `status: hot` and
+/// `last_active_at_ms: <now>` while a task is running — not stay `cold`
+/// until the task completes.
+///
+/// Previously, `status` and `last_active_at_ms` were only written on task
+/// completion (via `commit_hot_binding_and_status` which uses
+/// `COALESCE(last_active_at_ms, ?1)` — only fills NULL, never refreshes).
+/// The fix overlays runtime status at read-time in `show()` / `list()` via
+/// `overlay_runtime_status()` — a display-time computation that checks
+/// `has_running_task()` and overrides the returned DTO's `status` to `Hot`.
+/// The DB row is NOT modified, preserving the §3.3 invariant.
+#[tokio::test]
+async fn show_reflects_hot_status_while_task_running() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    // Delegate a task — it will hang on BlockingExecutor.
+    let r = m.delegate(req("hot-check", "do slow thing")).await.unwrap();
+    assert_eq!(r.status.as_str(), "running");
+
+    // Give the background execute_task time to register the cancel signal
+    // and reach the BlockingExecutor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // While the task is running, `show` must reflect hot status.
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail.status.as_str(),
+        "hot",
+        "subagent show should reflect 'hot' status while task is running"
+    );
+    assert!(
+        detail.last_active_at_ms.is_some(),
+        "last_active_at_ms should be set while task is running"
+    );
+    let now = busytok_domain::now_ms();
+    let last_active = detail.last_active_at_ms.unwrap();
+    // The timestamp should be recent (within the last 5 seconds).
+    assert!(
+        now - last_active < 5_000,
+        "last_active_at_ms should be recent: now={now}, last_active={last_active}"
+    );
+
+    // Clean up.
+    let _ = m.cancel_task(&r.task_id, Some("test cleanup")).await;
+    let _ = await_task_done(&m, &r.task_id).await;
+}
+
+// ── Bug #4 invariant: failed task does not leave status='hot' in DB ────────
+
+/// Bug #4 invariant test: after a task fails, the logical subagent's
+/// persistent `status` must NOT be `hot` — the spec §3.3 invariant
+/// ("status='hot' iff is_hot=1 binding exists") must hold. The read-time
+/// overlay in `show()` only affects the returned DTO, not the DB row.
+///
+/// This test was prompted by code review feedback: the previous fix
+/// (persisting `status='hot'` at task start via `touch_subagent_active`)
+/// would leave `hot` in the DB after a failure, with no hot binding to
+/// back it — breaking the invariant.
+#[tokio::test]
+async fn failed_task_does_not_leave_hot_status_in_db() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BoomExecutor) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    // Delegate — BoomExecutor will fail. `show()` returns `running` overlay,
+    // but the DB row must not be persistently `hot`.
+    let r = m.delegate(req("invariant-check", "do")).await.unwrap();
+    assert_eq!(r.status.as_str(), "running");
+
+    // While running, `show()` should report `hot` (read-time overlay).
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.status.as_str(),
+        "hot",
+        "show() should overlay 'hot' while task is running"
+    );
+
+    // Wait for the task to fail.
+    let final_status = await_task_done(&m, &r.task_id).await;
+    assert_eq!(final_status, "failed");
+
+    // After failure, `show()` must NOT report `hot` — no running task, no
+    // hot binding. The persistent invariant holds.
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        detail.status.as_str(),
+        "hot",
+        "failed task must not leave 'hot' status — invariant: status='hot' iff is_hot=1 binding exists"
+    );
+}
+
+// ── Bug #4: list() overlay consistency with show() ────────────────────────
+
+/// Bug #4 fix: `list()` must also overlay runtime status — a subagent with
+/// a running task should appear as `hot` in the list, consistent with
+/// `show()`. This closes a coverage gap identified in review: only `show()`
+/// was tested, not `list()`.
+#[tokio::test]
+async fn list_overlays_hot_status_for_running_task() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    // Delegate a task — it will hang on BlockingExecutor.
+    let r = m
+        .delegate(req("list-overlay-check", "do slow thing"))
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_str(), "running");
+
+    // Give the background execute_task time to reach the BlockingExecutor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // `list()` must show the subagent as `hot` (read-time overlay).
+    let list = m.list(None, None, false).await.unwrap();
+    let found = list.iter().find(|s| s.id == r.subagent_id);
+    assert!(found.is_some(), "subagent should appear in list()");
+    let found = found.unwrap();
+    assert_eq!(
+        found.status.as_str(),
+        "hot",
+        "list() should overlay 'hot' for subagent with running task"
+    );
+    assert!(
+        found.last_active_at_ms.is_some(),
+        "list() should set last_active_at_ms for running subagent"
+    );
+
+    // Clean up.
+    let _ = m.cancel_task(&r.task_id, Some("test cleanup")).await;
+    let _ = await_task_done(&m, &r.task_id).await;
+}
+
+// ── Bug #4: cancelled task does NOT trigger overlay ──────────────────────
+
+/// Bug #4 fix: after a task is cancelled, the overlay must NOT fire —
+/// `has_running_task` returns false for cancelled tasks. The subagent's
+/// status should reflect the DB state (warm/cold), not `hot`.
+#[tokio::test]
+async fn cancelled_task_does_not_trigger_hot_overlay() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    // Delegate a task — it will hang on BlockingExecutor.
+    let r = m
+        .delegate(req("cancel-overlay-check", "do slow thing"))
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_str(), "running");
+
+    // Give the background execute_task time to reach the BlockingExecutor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // While running, overlay should show `hot`.
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(detail.status.as_str(), "hot");
+
+    // Cancel the task.
+    let _ = m.cancel_task(&r.task_id, Some("test cancel")).await;
+    let _ = await_task_done(&m, &r.task_id).await;
+
+    // After cancellation, overlay should NOT fire — task is `cancelled`,
+    // not `running`. Status should be `cold` (no memory written).
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        detail.status.as_str(),
+        "hot",
+        "cancelled task must not trigger hot overlay"
+    );
+}
+
+// ── Bug: list --status hot misses running subagents ────────────────────────
+
+/// Bug: `list(status=Some(Hot))` filtered at SQL level BEFORE the runtime
+/// overlay, so subagents with running tasks (but DB status cold/warm) were
+/// excluded. The fix queries without the status filter, applies the overlay,
+/// then filters in Rust.
+#[tokio::test]
+async fn list_status_hot_includes_running_subagents() {
+    let _guard = install_tracing();
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(BlockingExecutor::new()) as std::sync::Arc<dyn TaskExecutor>,
+    ));
+
+    // Delegate a long-running task — it will hang on BlockingExecutor.
+    let r = m
+        .delegate(req("hot-filter-check", "do slow thing"))
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_str(), "running");
+
+    // Give the background execute_task time to reach the BlockingExecutor.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // `show()` correctly returns `hot` (overlay applied).
+    let detail = m
+        .show(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(detail.status.as_str(), "hot", "show() should overlay hot");
+
+    // Root-cause lock: verify the PERSISTENT DB row is NOT 'hot'. This
+    // proves `show()` returned 'hot' purely from the read-time overlay,
+    // not from a stale persistent write. If someone reintroduces the
+    // `touch_subagent_active()` pattern (writing status='hot' at task
+    // start), this assertion fails — protecting the §3.3 invariant.
+    let persisted_status = {
+        let g = db.lock().unwrap();
+        g.subagent_list_filtered(None, None, false)
+            .unwrap()
+            .iter()
+            .find(|s| s.id == r.subagent_id)
+            .map(|s| s.status.clone())
+            .expect("subagent row must exist in DB")
+    };
+    assert_ne!(
+        persisted_status, "hot",
+        "persisted DB status must NOT be 'hot' — runtime overlay must be \
+         display-time only. Got: {persisted_status}. If this fails, someone \
+         reintroduced persistent hot-status writes at task start."
+    );
+
+    // `list(status=Some(Hot))` must include this subagent — the SQL filter
+    // must NOT exclude it before the overlay runs.
+    let hot_list = m
+        .list(Some(SubagentStatus::Hot), None, false)
+        .await
+        .unwrap();
+    let found = hot_list.iter().find(|s| s.id == r.subagent_id);
+    assert!(
+        found.is_some(),
+        "list --status hot must include subagent with running task, got {} subagents",
+        hot_list.len()
+    );
+
+    // `list(status=Some(Cold))` must NOT include this subagent — it's hot
+    // (has a running task), so it should be excluded from the cold filter.
+    let cold_list = m
+        .list(Some(SubagentStatus::Cold), None, false)
+        .await
+        .unwrap();
+    let found_cold = cold_list.iter().find(|s| s.id == r.subagent_id);
+    assert!(
+        found_cold.is_none(),
+        "list --status cold must NOT include subagent with running task"
+    );
+
+    // Clean up.
+    let _ = m.cancel_task(&r.task_id, Some("test cleanup")).await;
+    let _ = await_task_done(&m, &r.task_id).await;
 }

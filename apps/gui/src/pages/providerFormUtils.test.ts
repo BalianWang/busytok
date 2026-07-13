@@ -5,6 +5,8 @@ import {
   errorMessage,
   parseTags,
   validateBaseUrl,
+  KIND_LABELS,
+  KIND_OPTIONS,
 } from "./providerFormUtils";
 
 describe("parseTags", () => {
@@ -67,19 +69,19 @@ describe("validateBaseUrl", () => {
     expect(validateBaseUrl("http://localhost:8080")).toBeNull();
   });
   it("returns error for empty input", () => {
-    expect(validateBaseUrl("")).toBe("Base URL 不能为空");
+    expect(validateBaseUrl("")).toBe("Base URL is required");
   });
   it("returns error for whitespace-only input", () => {
-    expect(validateBaseUrl("   ")).toBe("Base URL 不能为空");
+    expect(validateBaseUrl("   ")).toBe("Base URL is required");
   });
   it("returns error for missing protocol", () => {
-    expect(validateBaseUrl("api.deepseek.com")).toBe("请输入完整的 URL（以 http:// 或 https:// 开头）");
+    expect(validateBaseUrl("api.deepseek.com")).toBe("Enter a complete URL starting with http:// or https://");
   });
   it("returns error for ftp protocol", () => {
-    expect(validateBaseUrl("ftp://api.deepseek.com")).toBe("请输入完整的 URL（以 http:// 或 https:// 开头）");
+    expect(validateBaseUrl("ftp://api.deepseek.com")).toBe("Enter a complete URL starting with http:// or https://");
   });
   it("returns error for malformed URL", () => {
-    expect(validateBaseUrl("https://")).toBe("URL 格式不正确");
+    expect(validateBaseUrl("https://")).toBe("Invalid URL format");
   });
 });
 
@@ -101,5 +103,23 @@ describe("errorMessage", () => {
     expect(errorMessage(null, "fallback")).toBe("fallback");
     expect(errorMessage(undefined, "fallback")).toBe("fallback");
     expect(errorMessage(42, "fallback")).toBe("fallback");
+  });
+});
+
+describe("KIND_LABELS", () => {
+  it("maps known provider kinds to display labels", () => {
+    expect(KIND_LABELS["openai_compatible"]).toBe("OpenAI-compatible");
+    expect(KIND_LABELS["anthropic_compatible"]).toBe("Anthropic-compatible");
+  });
+  it("returns undefined for unknown kinds (callers fall back to raw value)", () => {
+    expect(KIND_LABELS["custom_kind"]).toBeUndefined();
+  });
+});
+
+describe("KIND_OPTIONS", () => {
+  it("contains all keys from KIND_LABELS", () => {
+    expect(KIND_OPTIONS).toEqual(Object.keys(KIND_LABELS));
+    expect(KIND_OPTIONS).toContain("openai_compatible");
+    expect(KIND_OPTIONS).toContain("anthropic_compatible");
   });
 });
