@@ -1601,13 +1601,24 @@ async fn worker_snapshot_caches_sample_after_health_tick() {
     };
     let sup = PiSidecarSupervisor::with_resource_policy(cfg, None, policy, None);
     let _ = sup.ensure_started().await.unwrap();
-    // Wait for at least 2 health-pinger + resource-sampling cycles (200ms).
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let snap = sup.worker_snapshot().await.unwrap();
-    assert!(
-        snap.sampled_at_ms.is_some(),
-        "sampled_at_ms must be set after sampling"
-    );
+    // Poll for the first health-pinger + resource-sampling tick. A fixed
+    // sleep (e.g. 600ms) is flaky on Windows CI where mock sidecar spawn
+    // is slower — the supervision loop may not have ticked yet. Poll up
+    // to 5s; on fast machines this returns in ~200ms.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = sup.worker_snapshot().await.unwrap();
+        if snap.sampled_at_ms.is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "sampled_at_ms was not set within 5s \
+                 (health_interval=200ms, POLL_INTERVAL=100ms)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     sup.shutdown().await.unwrap();
 }
 
@@ -1642,19 +1653,28 @@ async fn worker_snapshot_memory_used_pct_bound_to_sample_timestamp() {
 
     // Start the sidecar so the supervision loop's health pinger fires.
     let _ = sup.ensure_started().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    let snap = sup.worker_snapshot().await.unwrap();
-    assert!(
-        snap.sampled_at_ms.is_some(),
-        "sampled_at_ms must be set after sampling"
-    );
-    assert!(
-        snap.memory_used_pct.is_some(),
-        "memory_used_pct must be Some after sampling (bound to sampled_at_ms)"
-    );
-    let pct = snap.memory_used_pct.unwrap();
-    assert!(pct <= 100, "memory_used_pct should be <= 100, got {pct}");
+    // Poll for the first tick (see worker_snapshot_caches_sample_after_health_tick
+    // for rationale on polling vs fixed sleep).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = sup.worker_snapshot().await.unwrap();
+        if snap.sampled_at_ms.is_some() {
+            assert!(
+                snap.memory_used_pct.is_some(),
+                "memory_used_pct must be Some after sampling (bound to sampled_at_ms)"
+            );
+            let pct = snap.memory_used_pct.unwrap();
+            assert!(pct <= 100, "memory_used_pct should be <= 100, got {pct}");
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "sampled_at_ms was not set within 5s \
+                 (health_interval=200ms, POLL_INTERVAL=100ms)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     sup.shutdown().await.unwrap();
 }
