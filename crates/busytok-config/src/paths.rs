@@ -347,7 +347,10 @@ mod tests {
 
         // Test 2: override is used as-is (no app-name suffix appended).
         assert!(
-            !paths.data_dir().to_string_lossy().ends_with("busytok/busytok-test-all-data"),
+            !paths
+                .data_dir()
+                .to_string_lossy()
+                .ends_with("busytok/busytok-test-all-data"),
             "override should be used as-is, not appended with app name"
         );
 
@@ -363,7 +366,10 @@ mod tests {
         std::env::remove_var("BUSYTOK_RUNTIME_DIR");
         let paths = BusytokPaths::from_env();
         let s = paths.data_dir().to_string_lossy();
-        assert!(s.contains("busytok"), "fallback data_dir should contain 'busytok': {s}");
+        assert!(
+            s.contains("busytok"),
+            "fallback data_dir should contain 'busytok': {s}"
+        );
 
         // Restore old values.
         match old_data {

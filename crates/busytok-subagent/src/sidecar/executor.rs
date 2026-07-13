@@ -317,10 +317,8 @@ impl SidecarTaskExecutor {
                                         error_kind = ?kind
                                     );
                                     if kind == TaskErrorKind::Auth {
-                                        if let Err(kill_err) = self
-                                            .pool
-                                            .remove_worker_and_kill(&provider_id)
-                                            .await
+                                        if let Err(kill_err) =
+                                            self.pool.remove_worker_and_kill(&provider_id).await
                                         {
                                             error!(
                                                 event_code = "subagent.pool.auth_kill_failed",
@@ -399,7 +397,8 @@ impl SidecarTaskExecutor {
                                         // evictable) but we don't want to loop
                                         // forever on an unexpected state
                                         // transition.
-                                        HotLimitOutcome::Evict(_) | HotLimitOutcome::ProtocolViolation(_) => {
+                                        HotLimitOutcome::Evict(_)
+                                        | HotLimitOutcome::ProtocolViolation(_) => {
                                             break;
                                         }
                                     }
@@ -413,10 +412,8 @@ impl SidecarTaskExecutor {
                                         attempt = attempt + 1
                                     );
                                     if kind == TaskErrorKind::Auth {
-                                        if let Err(kill_err) = self
-                                            .pool
-                                            .remove_worker_and_kill(&provider_id)
-                                            .await
+                                        if let Err(kill_err) =
+                                            self.pool.remove_worker_and_kill(&provider_id).await
                                         {
                                             error!(
                                                 event_code = "subagent.pool.auth_kill_failed",
@@ -658,9 +655,9 @@ impl SidecarTaskExecutor {
             return Ok(());
         };
 
-        let adapter_session_id = binding
-            .adapter_session_id
-            .ok_or_else(|| SubagentError::Validation("LRU hot binding has no adapter_session_id".into()))?;
+        let adapter_session_id = binding.adapter_session_id.ok_or_else(|| {
+            SubagentError::Validation("LRU hot binding has no adapter_session_id".into())
+        })?;
 
         // Step 3: delegate to evict_session (resolves the supervisor via
         // supervisor_for_session — pool-wide routing).
@@ -755,9 +752,7 @@ impl SidecarTaskExecutor {
         // Return `AlreadyEvicted` so the caller retries `turn_auto`.
         let hibernate_result = match handle.prepare_hibernate(adapter_session_id).await {
             Ok(r) => r,
-            Err(SidecarError::Application(code, _msg, _data))
-                if code == SESSION_NOT_FOUND =>
-            {
+            Err(SidecarError::Application(code, _msg, _data)) if code == SESSION_NOT_FOUND => {
                 info!(
                     event_code = "subagent.session.eviction_already_evicted",
                     adapter_session_id = %adapter_session_id,

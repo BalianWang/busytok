@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use busytok_config::SubagentSettings;
 use busytok_store::{
-    Database, SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow,
-    SubagentUsageRecordRow,
+    Database, SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
 use tracing::{error, info, warn};
 
@@ -528,7 +527,9 @@ impl SubagentManager {
         let manager = Arc::clone(self);
         let subagent_clone = subagent.clone();
         tokio::spawn(async move {
-            manager.execute_and_persist(&task_row, &subagent_clone).await;
+            manager
+                .execute_and_persist(&task_row, &subagent_clone)
+                .await;
         });
 
         Ok(DelegateResult {
@@ -553,11 +554,7 @@ impl SubagentManager {
     /// (inline). This is the single seam for post-execution cleanup: on
     /// success the hook bridges usage into `usage_events` + rollups; on
     /// failure the task is marked `'failed'` in the DB.
-    async fn execute_and_persist(
-        &self,
-        task: &SubagentTaskRow,
-        subagent: &LogicalSubagent,
-    ) {
+    async fn execute_and_persist(&self, task: &SubagentTaskRow, subagent: &LogicalSubagent) {
         match self.execute_task(task, subagent).await {
             Ok(result) => {
                 let hook = {
@@ -594,10 +591,7 @@ impl SubagentManager {
                         );
                         let db = self.db.lock().expect("subagent db lock poisoned");
                         let _ = db.subagent_set_task_status_if_not_cancelled(
-                            &task.id,
-                            "queued",
-                            None,
-                            None,
+                            &task.id, "queued", None, None,
                         );
                         return;
                     }
@@ -616,8 +610,10 @@ impl SubagentManager {
                         None,
                         Some(e.to_string()),
                     );
-                    let _ = db
-                        .subagent_set_task_error_kind(&task.id, Some(TaskErrorKind::HotSessionLimit.as_str()));
+                    let _ = db.subagent_set_task_error_kind(
+                        &task.id,
+                        Some(TaskErrorKind::HotSessionLimit.as_str()),
+                    );
                     return;
                 }
                 warn!(
@@ -677,10 +673,7 @@ impl SubagentManager {
             )));
         }
         let model = db
-            .get_model_by_provider_and_model_id(
-                &subagent.bound_provider_id,
-                effective_model_id,
-            )
+            .get_model_by_provider_and_model_id(&subagent.bound_provider_id, effective_model_id)
             .map_err(SubagentError::Store)?
             .ok_or_else(|| {
                 SubagentError::Validation(format!(
@@ -1540,8 +1533,7 @@ impl SubagentManager {
         let rows = db
             .subagent_list_filtered(db_status_filter, project, include_deleted)
             .map_err(SubagentError::Store)?;
-        let mut subagents: Vec<LogicalSubagent> =
-            rows.iter().map(row_to_model).collect::<Vec<_>>();
+        let mut subagents: Vec<LogicalSubagent> = rows.iter().map(row_to_model).collect::<Vec<_>>();
         // Bug #4 fix: overlay runtime status at read-time. A subagent with an
         // in-flight task is presented as `hot` even if no hot binding exists
         // yet — this is a display-time computation, NOT a persistent write,
@@ -2067,9 +2059,7 @@ mod tests {
         );
         // Bug 2 fix: SidecarSpawn → Crash (was None).
         assert_eq!(
-            subagent_error_to_task_error_kind(&SubagentError::SidecarSpawn(
-                "spawn failed".into()
-            )),
+            subagent_error_to_task_error_kind(&SubagentError::SidecarSpawn("spawn failed".into())),
             Some(TaskErrorKind::Crash)
         );
         // Non-sidecar errors → None (no error_kind — these are config/lookup
@@ -2083,9 +2073,7 @@ mod tests {
             None
         );
         assert_eq!(
-            subagent_error_to_task_error_kind(&SubagentError::Store(anyhow::anyhow!(
-                "db error"
-            ))),
+            subagent_error_to_task_error_kind(&SubagentError::Store(anyhow::anyhow!("db error"))),
             None
         );
     }

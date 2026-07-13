@@ -795,8 +795,7 @@ async fn sidecar_e2e_misconfigured_sidecar_fails_delegate_not_silently_mock() {
     // (NOT "completed" — a "completed" status would mean a silent Mock
     // fallback masked the misconfiguration).
     assert_eq!(resp.status, "running");
-    let final_status =
-        await_task_done(&supervisor.subagent_manager(), &resp.task_id).await;
+    let final_status = await_task_done(&supervisor.subagent_manager(), &resp.task_id).await;
     assert_eq!(
         final_status, "failed",
         "task must reach 'failed' status — got success (silent mock fallback would have completed)"
@@ -879,8 +878,7 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     assert_eq!(resp1.status, "running");
     // Wait for async completion (Bug #1/#2 fix: delegate returns Running
     // immediately and execute_and_persist runs in the background).
-    let final_status1 =
-        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    let final_status1 = await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
     assert_eq!(final_status1, "completed");
     let sub1 = resp1.subagent_id;
 
@@ -908,8 +906,7 @@ async fn sidecar_e2e_eviction_releases_lru_and_retries() {
     // Wait for async completion (Bug #1/#2 fix). The second delegate
     // triggers eviction of sub1 (prepare_hibernate → persist → close),
     // then retries turn_auto for itself.
-    let final_status2 =
-        await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    let final_status2 = await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
     assert_eq!(final_status2, "completed");
     let sub2 = resp2.subagent_id;
 
@@ -1025,8 +1022,7 @@ async fn sidecar_e2e_evicted_retry_hot_limit_requeues_then_completes() {
         .await
         .unwrap();
     assert_eq!(resp1.status, "running");
-    let final_status1 =
-        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    let final_status1 = await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
     assert_eq!(final_status1, "completed", "first task must complete");
 
     // 2. Second delegate — triggers eviction → refill → HotSessionLimit →
@@ -1074,7 +1070,10 @@ async fn sidecar_e2e_evicted_retry_hot_limit_requeues_then_completes() {
         if let Some((status, error_kind)) = snap {
             if status != prev_status {
                 // Status transition detected — log it for debugging.
-                eprintln!("task {} transition: {} → {}", resp2.task_id, prev_status, status);
+                eprintln!(
+                    "task {} transition: {} → {}",
+                    resp2.task_id, prev_status, status
+                );
                 prev_status = status.clone();
             }
             if status == "queued" {
@@ -1840,8 +1839,7 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
     // immediately and execute_and_persist runs in the background). The mock
     // sends the turn_auto response THEN exits — so the task completes
     // before the crash is observed by the supervision loop.
-    let final_status1 =
-        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    let final_status1 = await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
     assert_eq!(final_status1, "completed");
 
     // 2. Wait for the supervision loop to observe the crash + write the
@@ -1894,8 +1892,7 @@ async fn sidecar_e2e_crash_recovery_next_delegate_restarts_sidecar() {
         "second delegate returns Running immediately after restart"
     );
     // Wait for async completion (Bug #1/#2 fix).
-    let final_status2 =
-        await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    let final_status2 = await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
     assert_eq!(
         final_status2, "completed",
         "second delegate completes after restart"
@@ -1998,8 +1995,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
     assert_eq!(resp1.status, "running");
     // Wait for async completion (Bug #1/#2 fix: delegate returns Running
     // immediately and execute_and_persist runs in the background).
-    let final_status1 =
-        await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
+    let final_status1 = await_task_done(&supervisor.subagent_manager(), &resp1.task_id).await;
     assert_eq!(final_status1, "completed");
     let sub_id = resp1.subagent_id.clone();
 
@@ -2049,8 +2045,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
         .expect("second delegate must complete after restart");
     assert_eq!(resp2.status, "running");
     // Wait for async completion (Bug #1/#2 fix).
-    let final_status2 =
-        await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
+    let final_status2 = await_task_done(&supervisor.subagent_manager(), &resp2.task_id).await;
     assert_eq!(final_status2, "completed");
 
     // Wait for crash #2 to be detected. WITHOUT the fix, this would time
@@ -2100,8 +2095,7 @@ async fn sidecar_e2e_double_crash_second_crash_still_detected() {
         .expect("third delegate must complete after second restart");
     assert_eq!(resp3.status, "running");
     // Wait for async completion (Bug #1/#2 fix).
-    let final_status3 =
-        await_task_done(&supervisor.subagent_manager(), &resp3.task_id).await;
+    let final_status3 = await_task_done(&supervisor.subagent_manager(), &resp3.task_id).await;
     assert_eq!(final_status3, "completed");
 
     // 4. Verify event counts: at least 2 crashes + exactly 2 restarts.
@@ -2468,15 +2462,13 @@ async fn delegate_returns_queued_when_pressure_gate_is_paused() {
     };
     let exec = Arc::new(busytok_subagent::mock_executor::MockTaskExecutor)
         as Arc<dyn busytok_subagent::mock_executor::TaskExecutor>;
-    let manager = std::sync::Arc::new(
-        busytok_subagent::SubagentManager::with_pressure_gate(
-            db2.clone(),
-            settings2,
-            "pi",
-            exec,
-            Some(gate.clone()),
-        ),
-    );
+    let manager = std::sync::Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
+        db2.clone(),
+        settings2,
+        "pi",
+        exec,
+        Some(gate.clone()),
+    ));
 
     let req = busytok_subagent::DelegateRequest {
         subagent_name: "paused-test".to_string(),

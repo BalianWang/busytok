@@ -1656,8 +1656,13 @@ mod phase2_tests {
                  (id, subagent_id, harness, adapter_session_id, adapter_process_id, \
                   is_hot, status, created_at_ms, last_used_at_ms, closed_at_ms, detail_json) \
              VALUES (?1, ?2, 'pi', ?3, NULL, ?4, ?5, 1000, 1000, NULL, NULL)",
-            rusqlite::params![id, subagent_id, adapter_session_id, is_hot,
-                if is_hot == 1 { "hot" } else { "closed" }],
+            rusqlite::params![
+                id,
+                subagent_id,
+                adapter_session_id,
+                is_hot,
+                if is_hot == 1 { "hot" } else { "closed" }
+            ],
         )
         .unwrap();
     }
@@ -1680,7 +1685,10 @@ mod phase2_tests {
         seed_subagent(conn, "sub-a");
         seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 0);
         let row = find_hot_binding_by_session(conn, "sess-1", "pi").unwrap();
-        assert!(row.is_none(), "cold binding should NOT be found by hot query");
+        assert!(
+            row.is_none(),
+            "cold binding should NOT be found by hot query"
+        );
     }
 
     #[test]
@@ -1690,7 +1698,10 @@ mod phase2_tests {
         seed_subagent(conn, "sub-a");
         seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 1);
         let row = find_binding_by_session(conn, "sess-1", "pi").unwrap();
-        assert!(row.is_some(), "binding should be found regardless of is_hot");
+        assert!(
+            row.is_some(),
+            "binding should be found regardless of is_hot"
+        );
         assert_eq!(row.unwrap().is_hot, 1);
     }
 
@@ -1704,7 +1715,10 @@ mod phase2_tests {
         seed_subagent(conn, "sub-a");
         seed_hot_binding_row(conn, "b1", "sub-a", "sess-1", 0);
         let row = find_binding_by_session(conn, "sess-1", "pi").unwrap();
-        assert!(row.is_some(), "cold binding should be found by non-hot query");
+        assert!(
+            row.is_some(),
+            "cold binding should be found by non-hot query"
+        );
         assert_eq!(row.unwrap().is_hot, 0, "is_hot should be 0");
     }
 

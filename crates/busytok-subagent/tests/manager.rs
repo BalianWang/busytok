@@ -526,7 +526,12 @@ async fn delegate_rejected_when_feature_disabled() {
         enabled: false,
         ..Default::default()
     };
-    let m = std::sync::Arc::new(SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor)));
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        settings,
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    ));
     let err = m.delegate(req("reviewer", "do")).await.unwrap_err();
     assert!(matches!(err, SubagentError::Disabled));
 }
@@ -1259,7 +1264,10 @@ async fn delegate_populates_attempts_after_first_completed_task() {
     assert_eq!(final_status, "completed");
     let task_row = {
         let db_guard = db.lock().unwrap();
-        db_guard.subagent_get_task(&result.task_id).unwrap().unwrap()
+        db_guard
+            .subagent_get_task(&result.task_id)
+            .unwrap()
+            .unwrap()
     };
     let summary = task_row
         .result_summary
@@ -1421,7 +1429,12 @@ async fn delegate_sets_model_when_execute_task_returns_none() {
         },
     );
     let db = test_db();
-    let m = std::sync::Arc::new(SubagentManager::new(db, settings, "pi", std::sync::Arc::new(MockTaskExecutor)));
+    let m = std::sync::Arc::new(SubagentManager::new(
+        db,
+        settings,
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+    ));
     let expected_model = bound_model_id();
     let r = m
         .delegate(DelegateRequest {
@@ -1597,10 +1610,7 @@ async fn delegate_queue_reason_pressure_gate_paused() {
         std::sync::Arc::new(MockTaskExecutor),
         Some(gate.clone()),
     ));
-    let r = manager
-        .delegate(req("sub-qr-gate", "do"))
-        .await
-        .unwrap();
+    let r = manager.delegate(req("sub-qr-gate", "do")).await.unwrap();
     assert_eq!(r.status, TaskStatus::Queued);
     assert_eq!(
         r.queue_reason,
@@ -1627,9 +1637,15 @@ async fn delegate_queue_reason_subagent_busy() {
     // First delegate starts executing (running).
     let r1 = manager.delegate(req("sub-qr-busy", "first")).await.unwrap();
     assert_eq!(r1.status, TaskStatus::Running);
-    assert_eq!(r1.queue_reason, None, "running task must have no queue_reason");
+    assert_eq!(
+        r1.queue_reason, None,
+        "running task must have no queue_reason"
+    );
     // Second delegate for the same subagent → must queue (subagent busy).
-    let r2 = manager.delegate(req("sub-qr-busy", "second")).await.unwrap();
+    let r2 = manager
+        .delegate(req("sub-qr-busy", "second"))
+        .await
+        .unwrap();
     assert_eq!(r2.status, TaskStatus::Queued);
     assert_eq!(
         r2.queue_reason,
@@ -1807,7 +1823,9 @@ fn seed_task(
     db.subagent_insert_task(&row).unwrap();
 }
 
-fn manager_with_db(db: std::sync::Arc<std::sync::Mutex<Database>>) -> std::sync::Arc<SubagentManager> {
+fn manager_with_db(
+    db: std::sync::Arc<std::sync::Mutex<Database>>,
+) -> std::sync::Arc<SubagentManager> {
     std::sync::Arc::new(SubagentManager::new(
         db,
         SubagentSettings::default(),
@@ -3100,7 +3118,10 @@ async fn cancel_task_aborts_in_flight_executor() {
     // execute_and_persist in the background. The BlockingExecutor hangs on
     // a pending future inside execute_task's `tokio::select!` — the
     // cooperative cancel signal is the only way out.
-    let r = m.delegate(req("cancel-in-flight", "do slow thing")).await.unwrap();
+    let r = m
+        .delegate(req("cancel-in-flight", "do slow thing"))
+        .await
+        .unwrap();
     assert_eq!(r.status.as_str(), "running");
     let task_id = r.task_id.clone();
 
@@ -3372,7 +3393,10 @@ async fn delegate_returns_running_without_blocking_on_executor() {
     ));
 
     let start = std::time::Instant::now();
-    let r = m.delegate(req("nonblock-check", "do slow thing")).await.unwrap();
+    let r = m
+        .delegate(req("nonblock-check", "do slow thing"))
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
 
     assert_eq!(r.status.as_str(), "running");
@@ -3528,7 +3552,10 @@ async fn list_overlays_hot_status_for_running_task() {
     ));
 
     // Delegate a task — it will hang on BlockingExecutor.
-    let r = m.delegate(req("list-overlay-check", "do slow thing")).await.unwrap();
+    let r = m
+        .delegate(req("list-overlay-check", "do slow thing"))
+        .await
+        .unwrap();
     assert_eq!(r.status.as_str(), "running");
 
     // Give the background execute_task time to reach the BlockingExecutor.
@@ -3571,7 +3598,10 @@ async fn cancelled_task_does_not_trigger_hot_overlay() {
     ));
 
     // Delegate a task — it will hang on BlockingExecutor.
-    let r = m.delegate(req("cancel-overlay-check", "do slow thing")).await.unwrap();
+    let r = m
+        .delegate(req("cancel-overlay-check", "do slow thing"))
+        .await
+        .unwrap();
     assert_eq!(r.status.as_str(), "running");
 
     // Give the background execute_task time to reach the BlockingExecutor.
@@ -3625,7 +3655,10 @@ async fn list_status_hot_includes_running_subagents() {
     ));
 
     // Delegate a long-running task — it will hang on BlockingExecutor.
-    let r = m.delegate(req("hot-filter-check", "do slow thing")).await.unwrap();
+    let r = m
+        .delegate(req("hot-filter-check", "do slow thing"))
+        .await
+        .unwrap();
     assert_eq!(r.status.as_str(), "running");
 
     // Give the background execute_task time to reach the BlockingExecutor.
@@ -3664,7 +3697,10 @@ async fn list_status_hot_includes_running_subagents() {
 
     // `list(status=Some(Hot))` must include this subagent — the SQL filter
     // must NOT exclude it before the overlay runs.
-    let hot_list = m.list(Some(SubagentStatus::Hot), None, false).await.unwrap();
+    let hot_list = m
+        .list(Some(SubagentStatus::Hot), None, false)
+        .await
+        .unwrap();
     let found = hot_list.iter().find(|s| s.id == r.subagent_id);
     assert!(
         found.is_some(),
@@ -3674,7 +3710,10 @@ async fn list_status_hot_includes_running_subagents() {
 
     // `list(status=Some(Cold))` must NOT include this subagent — it's hot
     // (has a running task), so it should be excluded from the cold filter.
-    let cold_list = m.list(Some(SubagentStatus::Cold), None, false).await.unwrap();
+    let cold_list = m
+        .list(Some(SubagentStatus::Cold), None, false)
+        .await
+        .unwrap();
     let found_cold = cold_list.iter().find(|s| s.id == r.subagent_id);
     assert!(
         found_cold.is_none(),

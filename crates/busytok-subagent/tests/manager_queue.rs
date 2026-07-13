@@ -429,9 +429,13 @@ async fn delegate_queues_when_subagent_already_running() {
         std::time::Duration::from_millis(500),
         Arc::clone(&call_count),
     )) as Arc<dyn TaskExecutor>;
-    let manager = std::sync::Arc::new(
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
-    );
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
 
     // Run two delegates concurrently for the SAME subagent.
     // r1 inserts as "running" + starts executing (sleeps 500ms).
@@ -501,9 +505,13 @@ async fn delegate_rejects_both_prompt_and_artifact_ref() {
     let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
-    let manager = std::sync::Arc::new(
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
-    );
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
     let mut r = req("test", "inline prompt");
     r.prompt_artifact_ref = Some("sub/task/prompt.txt".to_string());
     let err = manager.delegate(r).await.unwrap_err();
@@ -520,9 +528,13 @@ async fn delegate_rejects_neither_prompt_nor_artifact_ref() {
     let db = test_db();
     let settings = SubagentSettings::default();
     let executor = Arc::new(RecordingExecutor) as Arc<dyn TaskExecutor>;
-    let manager = std::sync::Arc::new(
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
-    );
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
     let r = req("test", "");
     let err = manager.delegate(r).await.unwrap_err();
     assert_eq!(
@@ -559,9 +571,13 @@ async fn delegate_preserves_prompt_artifact_ref_end_to_end() {
     let settings = SubagentSettings::default();
     let captured = Arc::new(StdMutex::new(None));
     let executor = Arc::new(CapturingExecutor(Arc::clone(&captured))) as Arc<dyn TaskExecutor>;
-    let manager = std::sync::Arc::new(
-        SubagentManager::with_pressure_gate(Arc::clone(&db), settings, "mock", executor, None),
-    );
+    let manager = std::sync::Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
 
     let mut r = req("artifact-sub", "");
     r.prompt_artifact_ref = Some("sub123/task456/prompt.txt".to_string());
@@ -701,7 +717,10 @@ async fn hot_session_limit_requeues_task_within_deadline() {
     ));
 
     // delegate() inserts as "running" + spawns background execute_and_persist.
-    let result = manager.delegate(req("hot-limit-sub", "do work")).await.unwrap();
+    let result = manager
+        .delegate(req("hot-limit-sub", "do work"))
+        .await
+        .unwrap();
     assert_eq!(result.status, TaskStatus::Running);
 
     // Poll for up to 5s for the task to be re-queued (status = "queued").
@@ -777,10 +796,7 @@ async fn hot_session_limit_marks_failed_after_deadline() {
         db.conn()
             .execute(
                 "UPDATE subagent_tasks SET created_at_ms = ?1 WHERE id = ?2",
-                rusqlite::params![
-                    busytok_domain::now_ms() - 400_000,
-                    result.task_id,
-                ],
+                rusqlite::params![busytok_domain::now_ms() - 400_000, result.task_id,],
             )
             .unwrap();
     }
@@ -794,17 +810,17 @@ async fn hot_session_limit_marks_failed_after_deadline() {
     let (status, error_kind, error) =
         await_task_terminal(&db, &result.subagent_id, &result.task_id).await;
 
-    assert_eq!(status, "failed", "deadline-exceeded task must be marked failed");
+    assert_eq!(
+        status, "failed",
+        "deadline-exceeded task must be marked failed"
+    );
     assert_eq!(
         error_kind.as_deref(),
         Some("hot_session_limit"),
         "error_kind must be 'hot_session_limit' (not 'unknown'), got: {error_kind:?}"
     );
     assert!(
-        error
-            .as_deref()
-            .unwrap_or("")
-            .contains("hot session limit"),
+        error.as_deref().unwrap_or("").contains("hot session limit"),
         "error message must mention hot session limit, got: {error:?}"
     );
 

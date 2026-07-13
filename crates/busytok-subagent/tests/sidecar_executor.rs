@@ -293,10 +293,7 @@ async fn delegate_via_sidecar_writes_binding_and_sets_hot() {
         assert_eq!(binding.status, "hot");
         binding.adapter_session_id
     };
-    assert!(
-        adapter_session_id.is_some(),
-        "expected adapter_session_id"
-    );
+    assert!(adapter_session_id.is_some(), "expected adapter_session_id");
     assert_eq!(r.adapter, "pi");
 
     // Subagent status is Hot (not Warm).
@@ -1209,9 +1206,7 @@ async fn executor_eviction_fails_when_candidate_missing_from_error() {
                 "error should explain the protocol violation, got: {msg}"
             );
         }
-        other => panic!(
-            "expected SubagentError::Validation, got {other:?} — Bug 2 regression"
-        ),
+        other => panic!("expected SubagentError::Validation, got {other:?} — Bug 2 regression"),
     }
 
     supervisor.shutdown().await.unwrap();
@@ -1258,9 +1253,9 @@ async fn executor_eviction_skips_when_all_sessions_busy() {
                 "candidate must be empty (all-busy path), got: {candidate}"
             );
         }
-        other => panic!(
-            "expected SubagentError::HotSessionLimit, got {other:?} — Bug 1 regression"
-        ),
+        other => {
+            panic!("expected SubagentError::HotSessionLimit, got {other:?} — Bug 1 regression")
+        }
     }
 
     supervisor.shutdown().await.unwrap();
@@ -1703,8 +1698,10 @@ async fn executor_eviction_already_evicted_via_session_not_found() {
     cfg.max_hot_sessions = 1;
     cfg.env
         .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
-    cfg.env
-        .insert("BUSYTOK_MOCK_PREPARE_HIBERNATE_NOT_FOUND".into(), "1".into());
+    cfg.env.insert(
+        "BUSYTOK_MOCK_PREPARE_HIBERNATE_NOT_FOUND".into(),
+        "1".into(),
+    );
     cfg.health_interval = Duration::from_secs(3600);
     let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
