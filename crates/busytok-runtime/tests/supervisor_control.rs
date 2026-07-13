@@ -4527,6 +4527,77 @@ async fn subagent_task_get_returns_populated_dto_for_existing_task() {
     sup.shutdown_writer().await.expect("writer shutdown");
 }
 
+/// v6 regression: `queue_reason` must be `None` in the poll DTO when a task
+/// is NOT in `queued` status, even if the DB row retains a stale value from
+/// a prior queued state. This guards the DTO contract at the read boundary
+/// (supervisor.rs `subagent_task_detail` derives `queue_reason` only when
+/// `status == "queued"`), covering two leak paths:
+/// - cancelled-while-queued (cancel_task_if_not_terminal doesn't clear it)
+/// - failed-while-queued (set_task_status_if_not_cancelled doesn't clear it)
+#[tokio::test]
+async fn subagent_task_get_omits_queue_reason_for_non_queued_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = busytok_store::Database::open_in_memory().unwrap();
+    let sup = make_supervisor(db, &tmp);
+
+    let sub_id = seed_subagent_row(&sup, "queued-then-cancelled", "warm");
+
+    // Seed a cancelled task whose DB row STILL has queue_reason set —
+    // simulating the leak path where cancel_task_if_not_terminal did not
+    // clear queue_reason.
+    let mut cancelled_row =
+        SubagentTaskRow::for_test("task-cancelled-leak", &sub_id, "pi/search-cheap", "do work");
+    cancelled_row.status = "cancelled".to_string();
+    cancelled_row.completed_at_ms = Some(2_000);
+    cancelled_row.queue_reason = Some("subagent_busy".to_string());
+    {
+        let db = sup.db_handle().lock().unwrap();
+        db.subagent_insert_task(&cancelled_row).expect("insert");
+    }
+
+    let dto = sup
+        .subagent_task_get(SubagentTaskGetRequestDto {
+            task_id: "task-cancelled-leak".to_string(),
+        })
+        .await
+        .expect("task_get should succeed");
+    assert_eq!(dto.status, "cancelled");
+    assert!(
+        dto.queue_reason.is_none(),
+        "queue_reason must be None for cancelled task, got: {:?}",
+        dto.queue_reason
+    );
+
+    // Seed a failed task whose DB row STILL has queue_reason set — simulating
+    // the leak path where set_task_status_if_not_cancelled("failed", ...) did
+    // not clear queue_reason.
+    let mut failed_row =
+        SubagentTaskRow::for_test("task-failed-leak", &sub_id, "pi/search-cheap", "do work");
+    failed_row.status = "failed".to_string();
+    failed_row.completed_at_ms = Some(3_000);
+    failed_row.error = Some("boom".to_string());
+    failed_row.queue_reason = Some("hot_session_limit".to_string());
+    {
+        let db = sup.db_handle().lock().unwrap();
+        db.subagent_insert_task(&failed_row).expect("insert");
+    }
+
+    let dto = sup
+        .subagent_task_get(SubagentTaskGetRequestDto {
+            task_id: "task-failed-leak".to_string(),
+        })
+        .await
+        .expect("task_get should succeed");
+    assert_eq!(dto.status, "failed");
+    assert!(
+        dto.queue_reason.is_none(),
+        "queue_reason must be None for failed task, got: {:?}",
+        dto.queue_reason
+    );
+
+    sup.shutdown_writer().await.expect("writer shutdown");
+}
+
 /// Missing task id returns a `MethodDispatchError` with the task-specific
 /// code `subagent.task_not_found` and message `task not found: <task_id>`.
 #[tokio::test]

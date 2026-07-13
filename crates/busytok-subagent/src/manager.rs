@@ -416,6 +416,20 @@ impl SubagentManager {
             let db = self.db.lock().expect("subagent db lock poisoned");
             let has_running = db.subagent_has_running_task(&subagent.id).unwrap_or(false);
             let should_queue = paused || has_running;
+            // v6: persist queue_reason at insert time so pollers can tell WHY
+            // a task was queued without reading the delegate RPC response.
+            // - paused → pressure_gate_paused
+            // - !paused but has_running → subagent_busy (per-subagent FIFO)
+            // - !should_queue → None (task starts running immediately)
+            let queue_reason_at_insert: Option<&str> = if should_queue {
+                Some(if paused {
+                    QueueReason::PressureGatePaused.as_str()
+                } else {
+                    QueueReason::SubagentBusy.as_str()
+                })
+            } else {
+                None
+            };
             db.subagent_insert_task(&SubagentTaskRow {
                 id: task_id.clone(),
                 subagent_id: subagent.id.clone(),
@@ -443,6 +457,7 @@ impl SubagentManager {
                 timeout_seconds,
                 model_override: req.model_override.clone(),
                 error_kind: None,
+                queue_reason: queue_reason_at_insert.map(|s| s.to_string()),
             })
             .map_err(SubagentError::Store)?;
             // Bug #4 fix: runtime status is computed at read-time in
@@ -523,6 +538,12 @@ impl SubagentManager {
             timeout_seconds,
             model_override: req.model_override.clone(),
             error_kind: None,
+            // This row is NOT inserted (the first insert above already wrote
+            // the row). It is passed to `execute_and_persist` as the in-memory
+            // snapshot. `queue_reason` is irrelevant here since the task is
+            // running, and the DB-persisted value (from the first insert, or
+            // set by the HotSessionLimit re-queue path) is the source of truth.
+            queue_reason: None,
         };
         let manager = Arc::clone(self);
         let subagent_clone = subagent.clone();
@@ -590,8 +611,29 @@ impl SubagentManager {
                             "HotSessionLimit — re-queuing task for dispatcher retry"
                         );
                         let db = self.db.lock().expect("subagent db lock poisoned");
+                        // ROOT CAUSE FIX: `set_task_status_if_not_cancelled`
+                        // now clears `started_at_ms` when transitioning to
+                        // `queued` (CASE WHEN ?6 THEN NULL ELSE started_at_ms
+                        // END). This preserves the invariant
+                        // `queued ⟹ started_at_ms IS NULL`. Previously the
+                        // stale `started_at_ms` from the initial `running`
+                        // insert survived the re-queue, producing an illegal
+                        // "queued but already started" row that confused
+                        // pollers (they saw a start time without a running
+                        // task).
                         let _ = db.subagent_set_task_status_if_not_cancelled(
                             &task.id, "queued", None, None,
+                        );
+                        // v6: persist WHY the task was re-queued so pollers
+                        // can distinguish global hot session capacity
+                        // contention (`hot_session_limit`) from per-subagent
+                        // serialization (`subagent_busy`) and pressure-gate
+                        // pauses (`pressure_gate_paused`). Without this,
+                        // external orchestrators see a queued task but cannot
+                        // tell which kind of queue it is.
+                        let _ = db.subagent_set_task_queue_reason(
+                            &task.id,
+                            Some(QueueReason::HotSessionLimit.as_str()),
                         );
                         return;
                     }

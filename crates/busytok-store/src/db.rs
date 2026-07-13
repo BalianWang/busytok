@@ -2114,6 +2114,19 @@ impl Database {
     pub fn subagent_set_task_error_kind(&self, id: &str, error_kind: Option<&str>) -> Result<()> {
         subagent_queries::set_task_error_kind(self.conn(), id, error_kind)
     }
+    /// Set or clear the `queue_reason` on a task row (v6 migration).
+    /// Used by the HotSessionLimit re-queue path to persist WHY the task was
+    /// re-queued, so pollers can distinguish global capacity contention from
+    /// per-subagent serialization (`subagent_busy`) and pressure-gate pauses
+    /// (`pressure_gate_paused`). Set to `None` when the dispatcher flips the
+    /// task back to `running`.
+    pub fn subagent_set_task_queue_reason(
+        &self,
+        id: &str,
+        queue_reason: Option<&str>,
+    ) -> Result<()> {
+        subagent_queries::set_task_queue_reason(self.conn(), id, queue_reason)
+    }
     pub fn subagent_upsert_binding(&self, row: &SubagentHarnessBindingRow) -> Result<()> {
         subagent_queries::upsert_binding(self.conn(), row)
     }

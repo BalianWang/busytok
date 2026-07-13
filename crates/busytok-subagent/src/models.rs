@@ -188,8 +188,9 @@ pub struct TaskUsage {
 /// Why a task was placed in `queued` status instead of starting immediately.
 ///
 /// Surfaced on `DelegateResult` so external orchestrators (CLI, automation
-/// scripts) can distinguish "gate paused" from "subagent busy" without
-/// guessing from logs. `None` when the task started immediately (`running`).
+/// scripts) can distinguish "gate paused" from "subagent busy" from
+/// "global hot session capacity contention" without guessing from logs.
+/// `None` when the task started immediately (`running`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueReason {
@@ -200,6 +201,13 @@ pub enum QueueReason {
     /// The subagent already has a running task. The queued task will start
     /// after the current one completes (per-subagent FIFO).
     SubagentBusy,
+    /// Cross-subagent global hot session capacity contention: all hot
+    /// sessions for the bound provider/model were busy when the task
+    /// attempted to start, so it was re-queued for dispatcher retry.
+    /// Distinguished from `SubagentBusy` (same subagent already running)
+    /// so orchestrators can tell per-subagent serialization apart from
+    /// global capacity queuing.
+    HotSessionLimit,
 }
 
 impl QueueReason {
@@ -209,6 +217,7 @@ impl QueueReason {
         match self {
             QueueReason::PressureGatePaused => "pressure_gate_paused",
             QueueReason::SubagentBusy => "subagent_busy",
+            QueueReason::HotSessionLimit => "hot_session_limit",
         }
     }
 }
@@ -317,6 +326,7 @@ mod tests {
         let cases = [
             (QueueReason::PressureGatePaused, "\"pressure_gate_paused\""),
             (QueueReason::SubagentBusy, "\"subagent_busy\""),
+            (QueueReason::HotSessionLimit, "\"hot_session_limit\""),
         ];
         for (reason, expected) in cases {
             let s = serde_json::to_string(&reason).unwrap();
@@ -335,6 +345,7 @@ mod tests {
         let cases = [
             (QueueReason::PressureGatePaused, "pressure_gate_paused"),
             (QueueReason::SubagentBusy, "subagent_busy"),
+            (QueueReason::HotSessionLimit, "hot_session_limit"),
         ];
         for (reason, expected) in cases {
             assert_eq!(reason.as_str(), expected, "as_str mismatch for {reason:?}");

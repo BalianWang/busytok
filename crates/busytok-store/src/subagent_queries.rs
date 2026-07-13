@@ -323,8 +323,8 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
              (id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
               prompt_artifact_ref, output_schema_name, output_schema_version, status, \
               result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-              timeout_seconds, model_override, error_kind) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+              timeout_seconds, model_override, error_kind, queue_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             row.id,
             row.subagent_id,
@@ -346,6 +346,7 @@ pub fn insert_task(conn: &Connection, row: &SubagentTaskRow) -> Result<()> {
             row.timeout_seconds,
             row.model_override,
             row.error_kind,
+            row.queue_reason,
         ],
     )
     .map(|_| ())
@@ -357,7 +358,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override, error_kind \
+                timeout_seconds, model_override, error_kind, queue_reason \
          FROM subagent_tasks WHERE id = ?1",
     )?;
     let row_opt = stmt
@@ -383,6 +384,7 @@ pub fn get_task(conn: &Connection, id: &str) -> Result<Option<SubagentTaskRow>> 
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
                 error_kind: row.get(19)?,
+                queue_reason: row.get(20)?,
             })
         })
         .ok();
@@ -398,7 +400,7 @@ pub fn list_tasks(
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override, error_kind \
+                timeout_seconds, model_override, error_kind, queue_reason \
          FROM subagent_tasks WHERE subagent_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
     )?;
     let rows = stmt
@@ -424,6 +426,7 @@ pub fn list_tasks(
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
                 error_kind: row.get(19)?,
+                queue_reason: row.get(20)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -440,11 +443,26 @@ pub fn set_task_status(
     let now = busytok_domain::now_ms();
     let completed_at: Option<i64> =
         (status == "completed" || status == "failed" || status == "cancelled").then_some(now);
+    // When transitioning to "queued", clear started_at_ms to maintain the
+    // invariant: queued ⟹ started_at_ms IS NULL. This happens on the
+    // HotSessionLimit re-queue path (running → queued). Without this, the
+    // task row would have status=queued but started_at_ms still set from
+    // its previous running state — an invalid "queued but already started"
+    // contradiction observed in production.
+    let clear_started_at = status == "queued";
     conn.execute(
         "UPDATE subagent_tasks SET status = ?2, result_summary = COALESCE(?3, result_summary), \
-            error = COALESCE(?4, error), completed_at_ms = COALESCE(?5, completed_at_ms) \
+            error = COALESCE(?4, error), completed_at_ms = COALESCE(?5, completed_at_ms), \
+            started_at_ms = CASE WHEN ?6 THEN NULL ELSE started_at_ms END \
          WHERE id = ?1",
-        params![id, status, result_summary, error, completed_at],
+        params![
+            id,
+            status,
+            result_summary,
+            error,
+            completed_at,
+            clear_started_at
+        ],
     )
     .map(|_| ())
     .with_context(|| format!("set task {} status {}", id, status))
@@ -466,12 +484,20 @@ pub fn set_task_status_if_not_cancelled(
     let now = busytok_domain::now_ms();
     let completed_at: Option<i64> =
         (status == "completed" || status == "failed" || status == "cancelled").then_some(now);
+    // When transitioning to "queued", clear started_at_ms to maintain the
+    // invariant: queued ⟹ started_at_ms IS NULL. This happens on the
+    // HotSessionLimit re-queue path (running → queued). Without this, the
+    // task row would have status=queued but started_at_ms still set from
+    // its previous running state — an invalid "queued but already started"
+    // contradiction observed in production.
+    let clear_started_at = status == "queued";
     let rows = conn
         .execute(
             "UPDATE subagent_tasks SET status = ?2, result_summary = COALESCE(?3, result_summary), \
-                error = COALESCE(?4, error), completed_at_ms = COALESCE(?5, completed_at_ms) \
+                error = COALESCE(?4, error), completed_at_ms = COALESCE(?5, completed_at_ms), \
+                started_at_ms = CASE WHEN ?6 THEN NULL ELSE started_at_ms END \
              WHERE id = ?1 AND status != 'cancelled'",
-            params![id, status, result_summary, error, completed_at],
+            params![id, status, result_summary, error, completed_at, clear_started_at],
         )
         .with_context(|| format!("set task {} status (if not cancelled) {}", id, status))?;
     Ok(rows > 0)
@@ -512,6 +538,25 @@ pub fn set_task_error_kind(conn: &Connection, id: &str, error_kind: Option<&str>
     )
     .map(|_| ())
     .with_context(|| format!("set task {} error_kind {:?}", id, error_kind))
+}
+
+/// Set the `queue_reason` column on a task row. Used by the re-queue path
+/// (HotSessionLimit) to persist WHY the task was re-queued, so external
+/// orchestrators polling `subagent.task` can distinguish between
+/// "subagent_busy" (same-subagent serialization) and "hot_session_limit"
+/// (transient capacity contention). Cleared (set to NULL) when the
+/// dispatcher flips the task to `running` via `pick_oldest_queued_task`.
+pub fn set_task_queue_reason(
+    conn: &Connection,
+    id: &str,
+    queue_reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE subagent_tasks SET queue_reason = ?2 WHERE id = ?1",
+        params![id, queue_reason],
+    )
+    .map(|_| ())
+    .with_context(|| format!("set task {} queue_reason {:?}", id, queue_reason))
 }
 
 /// Count tasks for a subagent with `created_at_ms > since_ms`.
@@ -654,9 +699,12 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
         return Ok(None);
     };
     // 2. CAS flip: only updates if still 'queued'. rows_affected == 1 means we won.
+    //    Clear `queue_reason` — the task is no longer queued, so the reason
+    //    it was queued is no longer relevant. If the task is re-queued later
+    //    (HotSessionLimit), `queue_reason` will be set again.
     let now = busytok_domain::now_ms();
     let rows = tx.execute(
-        "UPDATE subagent_tasks SET status = 'running', started_at_ms = ?1 \
+        "UPDATE subagent_tasks SET status = 'running', started_at_ms = ?1, queue_reason = NULL \
          WHERE id = ?2 AND status = 'queued'",
         rusqlite::params![now, id],
     )?;
@@ -671,7 +719,7 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
             "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                     prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                     result_summary, result_json, error, created_at_ms, started_at_ms, \
-                    completed_at_ms, timeout_seconds, model_override, error_kind \
+                    completed_at_ms, timeout_seconds, model_override, error_kind, queue_reason \
              FROM subagent_tasks WHERE id = ?1",
             rusqlite::params![id],
             |r| {
@@ -696,6 +744,7 @@ pub fn pick_oldest_queued_task(conn: &Connection) -> rusqlite::Result<Option<Sub
                     timeout_seconds: r.get(17)?,
                     model_override: r.get(18)?,
                     error_kind: r.get(19)?,
+                    queue_reason: r.get(20)?,
                 })
             },
         )
@@ -1414,7 +1463,7 @@ pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<Subage
         "SELECT id, subagent_id, source_harness, source_session_id, intent, profile, prompt, \
                 prompt_artifact_ref, output_schema_name, output_schema_version, status, \
                 result_summary, result_json, error, created_at_ms, started_at_ms, completed_at_ms, \
-                timeout_seconds, model_override, error_kind \
+                timeout_seconds, model_override, error_kind, queue_reason \
          FROM subagent_tasks \
          ORDER BY created_at_ms DESC, id DESC \
          LIMIT ?1",
@@ -1442,6 +1491,7 @@ pub fn list_recent_tasks_all(conn: &Connection, limit: i64) -> Result<Vec<Subage
                 timeout_seconds: row.get(17)?,
                 model_override: row.get(18)?,
                 error_kind: row.get(19)?,
+                queue_reason: row.get(20)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

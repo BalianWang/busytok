@@ -30,6 +30,7 @@ fn task_row(id: &str, summary: &str, created_at_ms: i64) -> SubagentTaskRow {
         timeout_seconds: None,
         model_override: None,
         error_kind: None,
+        queue_reason: None,
     }
 }
 

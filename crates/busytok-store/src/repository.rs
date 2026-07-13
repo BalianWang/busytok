@@ -549,6 +549,12 @@ pub struct SubagentTaskRow {
     /// `busytok-subagent::models`). `None` on success or when the
     /// executor couldn't classify the failure.
     pub error_kind: Option<String>,
+    /// v6: reason the task is queued. `None` for non-queued tasks.
+    /// Set when the task is inserted as `"queued"` (subagent_busy,
+    /// pressure_gate_paused) or re-queued via HotSessionLimit
+    /// (hot_session_limit). Cleared when the dispatcher flips the task
+    /// to `"running"`.
+    pub queue_reason: Option<String>,
 }
 
 impl SubagentTaskRow {
@@ -574,6 +580,7 @@ impl SubagentTaskRow {
             timeout_seconds: None,
             model_override: None,
             error_kind: None,
+            queue_reason: None,
         }
     }
 }

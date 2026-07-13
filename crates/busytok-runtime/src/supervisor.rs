@@ -2949,6 +2949,13 @@ fn subagent_task_detail(
         }
         None => (None, None, None),
     };
+    // v6: expose queue_reason ONLY when status == "queued". The DB
+    // retains queue_reason across transitions (for forensic value —
+    // "was this task ever queued?"), but the DTO contract says
+    // queue_reason is None for non-queued tasks. Deriving at read time
+    // is a single choke point: future transition paths (cancel, fail,
+    // complete) don't need to remember to clear it in SQL.
+    let is_queued = task.status == "queued";
     SubagentTaskDetailDto {
         id: task.id,
         subagent_id: task.subagent_id,
@@ -2970,6 +2977,7 @@ fn subagent_task_detail(
         effective_provider_id,
         effective_model_id,
         binding_source,
+        queue_reason: if is_queued { task.queue_reason } else { None },
     }
 }
 

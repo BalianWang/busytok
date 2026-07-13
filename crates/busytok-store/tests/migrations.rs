@@ -51,8 +51,8 @@ fn table_info_map(
 #[test]
 fn baseline_plus_cache_metrics_migrations() {
     let migs = busytok_store::schema::migrations();
-    assert_eq!(migs.len(), 5);
-    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 5);
+    assert_eq!(migs.len(), 6);
+    assert_eq!(busytok_store::schema::SCHEMA_VERSION, 6);
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(busytok_store::schema::CREATE_SCHEMA_VERSION_TABLE)
         .unwrap();
@@ -87,6 +87,18 @@ fn baseline_plus_cache_metrics_migrations() {
             "missing v5 table {table}"
         );
     }
+    // v6: queue_reason column exists on subagent_tasks.
+    let subagent_cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(subagent_tasks)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(
+        subagent_cols.contains(&"queue_reason".to_string()),
+        "missing v6 column queue_reason on subagent_tasks, got: {subagent_cols:?}"
+    );
 }
 
 #[test]
@@ -543,20 +555,21 @@ fn subagent_migration_creates_tables() {
 fn migrations_registered_in_order() {
     assert_eq!(
         schema::migrations().len(),
-        5,
-        "expected baseline + cache-metrics + subagent + subagent-task-fields + provider-catalog-and-subagent-route-binding migrations"
+        6,
+        "expected baseline + cache-metrics + subagent + subagent-task-fields + provider-catalog-and-subagent-route-binding + subagent-queue-reason migrations"
     );
     assert_eq!(schema::migrations()[0].0, 1);
     assert_eq!(schema::migrations()[1].0, 2);
     assert_eq!(schema::migrations()[2].0, 3);
     assert_eq!(schema::migrations()[3].0, 4);
     assert_eq!(schema::migrations()[4].0, 5);
-    assert_eq!(schema::SCHEMA_VERSION, 5);
+    assert_eq!(schema::migrations()[5].0, 6);
+    assert_eq!(schema::SCHEMA_VERSION, 6);
 }
 
 #[test]
-fn schema_version_is_five() {
-    assert_eq!(schema::SCHEMA_VERSION, 5);
+fn schema_version_is_six() {
+    assert_eq!(schema::SCHEMA_VERSION, 6);
     let max_version = schema::migrations().iter().map(|(v, _)| *v).max().unwrap();
     assert_eq!(max_version, schema::SCHEMA_VERSION);
 }

@@ -1506,6 +1506,14 @@ pub struct SubagentTaskDetailDto {
     /// when the parent subagent row is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_source: Option<String>,
+    /// v6: why the task is currently queued. `None` for non-queued tasks
+    /// (running/completed/failed/cancelled) and for tasks queued before
+    /// v6. Values: `"pressure_gate_paused"`, `"subagent_busy"`,
+    /// `"hot_session_limit"`. Lets pollers (CLI `subagent task`, automation)
+    /// distinguish per-subagent serialization from global hot session
+    /// capacity contention without reading the delegate RPC response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -2801,6 +2809,7 @@ mod tests {
             effective_provider_id: None,
             effective_model_id: None,
             binding_source: None,
+            queue_reason: None,
         };
         let json = serde_json::to_value(&dto).unwrap();
         assert_eq!(json["id"], "task-1");
@@ -2820,6 +2829,8 @@ mod tests {
         assert_eq!(json["created_at_ms"], 1_000);
         assert_eq!(json["started_at_ms"], 1_100);
         assert_eq!(json["completed_at_ms"], 2_000);
+        // queue_reason is None → skipped (skip_serializing_if = Option::is_none).
+        assert!(json.get("queue_reason").is_none() || json["queue_reason"].is_null());
 
         let back: SubagentTaskDetailDto = serde_json::from_value(json).unwrap();
         assert_eq!(back.id, "task-1");
@@ -2839,6 +2850,48 @@ mod tests {
         assert_eq!(back.created_at_ms, 1_000);
         assert_eq!(back.started_at_ms, Some(1_100));
         assert_eq!(back.completed_at_ms, Some(2_000));
+        assert!(back.queue_reason.is_none());
+    }
+
+    /// v6: `queue_reason` must round-trip when set (e.g. `"hot_session_limit"`
+    /// for a task re-queued due to global hot session capacity contention).
+    /// This guards the DTO boundary for the poll path — without it,
+    /// `subagent task` would not expose WHY a task is queued.
+    #[test]
+    fn subagent_task_detail_dto_queue_reason_round_trips() {
+        let dto = SubagentTaskDetailDto {
+            id: "task-2".to_string(),
+            subagent_id: "sub-2".to_string(),
+            subagent_name: Some("worker-2".to_string()),
+            source_harness: None,
+            source_session_id: None,
+            profile: "pi/plan-cheap".to_string(),
+            status: "queued".to_string(),
+            prompt: None,
+            prompt_artifact_ref: None,
+            result_summary: None,
+            error: None,
+            error_kind: None,
+            model_override: None,
+            timeout_seconds: None,
+            created_at_ms: 1_000,
+            started_at_ms: None,
+            completed_at_ms: None,
+            effective_provider_id: None,
+            effective_model_id: None,
+            binding_source: None,
+            queue_reason: Some("hot_session_limit".to_string()),
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["status"], "queued");
+        assert_eq!(json["queue_reason"], "hot_session_limit");
+        // started_at_ms must be null when queued (invariant from the fix).
+        assert_eq!(json["started_at_ms"], serde_json::Value::Null);
+
+        let back: SubagentTaskDetailDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.status, "queued");
+        assert_eq!(back.queue_reason.as_deref(), Some("hot_session_limit"));
+        assert!(back.started_at_ms.is_none());
     }
 
     #[test]
@@ -2865,6 +2918,7 @@ mod tests {
         assert!(nulls.timeout_seconds.is_none());
         assert!(nulls.started_at_ms.is_none());
         assert!(nulls.completed_at_ms.is_none());
+        assert!(nulls.queue_reason.is_none());
 
         // Optional fields explicitly null on the wire also deserialize as None.
         let explicit_nulls: SubagentTaskDetailDto = serde_json::from_str(
@@ -2898,6 +2952,7 @@ mod tests {
             effective_provider_id: None,
             effective_model_id: None,
             binding_source: None,
+            queue_reason: None,
         };
         let json = serde_json::to_value(&degraded).unwrap();
         // None serializes as explicit null — consistent with the TS contract

@@ -1572,6 +1572,7 @@ async fn dispatcher_skips_queued_task_while_gate_paused() {
             timeout_seconds: None,
             model_override: None,
             error_kind: None,
+            queue_reason: None,
         })
         .unwrap();
     }
@@ -3342,6 +3343,7 @@ async fn dispatcher_skips_cancelled_queued_task() {
             timeout_seconds: None,
             model_override: None,
             error_kind: None,
+            queue_reason: None,
         })
         .unwrap();
     }
