@@ -259,7 +259,7 @@ pub(crate) fn spawn_background_jobs(supervisor: Arc<BusytokSupervisor>) -> Backg
                 warn!(
                     event_code = "service.legacy_rebuild_check",
                     recommended = true,
-                    "Legacy audit data detected"
+                    "Legacy audit rows detected in usage_events; rebuild_rollups cannot repair source rows (rescan_all not yet implemented)"
                 );
             }
             Ok(Ok(false)) => {}

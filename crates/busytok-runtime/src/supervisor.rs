@@ -1958,6 +1958,14 @@ impl BusytokSupervisor {
     /// This is intentionally non-destructive: callers can surface a warning or
     /// trigger a controlled rebuild path later, but startup should never wipe
     /// persisted audit state before a rebuild has proven it can succeed.
+    ///
+    /// **Scope note:** `rebuild_rollups` only recalculates derived tables
+    /// (`daily_usage`, `sessions`, `projects`, `model_summary`,
+    /// `realtime_summary`) from the still-broken `usage_events` — it does NOT
+    /// repair the source audit rows. Clearing this recommendation requires
+    /// `rescan_all` (re-parse source logs and overwrite `usage_events`),
+    /// which is not yet implemented (see `settings_recovery_action`
+    /// `RescanAll` branch).
     pub fn legacy_audit_rebuild_recommended(&self) -> Result<bool> {
         let db = self.read_query_database()?;
         let conn = db.conn();
@@ -1982,7 +1990,7 @@ impl BusytokSupervisor {
         warn!(
             codex_legacy_rows = needs_codex_repair,
             claude_legacy_rows = needs_claude_repair,
-            "detected legacy audit rows; a controlled rebuild is recommended"
+            "detected legacy audit rows in usage_events; rebuild_rollups refreshes derived tables but cannot repair source rows — rescan_all is required for audit-row repair (not yet implemented)"
         );
         Ok(true)
     }
@@ -4680,14 +4688,14 @@ impl RuntimeControl for BusytokSupervisor {
                     SettingsRecoveryActionDto {
                         id: SettingsRecoveryActionIdDto::RescanAll,
                         label: "Rescan All Sources".to_string(),
-                        description: "Re-scan all configured log sources through the writer actor"
+                        description: "Re-parse source logs and overwrite usage_events to repair legacy audit rows (not yet implemented — returns accepted=false)"
                             .to_string(),
                         dangerous: false,
                     },
                     SettingsRecoveryActionDto {
                         id: SettingsRecoveryActionIdDto::RebuildRollups,
                         label: "Rebuild Rollups".to_string(),
-                        description: "Recalculate aggregate rollup tables through the writer actor"
+                        description: "Recalculate derived rollup tables (daily_usage, sessions, projects, model_summary) from existing usage_events — does NOT repair source audit rows"
                             .to_string(),
                         dangerous: false,
                     },
@@ -5062,7 +5070,8 @@ impl RuntimeControl for BusytokSupervisor {
                         Ok(Ok(())) => SettingsRecoveryActionResponseDto {
                             id: req.id,
                             accepted: true,
-                            message: "Rollups rebuilt through writer actor".to_string(),
+                            message: "Rollups rebuilt through writer actor (source usage_events unchanged — audit-row repair requires rescan_all)"
+                                .to_string(),
                         },
                         Ok(Err(err)) => SettingsRecoveryActionResponseDto {
                             id: req.id,
