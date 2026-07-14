@@ -15,15 +15,31 @@ import { logger } from './logger.js';
  * (-32002) with `data.candidate` naming the LRU session — busytok-service
  * then drives eviction via prepare_hibernate + close.
  *
+ * **Two-phase lifecycle (P0 fix):** newly-created sessions start in the
+ * `pending` state — they are NOT in the LRU and cannot be evicted. This
+ * closes the timing window between `turn_auto` returning success (which
+ * makes the session idle/evictable) and Rust committing the DB hot binding.
+ * Without this lifecycle, a concurrent delegate could evict a session whose
+ * binding hasn't been committed yet — creating a "ghost" (sidecar session
+ * exists, DB binding doesn't) that corrupts subsequent evictions.
+ *
+ * The flow:
+ * 1. `ensure()` miss → factory creates session → added to `pendingSessions`
+ *    (NOT `lru`). Session is usable for the current turn but not evictable.
+ * 2. `turn_auto` runs. On failure (new session), the session is closed
+ *    (removed entirely). On success, the session stays `pending`.
+ * 3. Rust commits the DB hot binding.
+ * 4. Rust calls `session.activate(adapter_session_id)` → session moves
+ *    from `pendingSessions` to `lru` (becomes evictable).
+ * 5. If the DB commit fails, Rust calls `session.close` to clean up the
+ *    orphaned pending session.
+ *
  * **In-use tracking (Bug 1 fix):** sessions that are currently running a
  * turn (`beginTurn` called, `endTurn` not yet called) are excluded from
  * LRU eviction candidates. This prevents evicting a session whose
- * `turn_auto` is still in-flight — a state that would (a) corrupt the
- * in-flight task and (b) trigger a spurious "no hot binding" error in
- * the Rust eviction flow (the binding is only persisted AFTER `turn_auto`
- * returns). When the pool is full and ALL sessions are in-use, the error
- * includes `data.all_busy = true` and `data.candidate = null` so the
- * executor knows NOT to attempt eviction.
+ * `turn_auto` is still in-flight. When the pool is full and ALL sessions
+ * are in-use or pending, the error includes `data.all_busy = true` and
+ * `data.candidate = null` so the executor knows NOT to attempt eviction.
  *
  * Sessions are real `PiSdkSession` wrappers around the Pi SDK's
  * `AgentSession`. The factory is injectable so tests can supply fakes
@@ -37,8 +53,9 @@ export class SessionPool {
   private readonly factory: SessionFactory;
   private readonly sessions = new Map<string, PiSdkSession>();       // adapter_session_id → session
   private readonly subagentMap = new Map<string, string>();          // logical_subagent_id → adapter_session_id
-  private readonly lru: string[] = [];                               // adapter_session_ids, MRU first
+  private readonly lru: string[] = [];                               // adapter_session_ids, MRU first (active only)
   private readonly busySessions = new Set<string>();                 // adapter_session_ids with in-flight turns
+  private readonly pendingSessions = new Set<string>();              // adapter_session_ids not yet activated
 
   constructor(maxHot: number, factory: SessionFactory = defaultSessionFactory) {
     if (maxHot < 1) throw new Error(`maxHot must be >= 1, got ${maxHot}`);
@@ -113,12 +130,17 @@ export class SessionPool {
       throw new SidecarError('hot session limit reached', -32002, { candidate });
     }
     // 3. Miss + capacity — create a new session via the factory.
+    // The session starts in `pending` state (NOT in LRU). It will be
+    // activated (moved to LRU) by Rust calling `session.activate` after
+    // the DB hot binding is committed. This closes the timing window
+    // where a successful turn_auto makes the session evictable before
+    // Rust has committed the binding.
     const factory = createOverride ?? this.factory;
     const session = await factory(logical_subagent_id, opts);
     const adapter_session_id = session.adapter_session_id;
     this.sessions.set(adapter_session_id, session);
     this.subagentMap.set(logical_subagent_id, adapter_session_id);
-    this.lru.unshift(adapter_session_id); // MRU at front
+    this.pendingSessions.add(adapter_session_id);
     return { session, reused: false };
   }
 
@@ -157,8 +179,37 @@ export class SessionPool {
     const idx = this.lru.indexOf(adapter_session_id);
     if (idx >= 0) this.lru.splice(idx, 1);
     this.busySessions.delete(adapter_session_id);
+    this.pendingSessions.delete(adapter_session_id);
     // Dispose the underlying SDK session (fire-and-forget; dispose() is sync).
     void session.close();
+  }
+
+  /**
+   * Activate a session — move it from `pending` to the LRU (evictable).
+   *
+   * Called by Rust via the `session.activate` RPC AFTER the DB hot binding
+   * is committed. Until activate is called, the session is in the pool
+   * (usable for reuse by the same subagent) but NOT in the LRU (cannot be
+   * selected as an eviction candidate). This closes the timing window
+   * between `turn_auto` success and DB binding commit.
+   *
+   * Idempotent: if the session is already active (in LRU), this is a no-op.
+   * If the session doesn't exist (already closed or never created), it's
+   * also a no-op — the caller (Rust) treats activate failure as best-effort.
+   */
+  activate(adapter_session_id: string): void {
+    if (!this.pendingSessions.has(adapter_session_id)) {
+      // Already active or not in pool — idempotent no-op.
+      return;
+    }
+    this.pendingSessions.delete(adapter_session_id);
+    this.lru.unshift(adapter_session_id); // MRU at front
+    logger.debug('session_pool.activated', { adapter_session_id });
+  }
+
+  /** Whether a session is in the pending state (not yet activated). */
+  isPending(adapter_session_id: string): boolean {
+    return this.pendingSessions.has(adapter_session_id);
   }
 
   /**

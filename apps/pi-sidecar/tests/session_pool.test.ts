@@ -50,8 +50,8 @@ describe('SessionPool', () => {
 
   it('ensure throws HOT_SESSION_LIMIT_REACHED with candidate when full', async () => {
     const pool = new SessionPool(2);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1')); // LRU after next
-    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2')); // MRU
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id); // LRU after next
+    pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id); // MRU
     await expect(pool.ensure('sub-c', OPTS, fakeFactory('sess-3'))).rejects.toThrow(SidecarError);
     try {
       await pool.ensure('sub-c', OPTS, fakeFactory('sess-3'));
@@ -74,8 +74,8 @@ describe('SessionPool', () => {
 
   it('LRU order updates on reuse', async () => {
     const pool = new SessionPool(2);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1')); // LRU
-    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2')); // MRU
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id); // LRU
+    pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id); // MRU
     // Reuse sess-1 → it becomes MRU, sess-2 becomes LRU
     await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
     await expect(pool.ensure('sub-c', OPTS, fakeFactory('sess-3'))).rejects.toThrow(SidecarError);
@@ -173,8 +173,8 @@ describe('SessionPool', () => {
     // selected as an eviction candidate — evicting it would corrupt the
     // in-flight task and fail on the Rust side (no DB binding yet).
     const pool = new SessionPool(2);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1')); // LRU
-    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2')); // MRU
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id); // LRU
+    pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id); // MRU
     pool.beginTurn('sess-1');
     // sess-1 is busy → getLruCandidate skips it, returns sess-2 instead.
     expect(pool.getLruCandidate()).toBe('sess-2');
@@ -183,8 +183,8 @@ describe('SessionPool', () => {
   it('getLruCandidate returns undefined when all sessions are in-use', async () => {
     // When every session is busy, there is no safe eviction candidate.
     const pool = new SessionPool(2);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
-    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id);
+    pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id);
     pool.beginTurn('sess-1');
     pool.beginTurn('sess-2');
     expect(pool.getLruCandidate()).toBeUndefined();
@@ -193,7 +193,7 @@ describe('SessionPool', () => {
   it('endTurn restores session evictability', async () => {
     // After endTurn, the session is again a valid LRU candidate.
     const pool = new SessionPool(1);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id);
     pool.beginTurn('sess-1');
     expect(pool.getLruCandidate()).toBeUndefined();
     pool.endTurn('sess-1');
@@ -205,7 +205,7 @@ describe('SessionPool', () => {
     // returns `data.candidate = null` + `data.all_busy = true` so the
     // executor knows NOT to attempt eviction.
     const pool = new SessionPool(1);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id);
     pool.beginTurn('sess-1');
     try {
       await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
@@ -224,8 +224,8 @@ describe('SessionPool', () => {
     // Mixed: pool full, one busy + one idle → the idle session is the
     // eviction candidate (not the busy one).
     const pool = new SessionPool(2);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1')); // LRU, busy
-    await pool.ensure('sub-b', OPTS, fakeFactory('sess-2')); // MRU, idle
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id); // LRU, busy
+    pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id); // MRU, idle
     pool.beginTurn('sess-1');
     try {
       await pool.ensure('sub-c', OPTS, fakeFactory('sess-3'));

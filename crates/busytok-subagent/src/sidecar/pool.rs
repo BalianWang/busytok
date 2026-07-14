@@ -47,7 +47,7 @@ use busytok_config::SubagentResourcePolicyConfig;
 
 use crate::pressure::{PressureGate, PressureResponder};
 use crate::sidecar::{
-    PiSidecarSupervisor, SharedDb, SidecarConfig, SidecarError, WorkerSnapshot, SESSION_NOT_FOUND,
+    PiSidecarSupervisor, SharedDb, SidecarConfig, SidecarError, WorkerSnapshot,
 };
 
 /// Provider runtime entry — everything WorkerPool needs to spawn a worker.
@@ -505,68 +505,6 @@ impl WorkerPool {
             }
         }
         None
-    }
-
-    /// Best-effort purge of a ghost session from all sidecar pools.
-    ///
-    /// Called by `evict_session` when `supervisor_for_session` returns `None`
-    /// (no DB binding for the candidate). The session exists in one
-    /// sidecar's in-memory pool but has no DB binding — a "ghost" left
-    /// behind by a failed/cancelled/timed-out `turn_auto` that created a
-    /// session but never committed a binding.
-    ///
-    /// Iterates all supervisors and calls `session.close` on each. The
-    /// sidecar that holds the session returns `{ ok: true }`; others
-    /// return `SESSION_NOT_FOUND` (-32001). Returns `true` if any
-    /// supervisor's close succeeded, `false` otherwise.
-    ///
-    /// This is defense-in-depth: the sidecar's `turn_auto` ghost cleanup
-    /// (closing newly-created sessions on failure) is the primary fix.
-    /// This method handles residual ghosts from pre-fix code, the
-    /// cancel-while-succeeding edge case, or sidecar/DB desync.
-    pub async fn purge_session(&self, adapter_session_id: &str) -> bool {
-        let supervisors: Vec<Arc<PiSidecarSupervisor>> = {
-            let workers = self.workers.lock().expect("workers map lock poisoned");
-            workers.values().map(Arc::clone).collect()
-        };
-        for sup in &supervisors {
-            let handle = match sup.ensure_started().await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(
-                        event_code = "subagent.session.purge_supervisor_unavailable",
-                        adapter_session_id = %adapter_session_id,
-                        error = %e,
-                        "could not ensure supervisor for purge — trying next"
-                    );
-                    continue;
-                }
-            };
-            match handle.close(adapter_session_id).await {
-                Ok(_) => {
-                    info!(
-                        event_code = "subagent.session.ghost_purged",
-                        adapter_session_id = %adapter_session_id,
-                        "ghost session purged from sidecar pool"
-                    );
-                    return true;
-                }
-                Err(SidecarError::Application(code, _msg, _data)) if code == SESSION_NOT_FOUND => {
-                    // Session not in this supervisor's pool — try next.
-                    continue;
-                }
-                Err(e) => {
-                    warn!(
-                        event_code = "subagent.session.purge_close_failed",
-                        adapter_session_id = %adapter_session_id,
-                        error = %e,
-                        "close RPC failed during purge — trying next supervisor"
-                    );
-                    continue;
-                }
-            }
-        }
-        false
     }
 }
 

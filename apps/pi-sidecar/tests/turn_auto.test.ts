@@ -40,9 +40,12 @@ describe('turn_auto with pool (mock path)', () => {
   it('throws HOT_SESSION_LIMIT_REACHED when full', async () => {
     const pool = new SessionPool(1);
     const handler = turnAutoHandlerWithPool(pool);
-    await handler(
+    const result1 = await handler(
       { logical_subagent_id: 'sub-a', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
-    );
+    ) as { adapter_session_id: string };
+    // Two-phase lifecycle: activate the session so it becomes an evictable
+    // LRU candidate (simulates Rust calling session.activate after DB commit).
+    pool.activate(result1.adapter_session_id);
     await expect(
       handler(
         { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },

@@ -1036,6 +1036,24 @@ impl SubagentManager {
         };
         let duration_ms = busytok_domain::now_ms().saturating_sub(started);
 
+        // Capture the hot session id + provider_id BEFORE the DB block so we
+        // can drive the two-phase session lifecycle (activate/close) AFTER the
+        // DB lock is released. The session was created by `turn_auto` in the
+        // `pending` state — it only becomes evictable (enters LRU) after Rust
+        // commits the binding and calls `session.activate`. If the commit
+        // fails, Rust must call `session.close` to clean up the orphaned
+        // pending session.
+        let hot_sid = out
+            .adapter_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let provider_id_for_session = resolved_provider.id.clone();
+        // Tracks the hot binding commit outcome so we can activate (success)
+        // or close (failure) the pending sidecar session after releasing the
+        // DB lock. `None` = warm path or commit not reached.
+        let mut binding_commit_err: Option<SubagentError> = None;
+
         // 4. persist results: task status, usage, memory, status.
         //    For the hot path (real adapter_session_id), the binding + status
         //    flip commit in a single transaction so the spec §3.3 invariant
@@ -1150,8 +1168,13 @@ impl SubagentManager {
             // violate spec §3.3 semantically. The task is the authority
             // that decides hot vs warm/cold (the executor only extracts the
             // raw value).
-            let hot_sid = out.adapter_session_id.as_deref().filter(|s| !s.is_empty());
-            if let Some(sid) = hot_sid {
+            //
+            // Two-phase lifecycle: the binding commit error is CAPTURED (not
+            // propagated via `?`) so we can call `session.close` on the
+            // pending sidecar session after releasing the DB lock. Propagating
+            // via `?` would skip the close, leaving an orphaned pending session
+            // in the sidecar pool.
+            if let Some(sid) = hot_sid.as_deref() {
                 let now_ms = busytok_domain::now_ms();
                 let binding = busytok_store::repository::SubagentHarnessBindingRow {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -1166,15 +1189,30 @@ impl SubagentManager {
                     closed_at_ms: None,
                     detail_json: None,
                 };
-                db.subagent_commit_hot_binding_and_status(&binding, &subagent.id)
-                    .map_err(|e| {
-                        error!(
-                            event_code = "subagent.delegate.binding_commit_failed",
-                            error = %e,
-                            "hot binding commit failed; task fails to preserve status invariant"
-                        );
-                        SubagentError::Store(e)
-                    })?;
+                if let Err(e) = db.subagent_commit_hot_binding_and_status(&binding, &subagent.id) {
+                    error!(
+                        event_code = "subagent.delegate.binding_commit_failed",
+                        error = %e,
+                        "hot binding commit failed; task fails to preserve status invariant"
+                    );
+                    let store_err = SubagentError::Store(e);
+                    // Immediately mark the task as 'failed' INSIDE the DB lock,
+                    // BEFORE releasing it. The task was briefly set to the
+                    // executor's output status ("completed") above (line 1067),
+                    // but the binding commit failure means it must be "failed".
+                    // Writing this inside the lock ensures observers never see a
+                    // stale "completed" status during the subsequent close_session
+                    // RPC (which runs after the lock is released and yields to
+                    // the tokio runtime — a polling observer could otherwise see
+                    // "completed" and return it as the final status).
+                    let _ = db.subagent_set_task_status_if_not_cancelled(
+                        &task.id,
+                        "failed",
+                        None,
+                        Some(store_err.to_string()),
+                    );
+                    binding_commit_err = Some(store_err);
+                }
             } else {
                 // Mock executor path OR empty adapter_session_id — no real
                 // session to bind. Derive warm/cold from memory state (§3.3:
@@ -1186,6 +1224,53 @@ impl SubagentManager {
                     SubagentStatus::Cold
                 };
                 self.set_logical_status(&db, &subagent.id, status)?;
+            }
+        } // db lock released here
+
+        // Two-phase session lifecycle: now that the DB lock is released, drive
+        // the sidecar session to the correct state.
+        //
+        // - Commit succeeded → `session.activate`: move the session from
+        //   `pending` to `active` (LRU-eligible). Until activate is called,
+        //   the session is usable for reuse by the same subagent but NOT
+        //   evictable by concurrent delegates. This closes the timing window
+        //   between `turn_auto` success and DB binding commit.
+        //
+        // - Commit failed → `session.close`: remove the orphaned pending
+        //   session from the sidecar pool so the slot is freed. Without this,
+        //   the pending session would linger indefinitely (never activated,
+        //   never evicted — pending sessions are excluded from LRU).
+        if let Some(sid) = hot_sid.as_deref() {
+            if let Some(err) = binding_commit_err.take() {
+                // Commit failed — close the orphaned pending session.
+                if let Err(close_err) = self
+                    .executor
+                    .close_session(sid, &provider_id_for_session)
+                    .await
+                {
+                    warn!(
+                        event_code = "subagent.session.close_after_commit_failed",
+                        adapter_session_id = %sid,
+                        error = %close_err,
+                        "session.close RPC failed after binding commit failure — \
+                         pending session may linger in sidecar pool"
+                    );
+                }
+                return Err(err);
+            }
+            // Commit succeeded — activate the session (move to LRU).
+            if let Err(e) = self
+                .executor
+                .activate_session(sid, &provider_id_for_session)
+                .await
+            {
+                warn!(
+                    event_code = "subagent.session.activate_failed",
+                    adapter_session_id = %sid,
+                    error = %e,
+                    "session.activate RPC failed — session stays pending; \
+                     will be activated on next reuse or cleaned up by eviction"
+                );
             }
         }
 

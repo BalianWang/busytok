@@ -137,6 +137,61 @@ impl SidecarTaskExecutor {
             .map_err(|e| anyhow::anyhow!("session.cancel RPC failed: {e}"))?;
         Ok(())
     }
+
+    /// Activate a session — move it from `pending` to `active` (LRU-eligible)
+    /// in the sidecar's hot pool. Called by the manager AFTER the DB hot
+    /// binding is committed. Best-effort: failure is logged but does NOT
+    /// fail the task (the binding is already committed; the session will be
+    /// activated on next reuse or cleaned up by eviction).
+    async fn activate_session_rpc(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(supervisor) = self.pool.get_worker(provider_id) else {
+            // No worker — sidecar was never started or was killed.
+            // Nothing to activate. This is acceptable: the binding is
+            // committed; the next turn_auto will create a fresh session.
+            return Ok(());
+        };
+        if !supervisor.try_is_running() {
+            return Ok(());
+        }
+        let handle = supervisor
+            .ensure_started()
+            .await
+            .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during activate: {e}"))?;
+        handle
+            .activate(adapter_session_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("session.activate RPC failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Close a pending session after a DB binding commit failure. The
+    /// session was created by `turn_auto` but the binding was never committed,
+    /// so it must be removed from the sidecar pool to free the slot.
+    async fn close_session_rpc(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(supervisor) = self.pool.get_worker(provider_id) else {
+            return Ok(());
+        };
+        if !supervisor.try_is_running() {
+            return Ok(());
+        }
+        let handle = supervisor
+            .ensure_started()
+            .await
+            .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during close: {e}"))?;
+        handle
+            .close(adapter_session_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("session.close RPC failed: {e}"))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -147,6 +202,23 @@ impl TaskExecutor for SidecarTaskExecutor {
 
     async fn cancel(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
         self.cancel_turn(subagent_id, provider_id).await
+    }
+
+    async fn activate_session(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        self.activate_session_rpc(adapter_session_id, provider_id)
+            .await
+    }
+
+    async fn close_session(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        self.close_session_rpc(adapter_session_id, provider_id).await
     }
 }
 
@@ -721,42 +793,38 @@ impl SidecarTaskExecutor {
         {
             Some(pair) => pair,
             None => {
-                // Ghost session: the sidecar named a candidate the DB has no
-                // binding for. Two possible causes:
+                // With the two-phase session lifecycle (pending → active), a
+                // candidate named by the sidecar should ALWAYS have a DB
+                // binding: only activated sessions are in the LRU, and
+                // activation only happens AFTER the DB binding is committed
+                // (manager calls `session.activate` post-commit). A candidate
+                // with no binding is therefore a permanent sidecar/DB state
+                // divergence — NOT a transient timing window.
                 //
-                // 1. **Transient timing window**: the sidecar's `endTurn()`
-                //    marks a session as idle (evictable) BEFORE Rust commits
-                //    the hot binding to DB. A concurrent delegate hitting
-                //    this window receives a candidate whose binding doesn't
-                //    exist YET but will be committed within milliseconds.
+                // Previously (pre-two-phase), `endTurn()` made a session
+                // evictable BEFORE Rust committed the binding, creating a
+                // timing window where `purge_session` could close a session
+                // whose binding was about to be committed. The two-phase
+                // lifecycle eliminates that window: pending sessions are never
+                // in the LRU and thus never selected as eviction candidates.
                 //
-                // 2. **Permanent ghost**: a failed/cancelled/timed-out
-                //    `turn_auto` created a session but never committed a
-                //    binding. The session lingers in the sidecar pool
-                //    indefinitely.
-                //
-                // The sidecar's `turn_auto` ghost cleanup (closing newly-created
-                // sessions on failure) eliminates cause #2 at the source.
-                // As defense-in-depth, we also purge the ghost session here
-                // via the pool — this handles residual ghosts from pre-fix
-                // code and the cancel-while-succeeding edge case.
-                //
-                // After purging, return `HotSessionLimit` (transient) so the
-                // re-queue path retries the task. By the time it's retried,
-                // either the ghost is gone (purged) or the binding is
-                // committed (timing window resolved).
-                let purged = self.pool.purge_session(adapter_session_id).await;
-                warn!(
-                    event_code = "subagent.session.eviction_ghost_session",
+                // Surfacing as `HotSessionStateDivergence` (fatal) instead of
+                // `HotSessionLimit` (transient) ensures the task fails loudly
+                // rather than silently retrying into a broken pool state.
+                error!(
+                    event_code = "subagent.session.eviction_state_divergence",
                     adapter_session_id = %adapter_session_id,
-                    purged = purged,
-                    "ghost session: sidecar returned candidate with no DB binding — \
-                     purging from sidecar pool (defense-in-depth); \
-                     surfacing as HotSessionLimit for re-queue"
+                    "eviction candidate has no DB binding — sidecar/DB state divergence \
+                     (with two-phase lifecycle, all LRU candidates must have committed bindings)"
                 );
-                return Err(SubagentError::HotSessionLimit {
-                    candidate: adapter_session_id.to_string(),
-                });
+                return Err(SubagentError::HotSessionStateDivergence(
+                    format!(
+                        "no binding found in DB for adapter_session_id={adapter_session_id}; \
+                         sidecar/DB state divergence (sidecar returned LRU candidate with no binding; \
+                         with two-phase lifecycle this should be impossible — pending sessions \
+                         are never in LRU)"
+                    ),
+                ));
             }
         };
 

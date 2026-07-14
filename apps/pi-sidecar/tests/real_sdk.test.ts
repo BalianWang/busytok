@@ -211,7 +211,10 @@ describe('turn_auto real SDK path', () => {
   it('throws HOT_SESSION_LIMIT_REACHED (-32002) with candidate when pool is full', async () => {
     const pool = new SessionPool(1, fakeFactory());
     const handler = turnAutoHandlerWithPool(pool);
-    await handler(BASE_PARAMS);
+    const r1 = await handler(BASE_PARAMS) as { adapter_session_id: string };
+    // Two-phase lifecycle: activate so the session becomes an evictable
+    // LRU candidate (simulates Rust calling session.activate after DB commit).
+    pool.activate(r1.adapter_session_id);
     await expect(
       handler({ ...BASE_PARAMS, logical_subagent_id: 'sub-2' }),
     ).rejects.toThrow(SidecarError);
@@ -387,6 +390,9 @@ describe('turn_auto ghost session cleanup', () => {
     };
     expect(pool.size()).toBe(1);
     const sessionId = r1.adapter_session_id;
+    // Two-phase lifecycle: activate the session (simulates Rust calling
+    // session.activate after DB commit) so it's in LRU for getLruCandidate.
+    pool.activate(sessionId);
 
     // Second turn: same subagent → reuses session → SDK fails (2nd prompt)
     await expect(handler({ ...BASE_PARAMS, logical_subagent_id: 'sub-reuse', prompt: 'second' }))

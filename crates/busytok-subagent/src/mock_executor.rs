@@ -82,6 +82,36 @@ pub trait TaskExecutor: Send + Sync {
     async fn cancel(&self, _subagent_id: &str, _provider_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Activate a session — move it from `pending` to `active` (LRU-eligible)
+    /// in the sidecar's hot pool. Called by the manager AFTER the DB hot
+    /// binding is committed. Best-effort: failure is logged but does NOT
+    /// fail the task (the binding is already committed; the session will
+    /// be activated on next use or cleaned up by eviction).
+    ///
+    /// Default impl: no-op (mock executors don't have a pending state).
+    /// `SidecarTaskExecutor` overrides this to send a `session.activate` RPC.
+    async fn activate_session(
+        &self,
+        _adapter_session_id: &str,
+        _provider_id: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Close a pending session after a DB binding commit failure. The
+    /// session was created by `turn_auto` but the binding was never committed,
+    /// so it must be removed from the sidecar pool to free the slot.
+    ///
+    /// Default impl: no-op (mock executors don't have a sidecar pool).
+    /// `SidecarTaskExecutor` overrides this to send a `session.close` RPC.
+    async fn close_session(
+        &self,
+        _adapter_session_id: &str,
+        _provider_id: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Deterministic in-process mock executor. Used by Plan 1 tests and by Plan 2

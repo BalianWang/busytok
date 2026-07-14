@@ -164,6 +164,14 @@ export interface CancelResult {
   cancelled: boolean;
 }
 
+export interface ActivateParams {
+  adapter_session_id: string;
+}
+
+export interface ActivateResult {
+  ok: boolean;
+}
+
 // New error codes start at -32010 to avoid collisions with existing
 // protocol constants -32001..-32008 (SESSION_NOT_FOUND through
 // PROTOCOL_MISMATCH) in Rust protocol.rs.
