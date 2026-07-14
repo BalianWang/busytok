@@ -2252,19 +2252,34 @@ async fn delegate_rolls_back_binding_when_activate_fails() {
     // (NOT is_hot=1/status='hot' which would indicate a stuck binding).
     {
         let db_guard = h.db.lock().unwrap();
-        let binding = db_guard
+        // `subagent_hot_binding` filters on is_hot=1, so it returns None after
+        // rollback — assert None to verify no hot binding lingers.
+        let hot_binding = db_guard
             .subagent_hot_binding(&r.subagent_id, "pi")
             .unwrap();
-        if let Some(b) = binding {
-            assert_eq!(
-                b.is_hot, 0,
-                "binding must be rolled back to is_hot=0 after activate failure"
-            );
-            assert_eq!(
-                b.status, "closed",
-                "binding status must be 'closed' after rollback"
-            );
-        }
+        assert!(
+            hot_binding.is_none(),
+            "no hot binding should exist after activate failure rollback"
+        );
+        // Query the raw row (without the is_hot=1 filter) to verify the
+        // binding was flipped to is_hot=0, status='closed'.
+        let binding_state: (i32, String) = db_guard
+            .conn()
+            .query_row(
+                "SELECT is_hot, status FROM subagent_harness_bindings \
+                 WHERE subagent_id = ?1 AND harness = 'pi'",
+                rusqlite::params![&r.subagent_id],
+                |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("binding row must exist after activate failure rollback");
+        assert_eq!(
+            binding_state.0, 0,
+            "binding is_hot must be 0 (rolled back after activate failure)"
+        );
+        assert_eq!(
+            binding_state.1, "closed",
+            "binding status must be 'closed' (rolled back after activate failure)"
+        );
         // The logical subagent status must NOT be 'hot'.
         let sub = db_guard.subagent_get_logical(&r.subagent_id).unwrap();
         if let Some(sub) = sub {
@@ -2305,6 +2320,125 @@ async fn delegate_rolls_back_binding_when_activate_fails() {
                  total_closes = {total_closes}, expected >= 2"
             );
         }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// P3 test: per-session activate failure + sequential recovery.
+///
+/// Scenario:
+/// 1. Delegate A for sub-X: turn_auto creates session S1, binding committed,
+///    but `session.activate(S1)` fails (per-session mock: S1 in fail list).
+///    The mock removes S1 from the sub→sess mapping on activate failure,
+///    so the next delegate for sub-X creates a NEW session S2.
+/// 2. A's rollback completes: binding flipped to is_hot=0, S1 closed.
+/// 3. Delegate B for sub-X (same subagent): turn_auto creates session S2
+///    (different sid), binding committed, activate succeeds.
+/// 4. Verify: B's binding is hot (is_hot=1, sid=S2), B's task completed.
+///
+/// NOTE: This test verifies SEQUENTIAL recovery — B starts after A's rollback
+/// completes. The P1-1 concurrent guard (skip rollback when binding has a
+/// different sid) is a defense-in-depth measure that requires a multi-
+/// threaded mock sidecar to test reliably. With the current single-threaded
+/// mock, B's turn_auto can only be processed after A's activate returns,
+/// and A's rollback runs immediately after — so B's commit always lands
+/// after A's rollback. The guard is exercised in production when real
+/// concurrency allows B's commit to win the race.
+#[tokio::test]
+async fn delegate_recovers_after_per_session_activate_failure() {
+    // Fail activate ONLY for the first session (pi_sess_mock_1).
+    // The mock removes the failed session from the sub→sess mapping so
+    // the next delegate creates a new session (pi_sess_mock_2).
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_MOCK_ACTIVATE_FAILS_FOR_SESSION".to_string(),
+        "pi_sess_mock_1".to_string(),
+    );
+    let h = make_harness_with_env(env);
+
+    // Delegate A — turn_auto succeeds, binding committed with sid=S1,
+    // activate fails (per-session). Task A completes (turn succeeded).
+    let r1 = h
+        .manager
+        .delegate(req("sub-per-session-fail", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    let status1 = await_task_done(&h.manager, &r1.task_id).await;
+    assert_eq!(
+        status1, "completed",
+        "task A must complete — turn succeeded; only activate failed"
+    );
+
+    // Wait for A's activate-failure rollback to complete (total_closes >= 1:
+    // A's orphaned pending session S1 was closed).
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = handle.health().await.unwrap();
+        let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+        if total_closes >= 1 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "A's activate/rollback did not complete within 5s — \
+                 total_closes still 0"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Verify: A's binding was rolled back (no hot binding for sub-X).
+    {
+        let db_guard = h.db.lock().unwrap();
+        let binding = db_guard
+            .subagent_hot_binding(&r1.subagent_id, "pi")
+            .unwrap();
+        assert!(
+            binding.is_none(),
+            "A's hot binding must be rolled back after activate failure"
+        );
+    }
+
+    // Delegate B for the SAME subagent — the mock's sub→sess mapping was
+    // cleared for S1 on activate failure, so B creates a NEW session S2.
+    // B's binding commits with sid=S2, activate succeeds.
+    let r2 = h
+        .manager
+        .delegate(req("sub-per-session-fail", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "task B must complete — recovery after per-session activate failure"
+    );
+
+    // Poll until the binding is hot (B's activate completed).
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let db_guard = h.db.lock().unwrap();
+        let binding = db_guard
+            .subagent_hot_binding(&r1.subagent_id, "pi")
+            .unwrap();
+        if let Some(b) = binding {
+            if b.is_hot == 1 {
+                assert_ne!(
+                    b.adapter_session_id.as_deref(),
+                    Some("pi_sess_mock_1"),
+                    "B's binding must NOT point to A's failed session S1"
+                );
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline2 {
+            panic!("B's binding did not become hot within 5s");
+        }
+        drop(db_guard);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 

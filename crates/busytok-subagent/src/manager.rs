@@ -1053,6 +1053,14 @@ impl SubagentManager {
         // or close (failure) the pending sidecar session after releasing the
         // DB lock. `None` = warm path or commit not reached.
         let mut binding_commit_err: Option<SubagentError> = None;
+        // P2 fix: CAS-style guard against same-sid reuse by a concurrent
+        // delegate. Captures the `last_used_at_ms` written to the binding at
+        // commit time. If a concurrent delegate re-commits the binding with
+        // the same `adapter_session_id` (sid reuse), `last_used_at_ms` will
+        // differ — the rollback detects the mismatch and skips the DB flip
+        // (the concurrent delegate now owns the binding). Only used on the
+        // hot path where a binding was actually committed.
+        let mut committed_last_used_at_ms: Option<i64> = None;
         // Tracks early DB persistence failures (task status, usage, memory).
         // If this is `Some`, the binding commit is skipped and the pending
         // sidecar session (if any) must be closed via the two-phase lifecycle
@@ -1231,6 +1239,14 @@ impl SubagentManager {
                                 Some(store_err.to_string()),
                             );
                             binding_commit_err = Some(store_err);
+                        } else {
+                            // Capture the `last_used_at_ms` we just wrote so the
+                            // activate-failure rollback can CAS-compare it. If a
+                            // concurrent delegate re-commits the binding with the
+                            // same sid (reuse path), `upsert_hot_binding` updates
+                            // `last_used_at_ms` to a newer timestamp — the rollback
+                            // sees the mismatch and skips the DB flip.
+                            committed_last_used_at_ms = Some(now_ms);
                         }
                     } else {
                         // Mock executor path OR empty adapter_session_id — no real
@@ -1314,24 +1330,83 @@ impl SubagentManager {
                 //    Rolling back to warm means future delegates for this
                 //    subagent will cold-start a new session. This is graceful
                 //    degradation, not a failure.
-                let rollback_result: Result<()> = {
+                //
+                //    Guards against concurrent delegates:
+                //    - Different adapter_session_id (P1-1): a concurrent delegate
+                //      re-committed the binding with a new session. Skip the DB
+                //      rollback (the concurrent delegate owns the binding). Still
+                //      close the orphaned pending session (it's a different sid).
+                //    - Same adapter_session_id but different last_used_at_ms (P2):
+                //      a concurrent delegate re-committed the binding reusing the
+                //      same session. Skip BOTH the DB rollback AND close_session —
+                //      the session is owned by the concurrent delegate, closing it
+                //      would destroy their active session.
+                let (rollback_result, should_close_session): (Result<()>, bool) = {
                     let db = self.db.lock().expect("subagent db lock poisoned");
-                    let mut binding = db
+                    let binding_opt = db
                         .subagent_hot_binding(&subagent.id, &self.adapter)
-                        .map_err(SubagentError::Store)?
-                        .ok_or_else(|| {
-                            SubagentError::Store(anyhow::anyhow!(
-                                "hot binding not found for rollback after activate failure: {}",
-                                subagent.id
-                            ))
-                        })?;
-                    let now_ms = busytok_domain::now_ms();
-                    binding.is_hot = 0;
-                    binding.status = "closed".to_string();
-                    binding.closed_at_ms = Some(now_ms);
-                    db.subagent_commit_eviction(&binding, &subagent.id, None)
                         .map_err(SubagentError::Store)?;
-                    Ok(())
+                    match binding_opt {
+                        None => {
+                            // No hot binding — nothing to roll back. This can
+                            // happen if a concurrent crash reconciliation or
+                            // graceful shutdown already flipped is_hot=0.
+                            // Semantically a no-op, not an error. The pending
+                            // session is still orphaned — close it below.
+                            warn!(
+                                event_code = "subagent.session.activate_rollback_noop",
+                                adapter_session_id = %sid,
+                                "no hot binding found for rollback after activate \
+                                 failure — likely already reconciled; nothing to \
+                                 roll back"
+                            );
+                            (Ok(()), true)
+                        }
+                        Some(binding) if binding.adapter_session_id.as_deref() != Some(sid) => {
+                            // P1-1 guard: different session ID. The concurrent
+                            // delegate owns the binding. The pending session
+                            // (sid) is orphaned — close it.
+                            warn!(
+                                event_code = "subagent.session.activate_rollback_skipped",
+                                adapter_session_id = %sid,
+                                binding_session_id = ?binding.adapter_session_id,
+                                "hot binding was re-committed by a concurrent delegate \
+                                 with a different session — skipping DB rollback"
+                            );
+                            (Ok(()), true)
+                        }
+                        Some(binding)
+                            if binding.last_used_at_ms != committed_last_used_at_ms =>
+                        {
+                            // P2 guard: same sid but different last_used_at_ms.
+                            // A concurrent delegate re-committed the binding
+                            // reusing the SAME session (sid reuse path). The
+                            // binding AND the session belong to the concurrent
+                            // delegate — skip BOTH the DB rollback and
+                            // close_session. Closing the session would destroy
+                            // the concurrent delegate's active session.
+                            warn!(
+                                event_code = "subagent.session.activate_rollback_sid_reuse",
+                                adapter_session_id = %sid,
+                                committed_last_used_at_ms = ?committed_last_used_at_ms,
+                                current_last_used_at_ms = ?binding.last_used_at_ms,
+                                "hot binding was re-committed by a concurrent delegate \
+                                 with the SAME session (sid reuse) — skipping DB rollback \
+                                 AND session close to preserve the concurrent delegate's \
+                                 binding and session"
+                            );
+                            (Ok(()), false)
+                        }
+                        Some(mut binding) => {
+                            let now_ms = busytok_domain::now_ms();
+                            binding.is_hot = 0;
+                            binding.status = "closed".to_string();
+                            binding.closed_at_ms = Some(now_ms);
+                            db.subagent_commit_eviction(&binding, &subagent.id, None)
+                                .map_err(SubagentError::Store)?;
+                            (Ok(()), true)
+                        }
+                    }
                 };
                 if let Err(rollback_err) = rollback_result {
                     error!(
@@ -1343,18 +1418,22 @@ impl SubagentManager {
                     );
                 }
                 // 2. Close the pending session in the sidecar (best-effort).
-                if let Err(close_err) = self
-                    .executor
-                    .close_session(sid, &provider_id_for_session)
-                    .await
-                {
-                    warn!(
-                        event_code = "subagent.session.close_after_activate_failure",
-                        adapter_session_id = %sid,
-                        error = %close_err,
-                        "session.close RPC failed after activate failure — \
-                         pending session may linger until TTL or sidecar restart"
-                    );
+                //    Skipped when the P2 guard detected same-sid reuse — the
+                //    session is owned by the concurrent delegate.
+                if should_close_session {
+                    if let Err(close_err) = self
+                        .executor
+                        .close_session(sid, &provider_id_for_session)
+                        .await
+                    {
+                        warn!(
+                            event_code = "subagent.session.close_after_activate_failure",
+                            adapter_session_id = %sid,
+                            error = %close_err,
+                            "session.close RPC failed after activate failure — \
+                             pending session may linger until TTL or sidecar restart"
+                        );
+                    }
                 }
             }
         } else if let Some(err) = persist_err.take() {
