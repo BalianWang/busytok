@@ -201,7 +201,10 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","result":{"protocol_version":1,"sidecar_version":"mock-1.0"},"id":%s}\n' "$ID"
       ;;
     adapter.health)
-      printf '{"jsonrpc":"2.0","result":{"status":"healthy","sessions":%d,"rss_mb":42},"id":%s}\n' "${#SESS_ORDER[@]}" "$ID"
+      # Include `pending_sessions` and `total_closes` so tests can verify
+      # two-phase lifecycle behavior (close_session called on commit
+      # failure, pending sessions lingering, etc.).
+      printf '{"jsonrpc":"2.0","result":{"status":"healthy","sessions":%d,"pending_sessions":%d,"total_closes":%d,"rss_mb":42},"id":%s}\n' "${#SESS_ORDER[@]}" "${#SESS_PENDING[@]}" "$CLOSES" "$ID"
       ;;
     adapter.shutdown)
       printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"

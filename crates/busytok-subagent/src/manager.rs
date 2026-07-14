@@ -1053,212 +1053,243 @@ impl SubagentManager {
         // or close (failure) the pending sidecar session after releasing the
         // DB lock. `None` = warm path or commit not reached.
         let mut binding_commit_err: Option<SubagentError> = None;
+        // Tracks early DB persistence failures (task status, usage, memory).
+        // If this is `Some`, the binding commit is skipped and the pending
+        // sidecar session (if any) must be closed via the two-phase lifecycle
+        // block below — otherwise the session would leak (pending sessions
+        // are NOT in LRU and can never be evicted).
+        let mut persist_err: Option<SubagentError> = None;
 
         // 4. persist results: task status, usage, memory, status.
         //    For the hot path (real adapter_session_id), the binding + status
         //    flip commit in a single transaction so the spec §3.3 invariant
         //    ("status='hot' iff is_hot=1 binding exists") holds at every
         //    observable point.
+        //
+        // P1-1 fix: the first 4 DB writes (task status, recent_tasks,
+        // usage_record, memory) use `?` inside a closure. If any fails, the
+        // error is captured into `persist_err` (not propagated via `?`), so
+        // the two-phase lifecycle block below can still call `close_session`
+        // on the pending sidecar session. Without this, an early `?` would
+        // skip the lifecycle block, leaving an orphaned pending session that
+        // can never be evicted (pending sessions are excluded from LRU).
         {
             let db = self.db.lock().expect("subagent db lock poisoned");
-            // Use the guarded variant so a late cancel is not overwritten
-            // by the executor's terminal write (P1-5 review finding C1).
-            let updated = db
-                .subagent_set_task_status_if_not_cancelled(
-                    &task.id,
-                    out.status.as_str(),
-                    Some(out.summary.clone()),
-                    None,
-                )
-                .map_err(SubagentError::Store)?;
-            if !updated {
-                info!(
-                    event_code = "subagent.task_terminal_write_skipped",
-                    task_id = %task.id,
-                    attempted_status = out.status.as_str(),
-                    "terminal write skipped: task was already cancelled"
-                );
-            }
-            // Task 5: persist classified error_kind on the task row.
-            if let Some(kind) = &out.error_kind {
-                if let Err(e) = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str())) {
-                    tracing::warn!(
-                        event_code = "subagent.error_kind_persist_failed",
-                        task_id = %task.id,
-                        error = %e,
-                        "failed to persist error_kind"
-                    );
-                }
-            }
-            // Re-fetch recent_tasks AFTER the task result is persisted so the
-            // snapshot includes the just-completed task's result_summary. The
-            // pre-execution snapshot (used only for context building above)
-            // has result_summary=None for the current task, which would make
-            // the attempts logic skip the entry and exclude the most recent
-            // task from compaction's "Recent findings" section.
-            let recent_tasks = db
-                .subagent_list_tasks(
-                    &subagent.id,
-                    self.settings.context.recent_tasks_limit as i64,
-                )
-                .map_err(SubagentError::Store)?;
-            db.subagent_insert_usage_record(&SubagentUsageRecordRow {
-                id: format!("usage_{}", task.id),
-                task_id: task.id.clone(),
-                subagent_id: subagent.id.clone(),
-                source_usage_event_id: None,
-                harness: self.adapter.clone(),
-                provider: out.usage.provider.clone(),
-                model: out.usage.model.clone(),
-                input_tokens: out.usage.input_tokens,
-                output_tokens: out.usage.output_tokens,
-                cache_read_tokens: out.usage.cache_read_tokens,
-                cache_write_tokens: out.usage.cache_write_tokens,
-                total_cost_usd: out.usage.cost_usd,
-                duration_ms: Some(duration_ms),
-                created_at_ms: busytok_domain::now_ms(),
-            })
-            .map_err(SubagentError::Store)?;
-
-            // memory: merge the sidecar's memory_update into the memory row
-            // (spec §6.2). hot_summary comes from current_state_summary, NOT
-            // task_summary. When memory_update is absent, hot_summary is
-            // preserved. Compaction runs if triggers fire.
-            let profile_budget = profile_cfg
-                .as_ref()
-                .map(|p| p.context_budget_tokens)
-                .unwrap_or(self.settings.context.default_budget_tokens);
-            let prev_compacted_at = memory_row.last_compacted_at_ms;
-            let updated_mem = self.memory_updater.update(
-                memory_row,
-                out.memory_update.clone(),
-                &recent_tasks,
-                tasks_since_last_compaction,
-                &task.id,
-                profile_budget,
-                &subagent.repo_path,
-            );
-            let compacted = updated_mem.last_compacted_at_ms != prev_compacted_at;
-            if compacted {
-                info!(
-                    event_code = "subagent.memory.compacted",
-                    subagent_id = %subagent.id,
-                    tasks_since_last_compaction,
-                    "memory compacted (trigger fired)"
-                );
-            }
-            info!(
-                event_code = "subagent.memory.updated",
-                subagent_id = %subagent.id,
-                has_hot_summary = updated_mem.hot_summary.is_some(),
-                compacted,
-                "memory updated after task"
-            );
-            db.subagent_upsert_memory(&updated_mem)
-                .map_err(SubagentError::Store)?;
-
-            // Spec §3.3 invariant: status='hot' iff is_hot=1 binding exists.
-            // Hot path: commit binding + status atomically; failure fails the
-            // task to preserve the status invariant (no `hot` without a
-            // backing binding). Warm path (mock executor, no adapter_session_id):
-            // just flip status — no real session to bind.
-            //
-            // An empty `adapter_session_id` is treated as warm/cold — there is
-            // no real backing session, so committing a hot binding would
-            // violate spec §3.3 semantically. The task is the authority
-            // that decides hot vs warm/cold (the executor only extracts the
-            // raw value).
-            //
-            // Two-phase lifecycle: the binding commit error is CAPTURED (not
-            // propagated via `?`) so we can call `session.close` on the
-            // pending sidecar session after releasing the DB lock. Propagating
-            // via `?` would skip the close, leaving an orphaned pending session
-            // in the sidecar pool.
-            if let Some(sid) = hot_sid.as_deref() {
-                let now_ms = busytok_domain::now_ms();
-                let binding = busytok_store::repository::SubagentHarnessBindingRow {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    subagent_id: subagent.id.clone(),
-                    harness: self.adapter.clone(),
-                    adapter_session_id: Some(sid.to_string()),
-                    adapter_process_id: None, // Plan 3 tracks PID
-                    is_hot: 1,
-                    status: "hot".to_string(),
-                    created_at_ms: now_ms,
-                    last_used_at_ms: Some(now_ms),
-                    closed_at_ms: None,
-                    detail_json: None,
-                };
-                if let Err(e) = db.subagent_commit_hot_binding_and_status(&binding, &subagent.id) {
-                    error!(
-                        event_code = "subagent.delegate.binding_commit_failed",
-                        error = %e,
-                        "hot binding commit failed; task fails to preserve status invariant"
-                    );
-                    let store_err = SubagentError::Store(e);
-                    // Immediately mark the task as 'failed' INSIDE the DB lock,
-                    // BEFORE releasing it. The task was briefly set to the
-                    // executor's output status ("completed") above (line 1067),
-                    // but the binding commit failure means it must be "failed".
-                    // Writing this inside the lock ensures observers never see a
-                    // stale "completed" status during the subsequent close_session
-                    // RPC (which runs after the lock is released and yields to
-                    // the tokio runtime — a polling observer could otherwise see
-                    // "completed" and return it as the final status).
-                    let _ = db.subagent_set_task_status_if_not_cancelled(
+            // Phase 1: persist task result, usage, memory. Returns the
+            // updated memory row (needed for warm/cold status derivation in
+            // Phase 2). Errors are captured, not propagated.
+            let persist: Result<SubagentMemoryRow> = (|| {
+                // Use the guarded variant so a late cancel is not overwritten
+                // by the executor's terminal write (P1-5 review finding C1).
+                let updated = db
+                    .subagent_set_task_status_if_not_cancelled(
                         &task.id,
-                        "failed",
+                        out.status.as_str(),
+                        Some(out.summary.clone()),
                         None,
-                        Some(store_err.to_string()),
+                    )
+                    .map_err(SubagentError::Store)?;
+                if !updated {
+                    info!(
+                        event_code = "subagent.task_terminal_write_skipped",
+                        task_id = %task.id,
+                        attempted_status = out.status.as_str(),
+                        "terminal write skipped: task was already cancelled"
                     );
-                    binding_commit_err = Some(store_err);
                 }
-            } else {
-                // Mock executor path OR empty adapter_session_id — no real
-                // session to bind. Derive warm/cold from memory state (§3.3:
-                // warm iff hot_summary IS NOT NULL). On a fresh subagent with
-                // no memory_update, hot_summary is None → Cold.
-                let status = if updated_mem.hot_summary.is_some() {
-                    SubagentStatus::Warm
-                } else {
-                    SubagentStatus::Cold
-                };
-                self.set_logical_status(&db, &subagent.id, status)?;
+                // Task 5: persist classified error_kind on the task row.
+                if let Some(kind) = &out.error_kind {
+                    if let Err(e) = db.subagent_set_task_error_kind(&task.id, Some(kind.as_str())) {
+                        tracing::warn!(
+                            event_code = "subagent.error_kind_persist_failed",
+                            task_id = %task.id,
+                            error = %e,
+                            "failed to persist error_kind"
+                        );
+                    }
+                }
+                // Re-fetch recent_tasks AFTER the task result is persisted so the
+                // snapshot includes the just-completed task's result_summary. The
+                // pre-execution snapshot (used only for context building above)
+                // has result_summary=None for the current task, which would make
+                // the attempts logic skip the entry and exclude the most recent
+                // task from compaction's "Recent findings" section.
+                let recent_tasks = db
+                    .subagent_list_tasks(
+                        &subagent.id,
+                        self.settings.context.recent_tasks_limit as i64,
+                    )
+                    .map_err(SubagentError::Store)?;
+                db.subagent_insert_usage_record(&SubagentUsageRecordRow {
+                    id: format!("usage_{}", task.id),
+                    task_id: task.id.clone(),
+                    subagent_id: subagent.id.clone(),
+                    source_usage_event_id: None,
+                    harness: self.adapter.clone(),
+                    provider: out.usage.provider.clone(),
+                    model: out.usage.model.clone(),
+                    input_tokens: out.usage.input_tokens,
+                    output_tokens: out.usage.output_tokens,
+                    cache_read_tokens: out.usage.cache_read_tokens,
+                    cache_write_tokens: out.usage.cache_write_tokens,
+                    total_cost_usd: out.usage.cost_usd,
+                    duration_ms: Some(duration_ms),
+                    created_at_ms: busytok_domain::now_ms(),
+                })
+                .map_err(SubagentError::Store)?;
+
+                // memory: merge the sidecar's memory_update into the memory row
+                // (spec §6.2). hot_summary comes from current_state_summary, NOT
+                // task_summary. When memory_update is absent, hot_summary is
+                // preserved. Compaction runs if triggers fire.
+                let profile_budget = profile_cfg
+                    .as_ref()
+                    .map(|p| p.context_budget_tokens)
+                    .unwrap_or(self.settings.context.default_budget_tokens);
+                let prev_compacted_at = memory_row.last_compacted_at_ms;
+                let updated_mem = self.memory_updater.update(
+                    memory_row,
+                    out.memory_update.clone(),
+                    &recent_tasks,
+                    tasks_since_last_compaction,
+                    &task.id,
+                    profile_budget,
+                    &subagent.repo_path,
+                );
+                let compacted = updated_mem.last_compacted_at_ms != prev_compacted_at;
+                if compacted {
+                    info!(
+                        event_code = "subagent.memory.compacted",
+                        subagent_id = %subagent.id,
+                        tasks_since_last_compaction,
+                        "memory compacted (trigger fired)"
+                    );
+                }
+                info!(
+                    event_code = "subagent.memory.updated",
+                    subagent_id = %subagent.id,
+                    has_hot_summary = updated_mem.hot_summary.is_some(),
+                    compacted,
+                    "memory updated after task"
+                );
+                db.subagent_upsert_memory(&updated_mem)
+                    .map_err(SubagentError::Store)?;
+                Ok(updated_mem)
+            })();
+            match persist {
+                Ok(updated_mem) => {
+                    // Phase 2: binding commit (hot path) or warm/cold status
+                    // flip (mock path). Only reached if Phase 1 succeeded.
+                    //
+                    // Spec §3.3 invariant: status='hot' iff is_hot=1 binding
+                    // exists. Hot path: commit binding + status atomically;
+                    // failure fails the task to preserve the status invariant
+                    // (no `hot` without a backing binding). Warm path (mock
+                    // executor, no adapter_session_id): just flip status — no
+                    // real session to bind.
+                    //
+                    // An empty `adapter_session_id` is treated as warm/cold.
+                    //
+                    // Two-phase lifecycle: the binding commit error is CAPTURED
+                    // (not propagated via `?`) so we can call `session.close` on
+                    // the pending sidecar session after releasing the DB lock.
+                    if let Some(sid) = hot_sid.as_deref() {
+                        let now_ms = busytok_domain::now_ms();
+                        let binding = busytok_store::repository::SubagentHarnessBindingRow {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            subagent_id: subagent.id.clone(),
+                            harness: self.adapter.clone(),
+                            adapter_session_id: Some(sid.to_string()),
+                            adapter_process_id: None, // Plan 3 tracks PID
+                            is_hot: 1,
+                            status: "hot".to_string(),
+                            created_at_ms: now_ms,
+                            last_used_at_ms: Some(now_ms),
+                            closed_at_ms: None,
+                            detail_json: None,
+                        };
+                        if let Err(e) = db.subagent_commit_hot_binding_and_status(&binding, &subagent.id) {
+                            error!(
+                                event_code = "subagent.delegate.binding_commit_failed",
+                                error = %e,
+                                "hot binding commit failed; task fails to preserve status invariant"
+                            );
+                            let store_err = SubagentError::Store(e);
+                            // Immediately mark the task as 'failed' INSIDE the DB lock,
+                            // BEFORE releasing it. The task was briefly set to the
+                            // executor's output status ("completed") above,
+                            // but the binding commit failure means it must be "failed".
+                            // Writing this inside the lock ensures observers never see a
+                            // stale "completed" status during the subsequent close_session
+                            // RPC (which runs after the lock is released and yields to
+                            // the tokio runtime — a polling observer could otherwise see
+                            // "completed" and return it as the final status).
+                            let _ = db.subagent_set_task_status_if_not_cancelled(
+                                &task.id,
+                                "failed",
+                                None,
+                                Some(store_err.to_string()),
+                            );
+                            binding_commit_err = Some(store_err);
+                        }
+                    } else {
+                        // Mock executor path OR empty adapter_session_id — no real
+                        // session to bind. Derive warm/cold from memory state (§3.3:
+                        // warm iff hot_summary IS NOT NULL). On a fresh subagent with
+                        // no memory_update, hot_summary is None → Cold.
+                        let status = if updated_mem.hot_summary.is_some() {
+                            SubagentStatus::Warm
+                        } else {
+                            SubagentStatus::Cold
+                        };
+                        if let Err(e) = self.set_logical_status(&db, &subagent.id, status) {
+                            persist_err = Some(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Phase 1 failed — skip Phase 2 (binding commit).
+                    // The pending sidecar session (if any) will be closed
+                    // by the two-phase lifecycle block below.
+                    persist_err = Some(e);
+                }
             }
         } // db lock released here
 
         // Two-phase session lifecycle: now that the DB lock is released, drive
         // the sidecar session to the correct state.
         //
-        // - Commit succeeded → `session.activate`: move the session from
-        //   `pending` to `active` (LRU-eligible). Until activate is called,
-        //   the session is usable for reuse by the same subagent but NOT
-        //   evictable by concurrent delegates. This closes the timing window
-        //   between `turn_auto` success and DB binding commit.
+        // - All DB writes succeeded → `session.activate`: move the session
+        //   from `pending` to `active` (LRU-eligible). Until activate is
+        //   called, the session is usable for reuse by the same subagent but
+        //   NOT evictable by concurrent delegates. This closes the timing
+        //   window between `turn_auto` success and DB binding commit.
         //
-        // - Commit failed → `session.close`: remove the orphaned pending
-        //   session from the sidecar pool so the slot is freed. Without this,
-        //   the pending session would linger indefinitely (never activated,
-        //   never evicted — pending sessions are excluded from LRU).
+        // - Any DB write failed (persist_err or binding_commit_err) →
+        //   `session.close`: remove the orphaned pending session from the
+        //   sidecar pool so the slot is freed. Without this, the pending
+        //   session would linger indefinitely (never activated, never evicted
+        //   — pending sessions are excluded from LRU).
         if let Some(sid) = hot_sid.as_deref() {
-            if let Some(err) = binding_commit_err.take() {
-                // Commit failed — close the orphaned pending session.
+            let err = persist_err.take().or(binding_commit_err.take());
+            if let Some(err) = err {
+                // A DB write failed — close the orphaned pending session.
                 if let Err(close_err) = self
                     .executor
                     .close_session(sid, &provider_id_for_session)
                     .await
                 {
                     warn!(
-                        event_code = "subagent.session.close_after_commit_failed",
+                        event_code = "subagent.session.close_after_db_failure",
                         adapter_session_id = %sid,
                         error = %close_err,
-                        "session.close RPC failed after binding commit failure — \
+                        "session.close RPC failed after DB write failure — \
                          pending session may linger in sidecar pool"
                     );
                 }
                 return Err(err);
             }
-            // Commit succeeded — activate the session (move to LRU).
+            // All DB writes succeeded — activate the session (move to LRU).
             if let Err(e) = self
                 .executor
                 .activate_session(sid, &provider_id_for_session)
@@ -1269,9 +1300,12 @@ impl SubagentManager {
                     adapter_session_id = %sid,
                     error = %e,
                     "session.activate RPC failed — session stays pending; \
-                     will be activated on next reuse or cleaned up by eviction"
+                     will be activated on next reuse or cleaned up by sidecar restart"
                 );
             }
+        } else if let Some(err) = persist_err.take() {
+            // Warm/cold path error (no pending session to close).
+            return Err(err);
         }
 
         // M2 fix: After persisting usage/memory/binding (tokens were consumed,

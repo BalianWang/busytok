@@ -791,8 +791,8 @@ impl SidecarTaskExecutor {
         // C7 fix: resolve which supervisor owns this session via the pool.
         let (_provider_id, supervisor) = match self.pool.supervisor_for_session(adapter_session_id)
         {
-            Some(pair) => pair,
-            None => {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
                 // With the two-phase session lifecycle (pending → active), a
                 // candidate named by the sidecar should ALWAYS have a DB
                 // binding: only activated sessions are in the LRU, and
@@ -825,6 +825,22 @@ impl SidecarTaskExecutor {
                          are never in LRU)"
                     ),
                 ));
+            }
+            Err(e) => {
+                // DB query error — transient, not permanent divergence.
+                // The binding might exist but the query failed (disk I/O,
+                // lock contention, etc.). Return `HotSessionLimit` so the
+                // caller re-queues the task for a later retry, rather than
+                // fatally failing on a transient DB error.
+                warn!(
+                    event_code = "subagent.session.supervisor_lookup_db_error",
+                    adapter_session_id = %adapter_session_id,
+                    error = %e,
+                    "DB query failed in supervisor_for_session — treating as transient"
+                );
+                return Err(SubagentError::HotSessionLimit {
+                    candidate: adapter_session_id.to_string(),
+                });
             }
         };
 

@@ -470,7 +470,7 @@ impl WorkerPool {
     pub fn supervisor_for_session(
         &self,
         adapter_session_id: &str,
-    ) -> Option<(String, Arc<PiSidecarSupervisor>)> {
+    ) -> anyhow::Result<Option<(String, Arc<PiSidecarSupervisor>)>> {
         // Collect (provider_id, supervisor, harness_name) under the map
         // lock, then release before querying the DB (DB lock is a
         // `std::sync::Mutex` — never hold both locks simultaneously to
@@ -491,20 +491,30 @@ impl WorkerPool {
         let Some(db) = &self.db else {
             // No DB — can't query bindings. Return the first supervisor
             // (single-provider fallback for no-DB test paths).
-            return candidates
+            return Ok(candidates
                 .into_iter()
                 .next()
-                .map(|(pid, sup, _)| (pid, sup));
+                .map(|(pid, sup, _)| (pid, sup)));
         };
         let db = db.lock().expect("db lock poisoned");
         for (pid, sup, harness) in &candidates {
-            if let Ok(Some(_binding)) =
-                db.subagent_find_binding_by_session(adapter_session_id, harness)
-            {
-                return Some((pid.clone(), Arc::clone(sup)));
+            match db.subagent_find_binding_by_session(adapter_session_id, harness) {
+                Ok(Some(_binding)) => return Ok(Some((pid.clone(), Arc::clone(sup)))),
+                Ok(None) => continue, // Not found in this harness — try next
+                Err(e) => {
+                    // DB query error — propagate as Err so the caller can
+                    // treat it as transient (HotSessionLimit) rather than
+                    // permanent divergence (HotSessionStateDivergence).
+                    // Previously this was silently swallowed by
+                    // `if let Ok(Some(...))`, causing a transient DB error
+                    // to be misclassified as permanent state divergence.
+                    return Err(anyhow::anyhow!(
+                        "DB query failed in supervisor_for_session: {e}"
+                    ));
+                }
             }
         }
-        None
+        Ok(None)
     }
 }
 

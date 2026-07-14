@@ -2047,16 +2047,24 @@ async fn pending_session_not_evicted_when_pool_full() {
 }
 
 /// After a successful `delegate()`, the manager must call `activate_session`
-/// to move the session from pending to LRU. Verify by running two delegates
-/// for DIFFERENT subagents — the second should trigger normal eviction (not
+/// to move the session from pending to LRU. Verify with `maxHot=1`: a second
+/// delegate for a DIFFERENT subagent must trigger normal eviction (not
 /// all_busy), proving the first session was activated after its commit.
+///
+/// If activate was NOT called, sub-a's session stays in SESS_PENDING (not in
+/// SESS_ORDER/LRU) → the sidecar returns `all_busy=true` → `HotSessionLimit`
+/// → the task is re-queued indefinitely → `await_task_done` panics.
 #[tokio::test]
 async fn delegate_activates_session_after_successful_commit() {
-    let h = make_harness();
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_MOCK_HOT_SESSION_LIMIT".to_string(),
+        "1".to_string(),
+    );
+    let h = make_harness_with_env(env);
 
     // First delegate — sub-a. Manager commits the binding and calls
-    // activate_session. Without activation, the second delegate would
-    // hit all_busy=true (no LRU candidates).
+    // activate_session, moving the session from SESS_PENDING to SESS_ORDER.
     let r1 = h
         .manager
         .delegate(req("reviewer-a", "first turn"))
@@ -2066,44 +2074,42 @@ async fn delegate_activates_session_after_successful_commit() {
     let status1 = await_task_done(&h.manager, &r1.task_id).await;
     assert_eq!(status1, "completed");
 
-    // Second delegate — different subagent name → different subagent.
-    // The pool is full (max_hot=3, but we only have 1 session). To test
-    // eviction we need max_hot=1. Instead, verify activation indirectly:
-    // the second delegate for sub-b should succeed, proving the session
-    // from sub-a was properly activated and can be evicted if needed.
+    // Second delegate — DIFFERENT subagent. With maxHot=1, the pool is full.
+    // If activate was called on sub-a's session, it's in SESS_ORDER (LRU) →
+    // the sidecar returns it as an evictable candidate → eviction succeeds →
+    // delegate completes.
     //
-    // Actually, with max_hot=3 (default), both sessions can coexist. We
-    // verify activation by re-delegating sub-a — if the session was NOT
-    // activated, reuse would fail and a new session would be created.
-    // The reuse path checks SESS_ORDER for an existing session; if the
-    // session is in SESS_PENDING, it won't be found for reuse.
+    // If activate was NOT called, sub-a's session is still in SESS_PENDING
+    // (not in LRU) → the sidecar returns all_busy=true → HotSessionLimit →
+    // task is re-queued → await_task_done panics (never reaches terminal
+    // status).
     let r2 = h
         .manager
-        .delegate(req("reviewer-a", "second turn"))
+        .delegate(req("reviewer-b", "second turn"))
         .await
         .unwrap();
     assert_eq!(r2.status, TaskStatus::Running);
     let status2 = await_task_done(&h.manager, &r2.task_id).await;
-    assert_eq!(status2, "completed");
-
-    // Verify: both delegates resolved to the same subagent (by name+cwd).
     assert_eq!(
-        r1.subagent_id, r2.subagent_id,
-        "same subagent name+cwd must resolve to same subagent"
+        status2, "completed",
+        "second delegate must complete — eviction succeeded, proving activate was called"
     );
 
-    // Verify: only one hot binding row exists (session was reused, not
-    // duplicated). This proves activation worked — the session was in
-    // SESS_ORDER (LRU) and was found for reuse by the second delegate.
+    // Verify: two different subagents (different names → different IDs).
+    assert_ne!(
+        r1.subagent_id, r2.subagent_id,
+        "different subagent names must resolve to different subagents"
+    );
+
+    // Verify: sub-b has a hot binding (it's the active hot session now).
+    // sub-a's binding was flipped to warm by the eviction flow.
     {
         let db_guard = h.db.lock().unwrap();
-        let binding = db_guard
-            .subagent_hot_binding(&r1.subagent_id, "pi")
+        let binding_b = db_guard
+            .subagent_hot_binding(&r2.subagent_id, "pi")
             .unwrap();
-        assert!(binding.is_some(), "hot binding must exist");
-        let binding = binding.unwrap();
-        assert_eq!(binding.is_hot, 1, "binding must be hot");
-        assert_eq!(binding.status, "hot");
+        assert!(binding_b.is_some(), "sub-b must have a hot binding");
+        assert_eq!(binding_b.unwrap().is_hot, 1);
     }
 
     h.supervisor.shutdown().await.unwrap();
@@ -2171,6 +2177,19 @@ async fn delegate_closes_session_on_commit_failure() {
             );
         }
     }
+
+    // Verify: the manager called `session.close` on the sidecar to clean up
+    // the orphaned pending session. The mock sidecar tracks total closes in
+    // its `adapter.health` response (`total_closes` field).
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let health = handle.health().await.unwrap();
+    let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+    assert!(
+        total_closes >= 1,
+        "manager must call session.close on binding commit failure — \
+         expected total_closes >= 1, got {total_closes} \
+         (orphaned pending session was not cleaned up)"
+    );
 
     h.supervisor.shutdown().await.unwrap();
 }

@@ -426,7 +426,7 @@ async fn supervisor_for_session_with_no_db_returns_first() {
 
     // No DB was passed to the pool, so supervisor_for_session should
     // fall back to returning the first candidate.
-    let result = pool.supervisor_for_session("any-session-id");
+    let result = pool.supervisor_for_session("any-session-id").unwrap();
     assert!(result.is_some(), "must return Some fallback when no DB");
     let (pid, _sup) = result.unwrap();
     // The first inserted provider — HashMap iteration order is not
