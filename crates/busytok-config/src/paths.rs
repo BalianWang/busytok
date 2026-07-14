@@ -50,8 +50,23 @@ impl BusytokPaths {
     /// defaults via `dirs`. Each `BUSYTOK_*` variable, when set, is used
     /// as the complete directory path (no app-name suffix appended).
     pub fn from_env() -> Self {
-        let data_dir = std::env::var("BUSYTOK_DATA_DIR")
-            .ok()
+        Self::from_env_values(
+            std::env::var("BUSYTOK_DATA_DIR").ok(),
+            std::env::var("BUSYTOK_CONFIG_DIR").ok(),
+            std::env::var("BUSYTOK_RUNTIME_DIR").ok(),
+        )
+    }
+
+    /// Resolve paths from explicit environment-like values. Keeping the
+    /// resolution pure lets tests verify override/fallback semantics without
+    /// mutating process-global environment variables (which would race other
+    /// tests running in parallel).
+    fn from_env_values(
+        data_override: Option<String>,
+        config_override: Option<String>,
+        runtime_override: Option<String>,
+    ) -> Self {
+        let data_dir = data_override
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -60,8 +75,7 @@ impl BusytokPaths {
                     .join(APP_NAME)
             });
 
-        let config_dir = std::env::var("BUSYTOK_CONFIG_DIR")
-            .ok()
+        let config_dir = config_override
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -70,8 +84,7 @@ impl BusytokPaths {
                     .join(APP_NAME)
             });
 
-        let runtime_dir = std::env::var("BUSYTOK_RUNTIME_DIR")
-            .ok()
+        let runtime_dir = runtime_override
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -319,26 +332,15 @@ mod tests {
 
     #[test]
     fn from_env_uses_busytk_overrides_and_falls_back() {
-        use std::sync::Mutex;
-        // Serialize env var tests — parallel tests that modify the same
-        // env vars would race.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        // Save old values.
-        let old_data = std::env::var("BUSYTOK_DATA_DIR").ok();
-        let old_config = std::env::var("BUSYTOK_CONFIG_DIR").ok();
-        let old_runtime = std::env::var("BUSYTOK_RUNTIME_DIR").ok();
-
         // Test 1: all three overrides set.
         let data = std::env::temp_dir().join("busytok-test-all-data");
         let config = std::env::temp_dir().join("busytok-test-all-config");
         let runtime = std::env::temp_dir().join("busytok-test-all-runtime");
-        std::env::set_var("BUSYTOK_DATA_DIR", &data);
-        std::env::set_var("BUSYTOK_CONFIG_DIR", &config);
-        std::env::set_var("BUSYTOK_RUNTIME_DIR", &runtime);
-        let paths = BusytokPaths::from_env();
+        let paths = BusytokPaths::from_env_values(
+            Some(data.to_string_lossy().into_owned()),
+            Some(config.to_string_lossy().into_owned()),
+            Some(runtime.to_string_lossy().into_owned()),
+        );
         assert_eq!(paths.data_dir(), &data, "data_dir override");
         assert_eq!(paths.config_dir(), &config, "config_dir override");
         assert_eq!(paths.runtime_dir(), &runtime, "runtime_dir override");
@@ -354,35 +356,12 @@ mod tests {
             "override should be used as-is, not appended with app name"
         );
 
-        // Test 3: new() delegates to from_env().
-        let from_new = BusytokPaths::new();
-        assert_eq!(from_new.data_dir(), paths.data_dir());
-        assert_eq!(from_new.config_dir(), paths.config_dir());
-        assert_eq!(from_new.runtime_dir(), paths.runtime_dir());
-
-        // Test 4: when env vars are unset, falls back to dirs crate.
-        std::env::remove_var("BUSYTOK_DATA_DIR");
-        std::env::remove_var("BUSYTOK_CONFIG_DIR");
-        std::env::remove_var("BUSYTOK_RUNTIME_DIR");
-        let paths = BusytokPaths::from_env();
+        // Test 3: empty/unset values fall back to dirs crate.
+        let paths = BusytokPaths::from_env_values(None, None, None);
         let s = paths.data_dir().to_string_lossy();
         assert!(
             s.contains("busytok"),
             "fallback data_dir should contain 'busytok': {s}"
         );
-
-        // Restore old values.
-        match old_data {
-            Some(v) => std::env::set_var("BUSYTOK_DATA_DIR", v),
-            None => std::env::remove_var("BUSYTOK_DATA_DIR"),
-        }
-        match old_config {
-            Some(v) => std::env::set_var("BUSYTOK_CONFIG_DIR", v),
-            None => std::env::remove_var("BUSYTOK_CONFIG_DIR"),
-        }
-        match old_runtime {
-            Some(v) => std::env::set_var("BUSYTOK_RUNTIME_DIR", v),
-            None => std::env::remove_var("BUSYTOK_RUNTIME_DIR"),
-        }
     }
 }
