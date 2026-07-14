@@ -8,6 +8,15 @@ import { SidecarError } from './errors.js';
 import { logger } from './logger.js';
 
 /**
+ * TTL for pending sessions (milliseconds). If a session stays pending longer
+ * than this, it's considered orphaned (Rust likely crashed between turn_auto
+ * and activate/close) and is closed to free the capacity slot. 60s is well
+ * beyond the activate RPC timeout (task_timeout, typically 10-300s) and the
+ * DB commit latency (milliseconds).
+ */
+const PENDING_TTL_MS = 60_000;
+
+/**
  * Sidecar-side hot session pool with LRU tracking (spec §5.2).
  *
  * Tracks adapter_session_id ↔ logical_subagent_id mappings. When the pool
@@ -56,6 +65,7 @@ export class SessionPool {
   private readonly lru: string[] = [];                               // adapter_session_ids, MRU first (active only)
   private readonly busySessions = new Set<string>();                 // adapter_session_ids with in-flight turns
   private readonly pendingSessions = new Set<string>();              // adapter_session_ids not yet activated
+  private readonly pendingSince = new Map<string, number>();        // adapter_session_id → creation timestamp (ms)
 
   constructor(maxHot: number, factory: SessionFactory = defaultSessionFactory) {
     if (maxHot < 1) throw new Error(`maxHot must be >= 1, got ${maxHot}`);
@@ -83,6 +93,13 @@ export class SessionPool {
     opts: CreateSessionOpts,
     createOverride?: SessionFactory,
   ): Promise<{ session: PiSdkSession; reused: boolean }> {
+    // 0. Safety net: close expired pending sessions. If Rust crashed
+    //    between turn_auto and activate/close, the pending session would
+    //    linger forever, occupying a capacity slot. A pending session
+    //    older than PENDING_TTL_MS is stale — close it and free the slot
+    //    before the capacity check below.
+    this.evictExpiredPending();
+
     // 1. Hit — subagent already has a hot session
     const existing = this.subagentMap.get(logical_subagent_id);
     if (existing !== undefined) {
@@ -141,6 +158,7 @@ export class SessionPool {
     this.sessions.set(adapter_session_id, session);
     this.subagentMap.set(logical_subagent_id, adapter_session_id);
     this.pendingSessions.add(adapter_session_id);
+    this.pendingSince.set(adapter_session_id, Date.now());
     return { session, reused: false };
   }
 
@@ -180,8 +198,32 @@ export class SessionPool {
     if (idx >= 0) this.lru.splice(idx, 1);
     this.busySessions.delete(adapter_session_id);
     this.pendingSessions.delete(adapter_session_id);
+    this.pendingSince.delete(adapter_session_id);
     // Dispose the underlying SDK session (fire-and-forget; dispose() is sync).
     void session.close();
+  }
+
+  /**
+   * Close pending sessions that have exceeded the TTL. This is a safety
+   * net for the case where Rust crashes between `turn_auto` success and
+   * `session.activate` / `session.close` — without this, the orphaned
+   * pending session would occupy a capacity slot indefinitely. Called at
+   * the top of `ensure()` before the capacity check.
+   */
+  evictExpiredPending(): void {
+    if (this.pendingSessions.size === 0) return;
+    const now = Date.now();
+    for (const id of this.pendingSessions) {
+      const since = this.pendingSince.get(id);
+      if (since !== undefined && now - since > PENDING_TTL_MS) {
+        logger.warn('session_pool.pending_expired', {
+          adapter_session_id: id,
+          age_ms: now - since,
+          ttl_ms: PENDING_TTL_MS,
+        });
+        this.close(id);
+      }
+    }
   }
 
   /**
@@ -193,16 +235,28 @@ export class SessionPool {
    * selected as an eviction candidate). This closes the timing window
    * between `turn_auto` success and DB binding commit.
    *
-   * Idempotent: if the session is already active (in LRU), this is a no-op.
-   * If the session doesn't exist (already closed or never created), it's
-   * also a no-op — the caller (Rust) treats activate failure as best-effort.
+   * Idempotent for already-active sessions: activating an active session
+   * is a no-op. For unknown sessions (closed, never created, or lost to
+   * sidecar restart), throws SESSION_NOT_FOUND so Rust can roll back the
+   * DB binding — a successful activate on a missing session would create
+   * a false `is_hot=1` binding with no backing sidecar session.
    */
   activate(adapter_session_id: string): void {
-    if (!this.pendingSessions.has(adapter_session_id)) {
-      // Already active or not in pool — idempotent no-op.
+    if (this.lru.includes(adapter_session_id)) {
+      // Already active — idempotent no-op.
       return;
     }
+    if (!this.pendingSessions.has(adapter_session_id)) {
+      // Session not in pool (closed, never created, or lost to restart).
+      // Throw so Rust knows the binding must be rolled back — returning
+      // success here would create a false `is_hot=1` ghost binding.
+      throw new SidecarError(
+        `session not found: ${adapter_session_id}`,
+        -32001, // SESSION_NOT_FOUND
+      );
+    }
     this.pendingSessions.delete(adapter_session_id);
+    this.pendingSince.delete(adapter_session_id);
     this.lru.unshift(adapter_session_id); // MRU at front
     logger.debug('session_pool.activated', { adapter_session_id });
   }

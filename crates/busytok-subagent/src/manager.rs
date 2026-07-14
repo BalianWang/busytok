@@ -1290,6 +1290,12 @@ impl SubagentManager {
                 return Err(err);
             }
             // All DB writes succeeded — activate the session (move to LRU).
+            // If activate fails (RPC timeout, session not found, sidecar
+            // crash), roll back the DB binding to warm/cold and close the
+            // pending session. Without rollback, the DB would have `is_hot=1`
+            // while the sidecar session stays pending (not in LRU, not
+            // evictable) — permanently occupying a capacity slot and blocking
+            // concurrent delegates from other subagents.
             if let Err(e) = self
                 .executor
                 .activate_session(sid, &provider_id_for_session)
@@ -1299,9 +1305,57 @@ impl SubagentManager {
                     event_code = "subagent.session.activate_failed",
                     adapter_session_id = %sid,
                     error = %e,
-                    "session.activate RPC failed — session stays pending; \
-                     will be activated on next reuse or cleaned up by sidecar restart"
+                    "session.activate RPC failed — rolling back DB binding \
+                     to warm/cold and closing pending session"
                 );
+                // 1. Roll back the DB binding: flip is_hot=0, status='closed',
+                //    and compute warm/cold from memory state (§3.3 invariant).
+                //    The task already completed — the user got their result.
+                //    Rolling back to warm means future delegates for this
+                //    subagent will cold-start a new session. This is graceful
+                //    degradation, not a failure.
+                let rollback_result: Result<()> = {
+                    let db = self.db.lock().expect("subagent db lock poisoned");
+                    let mut binding = db
+                        .subagent_hot_binding(&subagent.id, &self.adapter)
+                        .map_err(SubagentError::Store)?
+                        .ok_or_else(|| {
+                            SubagentError::Store(anyhow::anyhow!(
+                                "hot binding not found for rollback after activate failure: {}",
+                                subagent.id
+                            ))
+                        })?;
+                    let now_ms = busytok_domain::now_ms();
+                    binding.is_hot = 0;
+                    binding.status = "closed".to_string();
+                    binding.closed_at_ms = Some(now_ms);
+                    db.subagent_commit_eviction(&binding, &subagent.id, None)
+                        .map_err(SubagentError::Store)?;
+                    Ok(())
+                };
+                if let Err(rollback_err) = rollback_result {
+                    error!(
+                        event_code = "subagent.session.activate_rollback_failed",
+                        adapter_session_id = %sid,
+                        error = %rollback_err,
+                        "DB binding rollback failed after activate failure — \
+                         is_hot=1 binding may linger with no active sidecar session"
+                    );
+                }
+                // 2. Close the pending session in the sidecar (best-effort).
+                if let Err(close_err) = self
+                    .executor
+                    .close_session(sid, &provider_id_for_session)
+                    .await
+                {
+                    warn!(
+                        event_code = "subagent.session.close_after_activate_failure",
+                        adapter_session_id = %sid,
+                        error = %close_err,
+                        "session.close RPC failed after activate failure — \
+                         pending session may linger until TTL or sidecar restart"
+                    );
+                }
             }
         } else if let Some(err) = persist_err.take() {
             // Warm/cold path error (no pending session to close).

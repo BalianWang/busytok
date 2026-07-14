@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SessionPool } from '../src/session_pool.js';
 import { SidecarError } from '../src/errors.js';
 import { PiSdkSession, type SdkSession, type SessionFactory } from '../src/pi_session.js';
@@ -260,5 +260,95 @@ describe('SessionPool', () => {
     pool.beginTurn('sess-1');
     pool.close('sess-1');
     expect(() => pool.endTurn('sess-1')).not.toThrow();
+  });
+
+  it('activate throws SESSION_NOT_FOUND for unknown session', async () => {
+    // activate on a session that doesn't exist (closed, never created, or
+    // lost to sidecar restart) must throw SESSION_NOT_FOUND — returning
+    // success would create a false is_hot=1 ghost binding in the DB.
+    const pool = new SessionPool(3);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+
+    // Unknown session id — should throw, not return void.
+    expect(() => pool.activate('nonexistent-session')).toThrow(SidecarError);
+    try {
+      pool.activate('nonexistent-session');
+    } catch (e) {
+      expect((e as SidecarError).code).toBe(-32001); // SESSION_NOT_FOUND
+    }
+  });
+
+  it('activate is idempotent for already-active session', async () => {
+    // Activating a session that's already in the LRU (already active)
+    // must be a no-op (not throw).
+    const pool = new SessionPool(3);
+    const { session } = await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate(session.adapter_session_id);
+    // Second activate — should not throw.
+    expect(() => pool.activate(session.adapter_session_id)).not.toThrow();
+  });
+
+  it('activate on closed session throws SESSION_NOT_FOUND', async () => {
+    // After close, the session is no longer in the pool. activate should
+    // throw SESSION_NOT_FOUND so Rust knows to roll back the binding.
+    const pool = new SessionPool(3);
+    const { session } = await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate(session.adapter_session_id);
+    pool.close(session.adapter_session_id);
+    expect(() => pool.activate(session.adapter_session_id)).toThrow(SidecarError);
+    try {
+      pool.activate(session.adapter_session_id);
+    } catch (e) {
+      expect((e as SidecarError).code).toBe(-32001);
+    }
+  });
+
+  describe('pending TTL', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('evictExpiredPending closes pending sessions older than TTL', async () => {
+      // Safety net: if Rust crashes between turn_auto and activate/close,
+      // the orphaned pending session is closed after the TTL to free the
+      // capacity slot. Without this, the pending session would occupy a
+      // slot indefinitely (pending sessions are not in LRU, not evictable).
+      const pool = new SessionPool(1);
+      // Create a pending session (don't activate it).
+      await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+      expect(pool.size()).toBe(1);
+      expect(pool.isPending('sess-1')).toBe(true);
+
+      // Advance time past the TTL (60s).
+      vi.advanceTimersByTime(60_001);
+
+      // Trigger eviction by calling ensure() for a different subagent.
+      // evictExpiredPending runs at the top of ensure() and closes the
+      // expired pending session, freeing the slot for the new subagent.
+      const result = await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
+      expect(result.session.adapter_session_id).toBe('sess-2');
+      expect(result.reused).toBe(false);
+      expect(pool.size()).toBe(1);
+      expect(pool.isPending('sess-2')).toBe(true);
+    });
+
+    it('pending sessions under TTL are not evicted', async () => {
+      const pool = new SessionPool(1);
+      await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+
+      // Advance time but stay under the TTL.
+      vi.advanceTimersByTime(59_999);
+
+      // ensure() for a different subagent should still see the pool as
+      // full (pending session not expired yet).
+      await expect(pool.ensure('sub-b', OPTS, fakeFactory('sess-2')))
+        .rejects.toThrow();
+      // The pending session is still there.
+      expect(pool.isPending('sess-1')).toBe(true);
+    });
   });
 });

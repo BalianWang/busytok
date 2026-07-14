@@ -140,9 +140,10 @@ impl SidecarTaskExecutor {
 
     /// Activate a session — move it from `pending` to `active` (LRU-eligible)
     /// in the sidecar's hot pool. Called by the manager AFTER the DB hot
-    /// binding is committed. Best-effort: failure is logged but does NOT
-    /// fail the task (the binding is already committed; the session will be
-    /// activated on next reuse or cleaned up by eviction).
+    /// binding is committed. On failure (RPC timeout, SESSION_NOT_FOUND,
+    /// sidecar crash), the manager rolls back the DB binding to warm/cold
+    /// and closes the pending session — the task already completed, so the
+    /// user's result is preserved; future delegates will cold-start.
     async fn activate_session_rpc(
         &self,
         adapter_session_id: &str,

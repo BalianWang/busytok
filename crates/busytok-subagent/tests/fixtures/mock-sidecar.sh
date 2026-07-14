@@ -117,6 +117,10 @@ AUTH_FAIL="${BUSYTOK_MOCK_AUTH_FAIL:-0}"
 REFILL_AFTER_CLOSE="${BUSYTOK_MOCK_REFILL_AFTER_CLOSE:-0}"
 REFILL_AFTER_CLOSE_LIMIT="${BUSYTOK_MOCK_REFILL_AFTER_CLOSE_LIMIT:--1}"
 HOT_LIMIT_RESPONSES="${BUSYTOK_MOCK_HOT_LIMIT_RESPONSES:--1}"
+# When 1, session.activate returns a JSON-RPC error (-32603) to simulate
+# a transient failure. The Rust manager should roll back the DB binding
+# and close the pending session.
+ACTIVATE_FAILS="${BUSYTOK_MOCK_ACTIVATE_FAILS:-0}"
 COUNT=0
 # Number of successful session.close responses sent. Used by
 # BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE to fail the retry turn_auto issued
@@ -310,17 +314,47 @@ while IFS= read -r line; do
       ;;
     session.activate)
       # Two-phase lifecycle: move a session from pending (SESS_PENDING) to
-      # active (SESS_ORDER). Idempotent — if already active or not in pool,
-      # returns ok=true (matches the TypeScript SessionPool.activate).
-      for i in "${!SESS_PENDING[@]}"; do
-        if [[ "${SESS_PENDING[$i]}" == "$SESS_ID_PARAM" ]]; then
-          unset 'SESS_PENDING[i]'
-          SESS_PENDING=(${SESS_PENDING[@]+"${SESS_PENDING[@]}"})
-          SESS_ORDER+=("$SESS_ID_PARAM")
-          break
+      # active (SESS_ORDER). Idempotent for already-active sessions (no-op).
+      # For unknown sessions (not in pool), returns SESSION_NOT_FOUND so
+      # Rust can roll back the DB binding — a successful activate on a
+      # missing session would create a false is_hot=1 ghost binding.
+      if [[ "$ACTIVATE_FAILS" == "1" ]]; then
+        # Simulate a transient activate failure (e.g., RPC timeout, internal
+        # error). Rust should roll back the DB binding and close the pending
+        # session.
+        printf '{"jsonrpc":"2.0","error":{"code":-32603,"message":"activate failed: simulated error"},"id":%s}\n' "$ID"
+      else
+        FOUND=0
+      # Check if already active (idempotent no-op).
+      if [[ ${#SESS_ORDER[@]} -gt 0 ]]; then
+        for s in "${SESS_ORDER[@]}"; do
+          if [[ "$s" == "$SESS_ID_PARAM" ]]; then
+            FOUND=1
+            break
+          fi
+        done
+      fi
+      if [[ "$FOUND" -eq 0 ]]; then
+        # Check pending sessions.
+        if [[ ${#SESS_PENDING[@]} -gt 0 ]]; then
+          for i in "${!SESS_PENDING[@]}"; do
+            if [[ "${SESS_PENDING[$i]}" == "$SESS_ID_PARAM" ]]; then
+              unset 'SESS_PENDING[i]'
+              SESS_PENDING=(${SESS_PENDING[@]+"${SESS_PENDING[@]}"})
+              SESS_ORDER+=("$SESS_ID_PARAM")
+              FOUND=1
+              break
+            fi
+          done
         fi
-      done
-      printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
+      fi
+      if [[ "$FOUND" -eq 0 ]]; then
+        # Session not in pool — return error so Rust rolls back the binding.
+        printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"session not found: %s"},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
+      else
+        printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
+      fi
+      fi
       ;;
     session.prepare_hibernate)
       if [[ "$PREPARE_HIBERNATE_FAILS" == "1" ]]; then

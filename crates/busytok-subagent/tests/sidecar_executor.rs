@@ -2193,3 +2193,170 @@ async fn delegate_closes_session_on_commit_failure() {
 
     h.supervisor.shutdown().await.unwrap();
 }
+
+/// When `session.activate` RPC fails, the manager must:
+/// 1. Roll back the DB binding (flip `is_hot=0`, status → warm/cold).
+/// 2. Close the orphaned pending session in the sidecar.
+/// 3. The task itself still completes (the turn already succeeded — the
+///    user got their result; only the hot binding is lost).
+///
+/// After rollback, a DIFFERENT subagent's delegate must succeed — proving
+/// the capacity slot was freed (no stuck pending session).
+#[tokio::test]
+async fn delegate_rolls_back_binding_when_activate_fails() {
+    let mut env = HashMap::new();
+    env.insert("BUSYTOK_MOCK_ACTIVATE_FAILS".to_string(), "1".to_string());
+    let h = make_harness_with_env(env);
+
+    // Delegate — turn_auto succeeds, DB binding is committed, but
+    // session.activate fails (simulated by BUSYTOK_MOCK_ACTIVATE_FAILS=1).
+    // The manager must roll back the binding and close the pending session.
+    let r = h
+        .manager
+        .delegate(req("sub-activate-fail", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r.status, TaskStatus::Running);
+    let status = await_task_done(&h.manager, &r.task_id).await;
+    // The task still completes — the turn succeeded; only the hot binding
+    // was rolled back.
+    assert_eq!(
+        status, "completed",
+        "task must complete even when activate fails — the turn already succeeded"
+    );
+
+    // The task status is set to "completed" BEFORE the activate call (the
+    // turn already succeeded — the user got their result). The activate/
+    // rollback runs in the same background task but AFTER the status write.
+    // Poll the sidecar's total_closes to wait for the activate/rollback to
+    // complete: when total_closes >= 1, the pending session was closed after
+    // the activate failure.
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = handle.health().await.unwrap();
+        let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+        if total_closes >= 1 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "activate/rollback did not complete within 5s — \
+                 total_closes still 0"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Verify: the binding was rolled back — is_hot=0, status='closed'
+    // (NOT is_hot=1/status='hot' which would indicate a stuck binding).
+    {
+        let db_guard = h.db.lock().unwrap();
+        let binding = db_guard
+            .subagent_hot_binding(&r.subagent_id, "pi")
+            .unwrap();
+        if let Some(b) = binding {
+            assert_eq!(
+                b.is_hot, 0,
+                "binding must be rolled back to is_hot=0 after activate failure"
+            );
+            assert_eq!(
+                b.status, "closed",
+                "binding status must be 'closed' after rollback"
+            );
+        }
+        // The logical subagent status must NOT be 'hot'.
+        let sub = db_guard.subagent_get_logical(&r.subagent_id).unwrap();
+        if let Some(sub) = sub {
+            assert_ne!(
+                sub.status, "hot",
+                "subagent must NOT be 'hot' after activate failure rollback"
+            );
+        }
+    }
+
+    // Critical: a different subagent's delegate must succeed. With
+    // max_hot=3 (default), the pool has capacity — but this proves no
+    // capacity is permanently occupied by the activate failure.
+    let r2 = h
+        .manager
+        .delegate(req("sub-after-rollback", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "second delegate must complete — activate failure did not permanently block capacity"
+    );
+
+    // Wait for the second delegate's activate/rollback to complete before
+    // shutting down (same timing issue as the first delegate).
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = handle.health().await.unwrap();
+        let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+        if total_closes >= 2 {
+            break;
+        }
+        if std::time::Instant::now() > deadline2 {
+            panic!(
+                "second activate/rollback did not complete within 5s — \
+                 total_closes = {total_closes}, expected >= 2"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// When the sidecar restarts (losing all sessions), a subsequent delegate
+/// for the same subagent must recover: the stale hot binding is replaced
+/// with a fresh session, and activate succeeds on the new session.
+#[tokio::test]
+async fn delegate_recovers_after_sidecar_restart() {
+    let h = make_harness();
+
+    // First delegate — succeeds normally.
+    let r1 = h
+        .manager
+        .delegate(req("sub-restart", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    let status1 = await_task_done(&h.manager, &r1.task_id).await;
+    assert_eq!(status1, "completed");
+
+    // Restart the sidecar — all sessions are lost.
+    h.supervisor.shutdown().await.unwrap();
+
+    // Second delegate for the SAME subagent — the manager finds the
+    // existing hot binding, tries to reuse the session. The sidecar
+    // has no record of the old session, so it creates a new one. The
+    // new session is activated successfully.
+    let r2 = h
+        .manager
+        .delegate(req("sub-restart", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "delegate after sidecar restart must complete"
+    );
+
+    // Verify: the binding is hot (the new session was activated).
+    {
+        let db_guard = h.db.lock().unwrap();
+        let binding = db_guard
+            .subagent_hot_binding(&r2.subagent_id, "pi")
+            .unwrap();
+        assert!(binding.is_some(), "binding must exist");
+        let b = binding.unwrap();
+        assert_eq!(b.is_hot, 1, "binding must be hot after successful re-delegate");
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
