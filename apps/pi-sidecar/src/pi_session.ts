@@ -54,6 +54,7 @@ export interface SessionStatsLike {
 }
 
 export interface SendTurnOptions {
+  task_id?: string;
   model?: string;
   provider_id?: string;
   tools?: string[];
@@ -192,11 +193,19 @@ export class PiSdkSession {
   readonly resolvedModel: string;
   private closed = false;
   /**
-   * Set by `abort()` (called via `session.cancel` RPC) so `sendTurn()` can
-   * distinguish a user-initiated cancel from a timeout. Without this, the
-   * AbortError from `sdk.abort()` is classified as TASK_TIMEOUT (-32003).
+   * Monotonic turn generation cancelled by `abort()`.
+   *
+   * A boolean is insufficient here: a session can be reused after a cancel,
+   * and the old turn may settle after the next turn has started. Comparing the
+   * generation captured by `sendTurn()` prevents either stale cancellation
+   * from poisoning a new turn or a late SDK success from being accepted as a
+   * completed turn after the caller already cancelled it.
    */
-  private cancelled = false;
+  private turnGeneration = 0;
+  private cancelledTurnGeneration = 0;
+  private activeTaskId: string | undefined;
+  private turnInFlight = false;
+  private cancellationPending = false;
 
   constructor(
     sdk: SdkSession,
@@ -220,9 +229,10 @@ export class PiSdkSession {
     if (this.closed) {
       throw new SidecarError('session is closed', -32001);
     }
-    // Reset the cancel flag for this turn — a prior `abort()` must not
-    // poison a reused session (the session stays in the pool after cancel).
-    this.cancelled = false;
+    const turnGeneration = ++this.turnGeneration;
+    this.activeTaskId = options.task_id;
+    this.turnInFlight = true;
+    this.cancellationPending = false;
     this.last_used_at_ms = Date.now();
 
     const timeoutMs = options.timeout_ms;
@@ -240,58 +250,88 @@ export class PiSdkSession {
     });
 
     try {
-      await Promise.race([this.sdk.prompt(promptText), timeoutPromise]);
-    } catch (err) {
-      // Distinguish user-initiated cancel (via `session.cancel` RPC) from
-      // timeout. Both call `sdk.abort()`, which causes `prompt()` to reject
-      // with an AbortError. The `cancelled` flag is set by `abort()` BEFORE
-      // the SDK resolves the rejection, so it's reliably `true` here.
-      if (this.cancelled) {
+      try {
+        await Promise.race([this.sdk.prompt(promptText), timeoutPromise]);
+      } catch (err) {
+        // Distinguish user-initiated cancel (via `session.cancel`) from
+        // timeout. Both call `sdk.abort()`, but some SDK implementations may
+        // resolve prompt() instead of rejecting it after abort. The generation
+        // check remains authoritative in either case.
+        if (this.cancelledTurnGeneration === turnGeneration) {
+          throw new SidecarError('turn cancelled by user', ERROR_CODE_TURN_CANCELLED);
+        }
+        throw classifyError(err, timedOut);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+
+      // Do not accept a late successful SDK result after the caller cancelled
+      // this turn. Without this post-await check, `realTurnAuto` marks the turn
+      // successful and its finally block skips new-session ghost cleanup,
+      // leaving a pending session occupying a hot-pool slot until TTL expiry.
+      if (this.cancelledTurnGeneration === turnGeneration) {
         throw new SidecarError('turn cancelled by user', ERROR_CODE_TURN_CANCELLED);
       }
-      throw classifyError(err, timedOut);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
 
-    const text = this.sdk.getLastAssistantText() ?? '';
-    const stats = this.sdk.getSessionStats();
-    // Source model/provider from the SDK result (session.model — the actual
-    // model the SDK used) with the requested option as fallback only.
-    const sdkModel = this.sdk.model;
-    return {
-      status: 'completed',
-      task_summary: text,
-      usage: {
-        model: sdkModel?.id ?? options.model ?? 'unknown',
-        provider: sdkModel?.provider ?? this.resolvedProvider ?? options.provider_id ?? 'pi',
-        input_tokens: stats.tokens.input,
-        output_tokens: stats.tokens.output,
-        cache_read_tokens: stats.tokens.cacheRead,
-        cache_write_tokens: stats.tokens.cacheWrite,
-        cost_usd: stats.cost,
-      },
-    };
+      const text = this.sdk.getLastAssistantText() ?? '';
+      const stats = this.sdk.getSessionStats();
+      // Source model/provider from the SDK result (session.model — the actual
+      // model the SDK used) with the requested option as fallback only.
+      const sdkModel = this.sdk.model;
+      return {
+        status: 'completed',
+        task_summary: text,
+        usage: {
+          model: sdkModel?.id ?? options.model ?? 'unknown',
+          provider: sdkModel?.provider ?? this.resolvedProvider ?? options.provider_id ?? 'pi',
+          input_tokens: stats.tokens.input,
+          output_tokens: stats.tokens.output,
+          cache_read_tokens: stats.tokens.cacheRead,
+          cache_write_tokens: stats.tokens.cacheWrite,
+          cost_usd: stats.cost,
+        },
+      };
+    } finally {
+      if (this.turnGeneration === turnGeneration) {
+        this.activeTaskId = undefined;
+        this.turnInFlight = false;
+        this.cancellationPending = false;
+      }
+    }
   }
 
   /**
-   * Abort an in-flight `sendTurn()` call. Sets the `cancelled` flag so
-   * `sendTurn()` can classify the rejection as TURN_CANCELLED (not
-   * TASK_TIMEOUT), then calls `sdk.abort()` which aborts the underlying
-   * HTTP request to the LLM provider — stopping token generation.
+   * Abort an in-flight `sendTurn()` call. Records the active turn generation
+   * so `sendTurn()` can classify both rejected and late-success SDK outcomes
+   * as TURN_CANCELLED (not TASK_TIMEOUT), then calls `sdk.abort()` which
+   * aborts the underlying HTTP request to the LLM provider — stopping token
+   * generation.
    *
    * Called by the `session.cancel` RPC handler. Best-effort: if `abort()`
    * throws, the error is swallowed (the cancel RPC still succeeds — the
    * caller already flipped the DB status to `cancelled`).
    */
-  async abort(): Promise<void> {
-    this.cancelled = true;
+  async abort(expectedTaskId?: string): Promise<boolean> {
+    if (expectedTaskId !== undefined && this.activeTaskId !== expectedTaskId) {
+      return false;
+    }
+    if (!this.turnInFlight) {
+      return false;
+    }
+    this.cancelledTurnGeneration = this.turnGeneration;
+    this.cancellationPending = true;
     try {
       await this.sdk.abort();
     } catch {
       // Best-effort — the SDK may have already settled or the session
       // may be in a bad state. The cancel RPC still returns success.
     }
+    return true;
+  }
+
+  /** Whether a cancelled turn is still awaiting SDK settlement. */
+  isCancellationPending(): boolean {
+    return this.cancellationPending;
   }
 
   /** Dispose the underlying SDK session. Safe to call once. */

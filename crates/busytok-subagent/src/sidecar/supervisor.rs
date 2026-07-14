@@ -1261,11 +1261,15 @@ impl SidecarHandle {
     pub async fn cancel_session(
         &self,
         logical_subagent_id: &str,
+        task_id: Option<&str>,
     ) -> Result<serde_json::Value, SidecarError> {
         self.supervisor
             .call_rpc(
                 "session.cancel",
-                serde_json::json!({ "logical_subagent_id": logical_subagent_id }),
+                serde_json::json!({
+                    "logical_subagent_id": logical_subagent_id,
+                    "task_id": task_id,
+                }),
             )
             .await
     }

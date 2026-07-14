@@ -122,7 +122,8 @@ describe('turn_auto handler (mock path)', () => {
 describe('prepare_hibernate handler', () => {
   it('compacts a single session by adapter_session_id', async () => {
     const pool = new SessionPool(3);
-    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    const { session } = await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate(session.adapter_session_id);
     const handler = prepareHibernateHandlerWithPool(pool);
     const result = await handler({ adapter_session_id: 'sess-1' }, noopCtx) as {
       memory_delta: { hot_summary?: string } | null;
@@ -143,6 +144,19 @@ describe('prepare_hibernate handler', () => {
     };
     expect(result.stats.sessions_compacted).toBe(2);
     expect(result.sessions.map((s) => s.adapter_session_id).sort()).toEqual(['sess-1', 'sess-2']);
+  });
+
+  it('rejects a busy session instead of preparing it for eviction', async () => {
+    const pool = new SessionPool(1);
+    const { session } = await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate(session.adapter_session_id);
+    pool.beginTurn(session.adapter_session_id);
+    const handler = prepareHibernateHandlerWithPool(pool);
+
+    await expect(handler({ adapter_session_id: 'sess-1' }, noopCtx)).rejects.toMatchObject({
+      code: -32002,
+      data: { candidate: null, all_busy: true },
+    });
   });
 
   it('throws -32602 when neither all nor adapter_session_id provided', async () => {
@@ -202,22 +216,37 @@ describe('cancel handler', () => {
   it('aborts an existing session and returns cancelled: true', async () => {
     const pool = new SessionPool(3);
     let abortCalled = false;
+    let rejectPrompt: ((reason?: unknown) => void) | undefined;
     const spySdk: SdkSession = {
       sessionId: 'sess-cancel',
-      prompt: async () => {},
+      prompt: () =>
+        new Promise<void>((_, reject) => {
+          rejectPrompt = reject;
+        }),
       getLastAssistantText: () => '',
       getSessionStats: () => ({
         tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         cost: 0,
       }),
-      abort: async () => { abortCalled = true; },
+      abort: async () => {
+        abortCalled = true;
+        rejectPrompt?.(new Error('aborted'));
+      },
       dispose: () => {},
     };
     const factory: SessionFactory = async (subagent: string) =>
       new PiSdkSession(spySdk, subagent, 'sess-cancel', 'test-provider', 'test-model');
     await pool.ensure('sub-cancel', OPTS, factory);
+    const session = pool.get('sess-cancel');
+    expect(session).toBeDefined();
+    const turn = session!.sendTurn('cancel me', { task_id: 'task-cancel' }).catch(() => {});
+    pool.beginTurn('sess-cancel');
     const handler = cancelHandlerWithPool(pool);
-    const result = await handler({ logical_subagent_id: 'sub-cancel' }, noopCtx) as { cancelled: boolean };
+    const result = await handler(
+      { logical_subagent_id: 'sub-cancel', task_id: 'task-cancel' },
+      noopCtx,
+    ) as { cancelled: boolean };
+    await turn;
     expect(result.cancelled).toBe(true);
     expect(abortCalled).toBe(true);
     // Session stays in the pool (not closed) — it can be reused.

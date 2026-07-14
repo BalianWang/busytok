@@ -46,18 +46,16 @@ describe('turn_auto with pool (mock path)', () => {
     // Two-phase lifecycle: activate the session so it becomes an evictable
     // LRU candidate (simulates Rust calling session.activate after DB commit).
     pool.activate(result1.adapter_session_id);
-    await expect(
-      handler(
-        { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
-      ),
-    ).rejects.toThrow(SidecarError);
+    let error: unknown;
     try {
       await handler(
         { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
       );
     } catch (e) {
-      expect((e as SidecarError).code).toBe(-32002);
-      expect((e as SidecarError).data?.candidate).toBeTruthy();
+      error = e;
     }
+    expect(error).toBeInstanceOf(SidecarError);
+    expect((error as SidecarError).code).toBe(-32002);
+    expect((error as SidecarError).data?.candidate).toBeTruthy();
   });
 });

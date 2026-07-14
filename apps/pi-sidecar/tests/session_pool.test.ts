@@ -52,9 +52,9 @@ describe('SessionPool', () => {
     const pool = new SessionPool(2);
     pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id); // LRU after next
     pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id); // MRU
-    await expect(pool.ensure('sub-c', OPTS, fakeFactory('sess-3'))).rejects.toThrow(SidecarError);
     try {
       await pool.ensure('sub-c', OPTS, fakeFactory('sess-3'));
+      throw new Error('should have thrown');
     } catch (e) {
       expect((e as SidecarError).code).toBe(-32002);
       expect((e as SidecarError).data).toEqual({ candidate: 'sess-1' });
@@ -78,9 +78,9 @@ describe('SessionPool', () => {
     pool.activate((await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'))).session.adapter_session_id); // MRU
     // Reuse sess-1 → it becomes MRU, sess-2 becomes LRU
     await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
-    await expect(pool.ensure('sub-c', OPTS, fakeFactory('sess-3'))).rejects.toThrow(SidecarError);
     try {
       await pool.ensure('sub-c', OPTS, fakeFactory('sess-3'));
+      throw new Error('should have thrown');
     } catch (e) {
       expect((e as SidecarError).data).toEqual({ candidate: 'sess-2' });
     }
@@ -178,6 +178,22 @@ describe('SessionPool', () => {
     pool.beginTurn('sess-1');
     // sess-1 is busy → getLruCandidate skips it, returns sess-2 instead.
     expect(pool.getLruCandidate()).toBe('sess-2');
+  });
+
+  it('blocks reuse after an LRU candidate is reserved for eviction', async () => {
+    const pool = new SessionPool(1);
+    pool.activate((await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'))).session.adapter_session_id);
+
+    expect(pool.getLruCandidate()).toBe('sess-1');
+
+    // The eviction candidate has been handed to Rust. A concurrent turn for
+    // the same logical subagent must not reuse the session while the
+    // prepare_hibernate → DB flip → close sequence is in flight.
+    await expect(pool.ensure('sub-a', OPTS, fakeFactory('sess-2')))
+      .rejects.toMatchObject({
+        code: -32002,
+        data: { candidate: null, all_busy: true },
+      });
   });
 
   it('getLruCandidate returns undefined when all sessions are in-use', async () => {
@@ -349,6 +365,47 @@ describe('SessionPool', () => {
         .rejects.toThrow();
       // The pending session is still there.
       expect(pool.isPending('sess-1')).toBe(true);
+    });
+
+    it('does not expire a busy pending session and starts orphan TTL after endTurn', async () => {
+      const pool = new SessionPool(1);
+      await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+      pool.beginTurn('sess-1');
+
+      // A long-running turn may legitimately exceed the pending TTL. The
+      // in-flight session must remain available for its current turn and
+      // cannot be reclaimed as an orphan.
+      vi.advanceTimersByTime(60_001);
+      await expect(pool.ensure('sub-b', OPTS, fakeFactory('sess-2')))
+        .rejects.toThrow();
+      expect(pool.get('sess-1')).toBeDefined();
+      expect(pool.isPending('sess-1')).toBe(true);
+
+      // Once the turn ends, the orphan grace period starts. It is measured
+      // from endTurn rather than from session creation so Rust has a full
+      // window to commit the binding and activate the session.
+      pool.endTurn('sess-1');
+      vi.advanceTimersByTime(59_999);
+      await expect(pool.ensure('sub-b', OPTS, fakeFactory('sess-2')))
+        .rejects.toThrow();
+      expect(pool.get('sess-1')).toBeDefined();
+
+      vi.advanceTimersByTime(2);
+      const result = await pool.ensure('sub-b', OPTS, fakeFactory('sess-2'));
+      expect(result.session.adapter_session_id).toBe('sess-2');
+      expect(pool.get('sess-1')).toBeUndefined();
+    });
+
+    it('cancels pending cleanup when activation wins the race', async () => {
+      const pool = new SessionPool(1);
+      const { session } = await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+
+      await pool.abortSession('sub-a');
+      pool.activate(session.adapter_session_id);
+      vi.advanceTimersByTime(5_001);
+
+      expect(pool.get(session.adapter_session_id)).toBeDefined();
+      expect(pool.isPending(session.adapter_session_id)).toBe(false);
     });
   });
 });

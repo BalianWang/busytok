@@ -182,6 +182,7 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
   let turnSucceeded = false;
   try {
     const result = await session.sendTurn(p.prompt, {
+      task_id: p.task_id,
       model: p.model,
       provider_id: p.provider_id,
       tools: p.tools,

@@ -46,9 +46,7 @@ use tracing::{debug, info, warn};
 use busytok_config::SubagentResourcePolicyConfig;
 
 use crate::pressure::{PressureGate, PressureResponder};
-use crate::sidecar::{
-    PiSidecarSupervisor, SharedDb, SidecarConfig, SidecarError, WorkerSnapshot,
-};
+use crate::sidecar::{PiSidecarSupervisor, SharedDb, SidecarConfig, SidecarError, WorkerSnapshot};
 
 /// Provider runtime entry — everything WorkerPool needs to spawn a worker.
 /// Replaces the old `ProviderLookup` + `CredentialReader` closures.

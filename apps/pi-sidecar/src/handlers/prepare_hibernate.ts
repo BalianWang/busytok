@@ -32,6 +32,13 @@ export function prepareHibernateHandlerWithPool(pool: SessionPool): RequestHandl
     if (!session) {
       throw new SidecarError(`session not found: ${p.adapter_session_id}`, -32001);
     }
+    if (!pool.reserveForEviction(p.adapter_session_id)) {
+      throw new SidecarError(
+        `session is busy or unavailable: ${p.adapter_session_id}`,
+        -32002,
+        { candidate: null, all_busy: true },
+      );
+    }
     const result: PrepareHibernateResult = {
       memory_delta: {
         hot_summary: `[hibernate] session ${p.adapter_session_id} compacted`,

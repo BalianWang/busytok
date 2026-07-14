@@ -10,11 +10,27 @@ import { logger } from './logger.js';
 /**
  * TTL for pending sessions (milliseconds). If a session stays pending longer
  * than this, it's considered orphaned (Rust likely crashed between turn_auto
- * and activate/close) and is closed to free the capacity slot. 60s is well
- * beyond the activate RPC timeout (task_timeout, typically 10-300s) and the
- * DB commit latency (milliseconds).
+ * and activate/close) and is closed to free the capacity slot. In-flight
+ * turns are excluded; cancellation has a shorter, explicit grace below.
  */
 const PENDING_TTL_MS = 60_000;
+
+/**
+ * Bounded cleanup grace after cancellation. Some SDKs acknowledge abort but
+ * never settle the prompt promise, so relying on turn_auto's finally block
+ * alone can leave a session permanently quarantined. The fallback closes both
+ * pending and activated sessions; no replacement turn is admitted while the
+ * cancellation is pending.
+ */
+const PENDING_CANCEL_GRACE_MS = 5_000;
+
+/**
+ * A candidate reservation normally lasts until Rust completes
+ * prepare_hibernate → DB flip → close. If Rust crashes or loses the RPC
+ * response, release it lazily on the next pool operation so one abandoned
+ * eviction cannot block the pool forever.
+ */
+const EVICTION_RESERVATION_TTL_MS = 120_000;
 
 /**
  * Sidecar-side hot session pool with LRU tracking (spec §5.2).
@@ -65,7 +81,9 @@ export class SessionPool {
   private readonly lru: string[] = [];                               // adapter_session_ids, MRU first (active only)
   private readonly busySessions = new Set<string>();                 // adapter_session_ids with in-flight turns
   private readonly pendingSessions = new Set<string>();              // adapter_session_ids not yet activated
-  private readonly pendingSince = new Map<string, number>();        // adapter_session_id → creation timestamp (ms)
+  private readonly pendingSince = new Map<string, number>();        // adapter_session_id → orphan-watch timestamp (ms)
+  private readonly pendingCancelCleanup = new Map<string, ReturnType<typeof setTimeout>>(); // session → cancel fallback
+  private readonly evictingSessions = new Map<string, number>();     // adapter_session_id → reservation timestamp
 
   constructor(maxHot: number, factory: SessionFactory = defaultSessionFactory) {
     if (maxHot < 1) throw new Error(`maxHot must be >= 1, got ${maxHot}`);
@@ -93,6 +111,7 @@ export class SessionPool {
     opts: CreateSessionOpts,
     createOverride?: SessionFactory,
   ): Promise<{ session: PiSdkSession; reused: boolean }> {
+    this.releaseExpiredEvictions();
     // 0. Safety net: close expired pending sessions. If Rust crashed
     //    between turn_auto and activate/close, the pending session would
     //    linger forever, occupying a capacity slot. A pending session
@@ -105,6 +124,13 @@ export class SessionPool {
     if (existing !== undefined) {
       const session = this.sessions.get(existing);
       if (session) {
+        if (this.evictingSessions.has(existing) || session.isCancellationPending()) {
+          throw new SidecarError(
+            'hot session eviction in progress — all sessions are temporarily unavailable',
+            -32002,
+            { candidate: null, all_busy: true },
+          );
+        }
         // P1-1: forced cold miss on model mismatch. A task-level
         // `model_override` changes the effective model; the old session
         // (bound to a different model) MUST be evicted and a fresh one
@@ -171,20 +197,33 @@ export class SessionPool {
    * Abort an in-flight turn for `logical_subagent_id`. Looks up the hot
    * session by subagent id and calls `session.abort()`, which aborts the
    * underlying SDK HTTP request to the LLM provider — stopping token
-   * generation. The session stays in the pool (not closed) and can be
-   * reused for subsequent turns.
+   * generation. Activated sessions stay in the pool and can be reused for
+   * subsequent turns. A newly-created pending session has no DB binding yet,
+   * so a bounded fallback closes it if the SDK never settles the turn.
    *
    * Called by the `session.cancel` RPC handler. Returns `true` if a hot
    * session was found and abort was called, `false` if no hot session
    * exists for the subagent (the turn may have already completed or the
    * subagent was never seen by this sidecar).
    */
-  async abortSession(logical_subagent_id: string): Promise<boolean> {
+  async abortSession(logical_subagent_id: string, task_id?: string): Promise<boolean> {
     const adapter_session_id = this.subagentMap.get(logical_subagent_id);
     if (adapter_session_id === undefined) return false;
     const session = this.sessions.get(adapter_session_id);
     if (!session) return false;
-    await session.abort();
+    // `PiSdkSession.abort()` marks the turn as cancellation-pending before
+    // its first await. Schedule the fallback immediately so a hung SDK
+    // abort() cannot leave the session quarantined forever.
+    const abortPromise = session.abort(task_id);
+    if (!session.isCancellationPending()) {
+      return false;
+    }
+    this.schedulePendingCancelCleanup(adapter_session_id, logical_subagent_id);
+    const aborted = await abortPromise;
+    if (!aborted) {
+      this.clearPendingCancelCleanup(adapter_session_id);
+      return false;
+    }
     return true;
   }
 
@@ -197,6 +236,8 @@ export class SessionPool {
     const idx = this.lru.indexOf(adapter_session_id);
     if (idx >= 0) this.lru.splice(idx, 1);
     this.busySessions.delete(adapter_session_id);
+    this.evictingSessions.delete(adapter_session_id);
+    this.clearPendingCancelCleanup(adapter_session_id);
     this.pendingSessions.delete(adapter_session_id);
     this.pendingSince.delete(adapter_session_id);
     // Dispose the underlying SDK session (fire-and-forget; dispose() is sync).
@@ -207,13 +248,19 @@ export class SessionPool {
    * Close pending sessions that have exceeded the TTL. This is a safety
    * net for the case where Rust crashes between `turn_auto` success and
    * `session.activate` / `session.close` — without this, the orphaned
-   * pending session would occupy a capacity slot indefinitely. Called at
-   * the top of `ensure()` before the capacity check.
+   * pending session would occupy a capacity slot indefinitely. In-flight
+   * turns are never considered orphaned; their grace period starts when
+   * `endTurn()` clears the busy marker. Called at the top of `ensure()`
+   * before the capacity check.
    */
   evictExpiredPending(): void {
     if (this.pendingSessions.size === 0) return;
     const now = Date.now();
     for (const id of this.pendingSessions) {
+      // A pending session can legitimately live longer than the TTL while
+      // its turn is still executing. Only Rust's post-turn activate/close
+      // handshake can make it an orphan, so never reclaim a busy session.
+      if (this.busySessions.has(id)) continue;
       const since = this.pendingSince.get(id);
       if (since !== undefined && now - since > PENDING_TTL_MS) {
         logger.warn('session_pool.pending_expired', {
@@ -256,6 +303,7 @@ export class SessionPool {
       );
     }
     this.pendingSessions.delete(adapter_session_id);
+    this.clearPendingCancelCleanup(adapter_session_id);
     this.pendingSince.delete(adapter_session_id);
     this.lru.unshift(adapter_session_id); // MRU at front
     logger.debug('session_pool.activated', { adapter_session_id });
@@ -284,6 +332,71 @@ export class SessionPool {
    */
   endTurn(adapter_session_id: string): void {
     this.busySessions.delete(adapter_session_id);
+    // Start the orphan grace period only after the in-flight turn finishes.
+    // This gives Rust a full TTL window to persist the binding and call
+    // `session.activate`, regardless of how long the model call took.
+    if (this.pendingSessions.has(adapter_session_id)) {
+      this.pendingSince.set(adapter_session_id, Date.now());
+    }
+  }
+
+  /**
+   * Reserve an idle session for the prepare_hibernate → close protocol.
+   * `getLruCandidate()` calls this before returning a candidate from a
+   * HOT_SESSION_LIMIT response; the prepare_hibernate RPC also calls it for
+   * proactive pressure eviction, which selects candidates from the DB.
+   *
+   * Returns false when the session is missing or currently running a turn.
+   * Re-claiming an existing reservation is idempotent so concurrent Rust
+   * evictors can safely race and let the DB CAS distinguish the winner.
+   */
+  reserveForEviction(adapter_session_id: string): boolean {
+    this.releaseExpiredEvictions();
+    if (this.evictingSessions.has(adapter_session_id)) return true;
+    if (!this.sessions.has(adapter_session_id)) return false;
+    if (this.pendingSessions.has(adapter_session_id)) return false;
+    if (this.busySessions.has(adapter_session_id)) return false;
+    this.evictingSessions.set(adapter_session_id, Date.now());
+    return true;
+  }
+
+  /** Release an eviction reservation when the RPC cannot proceed. */
+  releaseEviction(adapter_session_id: string): void {
+    this.evictingSessions.delete(adapter_session_id);
+  }
+
+  /**
+   * Schedule a one-shot fallback for a cancelled session. The normal path is
+   * still turn_auto's finally block; this only handles SDKs whose prompt
+   * promise never settles after abort. A session remains quarantined until it
+   * settles; if it does not, this closes it so a replacement turn can start.
+   */
+  private schedulePendingCancelCleanup(
+    adapter_session_id: string,
+    logical_subagent_id: string,
+  ): void {
+    if (this.pendingCancelCleanup.has(adapter_session_id)) return;
+    const timer = setTimeout(() => {
+      this.pendingCancelCleanup.delete(adapter_session_id);
+      const session = this.sessions.get(adapter_session_id);
+      if (!session || !session.isCancellationPending()) return;
+      logger.warn('session_pool.pending_cancel_cleanup', {
+        adapter_session_id,
+        logical_subagent_id,
+        grace_ms: PENDING_CANCEL_GRACE_MS,
+      });
+      this.close(adapter_session_id);
+    }, PENDING_CANCEL_GRACE_MS);
+    this.pendingCancelCleanup.set(adapter_session_id, timer);
+  }
+
+  /** Cancel a scheduled fallback when the session reaches any terminal state. */
+  private clearPendingCancelCleanup(adapter_session_id: string): void {
+    const timer = this.pendingCancelCleanup.get(adapter_session_id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.pendingCancelCleanup.delete(adapter_session_id);
+    }
   }
 
   /** Current number of hot sessions. */
@@ -319,11 +432,29 @@ export class SessionPool {
    * `is_hot=0` (already flipped by the first) and returns `AlreadyEvicted`.
    */
   getLruCandidate(): string | undefined {
+    this.releaseExpiredEvictions();
     for (let i = this.lru.length - 1; i >= 0; i--) {
       const id = this.lru[i]!;
       if (this.busySessions.has(id)) continue;
+      if (this.evictingSessions.has(id)) continue;
+      this.evictingSessions.set(id, Date.now());
       return id;
     }
     return undefined;
+  }
+
+  private releaseExpiredEvictions(): void {
+    if (this.evictingSessions.size === 0) return;
+    const cutoff = Date.now() - EVICTION_RESERVATION_TTL_MS;
+    for (const [id, reservedAt] of this.evictingSessions) {
+      if (reservedAt <= cutoff) {
+        logger.warn('session_pool.eviction_reservation_expired', {
+          adapter_session_id: id,
+          age_ms: Date.now() - reservedAt,
+          ttl_ms: EVICTION_RESERVATION_TTL_MS,
+        });
+        this.evictingSessions.delete(id);
+      }
+    }
   }
 }

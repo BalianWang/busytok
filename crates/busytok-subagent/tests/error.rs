@@ -95,6 +95,7 @@ async fn failing_executor_always_errors() {
         reason: "bundle not found".to_string(),
     };
     let input = ExecutorInput {
+        task_id: "task-error".into(),
         subagent_id: "test".into(),
         subagent_name: "test".into(),
         cwd: "/tmp".into(),

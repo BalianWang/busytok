@@ -1,14 +1,14 @@
 //! The public logical-subagent manager.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use busytok_config::SubagentSettings;
 use busytok_store::{
     Database, SubagentMemoryRow, SubagentResourceEventRow, SubagentTaskRow, SubagentUsageRecordRow,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::context::ContextBuilder;
 use crate::error::{Result, SubagentError};
@@ -22,6 +22,14 @@ use crate::pressure::PressureGate;
 use crate::resolver::{resolve_by_id, resolve_by_name, row_to_model, Resolved};
 
 type SharedDb = Arc<Mutex<busytok_store::Database>>;
+
+/// Process-wide registry of per-logical-subagent lifecycle gates.
+///
+/// The runtime can rebuild its sidecar manager while detached delegate tasks
+/// from the old manager are still finishing. Sharing this registry across
+/// manager generations keeps hibernate/delete/delegate serialization intact
+/// across that swap instead of creating a second, unrelated lock map.
+pub type LifecycleRegistry = Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
 
 /// RAII guard that removes a task's cancel signal from the `cancel_signals`
 /// registry when dropped. This covers all exit paths from `execute_task`:
@@ -67,6 +75,11 @@ const MAX_SAFE_TIMEOUT_SECONDS: i64 = (i64::MAX - REAPER_BUFFER_MS) / 1000;
 /// deadline the task is marked `failed` with `error_kind = hot_session_limit`
 /// so it doesn't loop forever.
 const HOT_SESSION_RETRY_DEADLINE_MS: i64 = 300_000;
+
+/// Maximum time lifecycle operations such as hibernate/delete wait for an
+/// in-flight task of the same logical subagent. They are user-facing control
+/// operations and must not hang forever behind a model call.
+const LIFECYCLE_CONTROL_WAIT: Duration = Duration::from_secs(5);
 
 /// Convert a delegate-request `timeout_seconds` override (`u64` from
 /// CLI/DTO) to the `i64` representation stored in
@@ -128,6 +141,11 @@ pub struct SubagentManager {
     /// Set ONCE by `BusytokSupervisor::assemble_with_sidecar` after the
     /// generation manager is constructed.
     task_completion_hook: Mutex<Option<TaskCompletionHook>>,
+    /// Per-logical-subagent lifecycle gates. A gate spans executor work plus
+    /// its DB/session finalization, and hibernate holds the same gate through
+    /// the sidecar `close` RPC. Weak values avoid retaining one async mutex
+    /// forever for every deleted or one-shot subagent.
+    lifecycle_locks: LifecycleRegistry,
     /// Per-task cooperative cancel signal registry. When a task starts
     /// executing, a `oneshot::Sender` is registered here; `cancel_task`
     /// signals it so `execute_task` can abort the in-flight executor call
@@ -193,6 +211,27 @@ impl SubagentManager {
         executor: Arc<dyn TaskExecutor>,
         pressure_gate: Option<Arc<PressureGate>>,
     ) -> Self {
+        Self::with_pressure_gate_and_lifecycle_registry(
+            db,
+            settings,
+            adapter,
+            executor,
+            pressure_gate,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+    }
+
+    /// Construct a manager using an existing lifecycle registry. Runtime
+    /// rebuilds pass the previous manager's registry so in-flight work from
+    /// the old generation remains serialized with new requests.
+    pub fn with_pressure_gate_and_lifecycle_registry(
+        db: SharedDb,
+        settings: SubagentSettings,
+        adapter: &str,
+        executor: Arc<dyn TaskExecutor>,
+        pressure_gate: Option<Arc<PressureGate>>,
+        lifecycle_locks: LifecycleRegistry,
+    ) -> Self {
         let context_builder = ContextBuilder::new(settings.context.clone());
         let memory_updater = MemoryUpdater::new(settings.context.clone());
         Self {
@@ -204,7 +243,71 @@ impl SubagentManager {
             memory_updater,
             pressure_gate,
             task_completion_hook: Mutex::new(None),
+            lifecycle_locks,
             cancel_signals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Clone the registry handle for a successor manager during a runtime
+    /// rebuild. The registry itself is intentionally shared, not copied.
+    pub fn lifecycle_registry(&self) -> LifecycleRegistry {
+        Arc::clone(&self.lifecycle_locks)
+    }
+
+    /// Return the lifecycle gate for one logical subagent, creating it when
+    /// no live owner remains. The map itself is only held while looking up the
+    /// weak reference; callers await the async mutex without holding a
+    /// synchronous map/DB lock.
+    fn lifecycle_lock(&self, subagent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .lifecycle_locks
+            .lock()
+            .expect("lifecycle_locks lock poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(subagent_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(subagent_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Serialize lifecycle-sensitive work for one logical subagent without
+    /// blocking unrelated subagents or providers.
+    async fn acquire_lifecycle_guard(&self, subagent_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.lifecycle_lock(subagent_id);
+        match lock.clone().try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                debug!(
+                    event_code = "subagent.lifecycle.wait",
+                    subagent_id = %subagent_id,
+                    "waiting for same-subagent lifecycle operation to finish"
+                );
+                lock.lock_owned().await
+            }
+        }
+    }
+
+    async fn acquire_lifecycle_guard_with_timeout(
+        &self,
+        subagent_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self.lifecycle_lock(subagent_id);
+        match tokio::time::timeout(LIFECYCLE_CONTROL_WAIT, lock.lock_owned()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => {
+                warn!(
+                    event_code = "subagent.lifecycle.wait_timeout",
+                    subagent_id = %subagent_id,
+                    wait_ms = LIFECYCLE_CONTROL_WAIT.as_millis() as u64,
+                    "lifecycle control operation timed out waiting for an in-flight task"
+                );
+                Err(SubagentError::Validation(format!(
+                    "subagent lifecycle is busy; retry after the current task finishes (waited {} ms)",
+                    LIFECYCLE_CONTROL_WAIT.as_millis()
+                )))
+            }
         }
     }
 
@@ -576,7 +679,15 @@ impl SubagentManager {
     /// success the hook bridges usage into `usage_events` + rollups; on
     /// failure the task is marked `'failed'` in the DB.
     async fn execute_and_persist(&self, task: &SubagentTaskRow, subagent: &LogicalSubagent) {
-        match self.execute_task(task, subagent).await {
+        // Keep the per-subagent gate through executor execution, DB result
+        // persistence, and the pending→active/close sidecar handshake. This
+        // is the same gate hibernate uses, so hibernate cannot close a
+        // session while a delegate is committing/reusing it.
+        let result = {
+            let _lifecycle_guard = self.acquire_lifecycle_guard(&subagent.id).await;
+            self.execute_task(task, subagent).await
+        };
+        match result {
             Ok(result) => {
                 let hook = {
                     let guard = self
@@ -887,6 +998,7 @@ impl SubagentManager {
                 "built context for task"
             );
             let input = ExecutorInput {
+                task_id: task.id.clone(),
                 subagent_id: subagent.id.clone(),
                 subagent_name: subagent.name.clone(),
                 // Task 7 brief: `cwd` for `ExecutorInput` is the subagent's
@@ -1216,7 +1328,9 @@ impl SubagentManager {
                             closed_at_ms: None,
                             detail_json: None,
                         };
-                        if let Err(e) = db.subagent_commit_hot_binding_and_status(&binding, &subagent.id) {
+                        if let Err(e) =
+                            db.subagent_commit_hot_binding_and_status(&binding, &subagent.id)
+                        {
                             error!(
                                 event_code = "subagent.delegate.binding_commit_failed",
                                 error = %e,
@@ -1375,9 +1489,7 @@ impl SubagentManager {
                             );
                             (Ok(()), true)
                         }
-                        Some(binding)
-                            if binding.last_used_at_ms != committed_last_used_at_ms =>
-                        {
+                        Some(binding) if binding.last_used_at_ms != committed_last_used_at_ms => {
                             // P2 guard: same sid but different last_used_at_ms.
                             // A concurrent delegate re-committed the binding
                             // reusing the SAME session (sid reuse path). The
@@ -1773,7 +1885,7 @@ impl SubagentManager {
             let executor = std::sync::Arc::clone(&self.executor);
             let tid = task_id.to_string();
             tokio::spawn(async move {
-                let cancel_fut = executor.cancel(&subagent_id, &provider_id);
+                let cancel_fut = executor.cancel_for_task(&subagent_id, &provider_id, &tid);
                 match tokio::time::timeout(std::time::Duration::from_secs(5), cancel_fut).await {
                     Ok(Ok(())) => info!(
                         event_code = "subagent.sidecar_cancel_acknowledged",
@@ -2028,44 +2140,81 @@ impl SubagentManager {
     /// Release any hot binding for this subagent; keep DB state (warm/cold).
     /// Returns the resolved subagent id so callers can echo it back.
     pub async fn hibernate(&self, resolve: ResolveParams) -> Result<String> {
-        let db = self.db.lock().expect("subagent db lock poisoned");
-        let sub = self.resolve(&db, &resolve)?;
-        // Compute new_status (warm/cold based on memory) BEFORE the transaction.
-        // The status follows the invariant: memory exists → warm, else cold.
-        let new_status = match db
-            .subagent_get_memory(&sub.id)
-            .map_err(SubagentError::Store)?
-            .and_then(|m| m.hot_summary)
-        {
-            Some(_) => SubagentStatus::Warm,
-            None => SubagentStatus::Cold,
+        // Resolve the identity before awaiting the lifecycle gate. For a
+        // name-based request, switch to the resolved id after acquiring the
+        // gate so a delete/recreate cannot make this operation target a
+        // different logical subagent while it waits.
+        let resolved_id = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            self.resolve(&db, &resolve)?.id
         };
-        let binding = db
-            .subagent_hot_binding(&sub.id, &self.adapter)
-            .map_err(SubagentError::Store)?;
-        if let Some(mut b) = binding {
+        let _lifecycle_guard = self
+            .acquire_lifecycle_guard_with_timeout(&resolved_id)
+            .await?;
+        let locked_resolve = ResolveParams {
+            id: Some(resolved_id),
+            ..Default::default()
+        };
+        // Resolve and commit the DB transition while holding the DB lock, then
+        // release it before the sidecar RPC. Keeping resolution, binding
+        // lookup, and commit in one critical section prevents a concurrent
+        // eviction/delegate from racing a stale binding snapshot. The lock is
+        // never held across the awaited sidecar call.
+        let (sub, adapter_session_id, provider_id, original_binding) = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
+            let sub = self.resolve(&db, &locked_resolve)?;
+            // Compute new_status (warm/cold based on memory) BEFORE the
+            // transaction. The status follows the invariant: memory exists
+            // → warm, else cold.
+            let new_status = match db
+                .subagent_get_memory(&sub.id)
+                .map_err(SubagentError::Store)?
+                .and_then(|m| m.hot_summary)
+            {
+                Some(_) => SubagentStatus::Warm,
+                None => SubagentStatus::Cold,
+            };
+            let binding = db
+                .subagent_hot_binding(&sub.id, &self.adapter)
+                .map_err(SubagentError::Store)?;
+            let provider_id = sub.bound_provider_id.clone();
+            let Some(mut binding) = binding else {
+                // No hot binding to release — just flip the logical status.
+                // The §3.3 invariant already holds (no is_hot=1 binding
+                // exists), and this write remains serialized with the lookup.
+                self.set_logical_status(&db, &sub.id, new_status)?;
+                info!(
+                    event_code = "subagent.session.hibernate_noop",
+                    subagent_id = %sub.id,
+                    status = %new_status.as_str(),
+                    "no hot binding; flipped logical status"
+                );
+                return Ok(sub.id);
+            };
+
+            let original_binding = binding.clone();
             let now = busytok_domain::now_ms();
-            b.is_hot = 0;
-            b.status = "closed".to_string();
-            b.closed_at_ms = Some(now);
+            binding.is_hot = 0;
+            binding.status = "closed".to_string();
+            binding.closed_at_ms = Some(now);
+
             // Spec §3.3 invariant: status='hot' iff is_hot=1 binding exists.
-            // Commit the binding flip (is_hot=0, status='closed') AND the
-            // logical status flip (warm/cold) in a single transaction so
-            // readers never observe `status='hot'` with no `is_hot=1` binding.
-            // Mirrors the delegate path's `commit_hot_binding_and_status`.
-            db.subagent_commit_hibernate_binding_and_status(&b, &sub.id, new_status.as_str())
+            // Commit the binding flip and logical status flip in one
+            // transaction so readers never observe a half-transition.
+            db.subagent_commit_hibernate_binding_and_status(&binding, &sub.id, new_status.as_str())
                 .map_err(|e| {
                     error!(
                         event_code = "subagent.session.hibernate_commit_failed",
+                        subagent_id = %sub.id,
                         error = %e,
                         "hibernate binding+status commit failed; invariant may be violated"
                     );
                     SubagentError::Store(e)
                 })?;
-            // Resource event is observational (audit), not invariant-critical,
-            // so it stays OUTSIDE the transaction. If this insert fails the
-            // §3.3 invariant still holds — we only lose an audit row.
-            db.subagent_insert_resource_event(&SubagentResourceEventRow {
+            // Resource event is observational, not invariant-critical. Keep
+            // it after the atomic state transition but before cleanup so the
+            // transition remains visible even if sidecar cleanup fails.
+            if let Err(e) = db.subagent_insert_resource_event(&SubagentResourceEventRow {
                 id: format!("re_{}", uuid::Uuid::new_v4()),
                 event_type: "session_hibernate".to_string(),
                 target_id: Some(sub.id.clone()),
@@ -2073,21 +2222,77 @@ impl SubagentManager {
                 cpu_percent: None,
                 detail_json: None,
                 created_at_ms: now,
-            })
-            .map_err(SubagentError::Store)?;
-            info!(event_code = "subagent.session.hibernate", subagent_id = %sub.id, "hibernated hot session");
-        } else {
-            // No hot binding to release — just flip the logical status. The
-            // §3.3 invariant already holds (no is_hot=1 binding exists), so a
-            // non-atomic status flip is safe here.
-            self.set_logical_status(&db, &sub.id, new_status)?;
-            info!(
-                event_code = "subagent.session.hibernate_noop",
-                subagent_id = %sub.id,
-                status = %new_status.as_str(),
-                "no hot binding; flipped logical status"
-            );
+            }) {
+                warn!(
+                    event_code = "subagent.session.hibernate_event_failed",
+                    subagent_id = %sub.id,
+                    error = %e,
+                    "failed to write hibernate resource event"
+                );
+            }
+
+            (
+                sub,
+                binding.adapter_session_id,
+                provider_id,
+                Some(original_binding),
+            )
+        };
+
+        // Release the sidecar slot after the DB transition. `close_session`
+        // is idempotent for missing workers/sessions, while real RPC errors
+        // are surfaced instead of leaving an unobserved sidecar/DB split.
+        if let Some(adapter_session_id) = adapter_session_id.as_deref() {
+            if let Err(e) = self
+                .executor
+                .close_session(adapter_session_id, &provider_id)
+                .await
+            {
+                error!(
+                    event_code = "subagent.session.hibernate_close_failed",
+                    subagent_id = %sub.id,
+                    adapter_session_id = %adapter_session_id,
+                    provider_id = %provider_id,
+                    error = %e,
+                    "DB hibernate committed but sidecar session.close failed"
+                );
+                // Keep the DB binding hot when the sidecar did not close it.
+                // The active session is still reusable; leaving the binding
+                // warm/cold would make the session an untracked ghost that
+                // consumes capacity and cannot be reconciled by normal LRU
+                // eviction. This compensating write is best-effort and is
+                // deliberately reported if it fails.
+                if let Some(binding) = original_binding.as_ref() {
+                    let rollback = self
+                        .db
+                        .lock()
+                        .expect("subagent db lock poisoned")
+                        .subagent_commit_hot_binding_and_status(binding, &sub.id);
+                    if let Err(rollback_err) = rollback {
+                        error!(
+                            event_code = "subagent.session.hibernate_rollback_failed",
+                            subagent_id = %sub.id,
+                            adapter_session_id = %adapter_session_id,
+                            error = %rollback_err,
+                            "failed to restore hot binding after close failure"
+                        );
+                    }
+                }
+                return Err(SubagentError::SidecarRpc {
+                    message: format!(
+                        "session.close failed during hibernate for {adapter_session_id}: {e}"
+                    ),
+                    code: None,
+                });
+            }
         }
+
+        info!(
+            event_code = "subagent.session.hibernate",
+            subagent_id = %sub.id,
+            adapter_session_id = ?adapter_session_id,
+            "hibernated hot session and released sidecar slot"
+        );
         Ok(sub.id)
     }
 
@@ -2096,26 +2301,42 @@ impl SubagentManager {
     /// Hard delete may operate on already-tombstoned rows; soft delete on a
     /// tombstone is a no-op success.
     pub async fn delete(&self, resolve: ResolveParams, hard: bool) -> Result<String> {
-        let db = self.db.lock().expect("subagent db lock poisoned");
-        // Hard delete needs to reach tombstoned rows (user may soft-delete then
-        // hard-delete). Soft delete uses the ordinary resolve (rejects tombstones).
-        let sub = if hard {
+        // Resolve before waiting so a name-based request cannot retarget a
+        // delete/recreate while it is queued behind an in-flight task.
+        let resolved_id = {
+            let db = self.db.lock().expect("subagent db lock poisoned");
             if let Some(id) = &resolve.id {
-                crate::resolver::resolve_by_id_include_deleted(&db, id)?
+                id.clone()
             } else {
-                // name path: hard delete must reach tombstoned rows too
-                // (soft-delete-then-hard-delete-by-name is a valid flow).
-                let name = resolve.name.as_ref().expect("checked by resolve() below");
+                let name = resolve.name.as_ref().ok_or_else(|| {
+                    SubagentError::InvalidArgument("either id or name must be provided".to_string())
+                })?;
                 let cwd = resolve.cwd.as_deref().ok_or_else(|| {
                     SubagentError::InvalidArgument(
                         "cwd is required when name is provided".to_string(),
                     )
                 })?;
-                crate::resolver::lookup_by_name_include_deleted(&db, name, cwd)?
+                crate::resolver::lookup_by_name_include_deleted(&db, name, cwd)?.id
             }
-        } else {
-            self.resolve(&db, &resolve)?
         };
+        let _lifecycle_guard = self
+            .acquire_lifecycle_guard_with_timeout(&resolved_id)
+            .await?;
+        let db = self.db.lock().expect("subagent db lock poisoned");
+        // Hard delete needs to reach tombstoned rows (user may soft-delete then
+        // hard-delete). Soft delete uses the ordinary resolve (rejects tombstones).
+        let sub = if hard {
+            crate::resolver::resolve_by_id_include_deleted(&db, &resolved_id)?
+        } else {
+            // Resolve by the id captured before waiting, not by the original
+            // name/cwd, so a delete/recreate cannot redirect this operation.
+            crate::resolver::resolve_by_id_include_deleted(&db, &resolved_id)?
+        };
+        if !hard && sub.status == SubagentStatus::Deleted {
+            // Soft delete is idempotent, including when the tombstone was
+            // created while this control request was waiting on the gate.
+            return Ok(sub.id);
+        }
         if hard {
             // Application-layer cascade (spec §3.5: no DB-level CASCADE).
             // subagent_hard_delete removes usage, tasks, bindings, memory, events, then the row.

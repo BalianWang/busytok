@@ -26,8 +26,12 @@ export function cancelHandlerWithPool(pool: SessionPool): RequestHandler {
     if (!p.logical_subagent_id) {
       throw new SidecarError('logical_subagent_id required', -32602);
     }
-    const cancelled = await pool.abortSession(p.logical_subagent_id);
-    logger.info('session.cancel', { logical_subagent_id: p.logical_subagent_id, cancelled });
+    const cancelled = await pool.abortSession(p.logical_subagent_id, p.task_id);
+    logger.info('session.cancel', {
+      logical_subagent_id: p.logical_subagent_id,
+      task_id: p.task_id,
+      cancelled,
+    });
     const result: CancelResult = { cancelled };
     return result;
   };

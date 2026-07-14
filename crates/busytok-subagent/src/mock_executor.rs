@@ -9,6 +9,9 @@ use crate::models::{TaskErrorKind, TaskStatus, TaskUsage};
 /// Input to a task executor — everything needed to run one turn.
 #[derive(Clone)]
 pub struct ExecutorInput {
+    /// Stable task identity threaded through the sidecar turn so a delayed
+    /// cancel RPC cannot abort a replacement turn for the same subagent.
+    pub task_id: String,
     pub subagent_id: String,
     pub subagent_name: String,
     pub cwd: String,
@@ -83,11 +86,21 @@ pub trait TaskExecutor: Send + Sync {
         Ok(())
     }
 
+    /// Cancel a specific task turn. Executors that do not need task-scoped
+    /// cancellation inherit the legacy subagent-wide behavior.
+    async fn cancel_for_task(
+        &self,
+        subagent_id: &str,
+        provider_id: &str,
+        _task_id: &str,
+    ) -> anyhow::Result<()> {
+        self.cancel(subagent_id, provider_id).await
+    }
+
     /// Activate a session — move it from `pending` to `active` (LRU-eligible)
     /// in the sidecar's hot pool. Called by the manager AFTER the DB hot
-    /// binding is committed. Best-effort: failure is logged but does NOT
-    /// fail the task (the binding is already committed; the session will
-    /// be activated on next use or cleaned up by eviction).
+    /// binding is committed. An activation error causes the manager to roll
+    /// the binding back to warm/cold; the completed task result is preserved.
     ///
     /// Default impl: no-op (mock executors don't have a pending state).
     /// `SidecarTaskExecutor` overrides this to send a `session.activate` RPC.
@@ -99,9 +112,11 @@ pub trait TaskExecutor: Send + Sync {
         Ok(())
     }
 
-    /// Close a pending session after a DB binding commit failure. The
-    /// session was created by `turn_auto` but the binding was never committed,
-    /// so it must be removed from the sidecar pool to free the slot.
+    /// Close a sidecar session after a DB lifecycle transition. This is used
+    /// both to remove an uncommitted pending session after a persistence
+    /// failure and to release an active session after hibernate. The caller
+    /// serializes it with same-subagent execution so a successful rebind
+    /// cannot be closed accidentally.
     ///
     /// Default impl: no-op (mock executors don't have a sidecar pool).
     /// `SidecarTaskExecutor` overrides this to send a `session.close` RPC.

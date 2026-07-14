@@ -116,7 +116,12 @@ impl SidecarTaskExecutor {
     /// sidecar is unreachable or the RPC fails, the error is returned so
     /// the caller can log it. The cancel outcome in the DB is NOT affected
     /// by this call's result — the DB status is already `cancelled`.
-    async fn cancel_turn(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
+    async fn cancel_turn(
+        &self,
+        subagent_id: &str,
+        provider_id: &str,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let Some(supervisor) = self.pool.get_worker(provider_id) else {
             // No worker — sidecar was never started or was killed.
             // Nothing to cancel.
@@ -132,7 +137,7 @@ impl SidecarTaskExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during cancel: {e}"))?;
         handle
-            .cancel_session(subagent_id)
+            .cancel_session(subagent_id, task_id)
             .await
             .map_err(|e| anyhow::anyhow!("session.cancel RPC failed: {e}"))?;
         Ok(())
@@ -150,14 +155,16 @@ impl SidecarTaskExecutor {
         provider_id: &str,
     ) -> anyhow::Result<()> {
         let Some(supervisor) = self.pool.get_worker(provider_id) else {
-            // No worker — sidecar was never started or was killed.
-            // Nothing to activate. This is acceptable: the binding is
-            // committed; the next turn_auto will create a fresh session.
-            return Ok(());
+            warn!(
+                event_code = "subagent.session.activate_worker_missing",
+                adapter_session_id = %adapter_session_id,
+                provider_id = %provider_id,
+                "cannot activate session: provider worker is missing"
+            );
+            return Err(anyhow::anyhow!(
+                "provider worker {provider_id} is missing while activating session {adapter_session_id}"
+            ));
         };
-        if !supervisor.try_is_running() {
-            return Ok(());
-        }
         let handle = supervisor
             .ensure_started()
             .await
@@ -169,9 +176,9 @@ impl SidecarTaskExecutor {
         Ok(())
     }
 
-    /// Close a pending session after a DB binding commit failure. The
-    /// session was created by `turn_auto` but the binding was never committed,
-    /// so it must be removed from the sidecar pool to free the slot.
+    /// Close a session after a DB lifecycle transition. The operation is
+    /// idempotent: a session that was already removed by the sidecar (or a
+    /// concurrent cleanup) is treated as successfully closed.
     async fn close_session_rpc(
         &self,
         adapter_session_id: &str,
@@ -187,10 +194,18 @@ impl SidecarTaskExecutor {
             .ensure_started()
             .await
             .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during close: {e}"))?;
-        handle
-            .close(adapter_session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("session.close RPC failed: {e}"))?;
+        match handle.close(adapter_session_id).await {
+            Ok(_) => {}
+            Err(SidecarError::Application(code, _message, _data)) if code == SESSION_NOT_FOUND => {
+                info!(
+                    event_code = "subagent.session.close_already_closed",
+                    adapter_session_id = %adapter_session_id,
+                    provider_id = %provider_id,
+                    "session.close received SESSION_NOT_FOUND; treating cleanup as complete"
+                );
+            }
+            Err(e) => return Err(anyhow::anyhow!("session.close RPC failed: {e}")),
+        }
         Ok(())
     }
 }
@@ -201,8 +216,18 @@ impl TaskExecutor for SidecarTaskExecutor {
         Self::execute_impl(self, input).await
     }
 
+    async fn cancel_for_task(
+        &self,
+        subagent_id: &str,
+        provider_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<()> {
+        self.cancel_turn(subagent_id, provider_id, Some(task_id))
+            .await
+    }
+
     async fn cancel(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
-        self.cancel_turn(subagent_id, provider_id).await
+        self.cancel_turn(subagent_id, provider_id, None).await
     }
 
     async fn activate_session(
@@ -219,7 +244,8 @@ impl TaskExecutor for SidecarTaskExecutor {
         adapter_session_id: &str,
         provider_id: &str,
     ) -> anyhow::Result<()> {
-        self.close_session_rpc(adapter_session_id, provider_id).await
+        self.close_session_rpc(adapter_session_id, provider_id)
+            .await
     }
 }
 
@@ -277,6 +303,7 @@ impl SidecarTaskExecutor {
             "open_questions": open_questions_json,
         });
         let params = serde_json::json!({
+            "task_id": input.task_id,
             "logical_subagent_id": input.subagent_id,
             "logical_subagent_name": input.subagent_name,
             "cwd": input.cwd,
@@ -863,6 +890,22 @@ impl SidecarTaskExecutor {
                     "prepare_hibernate returned SESSION_NOT_FOUND — concurrent evictor already closed this session"
                 );
                 return Ok(EvictionOutcome::AlreadyEvicted);
+            }
+            Err(SidecarError::Application(code, _msg, _data))
+                if code == HOT_SESSION_LIMIT_REACHED =>
+            {
+                // The sidecar atomically rejected this eviction because the
+                // session became busy after candidate selection. Treat it as
+                // transient capacity contention; the caller can retry after
+                // the active turn releases the session.
+                warn!(
+                    event_code = "subagent.session.eviction_busy",
+                    adapter_session_id = %adapter_session_id,
+                    "eviction candidate became busy before prepare_hibernate"
+                );
+                return Err(SubagentError::HotSessionLimit {
+                    candidate: adapter_session_id.to_string(),
+                });
             }
             Err(e) => {
                 warn!(

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { SessionPool } from '../src/session_pool.js';
 import { SidecarError } from '../src/errors.js';
 import { turnAutoHandlerWithPool } from '../src/handlers/turn_auto.js';
@@ -215,15 +215,15 @@ describe('turn_auto real SDK path', () => {
     // Two-phase lifecycle: activate so the session becomes an evictable
     // LRU candidate (simulates Rust calling session.activate after DB commit).
     pool.activate(r1.adapter_session_id);
-    await expect(
-      handler({ ...BASE_PARAMS, logical_subagent_id: 'sub-2' }),
-    ).rejects.toThrow(SidecarError);
+    let error: unknown;
     try {
       await handler({ ...BASE_PARAMS, logical_subagent_id: 'sub-2' });
     } catch (e) {
-      expect((e as SidecarError).code).toBe(-32002);
-      expect((e as SidecarError).data?.candidate).toMatch(/^fake_/);
+      error = e;
     }
+    expect(error).toBeInstanceOf(SidecarError);
+    expect((error as SidecarError).code).toBe(-32002);
+    expect((error as SidecarError).data?.candidate).toMatch(/^fake_/);
   });
 });
 
@@ -353,6 +353,140 @@ describe('turn_auto ghost session cleanup', () => {
     // Ghost cleanup: cancelled session removed from pool
     expect(pool.size()).toBe(0);
     expect(pool.getLruCandidate()).toBeUndefined();
+  });
+
+  it('treats a late SDK success after abort as cancellation and closes the pending session', async () => {
+    let resolvePromptStarted: () => void = () => {};
+    const promptStarted = new Promise<void>((resolve) => {
+      resolvePromptStarted = resolve;
+    });
+    let releasePrompt: () => void = () => {};
+    const promptRelease = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    const lateSuccessFactory: SessionFactory = async (subagent, opts) => {
+      const id = `late_success_${subagent}`;
+      const sdk: SdkSession = {
+        sessionId: id,
+        prompt: async () => {
+          resolvePromptStarted();
+          await promptRelease;
+          // Simulate an SDK that resolves successfully after abort() rather
+          // than rejecting its in-flight prompt.
+        },
+        getLastAssistantText: () => 'should not be accepted',
+        getSessionStats: (): SessionStatsLike => ({
+          tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          cost: 0,
+        }),
+        abort: async () => {
+          releasePrompt();
+        },
+        dispose: () => {},
+      };
+      return new PiSdkSession(sdk, subagent, id, 'test-provider', opts.model);
+    };
+
+    const pool = new SessionPool(3, lateSuccessFactory);
+    const handler = turnAutoHandlerWithPool(pool);
+    const turnPromise = handler({ ...BASE_PARAMS, logical_subagent_id: 'sub-late-success' });
+    await promptStarted;
+    await pool.abortSession('sub-late-success');
+
+    await expect(turnPromise).rejects.toMatchObject({ code: ERROR_CODE_TURN_CANCELLED });
+    expect(pool.size()).toBe(0);
+    expect(pool.getLruCandidate()).toBeUndefined();
+  });
+
+  it('force-closes a pending session when SDK cancellation never settles the turn', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolvePromptStarted: () => void = () => {};
+      const promptStarted = new Promise<void>((resolve) => {
+        resolvePromptStarted = resolve;
+      });
+      let releasePrompt: () => void = () => {};
+      const promptRelease = new Promise<void>((resolve) => {
+        releasePrompt = resolve;
+      });
+      const hungCancelFactory: SessionFactory = async (subagent, opts) => {
+        const id = `hung_cancel_${subagent}`;
+        const sdk: SdkSession = {
+          sessionId: id,
+          prompt: async () => {
+            resolvePromptStarted();
+            await promptRelease;
+          },
+          getLastAssistantText: () => '',
+          getSessionStats: (): SessionStatsLike => ({
+            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          }),
+          abort: async () => {
+            // Simulate an SDK abort that acknowledges the request but leaves
+            // its in-flight prompt unresolved.
+          },
+          dispose: () => {
+            // Let the test await the turn's deterministic cancellation after
+            // SessionPool's bounded cleanup closes the SDK session.
+            releasePrompt();
+          },
+        };
+        return new PiSdkSession(sdk, subagent, id, 'test-provider', opts.model);
+      };
+
+      const pool = new SessionPool(1, hungCancelFactory);
+      const handler = turnAutoHandlerWithPool(pool);
+      // Attach the rejection handler before advancing the cleanup timer so a
+      // late cancellation cannot surface as an unhandled rejection.
+      const turnOutcome = handler({ ...BASE_PARAMS, logical_subagent_id: 'sub-hung-cancel' })
+        .then(() => ({ completed: true, error: undefined }))
+        .catch((error: unknown) => ({ completed: false, error }));
+      await promptStarted;
+      await pool.abortSession('sub-hung-cancel');
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      const outcome = await turnOutcome;
+      expect(outcome.completed).toBe(false);
+      expect(outcome.error).toMatchObject({ code: ERROR_CODE_TURN_CANCELLED });
+      expect(pool.size()).toBe(0);
+      expect(pool.getLruCandidate()).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a stale cancel once a replacement turn owns the session', async () => {
+    let call = 0;
+    let releaseFirst: () => void = () => {};
+    const firstRelease = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const sdk: SdkSession = {
+      sessionId: 'stale-cancel',
+      prompt: async () => {
+        call += 1;
+        if (call === 1) await firstRelease;
+      },
+      getLastAssistantText: () => 'ok',
+      getSessionStats: (): SessionStatsLike => ({
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        cost: 0,
+      }),
+      abort: async () => {},
+      dispose: () => {},
+    };
+    const session = new PiSdkSession(sdk, 'sub-stale-cancel', 'stale-cancel', 'test-provider', 'test-model');
+    const first = session.sendTurn('first', { task_id: 'task-1' });
+    await vi.waitFor(() => expect(call).toBe(1));
+
+    expect(await session.abort('task-1')).toBe(true);
+    const replacement = session.sendTurn('replacement', { task_id: 'task-2' });
+    // A delayed cancel for task-1 must not abort task-2.
+    expect(await session.abort('task-1')).toBe(false);
+    releaseFirst();
+
+    await expect(first).rejects.toMatchObject({ code: ERROR_CODE_TURN_CANCELLED });
+    await expect(replacement).resolves.toMatchObject({ status: 'completed' });
   });
 
   it('does NOT close a reused session when sendTurn fails', async () => {
