@@ -321,6 +321,7 @@ fn pick_oldest_queued_task_skips_subagent_with_running_task() {
         timeout_seconds: None,
         model_override: None,
         error_kind: None,
+        queue_reason: None,
     })
     .unwrap();
     db.subagent_insert_task(&SubagentTaskRow {
@@ -344,6 +345,7 @@ fn pick_oldest_queued_task_skips_subagent_with_running_task() {
         timeout_seconds: None,
         model_override: None,
         error_kind: None,
+        queue_reason: None,
     })
     .unwrap();
     // Per-subagent FIFO guard: the queued task must NOT be picked because
@@ -749,6 +751,85 @@ async fn hot_session_limit_requeues_task_within_deadline() {
                 panic!(
                     "task was marked failed instead of re-queued — HotSessionLimit regression. \
                      error_kind: {error_kind:?}"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        requeued,
+        "task must be re-queued after HotSessionLimit (not failed)"
+    );
+}
+
+/// Regression: when a task is re-queued via the HotSessionLimit path
+/// (running → queued), `started_at_ms` MUST be cleared to NULL. A queued
+/// task with a non-null `started_at_ms` is an invalid state — it implies
+/// the task has started execution when it hasn't (or has been re-queued
+/// for retry). The invariant is: `queued ⟹ started_at_ms IS NULL`.
+///
+/// This test catches the bug where `set_task_status_if_not_cancelled`
+/// only updated `status` but left `started_at_ms` populated, creating
+/// the "queued but already started" contradiction observed in production.
+#[tokio::test]
+async fn hot_session_limit_requeue_clears_started_at_ms() {
+    let db = test_db();
+    let settings = SubagentSettings::default();
+    let executor = Arc::new(HotSessionLimitExecutor) as Arc<dyn TaskExecutor>;
+    let manager = Arc::new(SubagentManager::with_pressure_gate(
+        Arc::clone(&db),
+        settings,
+        "mock",
+        executor,
+        None,
+    ));
+
+    // delegate() inserts as "running" with started_at_ms = Some(now).
+    let result = manager
+        .delegate(req("hot-limit-started-ms-sub", "do work"))
+        .await
+        .unwrap();
+    assert_eq!(result.status, TaskStatus::Running);
+
+    // Poll for the re-queue to complete (status → "queued").
+    let mut requeued = false;
+    for _ in 0..100 {
+        let snap = {
+            let db = db.lock().unwrap();
+            db.subagent_list_tasks(&result.subagent_id, 10)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == result.task_id)
+                .map(|t| (t.status, t.started_at_ms, t.queue_reason))
+        };
+        if let Some((status, started_at_ms, queue_reason)) = snap {
+            if status == "queued" {
+                // PRIMARY ASSERTION: started_at_ms must be None.
+                // A queued task must NOT retain started_at_ms from its
+                // previous running state — that would create a
+                // "queued but already started" contradiction.
+                assert!(
+                    started_at_ms.is_none(),
+                    "re-queued task must have started_at_ms = NULL, \
+                     got: {started_at_ms:?} — running→queued transition \
+                     did not clear started_at_ms"
+                );
+                // SECONDARY ASSERTION: queue_reason must be set so external
+                // orchestrators can distinguish hot_session_limit re-queue
+                // from same-subagent serialization.
+                assert_eq!(
+                    queue_reason.as_deref(),
+                    Some("hot_session_limit"),
+                    "re-queued task must carry queue_reason = 'hot_session_limit', \
+                     got: {queue_reason:?}"
+                );
+                requeued = true;
+                break;
+            }
+            if status == "failed" {
+                panic!(
+                    "task was marked failed instead of re-queued — \
+                     HotSessionLimit regression"
                 );
             }
         }

@@ -117,6 +117,16 @@ AUTH_FAIL="${BUSYTOK_MOCK_AUTH_FAIL:-0}"
 REFILL_AFTER_CLOSE="${BUSYTOK_MOCK_REFILL_AFTER_CLOSE:-0}"
 REFILL_AFTER_CLOSE_LIMIT="${BUSYTOK_MOCK_REFILL_AFTER_CLOSE_LIMIT:--1}"
 HOT_LIMIT_RESPONSES="${BUSYTOK_MOCK_HOT_LIMIT_RESPONSES:--1}"
+# When 1, session.activate returns a JSON-RPC error (-32603) to simulate
+# a transient failure. The Rust manager should roll back the DB binding
+# and close the pending session.
+ACTIVATE_FAILS="${BUSYTOK_MOCK_ACTIVATE_FAILS:-0}"
+# Per-session activate failure (CSV of session IDs). For sessions in this
+# list, session.activate returns -32603 (transient failure); other sessions
+# activate normally. Used by the concurrent-delegate guard test to simulate
+# a transient activate failure on one session while a different session
+# activates successfully.
+ACTIVATE_FAILS_FOR_SESSION="${BUSYTOK_MOCK_ACTIVATE_FAILS_FOR_SESSION:-}"
 COUNT=0
 # Number of successful session.close responses sent. Used by
 # BUSYTOK_MOCK_TURN_AUTO_FAILS_AFTER_CLOSE to fail the retry turn_auto issued
@@ -130,9 +140,16 @@ HOT_LIMIT_COUNT=0
 # Track active sessions using parallel indexed arrays (portable to bash 3.2
 # which does NOT support `declare -A`). SUB_IDS[i] maps to SESS_IDS[i].
 # SESS_ORDER tracks LRU order: index 0 = oldest (LRU), last = newest (MRU).
+# SESS_PENDING tracks sessions not yet activated (two-phase lifecycle).
+#   A newly-created session goes to SESS_PENDING (NOT SESS_ORDER). Rust
+#   calls `session.activate` after committing the DB binding to move it
+#   to SESS_ORDER (LRU-eligible / evictable). This closes the timing
+#   window where a successful turn_auto makes the session evictable before
+#   the binding is committed.
 SUB_IDS=()
 SESS_IDS=()
 SESS_ORDER=()
+SESS_PENDING=()
 SESS_COUNTER=0
 
 # Look up a subagent's session by iterating the parallel arrays.
@@ -194,7 +211,10 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","result":{"protocol_version":1,"sidecar_version":"mock-1.0"},"id":%s}\n' "$ID"
       ;;
     adapter.health)
-      printf '{"jsonrpc":"2.0","result":{"status":"healthy","sessions":%d,"rss_mb":42},"id":%s}\n' "${#SESS_ORDER[@]}" "$ID"
+      # Include `pending_sessions` and `total_closes` so tests can verify
+      # two-phase lifecycle behavior (close_session called on commit
+      # failure, pending sessions lingering, etc.).
+      printf '{"jsonrpc":"2.0","result":{"status":"healthy","sessions":%d,"pending_sessions":%d,"total_closes":%d,"rss_mb":42},"id":%s}\n' "${#SESS_ORDER[@]}" "${#SESS_PENDING[@]}" "$CLOSES" "$ID"
       ;;
     adapter.shutdown)
       printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
@@ -242,11 +262,22 @@ while IFS= read -r line; do
           if [[ "$HOT_LIMIT_RESPONSES" -ge 0 && "$HOT_LIMIT_COUNT" -ge "$HOT_LIMIT_RESPONSES" ]]; then
             HOT_LIMIT_BUDGET_OK=0
           fi
-          if [[ "$HOT_LIMIT" -gt 0 && "${#SESS_ORDER[@]}" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" && "$HOT_LIMIT_BUDGET_OK" == "1" ]]; then
+          # Two-phase lifecycle: pool capacity counts ALL sessions (pending +
+          # active), but only active sessions (SESS_ORDER) are evictable
+          # candidates. When the pool is full but all sessions are pending,
+          # return all_busy=true (no evictable candidate).
+          TOTAL_SESS=$(( ${#SESS_ORDER[@]} + ${#SESS_PENDING[@]} ))
+          if [[ "$HOT_LIMIT" -gt 0 && "$TOTAL_SESS" -ge "$HOT_LIMIT" && -z "$EXISTING_SESS" && "$HOT_LIMIT_BUDGET_OK" == "1" ]]; then
             HOT_LIMIT_COUNT=$((HOT_LIMIT_COUNT + 1))
-            # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED
-            CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
-            if [[ "$HOT_LIMIT_NO_CANDIDATE" == "1" ]]; then
+            # Pool is full and this is a NEW subagent — return HOT_SESSION_LIMIT_REACHED.
+            # Candidate = LRU of ACTIVE sessions (SESS_ORDER[0]). If no active
+            # sessions exist (all pending), return all_busy=true.
+            if [[ "${#SESS_ORDER[@]}" -eq 0 ]]; then
+              # All sessions are pending (not yet activated). No evictable
+              # candidate — return all_busy=true so the executor retries
+              # with backoff (waiting for activate to move a session to LRU).
+              printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached — all sessions pending","data":{"candidate":null,"all_busy":true}},"id":%s}\n' "$ID"
+            elif [[ "$HOT_LIMIT_NO_CANDIDATE" == "1" ]]; then
               # Omit data entirely — sidecar protocol violation. Exercises
               # executor.rs classify_hot_limit_error ProtocolViolation path.
               printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached"},"id":%s}\n' "$ID"
@@ -255,6 +286,7 @@ while IFS= read -r line; do
               # executor.rs classify_hot_limit_error AllBusy path (skip eviction).
               printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached — all sessions busy","data":{"candidate":null,"all_busy":true}},"id":%s}\n' "$ID"
             else
+              CANDIDATE="${SESS_ORDER[0]}"  # LRU = oldest = index 0
               printf '{"jsonrpc":"2.0","error":{"code":-32002,"message":"hot session limit reached","data":{"candidate":"%s"}},"id":%s}\n' "$CANDIDATE" "$ID"
             fi
           elif [[ -n "$EXISTING_SESS" ]]; then
@@ -272,15 +304,95 @@ while IFS= read -r line; do
             SESS_ORDER+=("$SESS")
             printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"%s"%s},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$COMPACT_CTX" "$MEM_FRAGMENT" "$ID"
           else
-            # Create new session
+            # Create new session — starts in PENDING state (two-phase lifecycle).
+            # Rust calls session.activate after committing the DB binding to
+            # move it to SESS_ORDER (LRU-eligible / evictable).
             SESS_COUNTER=$((SESS_COUNTER + 1))
             SESS="pi_sess_mock_${SESS_COUNTER}"
             SUB_IDS+=("$SUB_ID")
             SESS_IDS+=("$SESS")
-            SESS_ORDER+=("$SESS")
+            SESS_PENDING+=("$SESS")
             REUSED="false"
             printf '{"jsonrpc":"2.0","result":{"adapter_session_id":"%s","session_reused":%s,"status":"%s","result":{"task_summary":"%s"%s},"usage":{"model":"deepseek-chat","provider":"deepseek","input_tokens":100,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0.001}},"id":%s}\n' "$SESS" "$REUSED" "$STATUS_OUT" "$COMPACT_CTX" "$MEM_FRAGMENT" "$ID"
           fi
+        fi
+      fi
+      ;;
+    session.activate)
+      # Two-phase lifecycle: move a session from pending (SESS_PENDING) to
+      # active (SESS_ORDER). Idempotent for already-active sessions (no-op).
+      # For unknown sessions (not in pool), returns SESSION_NOT_FOUND so
+      # Rust can roll back the DB binding — a successful activate on a
+      # missing session would create a false is_hot=1 ghost binding.
+      #
+      # Failure modes (checked in order):
+      # 1. ACTIVATE_FAILS=1 → all activate calls fail (-32603)
+      # 2. ACTIVATE_FAILS_FOR_SESSION=csv → specific sessions fail (-32603)
+      #    and are removed from the sub→sess mapping so the next delegate
+      #    creates a new session (simulates broken-session recovery).
+      # 3. Otherwise → normal activate path (pending→active or not-found).
+      PROCEED_NORMAL=1
+      if [[ "$ACTIVATE_FAILS" == "1" ]]; then
+        PROCEED_NORMAL=0
+        printf '{"jsonrpc":"2.0","error":{"code":-32603,"message":"activate failed: simulated error"},"id":%s}\n' "$ID"
+      elif [[ -n "$ACTIVATE_FAILS_FOR_SESSION" ]]; then
+        SESSION_IN_LIST=0
+        IFS=',' read -ra FAIL_LIST <<< "$ACTIVATE_FAILS_FOR_SESSION"
+        for s in "${FAIL_LIST[@]}"; do
+          if [[ "$s" == "$SESS_ID_PARAM" ]]; then
+            SESSION_IN_LIST=1
+            break
+          fi
+        done
+        if [[ "$SESSION_IN_LIST" -eq 1 ]]; then
+          PROCEED_NORMAL=0
+          # Remove the failed session from the sub→sess mapping so the
+          # next delegate for the same subagent creates a NEW session
+          # (simulates model-mismatch cold-miss / broken-session recovery).
+          # The failed session stays in SESS_PENDING until Rust calls
+          # session.close.
+          for i in "${!SUB_IDS[@]}"; do
+            if [[ "${SESS_IDS[$i]}" == "$SESS_ID_PARAM" ]]; then
+              unset 'SUB_IDS[i]'
+              unset 'SESS_IDS[i]'
+              SUB_IDS=(${SUB_IDS[@]+"${SUB_IDS[@]}"})
+              SESS_IDS=(${SESS_IDS[@]+"${SESS_IDS[@]}"})
+              break
+            fi
+          done
+          printf '{"jsonrpc":"2.0","error":{"code":-32603,"message":"activate failed: per-session simulated error"},"id":%s}\n' "$ID"
+        fi
+      fi
+      if [[ "$PROCEED_NORMAL" -eq 1 ]]; then
+        FOUND=0
+        # Check if already active (idempotent no-op).
+        if [[ ${#SESS_ORDER[@]} -gt 0 ]]; then
+          for s in "${SESS_ORDER[@]}"; do
+            if [[ "$s" == "$SESS_ID_PARAM" ]]; then
+              FOUND=1
+              break
+            fi
+          done
+        fi
+        if [[ "$FOUND" -eq 0 ]]; then
+          # Check pending sessions.
+          if [[ ${#SESS_PENDING[@]} -gt 0 ]]; then
+            for i in "${!SESS_PENDING[@]}"; do
+              if [[ "${SESS_PENDING[$i]}" == "$SESS_ID_PARAM" ]]; then
+                unset 'SESS_PENDING[i]'
+                SESS_PENDING=(${SESS_PENDING[@]+"${SESS_PENDING[@]}"})
+                SESS_ORDER+=("$SESS_ID_PARAM")
+                FOUND=1
+                break
+              fi
+            done
+          fi
+        fi
+        if [[ "$FOUND" -eq 0 ]]; then
+          # Session not in pool — return error so Rust rolls back the binding.
+          printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"session not found: %s"},"id":%s}\n' "$SESS_ID_PARAM" "$ID"
+        else
+          printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"
         fi
       fi
       ;;
@@ -337,11 +449,20 @@ while IFS= read -r line; do
         # the fatal-close-failure eviction path (P1-2 fix).
         printf '{"jsonrpc":"2.0","error":{"code":-32001,"message":"session.close failed: adapter error"},"id":%s}\n' "$ID"
       else
-        # Remove from pool
+        # Remove from pool — check both SESS_ORDER (active) and SESS_PENDING
+        # (two-phase lifecycle: a pending session can be closed by Rust on
+        # binding commit failure, or by the sidecar's turn_auto ghost cleanup).
         for i in "${!SESS_ORDER[@]}"; do
           if [[ "${SESS_ORDER[$i]}" == "$SESS_ID_PARAM" ]]; then
             unset 'SESS_ORDER[i]'
             SESS_ORDER=(${SESS_ORDER[@]+"${SESS_ORDER[@]}"})
+            break
+          fi
+        done
+        for i in "${!SESS_PENDING[@]}"; do
+          if [[ "${SESS_PENDING[$i]}" == "$SESS_ID_PARAM" ]]; then
+            unset 'SESS_PENDING[i]'
+            SESS_PENDING=(${SESS_PENDING[@]+"${SESS_PENDING[@]}"})
             break
           fi
         done
@@ -381,6 +502,7 @@ while IFS= read -r line; do
             SESS_ORDER=()
             SUB_IDS=()
             SESS_IDS=()
+            SESS_PENDING=()
           fi
         fi
         printf '{"jsonrpc":"2.0","result":{"ok":true},"id":%s}\n' "$ID"

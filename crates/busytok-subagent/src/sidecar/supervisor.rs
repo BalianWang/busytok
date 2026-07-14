@@ -1233,6 +1233,23 @@ impl SidecarHandle {
             .await
     }
 
+    /// Activate a session — move it from `pending` to `active` (LRU-eligible)
+    /// in the sidecar's hot pool. Called by Rust AFTER the DB hot binding is
+    /// committed, closing the timing window between `turn_auto` success and
+    /// binding commit. Idempotent: activating an already-active session is
+    /// a no-op.
+    pub async fn activate(
+        &self,
+        adapter_session_id: &str,
+    ) -> Result<serde_json::Value, SidecarError> {
+        self.supervisor
+            .call_rpc(
+                "session.activate",
+                serde_json::json!({ "adapter_session_id": adapter_session_id }),
+            )
+            .await
+    }
+
     /// Cancel an in-flight `turn_auto` for the given subagent. The sidecar
     /// looks up the hot session by `logical_subagent_id` and calls
     /// `abort()` on the SDK session, which aborts the underlying HTTP
@@ -1244,11 +1261,15 @@ impl SidecarHandle {
     pub async fn cancel_session(
         &self,
         logical_subagent_id: &str,
+        task_id: Option<&str>,
     ) -> Result<serde_json::Value, SidecarError> {
         self.supervisor
             .call_rpc(
                 "session.cancel",
-                serde_json::json!({ "logical_subagent_id": logical_subagent_id }),
+                serde_json::json!({
+                    "logical_subagent_id": logical_subagent_id,
+                    "task_id": task_id,
+                }),
             )
             .await
     }

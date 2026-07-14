@@ -116,7 +116,12 @@ impl SidecarTaskExecutor {
     /// sidecar is unreachable or the RPC fails, the error is returned so
     /// the caller can log it. The cancel outcome in the DB is NOT affected
     /// by this call's result — the DB status is already `cancelled`.
-    async fn cancel_turn(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
+    async fn cancel_turn(
+        &self,
+        subagent_id: &str,
+        provider_id: &str,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let Some(supervisor) = self.pool.get_worker(provider_id) else {
             // No worker — sidecar was never started or was killed.
             // Nothing to cancel.
@@ -132,9 +137,75 @@ impl SidecarTaskExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during cancel: {e}"))?;
         handle
-            .cancel_session(subagent_id)
+            .cancel_session(subagent_id, task_id)
             .await
             .map_err(|e| anyhow::anyhow!("session.cancel RPC failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Activate a session — move it from `pending` to `active` (LRU-eligible)
+    /// in the sidecar's hot pool. Called by the manager AFTER the DB hot
+    /// binding is committed. On failure (RPC timeout, SESSION_NOT_FOUND,
+    /// sidecar crash), the manager rolls back the DB binding to warm/cold
+    /// and closes the pending session — the task already completed, so the
+    /// user's result is preserved; future delegates will cold-start.
+    async fn activate_session_rpc(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(supervisor) = self.pool.get_worker(provider_id) else {
+            warn!(
+                event_code = "subagent.session.activate_worker_missing",
+                adapter_session_id = %adapter_session_id,
+                provider_id = %provider_id,
+                "cannot activate session: provider worker is missing"
+            );
+            return Err(anyhow::anyhow!(
+                "provider worker {provider_id} is missing while activating session {adapter_session_id}"
+            ));
+        };
+        let handle = supervisor
+            .ensure_started()
+            .await
+            .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during activate: {e}"))?;
+        handle
+            .activate(adapter_session_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("session.activate RPC failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Close a session after a DB lifecycle transition. The operation is
+    /// idempotent: a session that was already removed by the sidecar (or a
+    /// concurrent cleanup) is treated as successfully closed.
+    async fn close_session_rpc(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(supervisor) = self.pool.get_worker(provider_id) else {
+            return Ok(());
+        };
+        if !supervisor.try_is_running() {
+            return Ok(());
+        }
+        let handle = supervisor
+            .ensure_started()
+            .await
+            .map_err(|e| anyhow::anyhow!("sidecar ensure_started failed during close: {e}"))?;
+        match handle.close(adapter_session_id).await {
+            Ok(_) => {}
+            Err(SidecarError::Application(code, _message, _data)) if code == SESSION_NOT_FOUND => {
+                info!(
+                    event_code = "subagent.session.close_already_closed",
+                    adapter_session_id = %adapter_session_id,
+                    provider_id = %provider_id,
+                    "session.close received SESSION_NOT_FOUND; treating cleanup as complete"
+                );
+            }
+            Err(e) => return Err(anyhow::anyhow!("session.close RPC failed: {e}")),
+        }
         Ok(())
     }
 }
@@ -145,8 +216,36 @@ impl TaskExecutor for SidecarTaskExecutor {
         Self::execute_impl(self, input).await
     }
 
+    async fn cancel_for_task(
+        &self,
+        subagent_id: &str,
+        provider_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<()> {
+        self.cancel_turn(subagent_id, provider_id, Some(task_id))
+            .await
+    }
+
     async fn cancel(&self, subagent_id: &str, provider_id: &str) -> anyhow::Result<()> {
-        self.cancel_turn(subagent_id, provider_id).await
+        self.cancel_turn(subagent_id, provider_id, None).await
+    }
+
+    async fn activate_session(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        self.activate_session_rpc(adapter_session_id, provider_id)
+            .await
+    }
+
+    async fn close_session(
+        &self,
+        adapter_session_id: &str,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        self.close_session_rpc(adapter_session_id, provider_id)
+            .await
     }
 }
 
@@ -204,6 +303,7 @@ impl SidecarTaskExecutor {
             "open_questions": open_questions_json,
         });
         let params = serde_json::json!({
+            "task_id": input.task_id,
             "logical_subagent_id": input.subagent_id,
             "logical_subagent_name": input.subagent_name,
             "cwd": input.cwd,
@@ -719,25 +819,56 @@ impl SidecarTaskExecutor {
         // C7 fix: resolve which supervisor owns this session via the pool.
         let (_provider_id, supervisor) = match self.pool.supervisor_for_session(adapter_session_id)
         {
-            Some(pair) => pair,
-            None => {
-                // No supervisor owns this session: either the binding belongs
-                // to a removed provider (session already gone), or the sidecar
-                // and DB are out of sync (the sidecar named a candidate the DB
-                // doesn't track). Surface this as a state-divergence error —
-                // NOT HotSessionLimit (which would mislead callers into
-                // retrying for capacity). Silently skipping would cause the
-                // turn_auto retry to hit HOT_SESSION_LIMIT_REACHED again,
-                // hiding the root cause (out-of-sync) behind the symptom.
-                warn!(
-                    event_code = "subagent.session.eviction_no_supervisor",
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                // With the two-phase session lifecycle (pending → active), a
+                // candidate named by the sidecar should ALWAYS have a DB
+                // binding: only activated sessions are in the LRU, and
+                // activation only happens AFTER the DB binding is committed
+                // (manager calls `session.activate` post-commit). A candidate
+                // with no binding is therefore a permanent sidecar/DB state
+                // divergence — NOT a transient timing window.
+                //
+                // Previously (pre-two-phase), `endTurn()` made a session
+                // evictable BEFORE Rust committed the binding, creating a
+                // timing window where `purge_session` could close a session
+                // whose binding was about to be committed. The two-phase
+                // lifecycle eliminates that window: pending sessions are never
+                // in the LRU and thus never selected as eviction candidates.
+                //
+                // Surfacing as `HotSessionStateDivergence` (fatal) instead of
+                // `HotSessionLimit` (transient) ensures the task fails loudly
+                // rather than silently retrying into a broken pool state.
+                error!(
+                    event_code = "subagent.session.eviction_state_divergence",
                     adapter_session_id = %adapter_session_id,
-                    "no supervisor owns this session — binding may belong to a removed provider, or sidecar/DB are out of sync; aborting eviction"
+                    "eviction candidate has no DB binding — sidecar/DB state divergence \
+                     (with two-phase lifecycle, all LRU candidates must have committed bindings)"
                 );
-                return Err(SubagentError::HotSessionStateDivergence(format!(
-                    "no supervisor owns adapter_session_id={adapter_session_id}; \
-                     binding may belong to a removed provider, or sidecar/DB are out of sync"
-                )));
+                return Err(SubagentError::HotSessionStateDivergence(
+                    format!(
+                        "no binding found in DB for adapter_session_id={adapter_session_id}; \
+                         sidecar/DB state divergence (sidecar returned LRU candidate with no binding; \
+                         with two-phase lifecycle this should be impossible — pending sessions \
+                         are never in LRU)"
+                    ),
+                ));
+            }
+            Err(e) => {
+                // DB query error — transient, not permanent divergence.
+                // The binding might exist but the query failed (disk I/O,
+                // lock contention, etc.). Return `HotSessionLimit` so the
+                // caller re-queues the task for a later retry, rather than
+                // fatally failing on a transient DB error.
+                warn!(
+                    event_code = "subagent.session.supervisor_lookup_db_error",
+                    adapter_session_id = %adapter_session_id,
+                    error = %e,
+                    "DB query failed in supervisor_for_session — treating as transient"
+                );
+                return Err(SubagentError::HotSessionLimit {
+                    candidate: adapter_session_id.to_string(),
+                });
             }
         };
 
@@ -759,6 +890,22 @@ impl SidecarTaskExecutor {
                     "prepare_hibernate returned SESSION_NOT_FOUND — concurrent evictor already closed this session"
                 );
                 return Ok(EvictionOutcome::AlreadyEvicted);
+            }
+            Err(SidecarError::Application(code, _msg, _data))
+                if code == HOT_SESSION_LIMIT_REACHED =>
+            {
+                // The sidecar atomically rejected this eviction because the
+                // session became busy after candidate selection. Treat it as
+                // transient capacity contention; the caller can retry after
+                // the active turn releases the session.
+                warn!(
+                    event_code = "subagent.session.eviction_busy",
+                    adapter_session_id = %adapter_session_id,
+                    "eviction candidate became busy before prepare_hibernate"
+                );
+                return Err(SubagentError::HotSessionLimit {
+                    candidate: adapter_session_id.to_string(),
+                });
             }
             Err(e) => {
                 warn!(

@@ -455,6 +455,7 @@ fn count_tasks_since_returns_authoritative_count() {
             timeout_seconds: None,
             model_override: None,
             error_kind: None,
+            queue_reason: None,
         };
         db.subagent_insert_task(&task).unwrap();
     }
@@ -508,6 +509,7 @@ fn task_counts_by_status_returns_queued_and_running_counts() {
             timeout_seconds: None,
             model_override: None,
             error_kind: None,
+            queue_reason: None,
         };
         db.subagent_insert_task(&task).unwrap();
     }

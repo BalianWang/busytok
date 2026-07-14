@@ -1,0 +1,23 @@
+-- v6 subagent-queue-reason migration
+--
+-- Adds `queue_reason` column to `subagent_tasks` so the reason a task is
+-- queued is persisted alongside the task row. This lets external
+-- orchestrators distinguish between:
+--   - "subagent_busy"     — same-subagent serialization (another task
+--                           for this subagent is already running)
+--   - "pressure_gate_paused" — global pressure gate paused new tasks
+--   - "hot_session_limit" — all hot sessions were busy; the task was
+--                           optimistically started, hit HOT_SESSION_LIMIT_REACHED,
+--                           and was re-queued for dispatcher retry
+--
+-- Without this column, `queue_reason` was only available on the initial
+-- `delegate()` RPC response (computed at delegate-time), not on the
+-- `subagent.task` poll endpoint — external orchestrators polling task
+-- status had no way to tell WHY a task was queued.
+--
+-- The column is nullable: existing rows and non-queued tasks have
+-- `queue_reason = NULL`. Only rows with `status = 'queued'` carry a
+-- non-null value. The column is cleared (set to NULL) when the task
+-- transitions to `running` via `pick_oldest_queued_task`.
+
+ALTER TABLE subagent_tasks ADD COLUMN queue_reason TEXT;

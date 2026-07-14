@@ -40,21 +40,22 @@ describe('turn_auto with pool (mock path)', () => {
   it('throws HOT_SESSION_LIMIT_REACHED when full', async () => {
     const pool = new SessionPool(1);
     const handler = turnAutoHandlerWithPool(pool);
-    await handler(
+    const result1 = await handler(
       { logical_subagent_id: 'sub-a', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
-    );
-    await expect(
-      handler(
-        { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
-      ),
-    ).rejects.toThrow(SidecarError);
+    ) as { adapter_session_id: string };
+    // Two-phase lifecycle: activate the session so it becomes an evictable
+    // LRU candidate (simulates Rust calling session.activate after DB commit).
+    pool.activate(result1.adapter_session_id);
+    let error: unknown;
     try {
       await handler(
         { logical_subagent_id: 'sub-b', cwd: '/tmp', profile: 'p', model: 'test-model', prompt: 'x' },
       );
     } catch (e) {
-      expect((e as SidecarError).code).toBe(-32002);
-      expect((e as SidecarError).data?.candidate).toBeTruthy();
+      error = e;
     }
+    expect(error).toBeInstanceOf(SidecarError);
+    expect((error as SidecarError).code).toBe(-32002);
+    expect((error as SidecarError).data?.candidate).toBeTruthy();
   });
 });

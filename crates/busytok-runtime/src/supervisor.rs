@@ -566,7 +566,7 @@ impl BusytokSupervisor {
         // completion-hook + manager-construction path is used both at startup
         // and on mid-flight rebuild.
         let sidecar_runtime =
-            Self::build_sidecar_runtime(components, &db, &settings, &generation_manager);
+            Self::build_sidecar_runtime(components, &db, &settings, &generation_manager, None);
 
         // §8.3 step 2 "queue only" background dispatcher (Task 7 Finding 3
         // fix): spawn the dispatcher that polls `subagent_tasks` for queued
@@ -620,15 +620,21 @@ impl BusytokSupervisor {
         db: &Arc<Mutex<Database>>,
         settings: &Arc<Mutex<BusytokSettings>>,
         generation_manager: &Arc<crate::generation_manager::GenerationManager>,
+        lifecycle_registry: Option<busytok_subagent::LifecycleRegistry>,
     ) -> SidecarRuntime {
         let subagent_settings = settings.lock().unwrap().subagent.clone();
-        let subagent_manager = Arc::new(busytok_subagent::SubagentManager::with_pressure_gate(
-            Arc::clone(db),
-            subagent_settings,
-            "pi",
-            components.executor,
-            components.pressure_gate.clone(),
-        ));
+        let subagent_manager = Arc::new(
+            busytok_subagent::SubagentManager::with_pressure_gate_and_lifecycle_registry(
+                Arc::clone(db),
+                subagent_settings,
+                "pi",
+                components.executor,
+                components.pressure_gate.clone(),
+                lifecycle_registry.unwrap_or_else(|| {
+                    Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+                }),
+            ),
+        );
 
         // P1 #2 fix: register a post-task completion hook so queued tasks'
         // usage flows into `usage_events` + rollups via the SAME
@@ -727,6 +733,17 @@ impl BusytokSupervisor {
             let _ = handle.await;
         }
 
+        // Preserve the lifecycle registry before constructing a successor
+        // manager. Detached delegates from the old runtime may still be
+        // finalizing; the successor must share their per-subagent gates.
+        let lifecycle_registry = {
+            self.sidecar_runtime
+                .read()
+                .unwrap()
+                .subagent_manager
+                .lifecycle_registry()
+        };
+
         // 2. Construct fresh components from the CURRENT (already-swapped)
         //    settings. `construct_sidecar` reads `self.settings` which was
         //    updated by `pi_sidecar_locator_update` BEFORE calling this.
@@ -739,6 +756,7 @@ impl BusytokSupervisor {
             &self.db,
             &self.settings,
             &self.generation_manager,
+            Some(lifecycle_registry),
         );
 
         // Capture the init_error for observability before the runtime is
@@ -2949,6 +2967,13 @@ fn subagent_task_detail(
         }
         None => (None, None, None),
     };
+    // v6: expose queue_reason ONLY when status == "queued". The DB
+    // retains queue_reason across transitions (for forensic value —
+    // "was this task ever queued?"), but the DTO contract says
+    // queue_reason is None for non-queued tasks. Deriving at read time
+    // is a single choke point: future transition paths (cancel, fail,
+    // complete) don't need to remember to clear it in SQL.
+    let is_queued = task.status == "queued";
     SubagentTaskDetailDto {
         id: task.id,
         subagent_id: task.subagent_id,
@@ -2970,6 +2995,7 @@ fn subagent_task_detail(
         effective_provider_id,
         effective_model_id,
         binding_source,
+        queue_reason: if is_queued { task.queue_reason } else { None },
     }
 }
 

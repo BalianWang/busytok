@@ -63,6 +63,8 @@ export interface CompactContext {
 export type ProviderKind = 'openai_compatible' | 'anthropic_compatible';
 
 export interface TurnAutoParams {
+  /** Stable task identity used to scope cancellation to this turn. */
+  task_id?: string;
   logical_subagent_id: string;
   logical_subagent_name?: string;
   cwd: string;
@@ -158,10 +160,20 @@ export interface CloseResult {
 
 export interface CancelParams {
   logical_subagent_id: string;
+  /** When present, cancel only this task's active turn. */
+  task_id?: string;
 }
 
 export interface CancelResult {
   cancelled: boolean;
+}
+
+export interface ActivateParams {
+  adapter_session_id: string;
+}
+
+export interface ActivateResult {
+  ok: boolean;
 }
 
 // New error codes start at -32010 to avoid collisions with existing

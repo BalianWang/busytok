@@ -371,7 +371,16 @@ effective_model_id: string | null,
  * model_override) or `"bound"` (subagent's stored binding). `None`
  * when the parent subagent row is gone.
  */
-binding_source: string | null, };
+binding_source: string | null, 
+/**
+ * v6: why the task is currently queued. `None` for non-queued tasks
+ * (running/completed/failed/cancelled) and for tasks queued before
+ * v6. Values: `"pressure_gate_paused"`, `"subagent_busy"`,
+ * `"hot_session_limit"`. Lets pollers (CLI `subagent task`, automation)
+ * distinguish per-subagent serialization from global hot session
+ * capacity contention without reading the delegate RPC response.
+ */
+queue_reason: string | null, };
 
 export type SubagentTasksRequestDto = { name: string | null, id: string | null, cwd: string | null, limit: number | null, };
 

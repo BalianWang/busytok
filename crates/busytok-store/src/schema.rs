@@ -2,7 +2,7 @@
 ///
 /// The baseline schema is applied as a single migration when a new database
 /// is created. Future schema changes will increment from v1.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// SQL to create the schema version tracking table.
 pub const CREATE_SCHEMA_VERSION_TABLE: &str = "\
@@ -34,6 +34,15 @@ const SUBAGENT_TASK_FIELDS_SQL: &str = include_str!("../migrations/0004_subagent
 const PROVIDER_CATALOG_AND_SUBAGENT_ROUTE_BINDING_SQL: &str =
     include_str!("../migrations/0005_provider_catalog_and_subagent_route_binding.sql");
 
+/// v6 subagent-queue-reason migration SQL — adds `queue_reason` column to
+/// `subagent_tasks` so the reason a task is queued is persisted alongside
+/// the task row. This lets external orchestrators distinguish between
+/// "subagent_busy" (same-subagent serialization), "pressure_gate_paused"
+/// (global pressure gate), and "hot_session_limit" (transient capacity
+/// contention re-queue) when polling task status.
+const SUBAGENT_QUEUE_REASON_SQL: &str =
+    include_str!("../migrations/0006_subagent_queue_reason.sql");
+
 /// All migrations in order, from the v1 baseline through the latest version.
 pub fn migrations() -> Vec<(u32, &'static str)> {
     vec![
@@ -42,5 +51,6 @@ pub fn migrations() -> Vec<(u32, &'static str)> {
         (3, SUBAGENT_SQL),
         (4, SUBAGENT_TASK_FIELDS_SQL),
         (5, PROVIDER_CATALOG_AND_SUBAGENT_ROUTE_BINDING_SQL),
+        (6, SUBAGENT_QUEUE_REASON_SQL),
     ]
 }

@@ -392,6 +392,7 @@ async fn delegate_via_sidecar_empty_session_id_falls_to_cold() {
 
 fn executor_input() -> ExecutorInput {
     ExecutorInput {
+        task_id: "task-fixture".to_string(),
         subagent_id: "sub-test".to_string(),
         subagent_name: "reviewer".to_string(),
         cwd: "/tmp/repo".to_string(),
@@ -582,6 +583,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
 
     // First delegate — fills the pool (max_hot=1).
     let input1 = ExecutorInput {
+        task_id: "task-a".into(),
         subagent_id: "sub-a".into(),
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
@@ -641,7 +643,7 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
                     id: "bind_a".into(),
                     subagent_id: "sub-a".into(),
                     harness: "pi".into(),
-                    adapter_session_id: Some(sess_a),
+                    adapter_session_id: Some(sess_a.clone()),
                     adapter_process_id: None,
                     is_hot: 1,
                     status: "hot".into(),
@@ -655,8 +657,17 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
             .unwrap();
     }
 
+    // Two-phase lifecycle: activate the session (simulates what the manager
+    // does after committing the DB binding — moves the session from
+    // SESS_PENDING to SESS_ORDER so it becomes an evictable LRU candidate).
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
+
     // Second delegate — different subagent, triggers eviction.
     let input2 = ExecutorInput {
+        task_id: "task-b".into(),
         subagent_id: "sub-b".into(),
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
@@ -705,10 +716,15 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
 // --- eviction failure paths (Plan 3 Task 7) ---
 //
 // Two regression tests for the eviction driver's failure modes:
-//   1. The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X,
-//      but the DB has no hot binding for X (sidecar/service out of sync).
-//      The executor must error out rather than silently succeeding or
-//      retrying indefinitely.
+//   1. Ghost session (state divergence): the sidecar returns
+//      HOT_SESSION_LIMIT_REACHED with data.candidate=X, but the DB has no
+//      hot binding for X. With the two-phase lifecycle (pending → active),
+//      this can ONLY happen if the session was activated (moved to LRU)
+//      but the binding was deleted/never committed — a permanent state
+//      divergence, NOT a transient timing window. The executor must surface
+//      `HotSessionStateDivergence` (fatal) so the operator is alerted.
+//      Returning `HotSessionLimit` (transient) would cause an infinite
+//      retry loop because the binding will never appear.
 //   2. session.close fails during eviction (BUSYTOK_MOCK_CLOSE_FAILS=1).
 //      The executor must abort (return Err) — the DB has been flipped to
 //      closed/warm but the sidecar still holds the session hot, so
@@ -716,93 +732,77 @@ async fn executor_evicts_lru_session_on_hot_limit_and_retries() {
 //      diverge. State divergence risk → fatal.
 
 #[tokio::test]
-async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
-    // The sidecar returns HOT_SESSION_LIMIT_REACHED with data.candidate=X,
-    // but the DB has no hot binding for X (sidecar and busytok-service are
-    // out of sync). The executor must error out rather than silently
-    // succeeding or retrying indefinitely.
+async fn executor_eviction_ghost_session_surfaces_state_divergence() {
+    // With the two-phase session lifecycle (pending → active), the "ghost
+    // session" timing window is closed: newly-created sessions start as
+    // `pending` (NOT in LRU, NOT evictable) and only become LRU candidates
+    // after Rust commits the DB binding and calls `session.activate`.
+    //
+    // Therefore, a sidecar that names an LRU candidate whose DB binding
+    // doesn't exist is NOT a transient timing window — it's a permanent
+    // sidecar/DB state divergence. The only way an activated session
+    // (in SESS_ORDER) can lack a DB binding is a bug: either the binding
+    // was deleted, the activate RPC was called without a prior commit, or
+    // the sidecar and DB diverged permanently.
+    //
+    // The executor must surface `HotSessionStateDivergence` (fatal) — NOT
+    // `HotSessionLimit` (transient). A transient error would cause an
+    // infinite retry loop because the binding will never appear (it's not
+    // a pending commit — it's permanently missing).
     let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
     let mut cfg = mock_config();
     cfg.max_hot_sessions = 1;
-    // HOT_LIMIT=1 means the sidecar's pool is full after 1 session.
     cfg.env
         .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
     cfg.health_interval = Duration::from_secs(3600);
     let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
 
-    // First delegate — fills the sidecar's pool (max_hot=1)
-    let input1 = ExecutorInput {
-        subagent_id: "sub-a".into(),
-        subagent_name: "a".into(),
-        cwd: "/tmp".into(),
-        profile: "pi/search-cheap".into(),
-        model: "test-model".into(),
-        prompt: "do 1".into(),
-        prompt_artifact_ref: None,
-        timeout_seconds: None,
-        tools: vec![],
-        memory: empty_memory_snapshot(),
-        context: empty_compact_context(),
-        write_access: false,
-        provider_id: TEST_PROVIDER_ID.to_string(),
-        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
-        provider_base_url: "https://test".into(),
-        provider_api_key: "sk-test".into(),
-        model_reasoning: false,
-        model_context_window: 8000,
-        model_max_tokens: 1000,
-        model_display_name: None,
-    };
-    let _out1 = executor
-        .execute(&input1)
+    // First delegate — fills the sidecar's pool (max_hot=1). The session
+    // starts in SESS_PENDING (not yet an LRU candidate).
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
         .await
         .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
 
-    // NOTE: We deliberately do NOT persist the hot binding to the DB.
-    // This simulates the out-of-sync state: the sidecar has session X in
-    // its pool, but the DB has no hot binding for X. When the sidecar
-    // returns data.candidate=X, evict_session's find_hot_binding_by_session
-    // will return None.
+    // Seed the DB binding, then activate the session — this mirrors what
+    // the manager does after a successful commit. After activation, the
+    // session is in SESS_ORDER (LRU-eligible / evictable).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
-    // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with data.candidate,
-    // but eviction can't find the binding in the DB → must error out.
-    let input2 = ExecutorInput {
-        subagent_id: "sub-b".into(),
-        subagent_name: "b".into(),
-        cwd: "/tmp".into(),
-        profile: "pi/search-cheap".into(),
-        model: "test-model".into(),
-        prompt: "do 2".into(),
-        prompt_artifact_ref: None,
-        timeout_seconds: None,
-        tools: vec![],
-        memory: empty_memory_snapshot(),
-        context: empty_compact_context(),
-        write_access: false,
-        provider_id: TEST_PROVIDER_ID.to_string(),
-        provider_kind: busytok_domain::ProviderKind::OpenAiCompatible,
-        provider_base_url: "https://test".into(),
-        provider_api_key: "sk-test".into(),
-        model_reasoning: false,
-        model_context_window: 8000,
-        model_max_tokens: 1000,
-        model_display_name: None,
-    };
-    let result = executor.execute(&input2).await;
+    // Simulate a permanent state divergence: delete the DB binding that
+    // was just committed. The sidecar still has sess_a in SESS_ORDER, so
+    // it will return sess_a as an LRU candidate — but the DB has no
+    // binding for it. With the two-phase lifecycle, this can only happen
+    // due to a bug (not a transient timing window).
+    {
+        let db_guard = db.lock().unwrap();
+        db_guard
+            .conn()
+            .execute(
+                "DELETE FROM subagent_harness_bindings WHERE adapter_session_id = ?1",
+                rusqlite::params![&sess_a],
+            )
+            .unwrap();
+    }
+
+    // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with
+    // data.candidate=sess_a. evict_session calls find_hot_binding_by_session
+    // → returns None (binding was deleted). The executor must surface
+    // HotSessionStateDivergence (fatal), NOT HotSessionLimit (transient).
+    let result = executor.execute(&evict_input("sub-b")).await;
     assert!(
         result.is_err(),
-        "eviction must fail when the DB has no hot binding for the candidate"
+        "eviction must surface a fatal error when the DB has no binding for an activated candidate"
     );
     let err = match result {
         Ok(_) => panic!("expected error, got success"),
         Err(e) => e,
     };
-    // Bug 2 fix: the error must be a structured SubagentError::HotSessionStateDivergence,
-    // NOT a bare anyhow wrapped as SubagentError::Store ("database error") and
-    // NOT HotSessionLimit (which would mislead callers into retrying for capacity).
-    // This is a state sync issue — the sidecar holds a session the DB has no
-    // binding for. Downcast to verify the structured variant survives the
-    // anyhow round-trip.
     let downcasted = err.downcast_ref::<SubagentError>();
     assert!(
         downcasted.is_some(),
@@ -811,13 +811,15 @@ async fn executor_eviction_fails_when_db_has_no_binding_for_candidate() {
     match downcasted.unwrap() {
         SubagentError::HotSessionStateDivergence(msg) => {
             assert!(
-                msg.contains("pi_sess_mock_1"),
-                "error message should name the divergent session, got: {msg}"
+                msg.contains(&sess_a),
+                "divergence error should name the ghost session {sess_a}, got: {msg}"
             );
         }
         other => panic!(
-            "expected SubagentError::HotSessionStateDivergence, got {other:?} — \
-             Bug 2 regression: state-divergence misclassified"
+            "expected SubagentError::HotSessionStateDivergence (fatal), \
+             got {other:?} — with the two-phase lifecycle, a missing binding \
+             for an activated session is a permanent divergence, not a \
+             transient timing window"
         ),
     }
 
@@ -891,6 +893,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
 
     // First delegate — fills the sidecar's pool (max_hot=1), session pi_sess_mock_1.
     let input1 = ExecutorInput {
+        task_id: "task-a".into(),
         subagent_id: "sub-a".into(),
         subagent_name: "a".into(),
         cwd: "/tmp".into(),
@@ -912,10 +915,18 @@ async fn executor_eviction_aborts_when_session_close_fails() {
         model_max_tokens: 1000,
         model_display_name: None,
     };
-    let _out1 = executor
+    let out1 = executor
         .execute(&input1)
         .await
         .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Two-phase lifecycle: activate the session (simulates what the manager
+    // does after committing the DB binding). The pre-seeded binding matches
+    // sess_a, so activation makes it an evictable LRU candidate.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with
     // data.candidate=pi_sess_mock_1 (the LRU session).
@@ -924,6 +935,7 @@ async fn executor_eviction_aborts_when_session_close_fails() {
     // session.close(pi_sess_mock_1) → FAILS (BUSYTOK_MOCK_CLOSE_FAILS=1).
     // Executor must return an error, NOT retry.
     let input2 = ExecutorInput {
+        task_id: "task-b".into(),
         subagent_id: "sub-b".into(),
         subagent_name: "b".into(),
         cwd: "/tmp".into(),
@@ -1093,6 +1105,7 @@ async fn executor_turn_auto_unknown_status_falls_back_to_completed() {
 
 fn evict_input(id: &str) -> ExecutorInput {
     ExecutorInput {
+        task_id: format!("task-{id}"),
         subagent_id: id.into(),
         subagent_name: id.into(),
         cwd: "/tmp".into(),
@@ -1182,10 +1195,19 @@ async fn executor_eviction_fails_when_candidate_missing_from_error() {
     let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None);
 
     // Fill the pool (max_hot=1).
-    executor
+    let out1 = executor
         .execute(&evict_input("sub-a"))
         .await
         .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Two-phase lifecycle: activate the session so it enters SESS_ORDER
+    // (LRU-eligible). Without this, the mock sidecar would return
+    // all_busy=true (no evictable candidate) instead of the protocol
+    // violation error this test exercises.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate triggers HOT_SESSION_LIMIT_REACHED with no data field.
     let err = match executor.execute(&evict_input("sub-b")).await {
@@ -1282,10 +1304,19 @@ async fn executor_eviction_fails_without_db() {
     let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, None); // No DB
 
     // First delegate — fills the pool (max_hot=1).
-    executor
+    let out1 = executor
         .execute(&evict_input("sub-a"))
         .await
         .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+    // Two-phase lifecycle: activate the session so it enters SESS_ORDER
+    // (LRU-eligible). Without this, the mock sidecar would return
+    // all_busy=true instead of a named candidate, and the no-DB guard
+    // in evict_session would never be reached.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate — triggers HOT_SESSION_LIMIT_REACHED with a valid
     // data.candidate (classify_hot_limit_error returns Evict), then
@@ -1329,6 +1360,12 @@ async fn executor_eviction_fails_when_prepare_hibernate_fails() {
         .expect("first delegate must succeed");
     let sess_a = out1.adapter_session_id.expect("must have session id");
     seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate for the eviction flow.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),
@@ -1381,6 +1418,12 @@ async fn executor_eviction_skips_memory_write_when_memory_delta_null() {
     // Pre-seed the hot binding + an empty memory row (mirrors what
     // SubagentManager::delegate persists after a successful execute).
     seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate for the eviction flow.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     let out2 = executor
         .execute(&evict_input("sub-b"))
@@ -1437,6 +1480,12 @@ async fn executor_eviction_keeps_warm_when_prior_memory_exists_and_delta_null() 
     // Pre-seed the hot binding + a memory row that already has a hot_summary
     // (simulates a prior session that wrote memory).
     seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate for the eviction flow.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
     {
         let db_guard = db.lock().unwrap();
         db_guard
@@ -1496,6 +1545,12 @@ async fn executor_eviction_propagates_error_when_retry_turn_auto_fails() {
         .expect("first delegate must succeed");
     let sess_a = out1.adapter_session_id.expect("must have session id");
     seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate for the eviction flow.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     let err = match executor.execute(&evict_input("sub-b")).await {
         Ok(_) => panic!("expected error, got success"),
@@ -1603,6 +1658,14 @@ async fn executor_eviction_already_evicted_retry_succeeds() {
     // committed the eviction). The sidecar still holds the session in its
     // pool — until prepare_hibernate runs with EVICTS=1.
     seed_cold_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate. Even though the DB binding is pre-flipped to is_hot=0,
+    // the sidecar still holds the session and needs it in SESS_ORDER
+    // to return it as a candidate.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate — sub-b. The mock pool is full (sess-a still in it),
     // so turn_auto returns HOT_SESSION_LIMIT_REACHED with candidate=sess-a.
@@ -1652,6 +1715,13 @@ async fn executor_eviction_already_evicted_exhaustion_surfaces_hot_limit() {
     // committed the eviction). The sidecar still holds the session — and
     // will keep holding it (no EVICTS flag).
     seed_cold_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate. Without activation, the mock would return all_busy=true
+    // immediately (never exercising the eviction + retry-exhaustion path).
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate — sub-b. evict_session returns AlreadyEvicted (is_hot=0).
     // Retry turn_auto keeps hitting HOT_SESSION_LIMIT_REACHED because the mock
@@ -1714,6 +1784,12 @@ async fn executor_eviction_already_evicted_via_session_not_found() {
     // Seed a hot binding (normal state — no pre-flip; the -32001 from
     // prepare_hibernate is what triggers AlreadyEvicted, not the DB state).
     seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate for the eviction flow.
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate — sub-b. turn_auto returns HOT_SESSION_LIMIT_REACHED
     // with candidate=sess-a. evict_session calls prepare_hibernate(sess-a):
@@ -1768,6 +1844,13 @@ async fn executor_evicted_retry_hot_limit_surfaces_transient() {
     let sess_a = out1.adapter_session_id.expect("must have session id");
     // Seed a hot binding (normal state — the Evicted path will flip it).
     seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    // Two-phase lifecycle: activate the session so it becomes an LRU
+    // candidate. Without activation, the mock would return all_busy=true
+    // immediately (never exercising the eviction + refill + retry path).
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
 
     // Second delegate — sub-b. turn_auto returns HOT_SESSION_LIMIT_REACHED
     // with candidate=sess-a. evict_session succeeds (Evicted): prepare_hibernate
@@ -1867,4 +1950,715 @@ fn executor_pool_getter_returns_underlying_pool() {
         Arc::ptr_eq(pool_from_executor, &harness.pool),
         "pool() must return the same Arc<WorkerPool> passed to with_pool"
     );
+}
+
+#[tokio::test]
+async fn cancel_for_task_is_noop_without_worker() {
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        mock_config(),
+        None,
+        HashMap::new(),
+        Some(gate),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = SidecarTaskExecutor::with_pool(pool, None);
+
+    executor
+        .cancel_for_task("sub-no-worker", TEST_PROVIDER_ID, "task-1")
+        .await
+        .expect("cancel without a worker is best-effort and should succeed");
+}
+
+#[tokio::test]
+async fn cancel_for_task_is_noop_when_worker_is_not_running() {
+    let (_pool, executor, _supervisor, _holder) = make_pool_with_config(mock_config(), None);
+
+    // The worker is registered but its child process has not started.
+    // Cancellation must not spawn a sidecar solely to send cancel.
+    executor
+        .cancel_for_task("sub-stopped-worker", TEST_PROVIDER_ID, "task-2")
+        .await
+        .expect("cancel for a stopped worker should be a no-op");
+}
+
+#[tokio::test]
+async fn close_session_is_noop_without_worker_or_when_stopped() {
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        mock_config(),
+        None,
+        HashMap::new(),
+        Some(gate),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = SidecarTaskExecutor::with_pool(pool, None);
+    executor
+        .close_session("session-no-worker", TEST_PROVIDER_ID)
+        .await
+        .expect("close without a worker should be idempotent");
+
+    let (_pool, executor, _supervisor, _holder) = make_pool_with_config(mock_config(), None);
+    executor
+        .close_session("session-stopped-worker", TEST_PROVIDER_ID)
+        .await
+        .expect("close for a stopped worker should be idempotent");
+}
+
+#[tokio::test]
+async fn cancel_for_task_reaches_running_sidecar() {
+    let h = make_harness();
+    let r = h
+        .manager
+        .delegate(req("cancel-rpc", "complete before cancel"))
+        .await
+        .unwrap();
+    assert_eq!(await_task_done(&h.manager, &r.task_id).await, "completed");
+
+    // The completed session is still owned by the running worker. This call
+    // exercises the task-scoped RPC path without needing an in-flight model
+    // request; the fixture intentionally returns method-not-found so the
+    // caller's diagnostics path is covered.
+    let err = h
+        ._executor
+        .cancel_for_task(&r.subagent_id, TEST_PROVIDER_ID, &r.task_id)
+        .await
+        .expect_err("the mock sidecar intentionally lacks session.cancel");
+    assert!(
+        err.to_string().contains("session.cancel") || err.to_string().contains("method not found"),
+        "cancel RPC errors must preserve diagnostics: {err}"
+    );
+    h.supervisor.shutdown().await.unwrap();
+}
+
+// --- Two-phase session lifecycle regression tests ---
+//
+// The two-phase lifecycle (pending → active) closes the P0 timing window
+// where `purge_session` could close a session waiting for DB binding commit.
+// New sessions start as `pending` (NOT in LRU, NOT evictable). Rust calls
+// `session.activate` after committing the DB binding. On commit failure,
+// Rust calls `session.close` to clean up the orphaned pending session.
+//
+// These tests verify:
+//   1. A pending session is NOT evicted when the pool is full.
+//   2. The manager activates the session after a successful delegate.
+//   3. The manager closes the session on commit failure (no is_hot=1 leak).
+
+/// A pending session (not yet activated) must NOT be evicted when the pool
+/// is full. The sidecar returns `all_busy=true` (no LRU candidates), and the
+/// executor surfaces `HotSessionLimit` (transient). After activating the
+/// pending session, a subsequent delegate triggers normal eviction — proving
+/// the pending session survived the transient error and was not closed.
+#[tokio::test]
+async fn pending_session_not_evicted_when_pool_full() {
+    let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+    let mut cfg = mock_config();
+    cfg.max_hot_sessions = 1;
+    cfg.env
+        .insert("BUSYTOK_MOCK_HOT_SESSION_LIMIT".into(), "1".into());
+    cfg.health_interval = Duration::from_secs(3600);
+    let (_pool, executor, supervisor, _holder) = make_pool_with_config(cfg, Some(db.clone()));
+
+    // First delegate — fills the pool (max_hot=1). The session starts in
+    // SESS_PENDING (NOT activated, NOT in LRU).
+    let out1 = executor
+        .execute(&evict_input("sub-a"))
+        .await
+        .expect("first delegate must succeed");
+    let sess_a = out1.adapter_session_id.expect("must have session id");
+
+    // NOTE: We deliberately do NOT call activate_session — simulating the
+    // timing window where turn_auto succeeded but the DB binding hasn't
+    // been committed yet.
+
+    // Second delegate — triggers HOT_SESSION_LIMIT_REACHED. Because
+    // SESS_ORDER is empty (all sessions pending), the mock returns
+    // all_busy=true. The executor must surface HotSessionLimit (transient)
+    // and must NOT close the pending session.
+    let result = executor.execute(&evict_input("sub-b")).await;
+    assert!(
+        result.is_err(),
+        "eviction must surface an error when pool is full with only pending sessions"
+    );
+    let err = match result {
+        Ok(_) => panic!("expected error, got success"),
+        Err(e) => e,
+    };
+    let downcasted = err.downcast_ref::<SubagentError>();
+    assert!(
+        downcasted.is_some(),
+        "error must downcast to SubagentError, got bare anyhow: {err}"
+    );
+    match downcasted.unwrap() {
+        SubagentError::HotSessionLimit { candidate } => {
+            assert!(
+                candidate.is_empty(),
+                "candidate must be empty (all_busy=true), got: {candidate}"
+            );
+        }
+        other => panic!(
+            "expected SubagentError::HotSessionLimit (transient), got {other:?} — \
+             pending sessions must cause a transient retry, not a fatal error"
+        ),
+    }
+
+    // The pending session survived — it was NOT closed by the eviction
+    // attempt. Activate it now (simulates the manager's post-commit
+    // activate), then run a third delegate that should trigger normal
+    // eviction (session is now in SESS_ORDER / LRU).
+    seed_hot_binding(&db, "sub-a", "a", &sess_a);
+    executor
+        .activate_session(&sess_a, TEST_PROVIDER_ID)
+        .await
+        .unwrap();
+
+    let out3 = executor
+        .execute(&evict_input("sub-c"))
+        .await
+        .expect("eviction must succeed after activation — pending session survived");
+    assert_eq!(out3.status, TaskStatus::Completed);
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// After a successful `delegate()`, the manager must call `activate_session`
+/// to move the session from pending to LRU. Verify with `maxHot=1`: a second
+/// delegate for a DIFFERENT subagent must trigger normal eviction (not
+/// all_busy), proving the first session was activated after its commit.
+///
+/// If activate was NOT called, sub-a's session stays in SESS_PENDING (not in
+/// SESS_ORDER/LRU) → the sidecar returns `all_busy=true` → `HotSessionLimit`
+/// → the task is re-queued indefinitely → `await_task_done` panics.
+#[tokio::test]
+async fn delegate_activates_session_after_successful_commit() {
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_MOCK_HOT_SESSION_LIMIT".to_string(),
+        "1".to_string(),
+    );
+    let h = make_harness_with_env(env);
+
+    // First delegate — sub-a. Manager commits the binding and calls
+    // activate_session, moving the session from SESS_PENDING to SESS_ORDER.
+    let r1 = h
+        .manager
+        .delegate(req("reviewer-a", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    let status1 = await_task_done(&h.manager, &r1.task_id).await;
+    assert_eq!(status1, "completed");
+
+    // Second delegate — DIFFERENT subagent. With maxHot=1, the pool is full.
+    // If activate was called on sub-a's session, it's in SESS_ORDER (LRU) →
+    // the sidecar returns it as an evictable candidate → eviction succeeds →
+    // delegate completes.
+    //
+    // If activate was NOT called, sub-a's session is still in SESS_PENDING
+    // (not in LRU) → the sidecar returns all_busy=true → HotSessionLimit →
+    // task is re-queued → await_task_done panics (never reaches terminal
+    // status).
+    let r2 = h
+        .manager
+        .delegate(req("reviewer-b", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "second delegate must complete — eviction succeeded, proving activate was called"
+    );
+
+    // Verify: two different subagents (different names → different IDs).
+    assert_ne!(
+        r1.subagent_id, r2.subagent_id,
+        "different subagent names must resolve to different subagents"
+    );
+
+    // Verify: sub-b has a hot binding (it's the active hot session now).
+    // sub-a's binding was flipped to warm by the eviction flow.
+    {
+        let db_guard = h.db.lock().unwrap();
+        let binding_b = db_guard
+            .subagent_hot_binding(&r2.subagent_id, "pi")
+            .unwrap();
+        assert!(binding_b.is_some(), "sub-b must have a hot binding");
+        assert_eq!(binding_b.unwrap().is_hot, 1);
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// When the DB binding commit fails, the manager must call `close_session`
+/// to clean up the orphaned pending session. Verify: the task fails, and
+/// no `is_hot=1` binding leaks into the DB.
+#[tokio::test]
+async fn delegate_closes_session_on_commit_failure() {
+    let h = make_harness();
+
+    // Drop the bindings table to force `subagent_commit_hot_binding_and_status`
+    // to fail. This simulates a DB-level commit failure.
+    {
+        let db_guard = h.db.lock().unwrap();
+        db_guard
+            .conn()
+            .execute("DROP TABLE subagent_harness_bindings", [])
+            .unwrap();
+    }
+
+    // Delegate — execute succeeds (session created in SESS_PENDING), but
+    // the binding commit fails. The manager must call close_session to
+    // clean up the orphaned pending session.
+    let r = h
+        .manager
+        .delegate(req("commit-fail-sub", "do"))
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_str(), "running");
+    let final_status = await_task_done(&h.manager, &r.task_id).await;
+    assert_eq!(
+        final_status, "failed",
+        "task must fail when binding commit fails"
+    );
+
+    // Verify: the task error mentions the database failure.
+    let task_row = {
+        let db_guard = h.db.lock().unwrap();
+        db_guard.subagent_get_task(&r.task_id).unwrap().unwrap()
+    };
+    let err_str = task_row.error.as_deref().unwrap_or("");
+    assert!(
+        err_str.contains("database error") || err_str.contains("Store"),
+        "commit failure should surface as store error, got: {err_str}"
+    );
+
+    // Verify: no is_hot=1 binding leaked into the DB. The commit failed,
+    // so no binding row should exist with is_hot=1 for this subagent.
+    // (The table was dropped, so no rows exist at all — this is the
+    // strongest possible guarantee that no hot binding leaked.)
+    //
+    // We can't query the dropped table, but we CAN verify that the
+    // subagent's logical status is NOT 'hot' (it should be 'cold' or
+    // 'failed' because the binding was never committed).
+    {
+        let db_guard = h.db.lock().unwrap();
+        let sub = db_guard.subagent_get_logical(&r.subagent_id).unwrap();
+        if let Some(sub) = sub {
+            assert_ne!(
+                sub.status, "hot",
+                "subagent must NOT be 'hot' when binding commit failed — \
+                 no is_hot=1 binding should exist"
+            );
+        }
+    }
+
+    // Verify: the manager called `session.close` on the sidecar to clean up
+    // the orphaned pending session. The mock sidecar tracks total closes in
+    // its `adapter.health` response (`total_closes` field).
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let health = handle.health().await.unwrap();
+    let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+    assert!(
+        total_closes >= 1,
+        "manager must call session.close on binding commit failure — \
+         expected total_closes >= 1, got {total_closes} \
+         (orphaned pending session was not cleaned up)"
+    );
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// A failure in the first persistence phase (after the task row is written)
+/// must still close the pending sidecar session. Early `?` returns used to
+/// bypass the lifecycle cleanup block and leak a non-evictable session.
+#[tokio::test]
+async fn delegate_closes_session_on_usage_persist_failure() {
+    let h = make_harness();
+    {
+        let db_guard = h.db.lock().unwrap();
+        db_guard
+            .conn()
+            .execute("DROP TABLE subagent_usage_records", [])
+            .unwrap();
+    }
+
+    let r = h
+        .manager
+        .delegate(req("usage-persist-fail", "do"))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if h.manager.task_status(&r.task_id).unwrap().as_deref() == Some("failed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "phase-one persistence failure must eventually mark the task failed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let health = handle.health().await.unwrap();
+    assert!(
+        health["total_closes"].as_u64().unwrap_or(0) >= 1,
+        "phase-one persistence failure must close the pending session"
+    );
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// When `session.activate` RPC fails, the manager must:
+/// 1. Roll back the DB binding (flip `is_hot=0`, status → warm/cold).
+/// 2. Close the orphaned pending session in the sidecar.
+/// 3. The task itself still completes (the turn already succeeded — the
+///    user got their result; only the hot binding is lost).
+///
+/// After rollback, a DIFFERENT subagent's delegate must succeed — proving
+/// the capacity slot was freed (no stuck pending session).
+#[tokio::test]
+async fn delegate_rolls_back_binding_when_activate_fails() {
+    let mut env = HashMap::new();
+    env.insert("BUSYTOK_MOCK_ACTIVATE_FAILS".to_string(), "1".to_string());
+    let h = make_harness_with_env(env);
+
+    // Delegate — turn_auto succeeds, DB binding is committed, but
+    // session.activate fails (simulated by BUSYTOK_MOCK_ACTIVATE_FAILS=1).
+    // The manager must roll back the binding and close the pending session.
+    let r = h
+        .manager
+        .delegate(req("sub-activate-fail", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r.status, TaskStatus::Running);
+    let status = await_task_done(&h.manager, &r.task_id).await;
+    // The task still completes — the turn succeeded; only the hot binding
+    // was rolled back.
+    assert_eq!(
+        status, "completed",
+        "task must complete even when activate fails — the turn already succeeded"
+    );
+
+    // The task status is set to "completed" BEFORE the activate call (the
+    // turn already succeeded — the user got their result). The activate/
+    // rollback runs in the same background task but AFTER the status write.
+    // Poll the sidecar's total_closes to wait for the activate/rollback to
+    // complete: when total_closes >= 1, the pending session was closed after
+    // the activate failure.
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = handle.health().await.unwrap();
+        let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+        if total_closes >= 1 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "activate/rollback did not complete within 5s — \
+                 total_closes still 0"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Verify: the binding was rolled back — is_hot=0, status='closed'
+    // (NOT is_hot=1/status='hot' which would indicate a stuck binding).
+    {
+        let db_guard = h.db.lock().unwrap();
+        // `subagent_hot_binding` filters on is_hot=1, so it returns None after
+        // rollback — assert None to verify no hot binding lingers.
+        let hot_binding = db_guard.subagent_hot_binding(&r.subagent_id, "pi").unwrap();
+        assert!(
+            hot_binding.is_none(),
+            "no hot binding should exist after activate failure rollback"
+        );
+        // Query the raw row (without the is_hot=1 filter) to verify the
+        // binding was flipped to is_hot=0, status='closed'.
+        let binding_state: (i32, String) = db_guard
+            .conn()
+            .query_row(
+                "SELECT is_hot, status FROM subagent_harness_bindings \
+                 WHERE subagent_id = ?1 AND harness = 'pi'",
+                rusqlite::params![&r.subagent_id],
+                |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("binding row must exist after activate failure rollback");
+        assert_eq!(
+            binding_state.0, 0,
+            "binding is_hot must be 0 (rolled back after activate failure)"
+        );
+        assert_eq!(
+            binding_state.1, "closed",
+            "binding status must be 'closed' (rolled back after activate failure)"
+        );
+        // The logical subagent status must NOT be 'hot'.
+        let sub = db_guard.subagent_get_logical(&r.subagent_id).unwrap();
+        if let Some(sub) = sub {
+            assert_ne!(
+                sub.status, "hot",
+                "subagent must NOT be 'hot' after activate failure rollback"
+            );
+        }
+    }
+
+    // Critical: a different subagent's delegate must succeed. With
+    // max_hot=3 (default), the pool has capacity — but this proves no
+    // capacity is permanently occupied by the activate failure.
+    let r2 = h
+        .manager
+        .delegate(req("sub-after-rollback", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "second delegate must complete — activate failure did not permanently block capacity"
+    );
+
+    // Wait for the second delegate's activate/rollback to complete before
+    // shutting down (same timing issue as the first delegate).
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = handle.health().await.unwrap();
+        let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+        if total_closes >= 2 {
+            break;
+        }
+        if std::time::Instant::now() > deadline2 {
+            panic!(
+                "second activate/rollback did not complete within 5s — \
+                 total_closes = {total_closes}, expected >= 2"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// P3 test: per-session activate failure + sequential recovery.
+///
+/// Scenario:
+/// 1. Delegate A for sub-X: turn_auto creates session S1, binding committed,
+///    but `session.activate(S1)` fails (per-session mock: S1 in fail list).
+///    The mock removes S1 from the sub→sess mapping on activate failure,
+///    so the next delegate for sub-X creates a NEW session S2.
+/// 2. A's rollback completes: binding flipped to is_hot=0, S1 closed.
+/// 3. Delegate B for sub-X (same subagent): turn_auto creates session S2
+///    (different sid), binding committed, activate succeeds.
+/// 4. Verify: B's binding is hot (is_hot=1, sid=S2), B's task completed.
+///
+/// NOTE: This test verifies SEQUENTIAL recovery — B starts after A's rollback
+/// completes. The P1-1 concurrent guard (skip rollback when binding has a
+/// different sid) is a defense-in-depth measure that requires a multi-
+/// threaded mock sidecar to test reliably. With the current single-threaded
+/// mock, B's turn_auto can only be processed after A's activate returns,
+/// and A's rollback runs immediately after — so B's commit always lands
+/// after A's rollback. The guard is exercised in production when real
+/// concurrency allows B's commit to win the race.
+#[tokio::test]
+async fn delegate_recovers_after_per_session_activate_failure() {
+    // Fail activate ONLY for the first session (pi_sess_mock_1).
+    // The mock removes the failed session from the sub→sess mapping so
+    // the next delegate creates a new session (pi_sess_mock_2).
+    let mut env = HashMap::new();
+    env.insert(
+        "BUSYTOK_MOCK_ACTIVATE_FAILS_FOR_SESSION".to_string(),
+        "pi_sess_mock_1".to_string(),
+    );
+    let h = make_harness_with_env(env);
+
+    // Delegate A — turn_auto succeeds, binding committed with sid=S1,
+    // activate fails (per-session). Task A completes (turn succeeded).
+    let r1 = h
+        .manager
+        .delegate(req("sub-per-session-fail", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    let status1 = await_task_done(&h.manager, &r1.task_id).await;
+    assert_eq!(
+        status1, "completed",
+        "task A must complete — turn succeeded; only activate failed"
+    );
+
+    // Wait for A's activate-failure rollback to complete (total_closes >= 1:
+    // A's orphaned pending session S1 was closed).
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let health = handle.health().await.unwrap();
+        let total_closes = health["total_closes"].as_u64().unwrap_or(0);
+        if total_closes >= 1 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "A's activate/rollback did not complete within 5s — \
+                 total_closes still 0"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Verify: A's binding was rolled back (no hot binding for sub-X).
+    {
+        let db_guard = h.db.lock().unwrap();
+        let binding = db_guard
+            .subagent_hot_binding(&r1.subagent_id, "pi")
+            .unwrap();
+        assert!(
+            binding.is_none(),
+            "A's hot binding must be rolled back after activate failure"
+        );
+    }
+
+    // Delegate B for the SAME subagent — the mock's sub→sess mapping was
+    // cleared for S1 on activate failure, so B creates a NEW session S2.
+    // B's binding commits with sid=S2, activate succeeds.
+    let r2 = h
+        .manager
+        .delegate(req("sub-per-session-fail", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "task B must complete — recovery after per-session activate failure"
+    );
+
+    // Poll until the binding is hot (B's activate completed).
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let active_session_id = {
+            let db_guard = h.db.lock().unwrap();
+            db_guard
+                .subagent_hot_binding(&r1.subagent_id, "pi")
+                .unwrap()
+                .filter(|binding| binding.is_hot == 1)
+                .and_then(|binding| binding.adapter_session_id)
+        };
+        if let Some(adapter_session_id) = active_session_id {
+            assert_ne!(
+                Some(adapter_session_id.as_str()),
+                Some("pi_sess_mock_1"),
+                "B's binding must NOT point to A's failed session S1"
+            );
+            break;
+        }
+        if std::time::Instant::now() > deadline2 {
+            panic!("B's binding did not become hot within 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// When the sidecar restarts (losing all sessions), a subsequent delegate
+/// for the same subagent must recover: the stale hot binding is replaced
+/// with a fresh session, and activate succeeds on the new session.
+#[tokio::test]
+async fn delegate_recovers_after_sidecar_restart() {
+    let h = make_harness();
+
+    // First delegate — succeeds normally.
+    let r1 = h
+        .manager
+        .delegate(req("sub-restart", "first turn"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, TaskStatus::Running);
+    let status1 = await_task_done(&h.manager, &r1.task_id).await;
+    assert_eq!(status1, "completed");
+
+    // Restart the sidecar — all sessions are lost.
+    h.supervisor.shutdown().await.unwrap();
+
+    // Second delegate for the SAME subagent — the manager finds the
+    // existing hot binding, tries to reuse the session. The sidecar
+    // has no record of the old session, so it creates a new one. The
+    // new session is activated successfully.
+    let r2 = h
+        .manager
+        .delegate(req("sub-restart", "second turn"))
+        .await
+        .unwrap();
+    assert_eq!(r2.status, TaskStatus::Running);
+    let status2 = await_task_done(&h.manager, &r2.task_id).await;
+    assert_eq!(
+        status2, "completed",
+        "delegate after sidecar restart must complete"
+    );
+
+    // Verify: the binding is hot (the new session was activated).
+    {
+        let db_guard = h.db.lock().unwrap();
+        let binding = db_guard
+            .subagent_hot_binding(&r2.subagent_id, "pi")
+            .unwrap();
+        assert!(binding.is_some(), "binding must exist");
+        let b = binding.unwrap();
+        assert_eq!(
+            b.is_hot, 1,
+            "binding must be hot after successful re-delegate"
+        );
+    }
+
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// Activation is part of the successful hot-binding commit protocol. If the
+/// worker disappeared between `turn_auto` and the post-commit lifecycle step,
+/// silently returning `Ok(())` would leave a durable `is_hot=1` binding with
+/// no sidecar session. The manager must receive an error so its existing
+/// rollback path can restore the warm/cold invariant.
+#[tokio::test]
+async fn activate_session_errors_when_worker_is_missing() {
+    let pool = Arc::new(WorkerPool::new(
+        mock_config(),
+        None,
+        make_providers(),
+        None,
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = SidecarTaskExecutor::with_pool(Arc::clone(&pool), None);
+
+    let err = executor
+        .activate_session("session-without-worker", TEST_PROVIDER_ID)
+        .await
+        .expect_err("activation must fail when no worker owns the session");
+
+    assert!(
+        err.to_string().contains("worker") && err.to_string().contains(TEST_PROVIDER_ID),
+        "error should identify the missing provider worker, got: {err}"
+    );
+}
+
+/// A worker can still exist in the pool after its child sidecar exited. The
+/// activation path must restart the worker and surface the session-not-found
+/// response, rather than treating `try_is_running() == false` as success.
+#[tokio::test]
+async fn activate_session_surfaces_missing_session_after_worker_restart() {
+    let (pool, executor, supervisor, _holder) = make_pool_with_config(mock_config(), None);
+    supervisor.shutdown().await.unwrap();
+
+    let err = executor
+        .activate_session("session-lost-with-sidecar", TEST_PROVIDER_ID)
+        .await
+        .expect_err("activation must fail when the restarted sidecar lost the session");
+
+    assert!(
+        err.to_string().contains("activate")
+            && (err.to_string().contains("not found")
+                || err.to_string().contains("SESSION_NOT_FOUND")),
+        "error should preserve the activation/session-loss diagnosis, got: {err}"
+    );
+
+    // Keep the pool alive until the RPC has completed; this also makes the
+    // ownership of the restarted supervisor explicit in the test.
+    drop(pool);
 }

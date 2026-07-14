@@ -9,6 +9,9 @@ use crate::models::{TaskErrorKind, TaskStatus, TaskUsage};
 /// Input to a task executor — everything needed to run one turn.
 #[derive(Clone)]
 pub struct ExecutorInput {
+    /// Stable task identity threaded through the sidecar turn so a delayed
+    /// cancel RPC cannot abort a replacement turn for the same subagent.
+    pub task_id: String,
     pub subagent_id: String,
     pub subagent_name: String,
     pub cwd: String,
@@ -80,6 +83,48 @@ pub trait TaskExecutor: Send + Sync {
     /// cancel). `SidecarTaskExecutor` overrides this to send a
     /// `session.cancel` RPC to the sidecar process.
     async fn cancel(&self, _subagent_id: &str, _provider_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Cancel a specific task turn. Executors that do not need task-scoped
+    /// cancellation inherit the legacy subagent-wide behavior.
+    async fn cancel_for_task(
+        &self,
+        subagent_id: &str,
+        provider_id: &str,
+        _task_id: &str,
+    ) -> anyhow::Result<()> {
+        self.cancel(subagent_id, provider_id).await
+    }
+
+    /// Activate a session — move it from `pending` to `active` (LRU-eligible)
+    /// in the sidecar's hot pool. Called by the manager AFTER the DB hot
+    /// binding is committed. An activation error causes the manager to roll
+    /// the binding back to warm/cold; the completed task result is preserved.
+    ///
+    /// Default impl: no-op (mock executors don't have a pending state).
+    /// `SidecarTaskExecutor` overrides this to send a `session.activate` RPC.
+    async fn activate_session(
+        &self,
+        _adapter_session_id: &str,
+        _provider_id: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Close a sidecar session after a DB lifecycle transition. This is used
+    /// both to remove an uncommitted pending session after a persistence
+    /// failure and to release an active session after hibernate. The caller
+    /// serializes it with same-subagent execution so a successful rebind
+    /// cannot be closed accidentally.
+    ///
+    /// Default impl: no-op (mock executors don't have a sidecar pool).
+    /// `SidecarTaskExecutor` overrides this to send a `session.close` RPC.
+    async fn close_session(
+        &self,
+        _adapter_session_id: &str,
+        _provider_id: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
