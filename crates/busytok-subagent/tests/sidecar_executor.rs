@@ -1952,6 +1952,85 @@ fn executor_pool_getter_returns_underlying_pool() {
     );
 }
 
+#[tokio::test]
+async fn cancel_for_task_is_noop_without_worker() {
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        mock_config(),
+        None,
+        HashMap::new(),
+        Some(gate),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = SidecarTaskExecutor::with_pool(pool, None);
+
+    executor
+        .cancel_for_task("sub-no-worker", TEST_PROVIDER_ID, "task-1")
+        .await
+        .expect("cancel without a worker is best-effort and should succeed");
+}
+
+#[tokio::test]
+async fn cancel_for_task_is_noop_when_worker_is_not_running() {
+    let (_pool, executor, _supervisor, _holder) = make_pool_with_config(mock_config(), None);
+
+    // The worker is registered but its child process has not started.
+    // Cancellation must not spawn a sidecar solely to send cancel.
+    executor
+        .cancel_for_task("sub-stopped-worker", TEST_PROVIDER_ID, "task-2")
+        .await
+        .expect("cancel for a stopped worker should be a no-op");
+}
+
+#[tokio::test]
+async fn close_session_is_noop_without_worker_or_when_stopped() {
+    let gate = Arc::new(PressureGate::new());
+    let pool = Arc::new(WorkerPool::new(
+        mock_config(),
+        None,
+        HashMap::new(),
+        Some(gate),
+        SubagentResourcePolicyConfig::default(),
+    ));
+    let executor = SidecarTaskExecutor::with_pool(pool, None);
+    executor
+        .close_session("session-no-worker", TEST_PROVIDER_ID)
+        .await
+        .expect("close without a worker should be idempotent");
+
+    let (_pool, executor, _supervisor, _holder) = make_pool_with_config(mock_config(), None);
+    executor
+        .close_session("session-stopped-worker", TEST_PROVIDER_ID)
+        .await
+        .expect("close for a stopped worker should be idempotent");
+}
+
+#[tokio::test]
+async fn cancel_for_task_reaches_running_sidecar() {
+    let h = make_harness();
+    let r = h
+        .manager
+        .delegate(req("cancel-rpc", "complete before cancel"))
+        .await
+        .unwrap();
+    assert_eq!(await_task_done(&h.manager, &r.task_id).await, "completed");
+
+    // The completed session is still owned by the running worker. This call
+    // exercises the task-scoped RPC path without needing an in-flight model
+    // request; the fixture intentionally returns method-not-found so the
+    // caller's diagnostics path is covered.
+    let err = h
+        ._executor
+        .cancel_for_task(&r.subagent_id, TEST_PROVIDER_ID, &r.task_id)
+        .await
+        .expect_err("the mock sidecar intentionally lacks session.cancel");
+    assert!(
+        err.to_string().contains("session.cancel") || err.to_string().contains("method not found"),
+        "cancel RPC errors must preserve diagnostics: {err}"
+    );
+    h.supervisor.shutdown().await.unwrap();
+}
+
 // --- Two-phase session lifecycle regression tests ---
 //
 // The two-phase lifecycle (pending → active) closes the P0 timing window
@@ -2187,6 +2266,45 @@ async fn delegate_closes_session_on_commit_failure() {
          (orphaned pending session was not cleaned up)"
     );
 
+    h.supervisor.shutdown().await.unwrap();
+}
+
+/// A failure in the first persistence phase (after the task row is written)
+/// must still close the pending sidecar session. Early `?` returns used to
+/// bypass the lifecycle cleanup block and leak a non-evictable session.
+#[tokio::test]
+async fn delegate_closes_session_on_usage_persist_failure() {
+    let h = make_harness();
+    {
+        let db_guard = h.db.lock().unwrap();
+        db_guard
+            .conn()
+            .execute("DROP TABLE subagent_usage_records", [])
+            .unwrap();
+    }
+
+    let r = h
+        .manager
+        .delegate(req("usage-persist-fail", "do"))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if h.manager.task_status(&r.task_id).unwrap().as_deref() == Some("failed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "phase-one persistence failure must eventually mark the task failed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let handle = h.supervisor.ensure_started().await.unwrap();
+    let health = handle.health().await.unwrap();
+    assert!(
+        health["total_closes"].as_u64().unwrap_or(0) >= 1,
+        "phase-one persistence failure must close the pending session"
+    );
     h.supervisor.shutdown().await.unwrap();
 }
 

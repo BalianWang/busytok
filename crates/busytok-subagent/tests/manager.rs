@@ -23,11 +23,19 @@ use busytok_subagent::SubagentError;
 /// call. Used to test cooperative cancel of in-flight executor calls — the
 /// only exit is the cancel signal dropping the executor future via
 /// `tokio::select!` in `execute_task`.
-struct BlockingExecutor;
+struct BlockingExecutor {
+    started: std::sync::Arc<tokio::sync::Notify>,
+}
 
 impl BlockingExecutor {
     fn new() -> Self {
-        Self
+        Self {
+            started: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn started(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.started)
     }
 }
 
@@ -37,6 +45,7 @@ impl TaskExecutor for BlockingExecutor {
         // Block forever until the cancel signal drops the future (via
         // `tokio::select!` in `execute_task`). This simulates a long-running
         // sidecar turn_auto call that never completes on its own.
+        self.started.notify_one();
         std::future::pending::<()>().await;
         unreachable!("BlockingExecutor should never complete — cancel drops the future");
     }
@@ -63,6 +72,26 @@ impl HibernateCloseTrackingExecutor {
         Self {
             closes: Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// Executor used to exercise hibernate's compensating rollback when the
+/// sidecar refuses to close a session after the DB transition. The manager
+/// must restore the hot binding instead of leaving DB and sidecar state split.
+struct HibernateCloseFailingExecutor;
+
+#[async_trait]
+impl TaskExecutor for HibernateCloseFailingExecutor {
+    async fn execute(&self, input: &ExecutorInput) -> anyhow::Result<ExecutorOutput> {
+        MockTaskExecutor.execute(input).await
+    }
+
+    async fn close_session(
+        &self,
+        _adapter_session_id: &str,
+        _provider_id: &str,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("simulated close failure"))
     }
 }
 
@@ -210,6 +239,24 @@ async fn manager() -> std::sync::Arc<SubagentManager> {
         "pi",
         std::sync::Arc::new(MockTaskExecutor),
     ))
+}
+
+#[tokio::test]
+async fn lifecycle_registry_is_shared_by_successor_managers() {
+    let first = manager().await;
+    let shared = first.lifecycle_registry();
+    let second = SubagentManager::with_pressure_gate_and_lifecycle_registry(
+        test_db(),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(MockTaskExecutor),
+        None,
+        std::sync::Arc::clone(&shared),
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&shared, &second.lifecycle_registry()),
+        "runtime successor must retain the previous lifecycle registry"
+    );
 }
 
 /// Wait for a task to reach a terminal status (completed/failed/cancelled).
@@ -1086,6 +1133,11 @@ async fn hibernate_closes_existing_hot_binding() {
             detail_json: None,
         })
         .unwrap();
+        // Keep the state transition successful while forcing the
+        // observational resource-event write down its warning path.
+        g.conn()
+            .execute("DROP TABLE subagent_resource_events", [])
+            .unwrap();
     }
 
     m.hibernate(ResolveParams {
@@ -1151,6 +1203,64 @@ async fn hibernate_closes_matching_sidecar_session_after_db_commit() {
 }
 
 #[tokio::test]
+async fn hibernate_close_failure_restores_hot_binding() {
+    let db = test_db();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        std::sync::Arc::new(HibernateCloseFailingExecutor),
+    ));
+    let r = m.delegate(req("hibernate-close-fail", "do")).await.unwrap();
+    let _ = await_task_done(&m, &r.task_id).await;
+
+    {
+        let g = db.lock().unwrap();
+        g.subagent_upsert_binding(&SubagentHarnessBindingRow {
+            id: format!("bind_{}", r.subagent_id),
+            subagent_id: r.subagent_id.clone(),
+            harness: "pi".to_string(),
+            adapter_session_id: Some("sess-close-fail".to_string()),
+            adapter_process_id: None,
+            is_hot: 1,
+            status: "hot".to_string(),
+            created_at_ms: busytok_domain::now_ms(),
+            last_used_at_ms: None,
+            closed_at_ms: None,
+            detail_json: None,
+        })
+        .unwrap();
+    }
+
+    let err = m
+        .hibernate(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::SidecarRpc { .. }));
+
+    let g = db.lock().unwrap();
+    let binding = g
+        .subagent_hot_binding(&r.subagent_id, "pi")
+        .unwrap()
+        .expect("close failure must restore the hot binding");
+    assert_eq!(
+        binding.adapter_session_id.as_deref(),
+        Some("sess-close-fail")
+    );
+    assert_eq!(binding.status, "hot");
+    assert_eq!(
+        g.subagent_get_logical(&r.subagent_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "hot"
+    );
+}
+
+#[tokio::test]
 async fn hibernate_serializes_same_subagent_delegate_until_session_close() {
     let db = test_db();
     let executor = std::sync::Arc::new(HibernateDelegateRaceExecutor::new());
@@ -1203,6 +1313,44 @@ async fn hibernate_serializes_same_subagent_delegate_until_session_close() {
         Some("session-race-new"),
         "hibernate must not close the replacement delegate's session"
     );
+}
+
+#[tokio::test]
+async fn hibernate_times_out_while_same_subagent_task_is_running() {
+    let db = test_db();
+    let executor = std::sync::Arc::new(BlockingExecutor::new());
+    let started = executor.started();
+    let m = std::sync::Arc::new(SubagentManager::new(
+        std::sync::Arc::clone(&db),
+        SubagentSettings::default(),
+        "pi",
+        executor,
+    ));
+
+    let r = m
+        .delegate(req("hibernate-timeout", "long task"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("delegate should reach the blocking executor before hibernate");
+    let err = m
+        .hibernate(ResolveParams {
+            id: Some(r.subagent_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SubagentError::Validation(message) if message.contains("lifecycle is busy"))
+    );
+
+    // Release the background task so this test does not leave a detached
+    // executor behind for subsequent tests.
+    m.cancel_task(&r.task_id, Some("cleanup after lifecycle timeout"))
+        .await
+        .unwrap();
+    assert_eq!(await_task_done(&m, &r.task_id).await, "cancelled");
 }
 
 // --- Plan 4 Task 3: ContextBuilder + MemoryUpdater wiring -------------------

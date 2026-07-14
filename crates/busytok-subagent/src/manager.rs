@@ -2267,7 +2267,7 @@ impl SubagentManager {
                         .db
                         .lock()
                         .expect("subagent db lock poisoned")
-                        .subagent_commit_hot_binding_and_status(binding, &sub.id);
+                        .subagent_restore_hot_binding_and_status(binding, &sub.id);
                     if let Err(rollback_err) = rollback {
                         error!(
                             event_code = "subagent.session.hibernate_rollback_failed",

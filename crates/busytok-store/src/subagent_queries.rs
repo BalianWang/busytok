@@ -842,6 +842,45 @@ pub fn commit_hot_binding_and_status(
     Ok(())
 }
 
+/// Atomically restore a binding that was just cooled down when the sidecar
+/// close RPC failed. Hibernate intentionally keeps the original binding row
+/// (for auditability), so a plain `upsert_hot_binding` would either preserve
+/// `is_hot=0` or hit the row's primary-key constraint. Restore the existing
+/// row in place when possible; fall back to a normal hot upsert only if the
+/// row was concurrently removed.
+pub fn restore_hot_binding_and_status(
+    conn: &Connection,
+    binding: &SubagentHarnessBindingRow,
+    subagent_id: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let now = busytok_domain::now_ms();
+    let restored = tx.execute(
+        "UPDATE subagent_harness_bindings SET is_hot = 1, status = 'hot', \
+            closed_at_ms = NULL, last_used_at_ms = ?1 \
+         WHERE id = ?2 AND subagent_id = ?3 AND harness = ?4",
+        params![now, binding.id, subagent_id, binding.harness],
+    )?;
+    if restored == 0 {
+        let mut hot_binding = binding.clone();
+        hot_binding.is_hot = 1;
+        hot_binding.status = "hot".to_string();
+        hot_binding.closed_at_ms = None;
+        hot_binding.last_used_at_ms = Some(now);
+        upsert_hot_binding(&tx, &hot_binding)?;
+    }
+    tx.execute(
+        "UPDATE subagent_logical_subagents SET status = 'hot', updated_at_ms = ?1, \
+            last_active_at_ms = COALESCE(last_active_at_ms, ?1) \
+         WHERE id = ?2",
+        params![now, subagent_id],
+    )
+    .with_context(|| format!("restore logical status hot for {subagent_id}"))?;
+    tx.commit()
+        .context("restore hot binding + status transaction")?;
+    Ok(())
+}
+
 /// Atomically: (1) upsert the (now-closed) binding, (2) roll the logical
 /// subagent status to `new_status` (`warm` or `cold`). Both writes commit in a
 /// single transaction so the spec §3.3 invariant ("status='hot' iff is_hot=1

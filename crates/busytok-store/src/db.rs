@@ -2142,6 +2142,14 @@ impl Database {
         let conn = self.conn();
         subagent_queries::commit_hot_binding_and_status(conn, binding, subagent_id)
     }
+    pub fn subagent_restore_hot_binding_and_status(
+        &self,
+        binding: &SubagentHarnessBindingRow,
+        subagent_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        subagent_queries::restore_hot_binding_and_status(conn, binding, subagent_id)
+    }
     pub fn subagent_commit_hibernate_binding_and_status(
         &self,
         binding: &SubagentHarnessBindingRow,
