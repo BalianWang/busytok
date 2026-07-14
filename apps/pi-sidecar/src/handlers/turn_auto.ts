@@ -3,6 +3,7 @@ import type { RequestHandler } from '../rpc.js';
 import { SidecarError } from '../errors.js';
 import type { SessionPool } from '../session_pool.js';
 import { PiSdkSession, type SdkSession, type SessionFactory, type CreateSessionOpts } from '../pi_session.js';
+import { logger } from '../logger.js';
 
 // Mock session id generator (used only when BUSYTOK_USE_MOCK_SIDECAR=1).
 let sessionCounter = 0;
@@ -93,10 +94,17 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
     buildSessionOpts(p),
     mockSessionFactory,
   );
+  logger.debug('turn_auto.session', {
+    logical_subagent_id: p.logical_subagent_id,
+    adapter_session_id: session.adapter_session_id,
+    session_created: !reused,
+    session_reused: reused,
+  });
   // Bug 1 fix: mark the session as in-use so getLruCandidate skips it
   // while the turn is running. `endTurn` in finally covers success,
   // error, and abort paths.
   pool.beginTurn(session.adapter_session_id);
+  let turnSucceeded = false;
   try {
     const now = Date.now();
     const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
@@ -109,6 +117,7 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
       : undefined;
     // task_summary is a REAL summary, NOT an echo of compact_context.
     // The bash mock fixture (mock-sidecar.sh) handles the echo for e2e tests.
+    turnSucceeded = true;
     return {
       adapter_session_id: session.adapter_session_id,
       session_reused: reused,
@@ -129,6 +138,22 @@ async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
     };
   } finally {
     pool.endTurn(session.adapter_session_id);
+    // Ghost session cleanup: if this session was newly created (not
+    // reused) and the turn did NOT succeed, close it immediately. A
+    // failed/timeout/cancelled turn never gets a DB binding committed
+    // by Rust (the success path in manager.rs is unreachable on Err).
+    // Without this cleanup the session lingers in the LRU as a ghost
+    // candidate — subsequent evictions hit it, get "no DB binding",
+    // and tasks loop in HotSessionLimit re-queue until the 5-minute
+    // deadline expires.
+    if (!reused && !turnSucceeded) {
+      logger.warn('session_pool.ghost_cleanup', {
+        adapter_session_id: session.adapter_session_id,
+        logical_subagent_id: p.logical_subagent_id,
+        reused: false,
+      });
+      pool.close(session.adapter_session_id);
+    }
   }
 }
 
@@ -145,9 +170,16 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
     p.logical_subagent_id,
     buildSessionOpts(p),
   );
+  logger.debug('turn_auto.session', {
+    logical_subagent_id: p.logical_subagent_id,
+    adapter_session_id: session.adapter_session_id,
+    session_created: !reused,
+    session_reused: reused,
+  });
   // Bug 1 fix: mark session as in-use during sendTurn so concurrent
   // turn_auto calls cannot select it for eviction.
   pool.beginTurn(session.adapter_session_id);
+  let turnSucceeded = false;
   try {
     const result = await session.sendTurn(p.prompt, {
       model: p.model,
@@ -155,6 +187,7 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
       tools: p.tools,
       timeout_ms: p.timeout_ms,
     });
+    turnSucceeded = true;
     return {
       adapter_session_id: session.adapter_session_id,
       session_reused: reused,
@@ -166,5 +199,21 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
     };
   } finally {
     pool.endTurn(session.adapter_session_id);
+    // Ghost session cleanup: if this session was newly created (not
+    // reused) and the turn did NOT succeed, close it immediately. A
+    // failed/timeout/cancelled turn never gets a DB binding committed
+    // by Rust (the success path in manager.rs is unreachable on Err).
+    // Without this cleanup the session lingers in the LRU as a ghost
+    // candidate — subsequent evictions hit it, get "no DB binding",
+    // and tasks loop in HotSessionLimit re-queue until the 5-minute
+    // deadline expires.
+    if (!reused && !turnSucceeded) {
+      logger.warn('session_pool.ghost_cleanup', {
+        adapter_session_id: session.adapter_session_id,
+        logical_subagent_id: p.logical_subagent_id,
+        reused: false,
+      });
+      pool.close(session.adapter_session_id);
+    }
   }
 }

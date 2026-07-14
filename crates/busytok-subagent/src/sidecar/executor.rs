@@ -722,30 +722,36 @@ impl SidecarTaskExecutor {
             Some(pair) => pair,
             None => {
                 // Ghost session: the sidecar named a candidate the DB has no
-                // binding for. This is a TRANSIENT timing window — the
-                // sidecar's `endTurn()` marks a session as idle (evictable)
-                // BEFORE Rust commits the hot binding to DB
-                // (`subagent_commit_hot_binding_and_status` runs after
-                // `turn_auto` returns). A concurrent delegate that hits this
-                // window will receive a candidate whose DB binding doesn't
-                // exist YET but will be committed within milliseconds.
+                // binding for. Two possible causes:
                 //
-                // Returning `HotSessionLimit` (transient) instead of
-                // `HotSessionStateDivergence` (fatal) causes the existing
-                // re-queue path to retry the task. By the time the task is
-                // retried, the binding will be committed and eviction will
-                // work correctly (or the pool will have freed up).
+                // 1. **Transient timing window**: the sidecar's `endTurn()`
+                //    marks a session as idle (evictable) BEFORE Rust commits
+                //    the hot binding to DB. A concurrent delegate hitting
+                //    this window receives a candidate whose binding doesn't
+                //    exist YET but will be committed within milliseconds.
                 //
-                // The previous design returned `HotSessionStateDivergence`
-                // assuming a missing binding meant permanent divergence. This
-                // was wrong: the binding WILL be committed by the concurrent
-                // `turn_auto` that's finishing up, making this a transient
-                // condition, not a permanent one.
+                // 2. **Permanent ghost**: a failed/cancelled/timed-out
+                //    `turn_auto` created a session but never committed a
+                //    binding. The session lingers in the sidecar pool
+                //    indefinitely.
+                //
+                // The sidecar's `turn_auto` ghost cleanup (closing newly-created
+                // sessions on failure) eliminates cause #2 at the source.
+                // As defense-in-depth, we also purge the ghost session here
+                // via the pool — this handles residual ghosts from pre-fix
+                // code and the cancel-while-succeeding edge case.
+                //
+                // After purging, return `HotSessionLimit` (transient) so the
+                // re-queue path retries the task. By the time it's retried,
+                // either the ghost is gone (purged) or the binding is
+                // committed (timing window resolved).
+                let purged = self.pool.purge_session(adapter_session_id).await;
                 warn!(
                     event_code = "subagent.session.eviction_ghost_session",
                     adapter_session_id = %adapter_session_id,
-                    "ghost session: sidecar returned candidate with no DB binding yet — \
-                     transient timing window (binding commit pending from concurrent turn_auto); \
+                    purged = purged,
+                    "ghost session: sidecar returned candidate with no DB binding — \
+                     purging from sidecar pool (defense-in-depth); \
                      surfacing as HotSessionLimit for re-queue"
                 );
                 return Err(SubagentError::HotSessionLimit {
