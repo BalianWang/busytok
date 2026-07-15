@@ -14,8 +14,8 @@
 //! The supervisor is constructed as `Arc<Self>` so that `SidecarHandle` and
 //! the background supervision task share ownership. RPC calls lock the state
 //! mutex only long enough to clone the client `Arc` and bump `last_activity`;
-//! the actual RPC runs with the state lock released, serialized on the
-//! client's own `tokio::Mutex`.
+//! the actual RPC runs with the state lock released; the client serializes
+//! only writes and multiplexes responses by JSON-RPC id.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -112,6 +112,9 @@ impl PressureLevel {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// Maximum time to let in-flight turns drain before falling back to process
+/// termination. Never send `adapter.shutdown` while a turn is still active.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Spec §5.4: rolling 5-min window for crash restart attempts.
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
 /// Spec §5.4: max 3 crash-restarts per 5-min rolling window (fixed,
@@ -146,10 +149,10 @@ pub struct PiSidecarSupervisor {
 
 pub struct SupervisorState {
     child: Option<Child>,
-    /// The RPC client is wrapped in `Arc<Mutex<…>>` so `call_rpc` can clone
-    /// the Arc and release the state lock before performing the (potentially
-    /// long) RPC call — avoids holding the state mutex across `.await`.
-    client: Option<Arc<Mutex<SidecarRpcClient>>>,
+    /// Concurrent RPC client. It multiplexes responses by request id, so
+    /// independent turns on one provider worker do not wait behind each
+    /// other.
+    client: Option<Arc<SidecarRpcClient>>,
     last_activity: tokio::time::Instant,
     restart_attempts: u32,
     /// Set true when the supervision loop is running; prevents double-spawn
@@ -400,30 +403,46 @@ impl PiSidecarSupervisor {
     /// (`run_subagent_doctor` protocol_version probe). Public so the runtime
     /// crate can call it after a short-lived probe.
     pub async fn shutdown_internal(&self) -> Result<(), SidecarError> {
+        // Serialize the entire shutdown lifecycle with spawn_internal. The
+        // state client is cleared before the child is reaped; without this
+        // guard, ensure_started could observe that transient state, launch a
+        // replacement worker, and have the old shutdown path take/kill it.
+        let _spawn_guard = self.spawn_lock.lock().await;
         let client = { self.state.lock().await.client.take() };
         if let Some(client) = &client {
-            // Best-effort: ask the sidecar to prepare all hot sessions for
-            // hibernate (Plan 3 tracks per-session state; Plan 2 uses `all`).
-            // Plan 3: consume memory_delta from the response.
-            let _ = client
-                .lock()
+            // The multiplexed client permits independent turns to overlap,
+            // so explicitly drain them before asking the sidecar to stop.
+            // If a provider call does not settle within the bounded window,
+            // skip graceful RPCs and use the child kill fallback below.
+            if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, client.close_for_shutdown())
                 .await
-                .call_with_timeout(
-                    "session.prepare_hibernate",
-                    serde_json::json!({"all": true}),
-                    Duration::from_secs(5),
-                )
-                .await;
-            // adapter.shutdown — sidecar should exit 0 after responding.
-            let _ = client
-                .lock()
-                .await
-                .call_with_timeout(
-                    "adapter.shutdown",
-                    serde_json::json!({}),
-                    Duration::from_secs(5),
-                )
-                .await;
+                .is_ok()
+            {
+                // Best-effort: ask the sidecar to prepare all hot sessions
+                // for hibernate (Plan 3 tracks per-session state; Plan 2
+                // uses `all`).
+                let _ = client
+                    .call_for_shutdown(
+                        "session.prepare_hibernate",
+                        serde_json::json!({"all": true}),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                // adapter.shutdown — sidecar should exit 0 after responding.
+                let _ = client
+                    .call_for_shutdown(
+                        "adapter.shutdown",
+                        serde_json::json!({}),
+                        Duration::from_secs(5),
+                    )
+                    .await;
+            } else {
+                warn!(
+                    event_code = "subagent.sidecar.shutdown_drain_timeout",
+                    timeout_ms = SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+                    "in-flight sidecar calls did not drain; falling back to process termination"
+                );
+            }
         }
         // Kill child with 10s grace (spec §5.4). The sidecar should have
         // exited on adapter.shutdown; this is the fallback.
@@ -670,7 +689,7 @@ impl PiSidecarSupervisor {
                 }
             });
         }
-        let mut client = SidecarRpcClient::new(stdin, stdout);
+        let client = SidecarRpcClient::new(stdin, stdout);
         let init = client
             .call(
                 "adapter.initialize",
@@ -690,7 +709,7 @@ impl PiSidecarSupervisor {
             let mut state = self.state.lock().await;
             let is_restart = state.restart_attempts > 0;
             state.child = Some(child);
-            state.client = Some(Arc::new(Mutex::new(client)));
+            state.client = Some(Arc::new(client));
             state.last_activity = tokio::time::Instant::now();
             state.restart_attempts = 0; // reset on successful spawn
             state.spawned_at = Some(tokio::time::Instant::now()); // Phase 2: uptime
@@ -826,8 +845,6 @@ impl PiSidecarSupervisor {
                 drop(state); // release state lock before .await
                 let hot_sessions = if let Some(client) = client {
                     match client
-                        .lock()
-                        .await
                         .call_with_timeout(
                             "adapter.health",
                             serde_json::json!({}),
@@ -1112,9 +1129,9 @@ impl PiSidecarSupervisor {
                 .clone()
                 .ok_or_else(|| SidecarError::Crashed("sidecar not running".to_string()))?
         };
-        // State lock released — RPC serialized on the client's own mutex.
-        let mut guard = client.lock().await;
-        guard
+        // State lock released — the client serializes only writes and
+        // dispatches response lines independently by JSON-RPC id.
+        client
             .call_with_timeout(method, params, self.config.task_timeout)
             .await
     }
