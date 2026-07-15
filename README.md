@@ -69,18 +69,19 @@ diagnostics; do not merge the streams in automation.
 
 ## Install the agent integration
 
-Busytok ships the same `busytok-subagent-offloading` skill in the open [Agent
-Skills format](https://agentskills.io/specification), plus native Codex and
+Busytok ships the same `Busytok: Subagent Offloading` skill
+(`subagent-offloading`) in the open [Agent Skills
+format](https://agentskills.io/specification), plus native Codex and
 Claude Code plugin manifests. Copy this
 single sentence to a coding agent to install and configure the integration:
 
-> Install Busytok's `busytok-subagent-offloading` skill from https://github.com/BalianWang/busytok, verify `busytok status` is ready and `busytok models --json` contains an enabled model, then use it for delegated tasks; if installation, service readiness, or catalog selection is blocked, report the blocker instead of silently working locally.
+> Install Busytok's `Busytok: Subagent Offloading` skill (`subagent-offloading`) from https://github.com/BalianWang/busytok, verify `busytok status` is ready and `busytok models --json` contains an enabled model, then use it for delegated tasks; if installation, service readiness, or catalog selection is blocked, report the blocker instead of silently working locally.
 
 The cross-agent installer is:
 
 ```bash
 npx skills add BalianWang/busytok \
-  --skill busytok-subagent-offloading \
+  --skill subagent-offloading \
   --agent codex --agent claude-code --yes
 ```
 
@@ -89,11 +90,11 @@ For native plugin installation:
 ```bash
 # Codex: add the repository marketplace, then install the plugin.
 codex plugin marketplace add BalianWang/busytok
-codex plugin add busytok-subagent-offloading@busytok
+codex plugin add busytok@busytok
 
 # Claude Code:
 claude plugin marketplace add BalianWang/busytok
-claude plugin install busytok-subagent-offloading@busytok
+claude plugin install busytok@busytok
 ```
 
 Start a new Codex/Claude Code session after installation. The skill is an
@@ -101,15 +102,19 @@ instruction layer; the installed `busytok` binary remains the execution and
 task-lifecycle boundary. The plugin package version is independent from the
 desktop app version; bump the plugin and marketplace manifest versions together
 when the skill contract changes. The canonical skill file lives under
-`skills/busytok-subagent-offloading/`; `.agents/skills/` is kept as a
-repo-local compatibility path.
+`skills/subagent-offloading/`; the Codex and Claude manifests both package
+this same source.
+
+If you installed the preview package under the old
+`busytok-subagent-offloading` ID, reinstall it as `busytok@busytok` and
+`subagent-offloading`.
 
 ### Example: delegate a code review
 
 After installing the integration, tell Codex or Claude Code explicitly when a
 task should run through Busytok:
 
-> Use the `busytok-subagent-offloading` skill to perform a read-only code review of this repository. Delegate the review to a Busytok subagent, wait for the result, and report findings grouped by severity with file/line evidence and suggested fixes. Do not review locally; if delegation is blocked, report the exact blocker and stop.
+> Use the `Busytok: Subagent Offloading` skill (`subagent-offloading`) to perform a read-only code review of this repository. Delegate the review to a Busytok subagent, wait for the result, and report findings grouped by severity with file/line evidence and suggested fixes. Do not review locally; if delegation is blocked, report the exact blocker and stop.
 
 This is useful for an independent review pass before merging a branch, opening
 a pull request, or releasing a package. The Agent handles catalog selection,

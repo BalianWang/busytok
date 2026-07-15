@@ -5,14 +5,14 @@
   },
   "plugins": [
     {
-      "name": "busytok-subagent-offloading",
+      "name": "busytok",
       "source": {
         "source": "url",
         "url": "https://github.com/BalianWang/busytok.git",
         "ref": "main"
       },
-      "description": "Route coding-agent subtasks through explicit Busytok provider/model bindings.",
-      "version": "0.1.0",
+      "description": "Task-level model routing skills for coding agents through Busytok.",
+      "version": "0.2.0",
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"

@@ -13,7 +13,7 @@ flow is:
 5. Wait, poll, or cancel using task-level state
 
 When this guide is explicitly invoked through the
-`busytok-subagent-offloading` skill, the caller must perform a real delegation
+`Busytok: Subagent Offloading` skill (`subagent-offloading`), the caller must perform a real delegation
 and close the task lifecycle. Reading the catalog alone is not a successful
 offload. If the service or catalog blocks delegation, report that blocker
 instead of silently doing the work in the controller.
@@ -29,7 +29,7 @@ Install it for Codex and Claude Code with the cross-agent installer:
 
 ```bash
 npx skills add BalianWang/busytok \
-  --skill busytok-subagent-offloading \
+  --skill subagent-offloading \
   --agent codex --agent claude-code --yes
 ```
 
@@ -37,14 +37,18 @@ Or install the native plugin from the repository marketplace:
 
 ```bash
 codex plugin marketplace add BalianWang/busytok
-codex plugin add busytok-subagent-offloading@busytok
+codex plugin add busytok@busytok
 claude plugin marketplace add BalianWang/busytok
-claude plugin install busytok-subagent-offloading@busytok
+claude plugin install busytok@busytok
 ```
 
 Start a new agent session after installation so the host reloads the plugin's
 skill. Installation does not install or configure the `busytok` executable;
 the desktop app and CLI remain prerequisites for delegation.
+
+If you installed the preview package under the old
+`busytok-subagent-offloading` ID, reinstall it as `busytok@busytok` and
+`subagent-offloading`.
 
 ## Prerequisites
 

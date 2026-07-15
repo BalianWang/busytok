@@ -1,9 +1,9 @@
 ---
-name: busytok-subagent-offloading
+name: subagent-offloading
 description: Use when a coding agent needs to offload a subtask through Busytok, select from its live model catalog, bind a logical subagent, or retrieve a delegated task result.
 ---
 
-# Busytok Subagent Offloading
+# Busytok: Subagent Offloading
 
 ## Overview
 
