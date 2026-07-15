@@ -22,6 +22,30 @@ Structured JSON is written to stdout. Diagnostics are written to stderr.
 Parse stdout only. Do not merge streams with `2>&1`, and do not discard
 stderr by default in automation.
 
+## Installation
+
+The skill is published from this repository in the open Agent Skills format.
+Install it for Codex and Claude Code with the cross-agent installer:
+
+```bash
+npx skills add BalianWang/busytok \
+  --skill busytok-subagent-offloading \
+  --agent codex --agent claude-code --yes
+```
+
+Or install the native plugin from the repository marketplace:
+
+```bash
+codex plugin marketplace add BalianWang/busytok
+codex plugin add busytok-subagent-offloading@busytok
+claude plugin marketplace add BalianWang/busytok
+claude plugin install busytok-subagent-offloading@busytok
+```
+
+Start a new agent session after installation so the host reloads the plugin's
+skill. Installation does not install or configure the `busytok` executable;
+the desktop app and CLI remain prerequisites for delegation.
+
 ## Prerequisites
 
 The Busytok desktop app must be installed and the service must be running:

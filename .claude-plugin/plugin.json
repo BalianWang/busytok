@@ -1,0 +1,20 @@
+{
+  "name": "busytok-subagent-offloading",
+  "version": "0.1.0",
+  "description": "Route coding-agent subtasks through Busytok with explicit provider/model bindings and observable task lifecycles.",
+  "author": {
+    "name": "Busytok Contributors",
+    "url": "https://github.com/BalianWang/busytok"
+  },
+  "homepage": "https://github.com/BalianWang/busytok",
+  "repository": "https://github.com/BalianWang/busytok",
+  "license": "Apache-2.0",
+  "keywords": [
+    "subagent",
+    "model-routing",
+    "task-routing",
+    "claude-code",
+    "codex"
+  ],
+  "skills": "./skills/"
+}

@@ -1,0 +1,35 @@
+{
+  "name": "busytok-subagent-offloading",
+  "version": "0.1.0",
+  "description": "Route coding-agent subtasks through Busytok with explicit provider/model bindings and observable task lifecycles.",
+  "author": {
+    "name": "Busytok Contributors",
+    "url": "https://github.com/BalianWang/busytok"
+  },
+  "homepage": "https://github.com/BalianWang/busytok",
+  "repository": "https://github.com/BalianWang/busytok",
+  "license": "Apache-2.0",
+  "keywords": [
+    "subagent",
+    "model-routing",
+    "task-routing",
+    "codex",
+    "claude-code"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Busytok Subagent Offloading",
+    "shortDescription": "Delegate coding subtasks through explicit Busytok model routes.",
+    "longDescription": "Provides a guarded workflow for catalog discovery, explicit provider/model binding, task polling, cancellation, and structured diagnostics through the Busytok CLI.",
+    "developerName": "Busytok Contributors",
+    "category": "Productivity",
+    "capabilities": ["Interactive"],
+    "websiteURL": "https://github.com/BalianWang/busytok",
+    "defaultPrompt": [
+      "Use Busytok to delegate this bounded coding subtask.",
+      "Check the live Busytok catalog before routing this task.",
+      "Poll the delegated task and report its structured result."
+    ],
+    "brandColor": "#6E56CF"
+  }
+}

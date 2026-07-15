@@ -85,4 +85,4 @@ and report the cancellation result.
 
 ## Reference
 
-- [Integration guide](/Users/wsd/Data/Busytok/busytok/docs/superpowers/guides/busytok-subagent-codex-integration.md)
+- [Integration guide](../../docs/superpowers/guides/busytok-subagent-codex-integration.md)
