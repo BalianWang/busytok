@@ -12,9 +12,39 @@ flow is:
 4. Delegate with explicit binding or reuse semantics
 5. Wait, poll, or cancel using task-level state
 
+When this guide is explicitly invoked through the
+`Busytok: Subagent Offloading` skill (`subagent-offloading`), the caller must perform a real delegation
+and close the task lifecycle. Reading the catalog alone is not a successful
+offload. If the service or catalog blocks delegation, report that blocker
+instead of silently doing the work in the controller.
+
 Structured JSON is written to stdout. Diagnostics are written to stderr.
 Parse stdout only. Do not merge streams with `2>&1`, and do not discard
 stderr by default in automation.
+
+## Installation
+
+The skill is published from this repository in the open Agent Skills format.
+Install it for Codex and Claude Code with the cross-agent installer:
+
+```bash
+npx skills add BalianWang/busytok \
+  --skill subagent-offloading \
+  --agent codex --agent claude-code --yes
+```
+
+Or install the native plugin from the repository marketplace:
+
+```bash
+codex plugin marketplace add BalianWang/busytok
+codex plugin add busytok@busytok
+claude plugin marketplace add BalianWang/busytok
+claude plugin install busytok@busytok
+```
+
+Start a new agent session after installation so the host reloads the plugin's
+skill. Installation does not install or configure the `busytok` executable;
+the desktop app and CLI remain prerequisites for delegation.
 
 ## Prerequisites
 
@@ -23,6 +53,10 @@ The Busytok desktop app must be installed and the service must be running:
 ```bash
 busytok status
 ```
+
+Parse the JSON and require `ready: true` before continuing. A non-ready service
+or an empty matching catalog is a routing/configuration failure, not a reason
+to guess a model.
 
 At least one provider with an API key and at least one enabled model must be
 configured. Providers can be added in the GUI or by CLI:
@@ -35,6 +69,11 @@ busytok provider add \
   --key "sk-..." \
   --model "my-model"
 ```
+
+The optional provider-level `--model` creates one enabled catalog entry with
+CLI defaults (`context_window=200000`, `max_tokens=8192`, `reasoning=true`,
+and the model ID as display name). Use `busytok provider model add` or `update`
+when custom model metadata is required.
 
 ## Step 1 — Discover the Live Catalog
 
@@ -104,6 +143,9 @@ Automation should usually pass both `provider_id` and `model_id`, even if
 
 ## Step 3 — Delegate a Task
 
+Set `REPO_ROOT` to the absolute repository or worktree path before using the
+examples (for example, `REPO_ROOT="$(pwd -P)"` from the repository root).
+
 ### Prompt Channels
 
 Exactly one prompt source must be provided:
@@ -123,6 +165,7 @@ reuse policy:
 
 ```bash
 busytok delegate \
+  --cwd "$REPO_ROOT" \
   --subagent "reviewer-deepseek-v4-pro-001" \
   --profile "pi/review-cheap" \
   --bind-provider "5e3a4034-f1fd-4d50-a092-54022adbfa3e" \
@@ -144,21 +187,25 @@ Important flags:
 |------|---------|
 | `--subagent` | Logical subagent identity |
 | `--profile` | Workload profile |
-| `--bind-provider` | Provider UUID from catalog |
+| `--intent` | Optional durable long-term goal included in subagent context |
+| `--cwd` | Absolute repository/worktree path; pass it explicitly in automation |
+| `--bind-provider` | Provider UUID from catalog (enabled provider name is also accepted by the CLI; UUID is safer) |
 | `--bind-model` | Model ID from catalog |
 | `--reuse-policy create|reuse|fail` | Name reuse behavior |
 | `--model` | One-task override; not the same as `--bind-model` |
-| `--timeout` | Task runtime timeout in seconds |
+| `--timeout` | Task runtime limit in seconds |
+| `--wait-timeout` | Caller-side deadline for `--wait`; expiry exits 124 |
+| `--poll-interval` | `--wait` polling interval in seconds (minimum effective value is 1) |
 | `--output json` | Machine-readable output |
 
 ### Reuse Semantics
 
-Reusing a `--subagent` name does not rebind it.
+Reusing a `--subagent` name does not rebind it. The CLI policies are exact:
 
-- Use `--reuse-policy create` when you are creating a new routing identity
-- Use `--reuse-policy reuse` only when you intentionally want the existing
-  binding
-- Use `--reuse-policy fail` when name collisions should be surfaced
+- `create`: fail if a subagent with that name exists; otherwise create it
+- `reuse`: fail if no subagent with that name exists; otherwise reuse it
+- `fail`: alias for `create`
+- omitted: create-or-reuse, but bound-field mismatches are rejected
 
 If you want a different provider/model routing decision, create a fresh
 subagent name instead of reusing the old one.
@@ -171,6 +218,7 @@ For short, bounded work, prefer `--wait` with a client-side deadline:
 
 ```bash
 busytok delegate \
+  --cwd "$REPO_ROOT" \
   --subagent "reviewer-deepseek-v4-pro-001" \
   --profile "pi/review-cheap" \
   --bind-provider "5e3a4034-f1fd-4d50-a092-54022adbfa3e" \
@@ -179,6 +227,7 @@ busytok delegate \
   --output json \
   --wait \
   --wait-timeout 120 \
+  --poll-interval 2 \
   --prompt-file "/tmp/review-prompt.txt"
 ```
 
@@ -264,15 +313,49 @@ Machine callers should determine outcome from task status, not only process
 exit code.
 
 - `completed` → success
-- `queued` / `running` → still in progress
+- `running` → still in progress
 - `failed` → surface `error`, `error_kind`, and summary
 - `cancelled` → treat as non-success and surface the cancellation context
+- `queued` → inspect `queue_reason` when present; it distinguishes resource
+  gating or subagent serialization from an unknown delay
 
 Output shape differences:
 
 - `delegate --output json` returns `task_id` and `summary`
 - `subagent task --output json` returns `id` and `result_summary`
 - `delegate --wait` returns the task-detail shape, not the initial delegate shape
+
+For implementation work, treat a `completed` task as execution success only;
+the controller still has to verify the diff, tests, and requested acceptance
+criteria. A useful semantic result envelope is:
+
+```json
+{
+  "outcome": "DONE",
+  "findings": [],
+  "tests": [],
+  "concerns": []
+}
+```
+
+Use `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED` when the subagent did
+not produce a clean handoff.
+
+## Development workflow and isolation
+
+Busytok supplies the execution protocol; it does not replace development
+workflow gates. For an implementation plan, use separate logical identities
+for:
+
+```text
+implementer → spec reviewer → code-quality reviewer → final reviewer
+```
+
+Fix findings and re-review before advancing. Review/search tasks should be
+read-only. Mutating tasks require an isolated branch/worktree, must not run in
+parallel against the same worktree, and must never write directly to `main`.
+Pass the absolute worktree path with `--cwd`, then independently inspect the
+resulting diff and commit identity.
 
 ## Step 7 — Inspect Existing Subagents
 
@@ -285,14 +368,20 @@ busytok subagent list --output json
 Resolve a single subagent:
 
 ```bash
-busytok subagent show "reviewer-deepseek-v4-pro-001" --output json
+busytok subagent show "reviewer-deepseek-v4-pro-001" \
+  --cwd "$REPO_ROOT" --output json
 ```
 
 List recent tasks for a subagent:
 
 ```bash
-busytok subagent tasks "reviewer-deepseek-v4-pro-001" --output json
+busytok subagent tasks "reviewer-deepseek-v4-pro-001" \
+  --cwd "$REPO_ROOT" --limit 20 --output json
 ```
+
+Name-based `show`, `tasks`, `hibernate`, and `delete` resolution is scoped to
+`--cwd` (which defaults to `.`). Pass the same absolute repository/worktree
+path used for delegation; use `--id` when path-independent lookup is needed.
 
 ## Complete Example (Bash)
 
@@ -300,6 +389,7 @@ busytok subagent tasks "reviewer-deepseek-v4-pro-001" --output json
 #!/bin/bash
 set -euo pipefail
 
+REPO_ROOT="${REPO_ROOT:-$(pwd -P)}"
 CATALOG=$(busytok models --tag Coding --reasoning --sort context_window_desc --json)
 COUNT=$(echo "$CATALOG" | jq 'length')
 if [ "$COUNT" -eq 0 ]; then
@@ -307,18 +397,23 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-MODEL=$(echo "$CATALOG" | jq '.[0]')
+# The CLI sort is a useful first ordering, but make the tie-break policy
+# explicit instead of treating catalog position as "best".
+MODEL=$(echo "$CATALOG" | jq -c 'sort_by(-(.context_window // 0), -(.max_tokens // 0), .provider_id, .model_id) | .[0]')
 PROVIDER_ID=$(echo "$MODEL" | jq -r '.provider_id')
 MODEL_ID=$(echo "$MODEL" | jq -r '.model_id')
 
 PROMPT_FILE=$(mktemp)
+trap 'rm -f "$PROMPT_FILE"' EXIT
 cat >"$PROMPT_FILE" <<'EOF'
-Review the scoped patch.
+Review the scoped patch in the current repository.
 Return ranked findings with file, line, impact, and evidence.
+Do not modify files. Report DONE, DONE_WITH_CONCERNS, NEEDS_CONTEXT, or BLOCKED.
 EOF
 
 set +e
 RESP=$(busytok delegate \
+  --cwd "$REPO_ROOT" \
   --subagent "reviewer-${MODEL_ID}-$(date +%s)" \
   --profile "pi/review-cheap" \
   --bind-provider "$PROVIDER_ID" \
@@ -327,15 +422,21 @@ RESP=$(busytok delegate \
   --output json \
   --wait \
   --wait-timeout 120 \
+  --poll-interval 2 \
   --prompt-file "$PROMPT_FILE")
 RC=$?
 set -e
 
 if [ "$RC" -eq 124 ]; then
-  TASK_ID=$(echo "$RESP" | jq -r '.id')
+  TASK_ID=$(echo "$RESP" | jq -r '.id // .task_id // empty')
   echo "Timed out waiting; last known state:"
   echo "$RESP" | jq .
-  busytok subagent cancel --task-id "$TASK_ID" --reason "caller deadline exceeded" --output json | jq .
+  if [ -n "$TASK_ID" ]; then
+    if ! busytok subagent cancel --task-id "$TASK_ID" \
+      --reason "caller deadline exceeded" --output json | jq .; then
+      echo "Warning: cancellation failed; retain the task_id and poll it separately." >&2
+    fi
+  fi
   exit 124
 fi
 
@@ -346,6 +447,10 @@ if [ "$STATUS" != "completed" ]; then
 fi
 
 echo "$RESP" | jq -r '.result_summary'
+
+# Optional lifecycle audit: retain the task/subagent identity for evidence.
+TASK_ID=$(echo "$RESP" | jq -r '.id // .task_id')
+busytok subagent task --task-id "$TASK_ID" --output json | jq '{id, status, error, error_kind, queue_reason}'
 ```
 
 ## Troubleshooting

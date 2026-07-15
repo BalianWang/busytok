@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "busytok",
+  "metadata": {
+    "description": "Busytok's task-level model routing skills for coding agents.",
+    "version": "0.2.0"
+  },
+  "owner": {
+    "name": "Busytok Contributors"
+  },
+  "plugins": [
+    {
+      "name": "busytok",
+      "source": {
+        "source": "github",
+        "repo": "BalianWang/busytok",
+        "ref": "main"
+      },
+      "description": "Task-level model routing skills for coding agents through Busytok.",
+      "version": "0.2.0",
+      "repository": "https://github.com/BalianWang/busytok",
+      "license": "Apache-2.0",
+      "keywords": ["subagent", "model-routing", "task-routing"]
+    }
+  ]
+}

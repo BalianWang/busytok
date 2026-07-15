@@ -1,0 +1,23 @@
+{
+  "name": "busytok",
+  "interface": {
+    "displayName": "Busytok"
+  },
+  "plugins": [
+    {
+      "name": "busytok",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/BalianWang/busytok.git",
+        "ref": "main"
+      },
+      "description": "Task-level model routing skills for coding agents through Busytok.",
+      "version": "0.2.0",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

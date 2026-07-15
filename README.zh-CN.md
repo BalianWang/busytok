@@ -66,6 +66,51 @@ busytok delegate \
 响应会以机器可读 JSON 写入 stdout。请将 stderr 与之分开以获取诊断信息；
 自动化时不要合并两个流。
 
+## 安装 Agent 集成
+
+Busytok 按照开放的 [Agent Skills 规范](https://agentskills.io/specification)
+提供同一份 `Busytok: Subagent Offloading` skill（机器 ID：
+`subagent-offloading`），同时提供 Codex 和 Claude
+Code 的原生插件 manifest。可以把下面这句话直接复制给常用的 coding agent，
+让它自行安装并配置：
+
+> 请从 https://github.com/BalianWang/busytok 安装 Busytok 的 `Busytok: Subagent Offloading` skill（机器 ID：`subagent-offloading`），先验证 `busytok status` 已就绪且 `busytok models --json` 中存在启用的模型，再用它派发任务；如果安装、服务就绪或 catalog 选择被阻塞，请报告阻塞原因，不要静默改为本地执行。
+
+跨 Agent 的安装命令：
+
+```bash
+npx skills add BalianWang/busytok \
+  --skill subagent-offloading \
+  --agent codex --agent claude-code --yes
+```
+
+也可以使用原生插件安装：
+
+```bash
+# Codex：添加仓库 marketplace，然后安装插件。
+codex plugin marketplace add BalianWang/busytok
+codex plugin add busytok@busytok
+
+# Claude Code：
+claude plugin marketplace add BalianWang/busytok
+claude plugin install busytok@busytok
+```
+
+安装后请启动新的 Codex/Claude Code 会话。skill 是操作规范层；已安装的
+`busytok` 二进制仍然是实际执行和任务生命周期的边界。插件包版本独立于桌面
+应用版本；skill 契约发生变化时，请同步递增 plugin 和 marketplace manifest
+中的版本。规范源文件位于 `skills/subagent-offloading/`；Codex 和 Claude
+manifest 都从这一个源文件打包。
+
+### 示例：派发一次 Code Review
+
+安装集成后，在需要通过 Busytok 执行任务时，明确告诉 Codex 或 Claude Code：
+
+> 使用 `Busytok: Subagent Offloading` skill（机器 ID：`subagent-offloading`），对当前仓库执行一次只读 Code Review。请将审查任务派发给 Busytok subagent，等待结果，并按严重级别整理发现，附上文件/行号证据和建议修复方案。不要在本地直接审查；如果派发被阻塞，请报告确切阻塞原因并停止。
+
+这个场景适合在合并分支、创建 Pull Request 或发布包之前进行独立复审。
+catalog 选择、显式绑定、轮询和失败诊断都由 Agent 处理；用户只需要提供审查范围和验收标准。
+
 ## 异步委派
 
 对于较长任务，不使用 `--wait` 提交，读取返回的 `task_id`，然后轮询任务，
