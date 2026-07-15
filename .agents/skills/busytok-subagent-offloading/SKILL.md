@@ -7,65 +7,81 @@ description: Use when a coding agent needs to offload a subtask through Busytok,
 
 ## Overview
 
-Busytok provides task-routing primitives; the calling agent chooses the model. Use JSON on stdout, bind or reuse logical subagents deliberately, and determine outcome from task `status`, not only process exit code.
+Busytok is the task-routing/lifecycle boundary: choose a model, provide
+complete context, and judge the task result—not process exit code alone.
 
-## When to Use
+## Explicit invocation contract
 
-- Offloading code review, repository search, planning, or writing
-- Selecting a configured model from tags, reasoning, and context capacity
-- Inspecting a task that is `queued`, `running`, `failed`, or `cancelled`
+If the user explicitly invokes this skill, perform one real `busytok delegate`
+for the requested subtask and report its outcome. Reading or discussing
+delegation does not count. If blocked, report the command, relevant
+stdout/stderr, and next action; do not silently work locally.
 
-Do not use this skill to choose a model-selection policy.
+Close the lifecycle: wait or poll `task_id` to a deadline; if abandoned, cancel
+and report the cancellation result.
 
 ## Protocol
 
-1. Verify availability, then read the enabled live catalog. If no candidate matches, stop and report the configuration/routing failure; never blindly select `.[0]`.
+1. Verify service readiness and read the enabled catalog. Require `ready: true`
+   and a matching enabled provider/model. Otherwise report a
+   configuration/routing blocker—never blindly use `.[0]`.
 
-```bash
-busytok status
-busytok models --tag <TAG> --reasoning --sort context_window_desc --json
-```
+   ```bash
+   busytok status
+   busytok models --tag <TAG> --reasoning --sort context_window_desc --json
+   ```
 
-`status` always emits JSON on stdout — no `--json` or `--output` flag needed. Tags are free-form, case-sensitive strings defined per model — discover yours with `busytok models --json` before filtering. `--tag` is repeatable with AND semantics. Valid `--sort` values: `name` (default), `context_window_desc`, `max_tokens_desc`.
+   `status` uses JSON stdout without a flag. `models` accepts repeatable,
+   case-sensitive `--tag`, `--reasoning`, the documented sort keys, and excludes
+   disabled entries unless `--all` is passed.
 
-Route with `provider_id` + `model_id`; use `tags`, `reasoning`, `context_window`, and `max_tokens` as selection inputs. Define a deterministic policy yourself: catalog order is not "latest" or "best". `models` already excludes disabled entries unless `--all` is passed.
+2. Prepare a complete prompt with task, scope, acceptance criteria, files/SHAs,
+   read/write permission, tests, and result format. Use exactly one of
+   positional prompt, `--prompt-file`, `--stdin`, or `--artifact-ref`; prefer a
+   file or artifact for large/untrusted input.
 
-2. For a new binding, use a unique name that describes the stable role/binding, not a generic task title. For automation, pass both bind fields and an explicit reuse policy.
+3. Delegate with an absolute `--cwd`, explicit provider/model binding, a
+   role-oriented unique name, and an explicit reuse policy.
 
-```bash
-busytok delegate \
-  --subagent "reviewer-<MODEL_ID>-<UNIQUE_SUFFIX>" \
-  --profile "pi/review-cheap" \
-  --bind-provider "<PROVIDER_ID>" \
-  --bind-model "<MODEL_ID>" \
-  --reuse-policy create \
-  --output json \
-  --prompt-file "<PROMPT_FILE>" \
-  --wait \
-  --wait-timeout 120
-```
+   ```bash
+   busytok delegate --cwd "$REPO_ROOT" \
+     --subagent "reviewer-<MODEL_ID>-<UNIQUE_SUFFIX>" \
+     --profile "pi/review-cheap" \
+     --bind-provider "<PROVIDER_ID>" --bind-model "<MODEL_ID>" \
+     --reuse-policy create --output json --prompt-file "$PROMPT_FILE" \
+     --wait --wait-timeout 120 --poll-interval 2
+   ```
 
-`<PROMPT_FILE>` should contain the full instructions, e.g. "Review the scoped patch. Return ranked findings with file, line, impact, and evidence."
+   `--bind-provider` accepts a provider UUID or enabled provider name; use the
+   UUID in automation. `--timeout` is the task runtime limit; `--wait-timeout`
+   is only the caller's polling deadline. `--intent` is an optional durable
+   long-term goal; keep per-task instructions in the prompt.
 
-Profiles: `pi/review-cheap` (review), `pi/search-cheap` (search), `pi/plan-cheap` (planning).
+4. Interpret the result. Only `completed` is success. For `failed` or
+   `cancelled`, surface `error`, `error_kind`, and summary. For `queued` or
+   `running`, inspect `queue_reason` when present, then poll:
 
-3. Choose one completion mode. For bounded short work, prefer `delegate --wait --wait-timeout <SECONDS> --poll-interval <SECONDS>`; timeout returns the last known task JSON and exits `124`. Default poll interval is 2s. For longer orchestration, read the initial `.status`, then poll `task_id` until your own deadline. If you abandon the task, cancel it explicitly.
+   ```bash
+   busytok subagent task --task-id "<TASK_ID>" --output json
+   busytok subagent cancel --task-id "<TASK_ID>" \
+     --reason "caller deadline exceeded" --output json
+   ```
 
-```bash
-busytok subagent task --task-id "<TASK_ID>" --output json
-busytok subagent cancel --task-id "<TASK_ID>" --reason "caller deadline exceeded" --output json
-```
+## Binding, safety, and output rules
 
-## Binding and Output Rules
-
-- `--model` is a one-task override; it is not `--bind-model`.
-- `--reuse-policy create|reuse|fail` controls whether an existing name may be reused. Reusing a `--subagent` name does not rebind it.
-- `--bind-model` without `--bind-provider` works only if the model ID is unique. Automation should pass both catalog fields.
-- `delegate --output json` returns `task_id` / `summary` plus `created`; `subagent task` and `delegate --wait` return `id` / `result_summary`.
-- Only `completed` is success. On `failed`/`cancelled`, read and surface `error` and `error_kind` as well as the summary.
-- JSON is stdout; diagnostics are stderr. Never merge streams with `2>&1`, and do not discard stderr by default.
-- `models` uses `--json` (boolean); `delegate` and all `subagent` subcommands use `--output json` (string enum). Do not mix them.
-- Prompt input is exactly one of: positional prompt, `--prompt-file`, `--stdin`, or `--artifact-ref`. Prefer `--prompt-file` or `--artifact-ref` for large or untrusted multi-line inputs.
+- `create`: fail if the name exists; otherwise create. `fail` aliases `create`.
+  `reuse`: fail if absent; otherwise reuse without rebinding. Omitted means
+  create-or-reuse, with bound-field mismatch rejected.
+- `--model` is a one-task override, not `--bind-model`; reusing a name never
+  rebinds it.
+- JSON is stdout and diagnostics are stderr; never use `2>&1`. Without
+  `--wait`, delegate returns `task_id`/`summary`; with `--wait` and via
+  `subagent task`, it returns task-detail `id`/`result_summary`.
+- Review/search tasks are read-only by default. Mutating tasks require an
+  isolated branch/worktree, no concurrent writes to one worktree, and no direct
+  writes to `main`; verify tests, diff, and commit identity independently.
+- For implementation plans, use separate implementer, spec-reviewer, and
+  quality-reviewer identities; fix findings and re-review at each gate.
 
 ## Reference
 
