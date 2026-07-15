@@ -101,6 +101,15 @@ claude plugin install busytok-subagent-offloading@busytok
 中的版本。规范源文件位于 `skills/busytok-subagent-offloading/`；
 `.agents/skills/` 作为仓库本地兼容路径保留。
 
+### 示例：派发一次 Code Review
+
+安装集成后，在需要通过 Busytok 执行任务时，明确告诉 Codex 或 Claude Code：
+
+> 使用 `busytok-subagent-offloading` skill，对当前仓库执行一次只读 Code Review。请将审查任务派发给 Busytok subagent，等待结果，并按严重级别整理发现，附上文件/行号证据和建议修复方案。不要在本地直接审查；如果派发被阻塞，请报告确切阻塞原因并停止。
+
+这个场景适合在合并分支、创建 Pull Request 或发布包之前进行独立复审。
+catalog 选择、显式绑定、轮询和失败诊断都由 Agent 处理；用户只需要提供审查范围和验收标准。
+
 ## 异步委派
 
 对于较长任务，不使用 `--wait` 提交，读取返回的 `task_id`，然后轮询任务，

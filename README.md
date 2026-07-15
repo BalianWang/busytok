@@ -104,6 +104,18 @@ when the skill contract changes. The canonical skill file lives under
 `skills/busytok-subagent-offloading/`; `.agents/skills/` is kept as a
 repo-local compatibility path.
 
+### Example: delegate a code review
+
+After installing the integration, tell Codex or Claude Code explicitly when a
+task should run through Busytok:
+
+> Use the `busytok-subagent-offloading` skill to perform a read-only code review of this repository. Delegate the review to a Busytok subagent, wait for the result, and report findings grouped by severity with file/line evidence and suggested fixes. Do not review locally; if delegation is blocked, report the exact blocker and stop.
+
+This is useful for an independent review pass before merging a branch, opening
+a pull request, or releasing a package. The Agent handles catalog selection,
+explicit binding, polling, and failure diagnostics; you only need to provide
+the review scope and acceptance criteria.
+
 ## Asynchronous delegation
 
 For longer work, submit without `--wait`, read the returned `task_id`, and poll
