@@ -102,9 +102,6 @@ claude plugin install busytok@busytok
 中的版本。规范源文件位于 `skills/subagent-offloading/`；Codex 和 Claude
 manifest 都从这一个源文件打包。
 
-如果之前安装过预览版的 `busytok-subagent-offloading`，请重新安装
-`busytok@busytok` 插件和 `subagent-offloading` skill。
-
 ### 示例：派发一次 Code Review
 
 安装集成后，在需要通过 Busytok 执行任务时，明确告诉 Codex 或 Claude Code：

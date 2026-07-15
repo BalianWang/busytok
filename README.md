@@ -105,10 +105,6 @@ when the skill contract changes. The canonical skill file lives under
 `skills/subagent-offloading/`; the Codex and Claude manifests both package
 this same source.
 
-If you installed the preview package under the old
-`busytok-subagent-offloading` ID, reinstall it as `busytok@busytok` and
-`subagent-offloading`.
-
 ### Example: delegate a code review
 
 After installing the integration, tell Codex or Claude Code explicitly when a

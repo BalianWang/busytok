@@ -46,10 +46,6 @@ Start a new agent session after installation so the host reloads the plugin's
 skill. Installation does not install or configure the `busytok` executable;
 the desktop app and CLI remain prerequisites for delegation.
 
-If you installed the preview package under the old
-`busytok-subagent-offloading` ID, reinstall it as `busytok@busytok` and
-`subagent-offloading`.
-
 ## Prerequisites
 
 The Busytok desktop app must be installed and the service must be running:
