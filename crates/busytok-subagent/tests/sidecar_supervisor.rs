@@ -197,10 +197,10 @@ done
 "#
     )
     .unwrap();
-    let mut perms = script.as_file().metadata().unwrap().permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut perms = script.as_file().metadata().unwrap().permissions();
         perms.set_mode(0o755);
         script.as_file().set_permissions(perms).unwrap();
     }
