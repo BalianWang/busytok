@@ -475,7 +475,7 @@ printf '{{"jsonrpc":"2.0","result":{{"wrong":true}},"id":99999}}\n'
 printf '{{"jsonrpc":"2.0","result":{{"ok":true}},"id":%s}}\n' "$ID"
 sleep 1"#
     );
-    let (_child, mut client) = spawn_client(&script).await;
+    let (_child, client) = spawn_client(&script).await;
     let result = client
         .call_with_timeout(
             "adapter.health",

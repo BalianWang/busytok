@@ -80,7 +80,17 @@ export class SessionPool {
   private readonly subagentMap = new Map<string, string>();          // logical_subagent_id → adapter_session_id
   private readonly lru: string[] = [];                               // adapter_session_ids, MRU first (active only)
   private readonly busySessions = new Set<string>();                 // adapter_session_ids with in-flight turns
+  private readonly turnLeases = new Map<string, {
+    taskId?: string;
+    started: boolean;
+    cancelled: boolean;
+  }>();
   private readonly pendingSessions = new Set<string>();              // adapter_session_ids not yet activated
+  // Reservations are made before awaiting the async factory so concurrent
+  // misses cannot oversubscribe maxHot or create duplicate sessions for one
+  // logical identity.
+  private readonly creatingSubagents = new Map<string, string | undefined>();
+  private readonly cancelledCreations = new Set<string>();
   private readonly pendingSince = new Map<string, number>();        // adapter_session_id → orphan-watch timestamp (ms)
   private readonly pendingCancelCleanup = new Map<string, ReturnType<typeof setTimeout>>(); // session → cancel fallback
   private readonly evictingSessions = new Map<string, number>();     // adapter_session_id → reservation timestamp
@@ -110,6 +120,8 @@ export class SessionPool {
     logical_subagent_id: string,
     opts: CreateSessionOpts,
     createOverride?: SessionFactory,
+    creationTaskId?: string,
+    acquireTurn = false,
   ): Promise<{ session: PiSdkSession; reused: boolean }> {
     this.releaseExpiredEvictions();
     // 0. Safety net: close expired pending sessions. If Rust crashed
@@ -127,6 +139,13 @@ export class SessionPool {
         if (this.evictingSessions.has(existing) || session.isCancellationPending()) {
           throw new SidecarError(
             'hot session eviction in progress — all sessions are temporarily unavailable',
+            -32002,
+            { candidate: null, all_busy: true },
+          );
+        }
+        if (this.busySessions.has(existing)) {
+          throw new SidecarError(
+            'logical subagent already has a turn in progress',
             -32002,
             { candidate: null, all_busy: true },
           );
@@ -149,6 +168,7 @@ export class SessionPool {
           this.close(existing);
         } else {
           this.touch(existing);
+          if (acquireTurn) this.acquireTurn(existing, creationTaskId);
           return { session, reused: true };
         }
       } else {
@@ -156,13 +176,23 @@ export class SessionPool {
         this.subagentMap.delete(logical_subagent_id);
       }
     }
+    // A miss for the same logical identity may already be creating its
+    // session. Do not start a second factory call; the caller can retry after
+    // the in-flight turn publishes the binding.
+    if (this.creatingSubagents.has(logical_subagent_id)) {
+      throw new SidecarError(
+        'logical subagent session creation is already in progress',
+        -32002,
+        { candidate: null, all_busy: true },
+      );
+    }
     // 2. Miss + full — throw HOT_SESSION_LIMIT_REACHED with `data.candidate`.
     //    Bug 1 fix: skip in-use sessions (currently running a turn) —
     //    evicting them would corrupt the in-flight task AND fail on the
     //    Rust side (no DB binding yet). If all sessions are in-use,
     //    `data.candidate = null` and `data.all_busy = true` so the executor
     //    knows NOT to attempt eviction.
-    if (this.sessions.size >= this.maxHot) {
+    if (this.sessions.size + this.creatingSubagents.size >= this.maxHot) {
       const candidate = this.getLruCandidate();
       if (candidate === undefined) {
         throw new SidecarError('hot session limit reached — all sessions busy', -32002, {
@@ -179,13 +209,50 @@ export class SessionPool {
     // where a successful turn_auto makes the session evictable before
     // Rust has committed the binding.
     const factory = createOverride ?? this.factory;
-    const session = await factory(logical_subagent_id, opts);
-    const adapter_session_id = session.adapter_session_id;
-    this.sessions.set(adapter_session_id, session);
-    this.subagentMap.set(logical_subagent_id, adapter_session_id);
-    this.pendingSessions.add(adapter_session_id);
-    this.pendingSince.set(adapter_session_id, Date.now());
-    return { session, reused: false };
+    this.creatingSubagents.set(logical_subagent_id, creationTaskId);
+    try {
+      const session = await factory(logical_subagent_id, opts);
+      if (this.cancelledCreations.delete(logical_subagent_id)) {
+        // Cancellation can arrive while the SDK session is still being
+        // constructed, before subagentMap has an adapter id to look up.
+        // Dispose the just-created session instead of publishing an
+        // unbound pending ghost into the hot pool.
+        void session.close();
+        throw new SidecarError('turn cancelled before session creation completed', -32013);
+      }
+      const adapter_session_id = session.adapter_session_id;
+      this.sessions.set(adapter_session_id, session);
+      this.subagentMap.set(logical_subagent_id, adapter_session_id);
+      this.pendingSessions.add(adapter_session_id);
+      this.pendingSince.set(adapter_session_id, Date.now());
+      if (acquireTurn) this.acquireTurn(adapter_session_id, creationTaskId);
+      return { session, reused: false };
+    } catch (error) {
+      // Do not let a cancellation marker from a failed creation poison the
+      // next turn for the same logical identity.
+      this.cancelledCreations.delete(logical_subagent_id);
+      throw error;
+    } finally {
+      this.creatingSubagents.delete(logical_subagent_id);
+    }
+  }
+
+  /**
+   * Acquire a session lease for a turn. The busy marker and task-aware lease
+   * are installed inside `ensure()` before the result is returned to the RPC
+   * handler, so eviction/cancel cannot race the hand-off.
+   */
+  ensureForTurn(
+    logical_subagent_id: string,
+    opts: CreateSessionOpts,
+    createOverride?: SessionFactory,
+    taskId?: string,
+  ): Promise<{ session: PiSdkSession; reused: boolean }> {
+    // Pass the lease request into ensure itself. For a hit, ensure executes
+    // synchronously up to its resolved Promise and marks the session busy
+    // before this function returns; this closes the event-loop gap where a
+    // concurrent prepare_hibernate could reserve the session first.
+    return this.ensure(logical_subagent_id, opts, createOverride, taskId, true);
   }
 
   /** Get a session by adapter_session_id. */
@@ -202,15 +269,34 @@ export class SessionPool {
    * so a bounded fallback closes it if the SDK never settles the turn.
    *
    * Called by the `session.cancel` RPC handler. Returns `true` if a hot
-   * session was found and abort was called, `false` if no hot session
-   * exists for the subagent (the turn may have already completed or the
+   * session was found and abort was called, or if an in-flight session
+   * creation was marked for cancellation. Returns `false` when no matching
+   * turn exists for the subagent (the turn may have already completed or the
    * subagent was never seen by this sidecar).
    */
   async abortSession(logical_subagent_id: string, task_id?: string): Promise<boolean> {
     const adapter_session_id = this.subagentMap.get(logical_subagent_id);
-    if (adapter_session_id === undefined) return false;
+    if (adapter_session_id === undefined) {
+      const creatingTaskId = this.creatingSubagents.get(logical_subagent_id);
+      if (task_id !== undefined && creatingTaskId !== task_id) {
+        return false;
+      }
+      if (creatingTaskId !== undefined || this.creatingSubagents.has(logical_subagent_id)) {
+        this.cancelledCreations.add(logical_subagent_id);
+        return true;
+      }
+      return false;
+    }
     const session = this.sessions.get(adapter_session_id);
     if (!session) return false;
+    const lease = this.turnLeases.get(adapter_session_id);
+    if (lease && !lease.started) {
+      if (task_id !== undefined && lease.taskId !== task_id) {
+        return false;
+      }
+      lease.cancelled = true;
+      return true;
+    }
     // `PiSdkSession.abort()` marks the turn as cancellation-pending before
     // its first await. Schedule the fallback immediately so a hung SDK
     // abort() cannot leave the session quarantined forever.
@@ -236,6 +322,7 @@ export class SessionPool {
     const idx = this.lru.indexOf(adapter_session_id);
     if (idx >= 0) this.lru.splice(idx, 1);
     this.busySessions.delete(adapter_session_id);
+    this.turnLeases.delete(adapter_session_id);
     this.evictingSessions.delete(adapter_session_id);
     this.clearPendingCancelCleanup(adapter_session_id);
     this.pendingSessions.delete(adapter_session_id);
@@ -326,12 +413,40 @@ export class SessionPool {
   }
 
   /**
+   * Reserve a turn before the handler's first await. This is distinct from
+   * `beginTurn`: the pool busy marker protects eviction, while the lease lets
+   * `session.cancel` cancel a request that has been admitted but has not yet
+   * entered the SDK's `sendTurn()` state machine.
+   */
+  private acquireTurn(adapter_session_id: string, taskId?: string): void {
+    this.beginTurn(adapter_session_id);
+    this.turnLeases.set(adapter_session_id, {
+      taskId,
+      started: false,
+      cancelled: false,
+    });
+  }
+
+  /** Mark an admitted turn as entering the SDK call. */
+  markTurnStarted(adapter_session_id: string, taskId?: string): boolean {
+    const lease = this.turnLeases.get(adapter_session_id);
+    if (!lease) return true;
+    if (lease.taskId !== taskId) {
+      return false;
+    }
+    if (lease.cancelled) return false;
+    lease.started = true;
+    return true;
+  }
+
+  /**
    * Mark a session as idle (turn completed). Paired with `beginTurn`.
    * Safe to call on a session that was already removed via `close()` —
    * the busy flag is cleaned up on close as well.
    */
   endTurn(adapter_session_id: string): void {
     this.busySessions.delete(adapter_session_id);
+    this.turnLeases.delete(adapter_session_id);
     // Start the orphan grace period only after the in-flight turn finishes.
     // This gives Rust a full TTL window to persist the binding and call
     // `session.activate`, regardless of how long the model call took.

@@ -39,6 +39,53 @@ describe('SessionPool', () => {
     expect(pool.size()).toBe(1);
   });
 
+  it('does not exceed maxHot when concurrent misses overlap factory creation', async () => {
+    const pool = new SessionPool(1);
+    let releaseFactory!: () => void;
+    const factoryReady = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    const factory: SessionFactory = async (subagent, opts) => {
+      await factoryReady;
+      return fakeSession(`sess-${subagent}`, subagent, opts.model);
+    };
+
+    const first = pool.ensure('sub-a', OPTS, factory);
+    const second = pool.ensure('sub-b', OPTS, factory);
+    await expect(second).rejects.toMatchObject({
+      code: -32002,
+      data: { candidate: null, all_busy: true },
+    });
+    releaseFactory();
+    await expect(first).resolves.toMatchObject({ reused: false });
+    expect(pool.size()).toBe(1);
+  });
+
+  it('does not create duplicate sessions for a concurrent same-subagent miss', async () => {
+    const pool = new SessionPool(2);
+    let releaseFactory!: () => void;
+    const factoryReady = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    let factoryCalls = 0;
+    const factory: SessionFactory = async (subagent, opts) => {
+      factoryCalls += 1;
+      await factoryReady;
+      return fakeSession(`sess-${factoryCalls}`, subagent, opts.model);
+    };
+
+    const first = pool.ensure('sub-a', OPTS, factory);
+    const second = pool.ensure('sub-a', OPTS, factory);
+    await expect(second).rejects.toMatchObject({
+      code: -32002,
+      data: { candidate: null, all_busy: true },
+    });
+    releaseFactory();
+    await first;
+    expect(factoryCalls).toBe(1);
+    expect(pool.size()).toBe(1);
+  });
+
   it('ensure reuses existing session for same subagent', async () => {
     const pool = new SessionPool(3);
     await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
@@ -46,6 +93,63 @@ describe('SessionPool', () => {
     expect(result.session.adapter_session_id).toBe('sess-1');
     expect(result.reused).toBe(true);
     expect(pool.size()).toBe(1);
+  });
+
+  it('rejects a second turn while the same logical session is busy', async () => {
+    const pool = new SessionPool(2);
+    const first = await pool.ensureForTurn('sub-a', OPTS, fakeFactory('sess-1'));
+    expect(first.reused).toBe(false);
+    await expect(pool.ensureForTurn('sub-a', OPTS, fakeFactory('sess-2')))
+      .rejects.toMatchObject({
+        code: -32002,
+        data: { candidate: null, all_busy: true },
+      });
+    pool.endTurn(first.session.adapter_session_id);
+    expect(pool.size()).toBe(1);
+  });
+
+  it('leases a reused session before the ensureForTurn promise yields', async () => {
+    const pool = new SessionPool(1);
+    await pool.ensure('sub-a', OPTS, fakeFactory('sess-1'));
+    pool.activate('sess-1');
+
+    // A concurrent prepare_hibernate must observe the lease immediately,
+    // even though ensureForTurn returns a Promise for the hit path.
+    const turn = pool.ensureForTurn('sub-a', OPTS, fakeFactory('sess-2'));
+    expect(pool.reserveForEviction('sess-1')).toBe(false);
+    await expect(turn).resolves.toMatchObject({ reused: true });
+    pool.endTurn('sess-1');
+  });
+
+  it('cancels an admitted turn before the handler starts the SDK call', async () => {
+    const pool = new SessionPool(1);
+    const { session } = await pool.ensureForTurn('sub-a', OPTS, fakeFactory('sess-1'), 'task-new');
+
+    await expect(pool.abortSession('sub-a', 'task-old')).resolves.toBe(false);
+    await expect(pool.abortSession('sub-a', 'task-new')).resolves.toBe(true);
+    expect(pool.markTurnStarted(session.adapter_session_id, 'task-new')).toBe(false);
+    pool.endTurn(session.adapter_session_id);
+  });
+
+  it('cancels a session while its factory is still pending', async () => {
+    const pool = new SessionPool(1);
+    let releaseFactory!: () => void;
+    const factoryReady = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    const factory: SessionFactory = async (subagent, opts) => {
+      await factoryReady;
+      return fakeSession('cancelled-before-publish', subagent, opts.model);
+    };
+
+    const turn = pool.ensureForTurn('sub-a', OPTS, factory, 'task-new');
+    await Promise.resolve();
+    await expect(pool.abortSession('sub-a', 'task-old')).resolves.toBe(false);
+    expect(pool.size()).toBe(0);
+    await expect(pool.abortSession('sub-a', 'task-new')).resolves.toBe(true);
+    releaseFactory();
+    await expect(turn).rejects.toMatchObject({ code: -32013 });
+    expect(pool.size()).toBe(0);
   });
 
   it('ensure throws HOT_SESSION_LIMIT_REACHED with candidate when full', async () => {

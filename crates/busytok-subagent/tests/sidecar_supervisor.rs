@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -156,6 +157,94 @@ async fn supervisor_spawns_and_initializes() {
     let handle = sup.ensure_started().await.unwrap();
     let health = handle.health().await.unwrap();
     assert_eq!(health["status"], "healthy");
+    sup.shutdown().await.unwrap();
+}
+
+/// A single provider worker must admit independent subagent turns
+/// concurrently. The JSON-RPC client shares one sidecar stdio stream, so
+/// responses must be multiplexed by request id rather than serializing the
+/// whole request/response round trip behind a mutex.
+#[tokio::test]
+async fn supervisor_allows_concurrent_turn_auto_calls() {
+    let mut script = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        script,
+        r#"#!/bin/bash
+set -eu
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+  case "$method" in
+    adapter.initialize)
+      printf '{{"jsonrpc":"2.0","result":{{"protocol_version":1}},"id":%s}}\n' "$id"
+      ;;
+    session.turn_auto)
+      if [[ "$line" == *slow* ]]; then
+        (sleep 1; printf '{{"jsonrpc":"2.0","result":{{"status":"completed","adapter_session_id":"slow-session","result":{{"task_summary":"slow"}}}},"id":%s}}\n' "$id") &
+      else
+        printf '{{"jsonrpc":"2.0","result":{{"status":"completed","adapter_session_id":"fast-session","result":{{"task_summary":"fast"}}}},"id":%s}}\n' "$id"
+      fi
+      ;;
+    session.prepare_hibernate)
+      printf '{{"jsonrpc":"2.0","result":{{"memory_delta":null,"stats":{{}}}},"id":%s}}\n' "$id"
+      ;;
+    adapter.shutdown)
+      printf '{{"jsonrpc":"2.0","result":{{"ok":true}},"id":%s}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+"#
+    )
+    .unwrap();
+    let mut perms = script.as_file().metadata().unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        script.as_file().set_permissions(perms).unwrap();
+    }
+
+    let cfg = SidecarConfig {
+        node_binary: support::sidecar_shell_path(),
+        bundle_path: script.path().to_path_buf(),
+        env: HashMap::new(),
+        idle_exit_seconds: 300,
+        health_interval: Duration::from_secs(3600),
+        task_timeout: Duration::from_secs(2),
+        max_restart_attempts: 3,
+        restart_backoff_base: Duration::from_millis(10),
+        harness_name: "pi".to_string(),
+        max_hot_sessions: 3,
+        memory_soft_limit_mb: 800,
+        memory_hard_limit_mb: 1200,
+    };
+    let sup = PiSidecarSupervisor::new(cfg, None);
+    let slow_handle = sup.ensure_started().await.unwrap();
+    let fast_handle = sup.ensure_started().await.unwrap();
+    let slow = tokio::spawn(async move {
+        slow_handle
+            .turn_auto(serde_json::json!({
+                "logical_subagent_id": "slow-subagent",
+                "prompt": "slow",
+            }))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let fast = tokio::time::timeout(
+        Duration::from_millis(500),
+        fast_handle.turn_auto(serde_json::json!({
+            "logical_subagent_id": "fast-subagent",
+            "prompt": "fast",
+        })),
+    )
+    .await;
+    assert!(
+        fast.is_ok(),
+        "independent turn_auto must not wait behind a slow turn: {fast:?}"
+    );
+    fast.unwrap().unwrap();
+    slow.await.unwrap().unwrap();
     sup.shutdown().await.unwrap();
 }
 

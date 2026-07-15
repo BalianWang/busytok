@@ -89,23 +89,23 @@ function buildSessionOpts(p: TurnAutoParams): CreateSessionOpts {
  * adapter_session_ids) so Rust-side e2e tests run without credentials.
  */
 async function mockTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnAutoResult> {
-  const { session, reused } = await pool.ensure(
+  const { session, reused } = await pool.ensureForTurn(
     p.logical_subagent_id,
     buildSessionOpts(p),
     mockSessionFactory,
+    p.task_id,
   );
-  logger.debug('turn_auto.session', {
-    logical_subagent_id: p.logical_subagent_id,
-    adapter_session_id: session.adapter_session_id,
-    session_created: !reused,
-    session_reused: reused,
-  });
-  // Bug 1 fix: mark the session as in-use so getLruCandidate skips it
-  // while the turn is running. `endTurn` in finally covers success,
-  // error, and abort paths.
-  pool.beginTurn(session.adapter_session_id);
   let turnSucceeded = false;
   try {
+    if (!pool.markTurnStarted(session.adapter_session_id, p.task_id)) {
+      throw new SidecarError('turn cancelled before start', -32013);
+    }
+    logger.debug('turn_auto.session', {
+      logical_subagent_id: p.logical_subagent_id,
+      adapter_session_id: session.adapter_session_id,
+      session_created: !reused,
+      session_reused: reused,
+    });
     const now = Date.now();
     const memoryUpdate = process.env.BUSYTOK_MOCK_MEMORY_UPDATE === '1'
       ? {
@@ -166,21 +166,23 @@ async function realTurnAuto(p: TurnAutoParams, pool: SessionPool): Promise<TurnA
   // M-5: `model` is now required on `TurnAutoParams` (tightened from optional).
   // The dead `if (!p.model) throw` guard is removed — TypeScript enforces the
   // contract at compile time, and the Rust side always sends the bound model.
-  const { session, reused } = await pool.ensure(
+  const { session, reused } = await pool.ensureForTurn(
     p.logical_subagent_id,
     buildSessionOpts(p),
+    undefined,
+    p.task_id,
   );
-  logger.debug('turn_auto.session', {
-    logical_subagent_id: p.logical_subagent_id,
-    adapter_session_id: session.adapter_session_id,
-    session_created: !reused,
-    session_reused: reused,
-  });
-  // Bug 1 fix: mark session as in-use during sendTurn so concurrent
-  // turn_auto calls cannot select it for eviction.
-  pool.beginTurn(session.adapter_session_id);
   let turnSucceeded = false;
   try {
+    if (!pool.markTurnStarted(session.adapter_session_id, p.task_id)) {
+      throw new SidecarError('turn cancelled before start', -32013);
+    }
+    logger.debug('turn_auto.session', {
+      logical_subagent_id: p.logical_subagent_id,
+      adapter_session_id: session.adapter_session_id,
+      session_created: !reused,
+      session_reused: reused,
+    });
     const result = await session.sendTurn(p.prompt, {
       task_id: p.task_id,
       model: p.model,
