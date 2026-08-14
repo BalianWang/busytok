@@ -1,3 +1,5 @@
+
+
 # Busytok
 
 [![CI](https://github.com/BalianWang/busytok/actions/workflows/verify.yml/badge.svg?branch=main)](https://github.com/BalianWang/busytok/actions/workflows/verify.yml)
@@ -205,6 +207,7 @@ reusing local prompt templates.
 - `apps/gui/src-tauri`: Tauri Rust host crate and bundle configuration
 - `apps/service`: Rust background service
 - `apps/cli`: Rust administrative CLI
+- `packages/busytok-protocol-types`: TypeScript protocol types shared by the frontend and agents
 - `crates/busytok-*`: Rust workspace crates
 
 Run the local acceptance gate before a pull request:
