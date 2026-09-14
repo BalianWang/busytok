@@ -28,7 +28,7 @@ time.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rusqlite.workspace = true
-dirs = "6"
+dirs = "7"
 reqwest = { workspace = true }
 
 [dev-dependencies]
