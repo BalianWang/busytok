@@ -25,12 +25,12 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 time.workspace = true
-tauri-plugin-global-shortcut = "=2.3.1"
-tauri-plugin-clipboard-manager = "=2.3.2"
+tauri-plugin-global-shortcut = "=2.3.2"
+tauri-plugin-clipboard-manager = "=2.3.3"
 tauri-plugin-process = "=2.3.1"
-tauri-plugin-dialog = "=2.7.1"
+tauri-plugin-dialog = "=2.7.3"
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = { version = "=2.10.1", default-features = false, features = ["native-tls", "zip"] }
+tauri-plugin-updater = { version = "=2.11.0", default-features = false, features = ["native-tls", "zip"] }
 # native-tls (NOT default-tls=rustls): matches the updater's TLS backend so the
 # macOS Security Framework root CAs are trusted. Used by list_available_versions.
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
@@ -44,7 +44,7 @@ libc = "0.2"
 objc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
